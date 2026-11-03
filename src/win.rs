@@ -14,7 +14,7 @@ use windows::{
             Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
-                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ReleaseDC,
+                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
             },
         },
         Storage::FileSystem::{
@@ -37,7 +37,7 @@ use windows::{
             },
             WindowsAndMessaging::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-                GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
+                GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
                 SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_EX_TOOLWINDOW,
             },
         },
@@ -57,6 +57,8 @@ pub enum Msg {
     /// File search results for one query generation.
     Files(u64, Vec<crate::search::Item>),
     FilesIndexed,
+    /// The window's content height changed (compact mode); resize between updates.
+    Resize,
     /// Something was installed or removed: the app list should be rescanned.
     AppsChanged,
     /// A script finished: (script index, succeeded, output).
@@ -201,6 +203,8 @@ pub fn place(hwnd: HWND, monitor: &str, width: f32, height: f32) -> isize {
         let mut pt = POINT::default();
         let mon = if monitor == "primary" {
             MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY)
+        } else if monitor == "active" {
+            MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
         } else {
             let _ = GetCursorPos(&mut pt);
             MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
@@ -221,6 +225,21 @@ pub fn place(hwnd: HWND, monitor: &str, width: f32, height: f32) -> isize {
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
         mon.0 as isize
+    }
+}
+
+/// Changes only the window's height (logical px), keeping its top-left corner.
+pub fn resize(hwnd: HWND, height: f32) {
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let (mut dx, mut dy) = (96, 96);
+        let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut cur);
+        let h = (height * dx as f32 / 96.) as i32;
+        if cur.bottom - cur.top != h {
+            let _ = SetWindowPos(hwnd, None, 0, 0, cur.right - cur.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 }
 
@@ -483,6 +502,14 @@ pub fn run_as_admin(id: &str) {
     unsafe {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         ShellExecuteW(None, w!("runas"), &HSTRING::from(format!("shell:AppsFolder\\{id}")), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Runs akscast itself elevated with one argument (Windows shows the admin prompt).
+pub fn run_self_as_admin(arg: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    unsafe {
+        ShellExecuteW(None, w!("runas"), &HSTRING::from(exe.as_os_str()), &HSTRING::from(arg), PCWSTR::null(), SW_SHOWNORMAL);
     }
 }
 

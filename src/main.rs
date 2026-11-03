@@ -7,6 +7,7 @@ mod design;
 mod ext;
 mod files;
 mod net;
+mod ntfs;
 mod scripts;
 mod search;
 mod settings;
@@ -28,7 +29,7 @@ use futures::{
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
     ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
-    actions, div, prelude::*, px, size, uniform_list,
+    actions, div, prelude::*, size, uniform_list,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -45,7 +46,7 @@ use windows::Win32::Foundation::HWND;
 
 use commands::Cmd;
 use config::Config;
-use design::{Tokens, g};
+use design::{Tokens, g, px};
 use ext::FieldKind;
 use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
@@ -60,6 +61,9 @@ const FOOTER: f32 = 34.;
 fn window_height(cfg: &Config) -> f32 {
     BAR + ROW * cfg.max_results.max(1) as f32 + 12. + FOOTER
 }
+
+/// Compact mode's favourites strip under the search bar.
+const FAV_ROW: f32 = 48.;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -95,7 +99,7 @@ fn hotkey_specs(cfg: &Config) -> [String; 4] {
 }
 
 fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> {
-    cfg.files.enabled.then(|| files::Files::start(cfg.files.roots(), cfg.files.exclude.clone(), tx.clone()))
+    cfg.files.enabled.then(|| files::Files::start(cfg.files.roots(), cfg.files.exclude.clone(), cfg.files.ntfs, tx.clone()))
 }
 
 /// Section marker for a row that stands in for an empty view (drawn as an empty state).
@@ -199,6 +203,17 @@ struct Launcher {
     hwnd: HWND,
     prev: HWND,
     visible: bool,
+    /// The akscast notification-area icon (Settings → General → Show in tray).
+    tray_icon: Option<TrayIcon>,
+    /// When the window last closed, for "pop to root" after a timeout.
+    hidden_at: Option<Instant>,
+    /// Earlier root searches (oldest first) and which one Up last restored.
+    searches: Vec<String>,
+    search_pos: Option<usize>,
+    /// Compact window opened up with Down.
+    peek: bool,
+    /// Height the window was last sized to, before interface scaling.
+    height: f32,
     _subs: Vec<Subscription>,
 }
 
@@ -259,6 +274,12 @@ impl Launcher {
             hwnd: HWND::default(),
             prev: HWND::default(),
             visible: false,
+            tray_icon: None,
+            hidden_at: None,
+            searches: std::fs::read_to_string(config::dir().join("search-history.txt")).unwrap_or_default().lines().map(String::from).collect(),
+            search_pos: None,
+            peek: false,
+            height: 0.,
             _subs: subs,
         };
         this.load_extensions();
@@ -267,6 +288,82 @@ impl Launcher {
 
     fn query(&self, cx: &App) -> String {
         self.input.read(cx).as_str().to_string()
+    }
+
+    /// Compact mode with nothing typed: only the search bar (and favourites) show.
+    fn collapsed(&self, cx: &App) -> bool {
+        self.cfg.window_mode == "compact"
+            && self.mode == Mode::Root
+            && !self.peek
+            && self.panel.is_none()
+            && self.notice.is_none()
+            && self.query(cx).trim().is_empty()
+    }
+
+    fn fav_strip(&self) -> bool {
+        self.cfg.launcher.compact_favorites && !self.cfg.launcher.favorites.is_empty()
+    }
+
+    /// Window height for the current state, before interface scaling.
+    fn target_height(&self, cx: &App) -> f32 {
+        if self.collapsed(cx) { BAR + if self.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&self.cfg) }
+    }
+
+    /// Asks the message loop to resize the window when its content height changed.
+    fn request_resize(&mut self, cx: &App) {
+        let h = self.target_height(cx);
+        if self.visible && h != self.height {
+            self.height = h;
+            let _ = self.tx.unbounded_send(Msg::Resize);
+        }
+    }
+
+    /// The last search survives closing for `[launcher] pop_to_root`.
+    fn keeps_state(&self) -> bool {
+        self.hidden_at.is_some_and(|t| self.cfg.launcher.keep_for().is_none_or(|d| t.elapsed() < d))
+    }
+
+    /// Up in an empty (or just-restored) root search bar: the previous search.
+    fn recall_search(&mut self, cx: &mut Context<Self>) -> bool {
+        let q = self.query(cx);
+        let restored = self.search_pos.is_some_and(|i| self.searches.get(i) == Some(&q));
+        if self.mode != Mode::Root || !self.cfg.launcher.history || self.searches.is_empty() || !(q.is_empty() || restored) {
+            return false;
+        }
+        let i = match self.search_pos.filter(|_| restored) {
+            Some(i) => i.saturating_sub(1),
+            None => self.searches.len() - 1,
+        };
+        self.search_pos = Some(i);
+        let text = self.searches[i].clone();
+        self.input.update(cx, |s, cx| s.emplace(&text, cx));
+        true
+    }
+
+    fn remember_search(&mut self, q: String) {
+        self.searches.retain(|s| *s != q);
+        self.searches.push(q);
+        let extra = self.searches.len().saturating_sub(50);
+        self.searches.drain(..extra);
+        let _ = std::fs::write(config::dir().join("search-history.txt"), self.searches.join("\n"));
+    }
+
+    /// Writes `[launcher] <name>` (favourites / hidden) and applies it at once.
+    fn save_launcher_list(&mut self, name: &str, list: Vec<String>, cx: &mut Context<Self>) {
+        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
+        let value = toml_edit::Value::Array(list.iter().map(String::as_str).collect());
+        match config::write_value(&text, &["launcher".into(), name.into()], value).and_then(|t| std::fs::write(config::path(), t).map_err(|e| e.to_string())) {
+            Ok(()) => {
+                if name == "favorites" {
+                    self.cfg.launcher.favorites = list;
+                } else {
+                    self.cfg.launcher.hidden = list;
+                }
+                self.rebuild_catalog(cx);
+            }
+            Err(e) => self.status = Some(e),
+        }
+        cx.notify();
     }
 
     fn query_changed(&mut self, cx: &mut Context<Self>) {
@@ -411,7 +508,17 @@ impl Launcher {
         let keep_selection = self.mode == Mode::Ext;
         self.armed = None;
         self.items = match self.mode {
-            Mode::Root => search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher),
+            Mode::Root => {
+                // Matching files arrive later (Msg::Files) and slot in above the fallbacks.
+                if self.cfg.launcher.files
+                    && query.trim().chars().count() >= 3
+                    && let Some(f) = &self.files
+                {
+                    self.file_gen += 1;
+                    f.search(self.file_gen, &query, 5);
+                }
+                search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher)
+            }
             Mode::Clipboard => search::clipboard(&query, &self.history.entries, 200, &mut self.matcher),
             Mode::Emoji => search::emoji(&query, 200, &mut self.matcher),
             Mode::Files => {
@@ -480,6 +587,7 @@ impl Launcher {
         let _ = max;
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
         self.scroll_to_selected();
+        self.request_resize(cx);
         cx.notify();
     }
 
@@ -561,7 +669,15 @@ impl Launcher {
             self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
         }
         self.status = None;
-        self.set_mode(mode, cx);
+        // Within the pop-to-root timeout the launcher reopens where it was.
+        if mode == Mode::Root && self.keeps_state() {
+            self.refresh(cx);
+        } else {
+            self.peek = false;
+            self.search_pos = None;
+            self.set_mode(mode, cx);
+        }
+        self.height = self.target_height(cx);
         win::cloak(self.hwnd, false);
         win::focus(self.hwnd);
         window.activate();
@@ -575,6 +691,7 @@ impl Launcher {
     fn hide(&mut self, restore: bool, cx: &mut Context<Self>) {
         win::cloak(self.hwnd, true);
         self.visible = false;
+        self.hidden_at = Some(Instant::now());
         self.panel = None;
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
         self.stop_ext_view();
@@ -1062,10 +1179,38 @@ impl Launcher {
     }
 
     fn run(&mut self, act: Act, key: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(key) = &key {
+        let housekeeping = matches!(act, Act::Favorite(..) | Act::Hide(_));
+        if let Some(key) = key.as_ref().filter(|_| !housekeeping) {
             self.frec.record(key, search::now());
         }
+        if self.mode == Mode::Root && self.cfg.launcher.history && !housekeeping {
+            let q = self.query(cx).trim().to_string();
+            if !q.is_empty() {
+                self.remember_search(q);
+            }
+        }
         match act {
+            Act::Favorite(key, add) => {
+                let mut list = self.cfg.launcher.favorites.clone();
+                list.retain(|k| *k != key);
+                if add {
+                    list.push(key);
+                }
+                self.status = Some(if add { "Added to Favorites" } else { "Removed from Favorites" }.into());
+                return self.save_launcher_list("favorites", list, cx);
+            }
+            Act::Hide(key) => {
+                let mut list = self.cfg.launcher.hidden.clone();
+                if !list.contains(&key) {
+                    list.push(key);
+                }
+                self.status = Some("Hidden from root search. Undo in Settings → Launcher".into());
+                return self.save_launcher_list("hidden", list, cx);
+            }
+            Act::Cmd(Cmd::ClearSearchHistory) => {
+                self.searches.clear();
+                let _ = std::fs::remove_file(config::dir().join("search-history.txt"));
+            }
             Act::App(id) => win::launch_app(&id),
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
             Act::Open(target) | Act::File(target) => win::open(&target),
@@ -1288,8 +1433,12 @@ impl Launcher {
                 if cfg.start_at_login != self.cfg.start_at_login {
                     win::set_start_at_login(cfg.start_at_login);
                 }
+                if cfg.tray != self.cfg.tray {
+                    self.tray_icon = if cfg.tray { tray(self.tx.clone()) } else { None };
+                }
+                design::set_size(&cfg.size);
                 let same_files = cfg.files.enabled == self.files.is_some()
-                    && self.files.as_ref().is_none_or(|f| f.same_roots(&cfg.files.roots(), &cfg.files.exclude));
+                    && self.files.as_ref().is_none_or(|f| f.same_roots(&cfg.files.roots(), &cfg.files.exclude, cfg.files.ntfs));
                 if !same_files {
                     self.files = start_files(&cfg, &self.tx);
                 }
@@ -1322,6 +1471,15 @@ impl Launcher {
                     }
                 }
             }
+            Msg::Files(generation, items) if self.mode == Mode::Root => {
+                if generation == self.file_gen && !items.is_empty() {
+                    let at = self.items.iter().position(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use \""))).unwrap_or(self.items.len());
+                    self.items.splice(at..at, items.into_iter().map(|it| it.sec("Files")));
+                    cx.notify();
+                }
+            }
+            // Handled by the message loop before this update.
+            Msg::Resize => {}
             Msg::Files(generation, items) => {
                 if self.mode == Mode::Files && generation == self.file_gen && !self.query(cx).trim().is_empty() {
                     self.items = if items.is_empty() { vec![empty_row(g::SEARCH, "No matching files".into(), "Try fewer letters, or add folders in Settings → Files".into(), vec![])] } else { items };
@@ -1459,7 +1617,8 @@ impl Launcher {
             && let Some(f) = &self.files
         {
             let n = f.count.load(std::sync::atomic::Ordering::SeqCst);
-            return if f.indexing.load(std::sync::atomic::Ordering::SeqCst) { format!("Indexing… {n} so far") } else { format!("{n} files indexed") };
+            let scope = if f.whole_drives() { " on all drives" } else { "" };
+            return if f.indexing.load(std::sync::atomic::Ordering::SeqCst) { format!("Indexing… {n} so far") } else { format!("{n} files indexed{scope}") };
         }
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
@@ -1615,6 +1774,8 @@ impl Launcher {
 /// Fluent glyph for an action in the Ctrl+K panel.
 fn act_glyph(act: &Act) -> char {
     match act {
+        Act::Favorite(..) => g::STAR,
+        Act::Hide(_) => g::CANCEL,
         Act::Copy(_) => g::COPY,
         Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => g::PASTE,
         Act::Open(_) => g::GLOBE,
@@ -1657,6 +1818,8 @@ enum Slot {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Rem-based spacing follows the interface size too.
+        window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
@@ -1810,6 +1973,31 @@ impl Render for Launcher {
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
             _ => list.into_any_element(),
         };
+
+        // ---- compact mode: favourites as icons ----
+        let collapsed = self.collapsed(cx);
+        let fav_strip = div()
+            .h(px(FAV_ROW))
+            .flex_none()
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .border_t_1()
+            .border_color(t.hairline)
+            .children(search::favorites(&self.catalog, &self.cfg).into_iter().take(12).enumerate().map(|(i, it)| {
+                let (act, key) = (it.act.clone(), it.key.clone());
+                div()
+                    .id(("fav", i))
+                    .size(px(36.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .hover(|s| s.bg(t.surface_strong))
+                    .on_click(cx.listener(move |this, _, window, cx| this.run(act.clone(), key.clone(), window, cx)))
+                    .child(design::icon_view(&it.icon, &t, false))
+            }));
 
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
@@ -2043,6 +2231,10 @@ impl Render for Launcher {
                 if this.panel.is_none() && this.is_form() {
                     return this.move_field(1, window, cx);
                 }
+                if this.collapsed(cx) {
+                    this.peek = true;
+                    return this.refresh(cx);
+                }
                 match &mut this.panel {
                     Some((item, i)) => *i = (*i + 1).min(item.actions().len().saturating_sub(1)),
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
@@ -2054,6 +2246,9 @@ impl Render for Launcher {
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
                 if this.panel.is_none() && this.is_form() {
                     return this.move_field(-1, window, cx);
+                }
+                if this.panel.is_none() && this.selected == 0 && this.recall_search(cx) {
+                    return;
                 }
                 match &mut this.panel {
                     Some((_, i)) => *i = i.saturating_sub(1),
@@ -2102,8 +2297,8 @@ impl Render for Launcher {
                     .child(design::fluent(g::WARNING, 13., t.warning))
                     .child(div().min_w_0().child(n))
             }))
-            .child(body)
-            .child(footer)
+            .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
+            .when(!collapsed, |d| d.child(body).child(footer))
             .children(popover)
             .children(dialog)
     }
@@ -2162,6 +2357,19 @@ fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
 }
 
 fn main() {
+    // The whole-drive file index helper (see ntfs.rs).
+    match std::env::args().nth(1).as_deref() {
+        Some("--indexer") => return ntfs::serve(),
+        Some(flag @ ("--install-indexer" | "--uninstall-indexer")) => {
+            let done = if flag == "--install-indexer" { ntfs::install() } else { ntfs::uninstall() };
+            if let Err(e) = done {
+                let _ = std::fs::write(std::env::temp_dir().join("akscast-indexer-error.txt"), e);
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {}
+    }
     // ponytail: a second launch just exits; forward "show" to the running instance later.
     if !win::single_instance() {
         return;
@@ -2197,8 +2405,9 @@ fn main() {
         };
         win::set_start_at_login(cfg.start_at_login);
         net::load_rates();
+        design::set_size(&cfg.size);
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
-        let tray = tray(tx.clone());
+        let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
 
         let bounds = Bounds::centered(None, size(px(cfg.width), px(window_height(&cfg))), cx);
@@ -2221,17 +2430,27 @@ fn main() {
             win::round_corners(this.hwnd);
             win::cloak(this.hwnd, true);
             window.set_visible(true);
+            this.tray_icon = tray;
             this.scan_apps(true, false);
         });
 
         cx.spawn(async move |cx| {
-            let _tray = tray;
             while let Some(msg) = rx.next().await {
+                if let Msg::Resize = msg {
+                    if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
+                        win::resize(hwnd, h * design::scale());
+                    }
+                    continue;
+                }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
                 // proc re-borrows the app, so the window is moved here, between updates.
                 let opens = matches!(msg, Msg::Hotkey(_) | Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(Bind::Launcher, Err(_)) | Msg::ScriptDone(..));
-                let geometry = handle.update(cx, |this, _, _| {
-                    (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width, window_height(&this.cfg)))
+                let opens_root = matches!(msg, Msg::Hotkey(Bind::Launcher) | Msg::Tray(TrayCmd::Open));
+                let geometry = handle.update(cx, |this, _, cx| {
+                    // Opening compact root search: just the bar, unless the last search is kept.
+                    let compact = opens_root && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
+                    let height = if compact { BAR + if this.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&this.cfg) };
+                    (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width * design::scale(), height * design::scale()))
                 });
                 if opens && let Ok(Some((hwnd, monitor, width, height))) = geometry {
                     win::place(hwnd, &monitor, width, height);

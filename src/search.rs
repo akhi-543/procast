@@ -60,6 +60,10 @@ pub enum Act {
     UninstallExt(String),
     /// Install a store extension by name.
     Install(String),
+    /// Pin (true) or unpin a root item, by key.
+    Favorite(String, bool),
+    /// Leave a root item out of root search, by key.
+    Hide(String),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -84,6 +88,9 @@ impl Act {
             Act::Confirm(false) => "Cancel",
             Act::UninstallExt(_) => "Uninstall Extension",
             Act::Fill(_) => "Type Query",
+            Act::Favorite(_, true) => "Add to Favorites",
+            Act::Favorite(_, false) => "Remove from Favorites",
+            Act::Hide(_) => "Hide from Root Search",
             Act::None => "",
         }
     }
@@ -121,12 +128,14 @@ pub struct Item {
     hay: String,
     /// Explicit Ctrl+K actions (extension rows); empty = derived from `act`.
     pub extra: Vec<(String, Act)>,
+    /// Root-search item: whether it's a favourite (Ctrl+K offers pin/unpin and hide).
+    pub fav: Option<bool>,
 }
 
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![] }
+        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None }
     }
 
     pub fn acc(mut self, accessory: impl Into<String>) -> Self {
@@ -147,6 +156,14 @@ impl Item {
 
     /// The Ctrl+K action panel, labelled: primary action first, then secondary ones.
     pub fn actions(&self) -> Vec<(String, Act)> {
+        let mut out = self.own_actions();
+        if let (Some(fav), Some(key)) = (self.fav, &self.key) {
+            out.extend([Act::Favorite(key.clone(), !fav), Act::Hide(key.clone())].map(|a| (a.label().to_string(), a)));
+        }
+        out
+    }
+
+    fn own_actions(&self) -> Vec<(String, Act)> {
         if !self.extra.is_empty() {
             return self.extra.clone();
         }
@@ -212,6 +229,15 @@ impl Frecency {
 
 /// Everything root search can find. Rebuilt when apps or config change.
 pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
+    let mut items = all_items(apps, scripts, exts, cfg);
+    items.retain(|it| it.key.as_ref().is_none_or(|k| !cfg.launcher.hidden.contains(k)));
+    for it in &mut items {
+        it.fav = it.key.as_ref().map(|k| cfg.launcher.favorites.contains(k));
+    }
+    items
+}
+
+fn all_items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
@@ -285,15 +311,21 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
 
     if q.is_empty() {
         let now = now();
-        let mut recent: Vec<_> =
-            catalog.iter().filter_map(|it| Some((frec.score(it.key.as_deref()?, now), it))).filter(|(s, _)| *s > 0.01).collect();
+        let favorites = favorites(catalog, cfg);
+        let mut recent: Vec<_> = catalog
+            .iter()
+            .filter(|it| it.fav != Some(true))
+            .filter_map(|it| Some((frec.score(it.key.as_deref()?, now), it)))
+            .filter(|(s, _)| *s > 0.01)
+            .collect();
         recent.sort_by(|a, b| b.0.total_cmp(&a.0));
-        if recent.is_empty() {
+        if recent.is_empty() && favorites.is_empty() {
             // First run: point at a few things worth knowing about.
             let starters = [Cmd::ClipboardHistory, Cmd::SearchFiles, Cmd::Emoji, Cmd::BrowseStore, Cmd::Settings];
             return catalog.iter().filter(|it| matches!(it.act, Act::Cmd(c) if starters.contains(&c))).map(|it| it.clone().sec("Suggestions")).collect();
         }
-        return recent.into_iter().take(max).map(|(_, it)| it.clone().sec("Recent")).collect();
+        let favorites = favorites.into_iter().map(|it| it.sec("Favorites"));
+        return favorites.chain(recent.into_iter().take(max).map(|(_, it)| it.clone().sec("Recent"))).collect();
     }
 
     let mut top = Vec::new();
@@ -313,19 +345,47 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         top.push(Item::new(&result, format!("{q} ="), Icon::Fluent(g::CALCULATOR), Act::Copy(result.clone())).acc("Calculator"));
     }
 
-    let fallback = (!cfg.search.fallback.is_empty()).then(|| {
-        Item::new("Search the web", "", Icon::Fluent(g::GLOBE), Act::Open(cfg.search.fallback.replace("{query}", &url_encode(q))))
-            .acc("Web")
-            .sec(format!("Use \"{q}\" with"))
-    });
-    let room = max.saturating_sub(top.len() + fallback.is_some() as usize);
-    top.extend(fuzzy(q, catalog.iter(), frec, matcher).into_iter().take(room).map(|(_, it)| it.clone()));
+    // Fallback commands: the web search and quicklinks that take a query, in the configured order.
+    let fallbacks: Vec<Item> = cfg
+        .search
+        .fallbacks
+        .iter()
+        .filter_map(|name| {
+            let (title, url, glyph, kind) = if name.eq_ignore_ascii_case("web") {
+                (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), g::GLOBE, "Web"))?
+            } else {
+                let l = cfg.quicklink.iter().find(|l| l.title().eq_ignore_ascii_case(name) && l.url.contains("{query}"))?;
+                (l.title().to_string(), l.url.clone(), g::LINK, "Quicklink")
+            };
+            Some(Item::new(title, "", Icon::Fluent(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).sec(format!("Use \"{q}\" with")))
+        })
+        .collect();
+    let room = max.saturating_sub(top.len() + fallbacks.len());
+    let hits = fuzzy(q, catalog.iter(), frec, matcher);
+    let best = hits.first().map_or(0., |h| h.0);
+    let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
+    let sensitive = |(score, it): &(f64, &Item)| match cfg.launcher.sensitivity.as_str() {
+        // Every word appears as typed (case aside).
+        "low" => {
+            let hay = it.hay.to_lowercase();
+            words.iter().all(|w| hay.contains(w.as_str()))
+        }
+        "high" => true,
+        // Drop the weakest fuzzy matches.
+        _ => *score >= best * 0.3,
+    };
+    top.extend(hits.into_iter().filter(sensitive).take(room).map(|(_, it)| it.clone()));
     for it in &mut top {
         it.section = Some("Results".into());
     }
-    top.extend(fallback);
+    top.extend(fallbacks);
     top.truncate(max);
     top
+}
+
+/// The pinned items, in the order they were pinned.
+pub fn favorites(catalog: &[Item], cfg: &Config) -> Vec<Item> {
+    cfg.launcher.favorites.iter().filter_map(|k| catalog.iter().find(|it| it.key.as_ref() == Some(k)).cloned()).collect()
 }
 
 pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Matcher) -> Vec<Item> {
@@ -518,6 +578,35 @@ mod tests {
         assert_eq!((thirds[0].right, thirds[1].left, thirds[1].right, thirds[2].left, thirds[2].right), (640, 640, 1280, 1280, 1920));
         let c = layout(Snap::Center, wa, cur);
         assert_eq!((c.right - c.left, c.left), (800, 560));
+    }
+
+    #[test]
+    fn launcher_favorites_hidden_sensitivity_and_fallbacks() {
+        let apps: Vec<App> = ["Notepad", "Paint", "Photos"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
+        let mut cfg = crate::config::parse(
+            "[launcher]\nfavorites = [\"app:Photos\"]\nhidden = [\"app:Paint\"]\n\
+             [search]\nfallbacks = [\"GitHub\", \"web\"]\n\
+             [[quicklink]]\nname = \"GitHub\"\nurl = \"https://github.com/search?q={query}\"",
+        )
+        .unwrap();
+        let cat = catalog(&apps, &[], &[], &cfg);
+        let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let frec = Frecency::default();
+        assert!(cat.iter().all(|it| it.title != "Paint"), "hidden items leave the catalog");
+
+        let empty = root("", &cat, &cfg, &frec, &mut m);
+        assert_eq!((empty[0].title.as_str(), empty[0].section.as_deref()), ("Photos", Some("Favorites")));
+        let acts: Vec<String> = empty[0].actions().into_iter().map(|a| a.0).collect();
+        assert!(acts.contains(&"Remove from Favorites".to_string()) && acts.contains(&"Hide from Root Search".to_string()));
+
+        let hits = root("ntpd", &cat, &cfg, &frec, &mut m);
+        assert_eq!(hits[0].title, "Notepad");
+        let tail: Vec<&str> = hits.iter().filter(|h| h.section.as_deref() == Some("Use \"ntpd\" with")).map(|h| h.title.as_str()).collect();
+        assert_eq!(tail, ["GitHub", "Search the web"], "fallbacks in configured order");
+
+        cfg.launcher.sensitivity = "low".into();
+        assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");
+        assert_eq!(root("note", &cat, &cfg, &frec, &mut m)[0].title, "Notepad");
     }
 
     #[test]

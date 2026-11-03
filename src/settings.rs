@@ -5,11 +5,11 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
-    prelude::*, px,
+    prelude::*,
 };
 use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, text_input};
 
-use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, ext};
+use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, design::px, ext};
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -31,7 +31,7 @@ struct Row {
     kind: Kind,
 }
 
-const SECTIONS: [&str; 7] = ["General", "Search", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 7] = ["General", "Launcher", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
     Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind }
@@ -40,16 +40,30 @@ fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
 fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
     match SECTIONS[section] {
         "General" => vec![
+            row("Open at login", "start_at_login", Kind::Bool, ""),
+            row("Show in tray", "tray", Kind::Bool, "The akscast icon in the notification area"),
             row("Launcher hotkey", "hotkey", Kind::Hotkey, "Opens akscast"),
             row("Emoji hotkey", "emoji.hotkey", Kind::Hotkey, "Opens emoji search directly"),
-            row("Monitor", "monitor", Kind::Choice(&["cursor", "primary"]), "Where the window opens"),
-            row("Width", "width", Kind::Number, "Window width in pixels (at 100% scaling)"),
-            row("Rows", "max_results", Kind::Number, "Results shown in root search"),
-            row("Start at login", "start_at_login", Kind::Bool, ""),
+            row("Appearance", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "system follows Windows"),
+            row("Dark theme", "theme.dark", Kind::Choice(crate::design::DARK_THEMES), ""),
+            row("Light theme", "theme.light", Kind::Choice(crate::design::LIGHT_THEMES), ""),
+            row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Text, rows and window"),
+            row("Window mode", "window_mode", Kind::Choice(&["expanded", "compact"]), "Compact: only the search bar until you type"),
+            row("Favourites in compact mode", "launcher.compact_favorites", Kind::Bool, "Icons under the search bar"),
+            row("Width", "width", Kind::Number, "Window width in pixels"),
         ],
-        "Search" => vec![
-            row("Calculator", "search.calculator", Kind::Bool, "Math and unit conversion in root search"),
-            row("Web fallback", "search.fallback", Kind::Text, "{query} is replaced; empty hides the row"),
+        "Launcher" => vec![
+            row("Show akscast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Screen with the mouse, with the focused window, or the main one"),
+            row("Pop to root search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long the last search survives closing"),
+            row("Search sensitivity", "launcher.sensitivity", Kind::Choice(&["low", "medium", "high"]), "Low shows only close matches"),
+            row("Rows", "max_results", Kind::Number, "Results shown in root search"),
+            row("Include files", "launcher.files", Kind::Bool, "Matching files under root results"),
+            row("Search history", "launcher.history", Kind::Bool, "Up arrow brings back earlier searches"),
+            row("Favourites", "launcher.favorites", Kind::List, "Pinned to the top · Ctrl+K → Add to Favorites"),
+            row("Hidden from root search", "launcher.hidden", Kind::List, "Ctrl+K → Hide from Root Search; remove one to show it again"),
+            row("Calculator", "search.calculator", Kind::Bool, "Math, units and currencies"),
+            row("Fallback commands", "search.fallbacks", Kind::List, "Offered for any query, in order: web, or quicklink names"),
+            row("Web search URL", "search.fallback", Kind::Text, "{query} is replaced"),
         ],
         "Clipboard" => vec![
             row("Clipboard history", "clipboard.enabled", Kind::Bool, "Text only, encrypted for your Windows account"),
@@ -62,6 +76,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             row("Hotkey", "files.hotkey", Kind::Hotkey, "Opens file search directly"),
             row("Folders", "files.roots", Kind::List, "Empty = your user folder"),
             row("Skip names", "files.exclude", Kind::List, "Folder or file names skipped anywhere"),
+            row("Whole-drive search", "files.ntfs", Kind::Bool, "Every NTFS drive, live. Needs \"Enable Fast File Search\" once (admin)"),
         ],
         "Theme" => {
             let mut r = vec![row("Mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "")];
@@ -296,6 +311,19 @@ impl Settings {
     }
 
     fn control(&self, r: &Row, on: bool, t: &crate::design::Tokens) -> AnyElement {
+        if let Some(color) = swatch(r, t) {
+            return div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().size(px(22.)).flex_none().rounded(px(5.)).border_1().border_color(t.border).bg(color))
+                .child(div().flex_1().min_w_0().child(self.input_control(r, on, t)))
+                .into_any_element();
+        }
+        self.input_control(r, on, t)
+    }
+
+    fn input_control(&self, r: &Row, on: bool, t: &crate::design::Tokens) -> AnyElement {
         let value = config::read_value(&self.text, &r.path);
         let pill = |text: String, active: bool| {
             div()
@@ -329,6 +357,7 @@ impl Settings {
             Kind::Bool => crate::design::toggle(value == "true", t).into_any_element(),
             Kind::Choice(opts) => div()
                 .flex()
+                .flex_wrap()
                 .p(px(2.))
                 .gap(px(2.))
                 .rounded(px(6.))
@@ -356,6 +385,7 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
         let t = crate::design::Tokens::from_theme(&theme, window);
+        window.set_rem_size(px(16.));
         let rows = self.rows();
         let me = cx.weak_entity();
         crate::dump_ui(
@@ -438,6 +468,7 @@ impl Render for Settings {
                             .flex_col()
                             .gap_1()
                             .child(div().font_family(crate::design::FONT_DISPLAY).text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
+                            .children((SECTIONS[self.section] == "Theme").then(|| preview(&t)))
                             .children(rows.iter().enumerate().map(|(i, r)| {
                                 let on = i == self.selected;
                                 let me = me.clone();
@@ -490,4 +521,87 @@ impl Render for Settings {
                     ),
             )
     }
+}
+
+/// Theme rows show the colour in use: the override, or the palette's own.
+fn swatch(r: &Row, t: &crate::design::Tokens) -> Option<gpui::Hsla> {
+    let [section, key] = r.path.as_slice() else { return None };
+    if section != "theme" {
+        return None;
+    }
+    Some(match key.as_str() {
+        "background" => t.bg,
+        "text" => t.text,
+        "muted" => t.text_muted,
+        "selected" => t.accent,
+        "selected_text" => t.accent_text,
+        "border" => t.border,
+        "separator" => t.hairline,
+        "container" => t.bg_elevated,
+        _ => return None,
+    })
+}
+
+/// Theme studio: a small launcher drawn with the current theme, updated as you edit.
+fn preview(t: &crate::design::Tokens) -> impl IntoElement {
+    use crate::design::{FONT_UI, fluent, g, key_cap};
+    let row = |glyph: char, title: &str, sub: &str, acc: &str, on: bool| {
+        div()
+            .h(px(36.))
+            .mx(px(6.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .rounded(px(6.))
+            .relative()
+            .when(on, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)))
+            .child(div().size(px(24.)).flex().items_center().justify_center().rounded(px(6.)).bg(t.surface).child(fluent(glyph, 13., t.text_muted)))
+            .child(div().child(title.to_string()))
+            .child(div().text_color(t.text_muted).child(sub.to_string()))
+            .child(div().flex_1())
+            .child(div().text_size(px(12.)).text_color(t.text_faint).child(acc.to_string()))
+    };
+    div()
+        .mb(px(14.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.bg)
+        .font_family(FONT_UI)
+        .text_size(px(13.))
+        .text_color(t.text)
+        .overflow_hidden()
+        .child(
+            div()
+                .h(px(44.))
+                .px(px(14.))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .border_b_1()
+                .border_color(t.hairline)
+                .child(fluent(g::SEARCH, 15., t.accent))
+                .child(div().text_color(t.text_muted).child("Search apps and commands…")),
+        )
+        .child(div().px(px(14.)).pt(px(8.)).pb(px(4.)).text_size(px(11.5)).text_color(t.text_faint).child("Results"))
+        .child(row(g::FOLDER, "Search Files", "akscast", "Command", true))
+        .child(row(g::PASTE, "Clipboard History", "akscast", "Command", false))
+        .child(row(g::CALCULATOR, "42", "6 × 7 =", "Calculator", false))
+        .child(
+            div()
+                .h(px(36.))
+                .mt(px(6.))
+                .px(px(14.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .border_t_1()
+                .border_color(t.hairline)
+                .bg(t.bg_elevated)
+                .child(div().size(px(8.)).rounded_full().bg(t.success))
+                .child(div().flex_1().text_color(t.text_muted).child("Preview"))
+                .child(div().text_color(t.text).child("Open"))
+                .child(key_cap("↵", t)),
+        )
 }

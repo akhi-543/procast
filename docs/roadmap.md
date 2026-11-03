@@ -19,33 +19,33 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | [x] | A3 | **Live file index.** `ReadDirectoryChangesW` on each folder applies creates, deletes, renames and moves as they happen. Safety re-crawl at most hourly | ✅ | M | |
 | [x] | A4 | **File index saved to disk** (`files.bin`). 138,617 entries load in 54 ms vs a 1.3 s crawl; one background crawl at start catches changes made while akscast was off | ✅ | S | |
 | [ ] | A5 | **Use Everything if it's installed.** Ask voidtools Everything over IPC: whole drives, instant, no index of our own | ✗ | M | install Everything (free) |
-| [ ] | A6 | **NTFS MFT scanner + USN journal** (what Raycast's "NTFS Scanner" service does). Indexes whole drives in seconds and stays live. Needs an elevated helper service | ✗ | L | OK to install an admin service |
+| [x] | A6 | **NTFS MFT scanner + USN journal** (what Raycast's "NTFS Scanner" service does). Indexes whole drives in seconds and stays live. Needs an elevated helper service | ✅ enabled: C:, D:, E:: 2.7 M entries in ~10 s at logon, 20–44 ms per search, changes show in ~60 ms | L | OK to install an admin service |
 | [ ] | A7 | **File content search** via the Windows Search index (Raycast does the same) | ✗ | M | turn on Windows Search indexing for your folders |
-| [ ] | A8 | Faster matching over large file indexes (prefilter before fuzzy match). Only worth it if A5/A6 make the index millions of files | ✗ | S | |
+| [x] | A8 | Faster matching over large file indexes (prefilter before fuzzy match). Only worth it if A5/A6 make the index millions of files | ✅ parallel prefilter in the NTFS search | S | |
 
 ## B. General
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Open at login, launcher hotkey, follow system appearance | ✅ | | |
-| [ ] | B1 | Toggle "Show in system tray" (today the akscast tray icon is always on) | ✗ | S | |
-| [ ] | B2 | Named themes: pick a dark theme and a light theme from a list | ◐ colour overrides only | S | |
-| [ ] | B3 | Theme studio: visual colour editor with live preview | ✗ | M | |
-| [ ] | B4 | Interface size: small / default / large | ✗ | S | |
-| [ ] | B5 | **Compact window mode:** only the search bar until you type, then it expands | ✗ | M | |
-| [ ] | B6 | Favourites shown as icons in compact mode | ✗ | S | needs B5 + D4 |
+| [x] | B1 | Toggle "Show in system tray" (today the akscast tray icon is always on) | ✅ | S | |
+| [x] | B2 | Named themes: pick a dark theme and a light theme from a list | ✅ akscast Dark, Midnight, Graphite, Forest · akscast Light, Paper, Mist | S | |
+| [x] | B3 | Theme studio: visual colour editor with live preview | ✅ live preview + swatches in Settings → Theme | M | |
+| [x] | B4 | Interface size: small / default / large | ✅ | S | |
+| [x] | B5 | **Compact window mode:** only the search bar until you type, then it expands | ✅ Down opens the list | M | |
+| [x] | B6 | Favourites shown as icons in compact mode | ✅ | S | needs B5 + D4 |
 
 ## C. Launcher (root search)
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | C1 | Show on: screen with the mouse / **active window** / primary | ◐ no "active window" | S | |
-| [ ] | C2 | Pop to root after closing: immediately / after 5–180 s (today akscast always resets) | ✗ | S | |
-| [ ] | C3 | Root search sensitivity: low / medium / high | ✗ | S | |
-| [ ] | C4 | Include files in root search | ✗ | S | |
-| [ ] | C5 | Search history: Up arrow restores recent queries | ✗ | S | |
-| [ ] | C6 | Hide any item from root search | ✗ | S | |
-| [ ] | C7 | Several fallback commands (Google, GitHub, ChatGPT, …), reorderable | ◐ one web fallback | S | |
+| [x] | C1 | Show on: screen with the mouse / **active window** / primary | ✅ | S | |
+| [x] | C2 | Pop to root after closing: immediately / after 5–180 s (today akscast always resets) | ✅ | S | |
+| [x] | C3 | Root search sensitivity: low / medium / high | ✅ | S | |
+| [x] | C4 | Include files in root search | ✅ | S | |
+| [x] | C5 | Search history: Up arrow restores recent queries | ✅ + Clear Search History | S | |
+| [x] | C6 | Hide any item from root search | ✅ | S | |
+| [x] | C7 | Several fallback commands (Google, GitHub, ChatGPT, …), reorderable | ✅ | S | |
 
 ## D. Shortcuts page (the Raycast "Shortcuts" table)
 
@@ -54,7 +54,7 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | [ ] | D1 | **One table of every command** (apps, built-ins, extensions, quicklinks, scripts), filterable by category | ✗ | M | |
 | [ ] | D2 | **Hotkey for any command or app**, with conflict warning | ◐ launcher, clipboard, emoji and files only | M | |
 | [ ] | D3 | **Alias for any command** (type `cl` to run Clipboard History) | ◐ quicklink keywords only | S | |
-| [ ] | D4 | Favourites (pinned to the top of root search) | ✗ | S | |
+| [x] | D4 | Favourites (pinned to the top of root search) | ✅ Ctrl+K → Add to Favorites | S | |
 | [ ] | D5 | Enable / disable any command or extension | ✗ | S | |
 
 ## E. Keyboard

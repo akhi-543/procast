@@ -9,11 +9,18 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub hotkey: String,
-    /// `cursor` (monitor under the mouse) or `primary`.
+    /// `cursor` (monitor under the mouse), `active` (monitor of the focused window) or `primary`.
     pub monitor: String,
     pub width: f32,
     pub max_results: usize,
     pub start_at_login: bool,
+    /// The akscast icon in the notification area.
+    pub tray: bool,
+    /// Interface size: small | default | large.
+    pub size: String,
+    /// expanded | compact (only the search bar until you type).
+    pub window_mode: String,
+    pub launcher: Launcher,
     pub search: Search,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
@@ -40,6 +47,52 @@ pub struct Clipboard {
     pub ignore_apps: Vec<String>,
 }
 
+/// Root search behaviour (Raycast's "Launcher" settings).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Launcher {
+    /// How long the last search survives closing the window: immediately | 5s … 180s | never.
+    pub pop_to_root: String,
+    /// low | medium | high: how loose a fuzzy match may be.
+    pub sensitivity: String,
+    /// Show matching files under root results.
+    pub files: bool,
+    /// Up arrow in an empty search bar brings back earlier searches.
+    pub history: bool,
+    /// Items (by key) left out of root search.
+    pub hidden: Vec<String>,
+    /// Items (by key) pinned to the top of root search.
+    pub favorites: Vec<String>,
+    /// In compact mode, show favourites as icons under the search bar.
+    pub compact_favorites: bool,
+}
+
+impl Default for Launcher {
+    fn default() -> Self {
+        Self {
+            pop_to_root: "immediately".into(),
+            sensitivity: "medium".into(),
+            files: false,
+            history: true,
+            hidden: vec![],
+            favorites: vec![],
+            compact_favorites: true,
+        }
+    }
+}
+
+impl Launcher {
+    /// `pop_to_root` as a duration; None = never pop.
+    pub fn keep_for(&self) -> Option<std::time::Duration> {
+        match self.pop_to_root.as_str() {
+            "never" => None,
+            s => Some(std::time::Duration::from_secs(s.trim_end_matches('s').parse().unwrap_or(0))),
+        }
+    }
+}
+
+pub const POP_TO_ROOT: &[&str] = &["immediately", "5s", "15s", "30s", "60s", "90s", "120s", "180s", "never"];
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Emoji {
@@ -55,6 +108,8 @@ pub struct Files {
     /// File or folder names skipped anywhere in the tree.
     pub exclude: Vec<String>,
     pub hotkey: String,
+    /// Search every NTFS drive through the admin helper, when it's installed.
+    pub ntfs: bool,
 }
 
 impl Default for Files {
@@ -66,6 +121,7 @@ impl Default for Files {
                 .map(String::from)
                 .to_vec(),
             hotkey: String::new(),
+            ntfs: true,
         }
     }
 }
@@ -80,8 +136,11 @@ impl Files {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Theme {
-    /// system | dark | light
+    /// system (follow Windows) | dark | light
     pub mode: String,
+    /// Named palettes used in dark and light mode (see design::DARK_THEMES / LIGHT_THEMES).
+    pub dark: String,
+    pub light: String,
     pub background: Option<String>,
     pub text: Option<String>,
     pub muted: Option<String>,
@@ -96,6 +155,8 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             mode: "system".into(),
+            dark: "akscast Dark".into(),
+            light: "akscast Light".into(),
             background: None,
             text: None,
             muted: None,
@@ -197,8 +258,10 @@ impl Default for Clipboard {
 #[serde(default)]
 pub struct Search {
     pub calculator: bool,
-    /// `{query}` is replaced with the URL-encoded query. Empty disables the fallback row.
+    /// `{query}` is replaced with the URL-encoded query. Empty disables the web row.
     pub fallback: String,
+    /// Rows offered for any query, in order: "web" (the URL above) or a quicklink's name.
+    pub fallbacks: Vec<String>,
 }
 
 impl Default for Config {
@@ -209,6 +272,10 @@ impl Default for Config {
             width: 750.,
             max_results: 8,
             start_at_login: true,
+            tray: true,
+            size: "default".into(),
+            window_mode: "expanded".into(),
+            launcher: Launcher::default(),
             search: Search::default(),
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
@@ -225,20 +292,33 @@ impl Default for Config {
 
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into() }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: vec!["web".into()] }
     }
 }
 
 const TEMPLATE: &str = r##"# akscast settings. Saved changes apply within ~2 seconds.
 hotkey = "Alt+Space"          # e.g. "Ctrl+Shift+Space", "Alt+F1"
-monitor = "cursor"            # cursor | primary
+monitor = "cursor"            # cursor | active (screen of the focused window) | primary
 width = 750
 max_results = 8
 start_at_login = true
+tray = true                   # icon in the notification area
+size = "default"              # small | default | large
+window_mode = "expanded"      # expanded | compact (only the search bar until you type)
+
+[launcher]
+pop_to_root = "immediately"   # keep the last search after closing: immediately | 5s | 15s | 30s | 60s | 90s | 120s | 180s | never
+sensitivity = "medium"        # low (close matches only) | medium | high (any fuzzy match)
+files = false                 # also show matching files in root search
+history = true                # Up arrow in an empty search bar restores earlier searches
+hidden = []                   # items left out of root search (use Ctrl+K → Hide from Root Search)
+favorites = []                # items pinned to the top (Ctrl+K → Add to Favorites)
+compact_favorites = true      # compact mode: favourites as icons under the search bar
 
 [search]
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
+fallbacks = ["web"]           # rows for any query, in order: "web" or a quicklink name with {query}
 
 [clipboard]
 enabled = true                # text history, encrypted at rest for your Windows account
@@ -254,6 +334,7 @@ enabled = true
 roots = []                    # empty = your user folder; e.g. ["C:\\Users\\you", "D:\\Projects"]
 exclude = ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
 hotkey = ""
+ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
 
 [scripts]
 # Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\akscast\scripts
@@ -267,7 +348,9 @@ background = true             # run commands that declare an interval (e.g. ever
 menu_bar = false              # also show menu-bar commands as tray icons
 
 [theme]
-mode = "system"               # system | dark | light
+mode = "system"               # system (follow Windows) | dark | light
+dark = "akscast Dark"         # akscast Dark | Midnight | Graphite | Forest
+light = "akscast Light"       # akscast Light | Paper | Mist
 # Any colour can be overridden ("#rrggbb" or "#rrggbbaa"):
 # background = "#1e1e2e"
 # text = "#cdd6f4"

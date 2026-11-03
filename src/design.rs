@@ -1,7 +1,9 @@
 //! akscast's design tokens and small shared components (see docs/design/DESIGN.md).
 //! Views take every colour, size and font from here.
 
-use gpui::{AnyElement, Div, Hsla, Window, div, img, prelude::*, px, rgba};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use gpui::{AnyElement, Div, Hsla, Pixels, Window, div, img, prelude::*, rgba};
 
 use crate::{config, search::Icon};
 
@@ -10,6 +12,30 @@ pub const FONT_DISPLAY: &str = "Segoe UI Variable Display";
 pub const FONT_MONO: &str = "Cascadia Mono";
 pub const FONT_ICON: &str = "Segoe Fluent Icons";
 pub const FONT_EMOJI: &str = "Segoe UI Emoji";
+
+/// Interface size (Settings → General): every length goes through `px`, which scales it.
+static SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+
+pub fn set_size(size: &str) {
+    let s: f32 = match size {
+        "small" => 0.9,
+        "large" => 1.15,
+        _ => 1.,
+    };
+    SCALE.store(s.to_bits(), Ordering::Relaxed);
+}
+
+pub fn scale() -> f32 {
+    f32::from_bits(SCALE.load(Ordering::Relaxed))
+}
+
+/// Logical pixels at the chosen interface size. Use this, not `gpui::px`.
+pub fn px(v: f32) -> Pixels {
+    gpui::px(v * scale())
+}
+
+pub const DARK_THEMES: &[&str] = &["akscast Dark", "Midnight", "Graphite", "Forest"];
+pub const LIGHT_THEMES: &[&str] = &["akscast Light", "Paper", "Mist"];
 
 pub const BAR: f32 = 56.;
 pub const ROW: f32 = 40.;
@@ -133,14 +159,29 @@ impl Tokens {
         }
     }
 
-    /// From `[theme]`: base palette by mode (system follows Windows), then overrides.
+    /// A named palette; unknown names fall back to akscast Dark / Light.
+    pub fn named(name: &str, dark: bool) -> Self {
+        let base = if dark { Self::dark() } else { Self::light() };
+        // (background, panels, text, muted, faint, accent)
+        let (bg, elevated, text, muted, faint, accent) = match (dark, name) {
+            (true, "Midnight") => (0x0f1424db, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x67728fff, 0x4fb3ffff),
+            (true, "Graphite") => (0x1f1f1fdb, 0x2a2a2aff, 0xf0f0f0ff, 0xa8a8a8ff, 0x707070ff, 0xff8a3dff),
+            (true, "Forest") => (0x141c18db, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x6a8174ff, 0x4cc38aff),
+            (false, "Paper") => (0xfbf8f1e6, 0xffffffff, 0x2b2620ff, 0x6e655aff, 0x9a9083ff, 0xc2410cff),
+            (false, "Mist") => (0xf1f5f9e6, 0xffffffff, 0x14212bff, 0x55667aff, 0x8796a8ff, 0x0f9b8eff),
+            _ => return base,
+        };
+        Self { bg: c(bg), bg_elevated: c(elevated), text: c(text), text_muted: c(muted), text_faint: c(faint), accent: c(accent), ..base }
+    }
+
+    /// From `[theme]`: the named palette for the mode (system follows Windows), then overrides.
     pub fn from_theme(t: &config::Theme, window: &Window) -> Self {
         let dark = match t.mode.as_str() {
             "dark" => true,
             "light" => false,
             _ => !matches!(window.appearance(), gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight),
         };
-        let mut k = if dark { Self::dark() } else { Self::light() };
+        let mut k = Self::named(if dark { &t.dark } else { &t.light }, dark);
         let set = |slot: &mut Hsla, v: &Option<String>| {
             if let Some(hex) = v.as_deref().and_then(config::parse_hex) {
                 *slot = c(hex);

@@ -54,12 +54,17 @@ pub struct Files {
     roots: Vec<String>,
     exclude: Vec<String>,
     tx: UnboundedSender<Msg>,
+    /// Whole-drive index from the admin helper; used instead of the folder index once ready.
+    ntfs: Option<crate::ntfs::Client>,
 }
 
 impl Files {
-    pub fn start(roots: Vec<String>, exclude: Vec<String>, tx: UnboundedSender<Msg>) -> Self {
+    pub fn start(roots: Vec<String>, exclude: Vec<String>, ntfs: bool, tx: UnboundedSender<Msg>) -> Self {
         let index = Arc::new(RwLock::new(Vec::new()));
         let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
+        let (count, indexing) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        let ntfs = ntfs.then(|| crate::ntfs::connect(&exclude, count.clone(), indexing.clone(), tx.clone()));
+        let worker_ntfs = ntfs.as_ref().map(|c| (c.index.clone(), c.ready.clone()));
         let worker_index = index.clone();
         let worker_tx = tx.clone();
         std::thread::spawn(move || {
@@ -71,28 +76,36 @@ impl Files {
                     job = newer;
                 }
                 let (generation, query, max) = job;
-                let items = search(&worker_index.read().unwrap(), &query, max, &mut matcher);
+                let items = match &worker_ntfs {
+                    Some((ntfs, ready)) if ready.load(Ordering::SeqCst) => ntfs.read().unwrap().search(&query, max),
+                    _ => search(&worker_index.read().unwrap(), &query, max, &mut matcher),
+                };
                 if tx.unbounded_send(Msg::Files(generation, items)).is_err() {
                     return;
                 }
             }
         });
-        // Searchable at once from the saved index; the crawl below refreshes it.
-        let saved = load(&cache_path(), &cache_key(&roots, &exclude)).unwrap_or_default();
-        let count = saved.len();
-        *index.write().unwrap() = saved;
         let files = Self {
             index,
             queries,
-            count: Arc::new(AtomicUsize::new(count)),
-            indexing: Arc::new(AtomicBool::new(false)),
+            count,
+            indexing,
             built: Arc::new(RwLock::new(None)),
             roots,
             exclude,
             tx,
+            ntfs,
         };
-        files.refresh_if_stale(Duration::ZERO);
-        files.watch();
+        // With the helper installed its whole-drive index takes over; the folder index is
+        // only built if the helper doesn't answer (on the next File Search).
+        if !(files.ntfs.is_some() && crate::ntfs::installed()) {
+            // Searchable at once from the saved index; the crawl below refreshes it.
+            let saved = load(&cache_path(), &cache_key(&files.roots, &files.exclude)).unwrap_or_default();
+            files.count.store(saved.len(), Ordering::SeqCst);
+            *files.index.write().unwrap() = saved;
+            files.refresh_if_stale(Duration::ZERO);
+            files.watch();
+        }
         files
     }
 
@@ -103,6 +116,9 @@ impl Files {
     /// Re-crawls in the background when the index is older than `max_age`, then sends
     /// `Msg::FilesIndexed` so the UI can re-run its current query.
     pub fn refresh_if_stale(&self, max_age: Duration) {
+        if self.whole_drives() {
+            return;
+        }
         let fresh = self.built.read().unwrap().is_some_and(|t| t.elapsed() < max_age);
         if fresh || self.indexing.swap(true, Ordering::SeqCst) {
             return;
@@ -144,8 +160,13 @@ impl Files {
         }
     }
 
-    pub fn same_roots(&self, roots: &[String], exclude: &[String]) -> bool {
-        self.roots == roots && self.exclude == exclude
+    pub fn same_roots(&self, roots: &[String], exclude: &[String], ntfs: bool) -> bool {
+        self.roots == roots && self.exclude == exclude && self.ntfs.is_some() == ntfs
+    }
+
+    /// Searching every NTFS drive (the admin helper is connected).
+    pub fn whole_drives(&self) -> bool {
+        self.ntfs.as_ref().is_some_and(|c| c.ready.load(Ordering::SeqCst))
     }
 }
 
@@ -269,15 +290,17 @@ pub fn search(index: &[Entry], query: &str, max: usize, matcher: &mut Matcher) -
         .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.len().cmp(&b.1.path.len())));
     let home = std::env::var("USERPROFILE").unwrap_or_default();
-    hits.into_iter()
-        .take(max)
-        .map(|(_, e)| {
-            let parent = Path::new(&*e.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            let parent = if !home.is_empty() && parent.starts_with(&home) { format!("~{}", &parent[home.len()..]) } else { parent };
-            let (glyph, kind) = if e.dir { (crate::design::g::FOLDER, "Folder") } else { (crate::design::g::DOCUMENT, "File") };
-            Item::new(e.name(), parent, Icon::Fluent(glyph), Act::File(e.path.to_string())).acc(kind)
-        })
-        .collect()
+    hits.into_iter().take(max).map(|(_, e)| item(&e.path, e.dir, &home)).collect()
+}
+
+/// A result row: name, its folder (with ~ for your user folder), file or folder icon.
+pub fn item(path: &str, dir: bool, home: &str) -> Item {
+    let p = Path::new(path);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+    let parent = p.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let parent = if !home.is_empty() && parent.starts_with(home) { format!("~{}", &parent[home.len()..]) } else { parent };
+    let (glyph, kind) = if dir { (crate::design::g::FOLDER, "Folder") } else { (crate::design::g::DOCUMENT, "File") };
+    Item::new(name, parent, Icon::Fluent(glyph), Act::File(path.to_string())).acc(kind)
 }
 
 #[cfg(test)]

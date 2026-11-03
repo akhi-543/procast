@@ -31,6 +31,7 @@ pub enum Cmd {
     SearchFiles,
     ClipboardHistory,
     ClearClipboardHistory,
+    ClearSearchHistory,
     Emoji,
     Lock,
     Sleep,
@@ -45,6 +46,8 @@ pub enum Cmd {
     ReloadApps,
     InstallExtension,
     BrowseStore,
+    /// Install (true) or remove the admin helper for whole-drive file search.
+    FastFileSearch(bool),
     Quit,
 }
 
@@ -73,6 +76,7 @@ pub const ALL: &[(Cmd, &str, &str, char)] = &[
     (Cmd::SearchFiles, "Search Files", "find documents folders", g::FOLDER),
     (Cmd::ClipboardHistory, "Clipboard History", "paste copy", g::PASTE),
     (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", g::DELETE),
+    (Cmd::ClearSearchHistory, "Clear Search History", "recent queries up arrow forget", g::DELETE),
     (Cmd::Emoji, "Search Emoji", "emoji symbols", g::EMOJI),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
@@ -100,6 +104,8 @@ pub const ALL: &[(Cmd, &str, &str, char)] = &[
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", g::REFRESH),
     (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", g::DOWNLOAD),
     (Cmd::BrowseStore, "Browse Extension Store", "raycast store extensions catalog install", g::SHOP),
+    (Cmd::FastFileSearch(true), "Enable Fast File Search", "ntfs everything all drives admin index mft", g::SHIELD),
+    (Cmd::FastFileSearch(false), "Disable Fast File Search", "ntfs everything all drives admin index mft", g::SHIELD),
     (Cmd::Quit, "Quit akscast", "exit close", g::CANCEL),
 ];
 
@@ -116,8 +122,8 @@ impl Cmd {
     pub fn subtitle(self) -> &'static str {
         match self {
             Cmd::Snap(_) => "Window Management",
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "akscast",
-            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => "akscast",
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji => "akscast",
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "akscast",
             _ => "System",
         }
     }
@@ -135,8 +141,10 @@ pub fn run(cmd: Cmd, target: HWND) {
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s),
+            // Windows asks for admin once; the helper then starts at every logon.
+            Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => {}
         }
     }
 }
