@@ -19,6 +19,9 @@ pub struct Config {
     pub emoji: Emoji,
     pub files: Files,
     pub scripts: Scripts,
+    pub extensions: Extensions,
+    /// Per-extension preference values: `[extension.obsidian] notePath = "..."`.
+    pub extension: std::collections::HashMap<String, toml::Table>,
     /// `[[alias]]` from Phase 1 configs still works.
     #[serde(alias = "alias")]
     pub quicklink: Vec<Quicklink>,
@@ -69,6 +72,23 @@ impl Default for Files {
 impl Files {
     pub fn roots(&self) -> Vec<String> {
         if self.roots.is_empty() { std::env::var("USERPROFILE").into_iter().collect() } else { self.roots.clone() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Extensions {
+    /// Node.js executable for the extension host.
+    pub node: String,
+    /// Heap limit per running command.
+    pub memory_mb: u32,
+    /// Run commands that declare an `interval` (e.g. every 5m) in the background.
+    pub background: bool,
+}
+
+impl Default for Extensions {
+    fn default() -> Self {
+        Self { node: "node".into(), memory_mb: 256, background: true }
     }
 }
 
@@ -148,6 +168,8 @@ impl Default for Config {
             emoji: Emoji::default(),
             files: Files::default(),
             scripts: Scripts::default(),
+            extensions: Extensions::default(),
+            extension: Default::default(),
             quicklink: vec![],
             snippet: vec![],
         }
@@ -189,6 +211,16 @@ hotkey = ""
 [scripts]
 # Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\akscast\scripts
 dirs = []
+
+# Raycast extensions: run "Install Extension" and type a store name (e.g. obsidian) or a folder.
+[extensions]
+node = "node"                 # Node.js 22+ runs the extension host
+memory_mb = 256               # heap limit per running command
+background = true             # run commands that declare an interval (e.g. every 5m)
+
+# Preference values per extension, by the names in its package.json:
+# [extension.obsidian]
+# notePath = "D:\\Notes"
 
 # Quicklinks: search by name, or type the keyword, a space, then your query.
 [[quicklink]]

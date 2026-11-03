@@ -46,6 +46,19 @@ pub enum Act {
     Cmd(Cmd),
     /// Put text in the search box (quicklink waiting for its argument).
     Fill(String),
+    /// Start extension command (extension index, command index).
+    ExtRun(usize, usize),
+    /// Call a handler in the running extension view.
+    ExtFn(String),
+    /// Call a handler with one value (search-bar dropdown `onChange`).
+    ExtSet(String, String),
+    /// Set a form field (field id, value).
+    FormSet(String, String),
+    /// Answer an extension's confirmAlert.
+    Confirm(bool),
+    UninstallExt(String),
+    /// A row with nothing to do (loading, empty views).
+    None,
 }
 
 impl Act {
@@ -59,9 +72,15 @@ impl Act {
             Act::Copy(_) => "Copy",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji) => "Open",
-            Act::Cmd(_) => "Run Command",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension) => "Open",
+            Act::Cmd(_) | Act::ExtRun(..) => "Run Command",
+            Act::ExtFn(_) => "Run Action",
+            Act::ExtSet(..) | Act::FormSet(..) => "Choose",
+            Act::Confirm(true) => "Confirm",
+            Act::Confirm(false) => "Cancel",
+            Act::UninstallExt(_) => "Uninstall Extension",
             Act::Fill(_) => "Type Query",
+            Act::None => "",
         }
     }
 }
@@ -88,16 +107,27 @@ pub struct Item {
     pub key: Option<String>,
     /// Text the fuzzy matcher sees.
     hay: String,
+    /// Explicit Ctrl+K actions (extension rows); empty = derived from `act`.
+    pub extra: Vec<(String, Act)>,
 }
 
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), icon, act, key: None }
+        Self { hay: title.clone(), title, subtitle: subtitle.into(), icon, act, key: None, extra: vec![] }
     }
 
-    /// The Ctrl+K action panel: primary action first, then secondary ones.
-    pub fn actions(&self) -> Vec<Act> {
+    /// Searchable text beyond the title (subtitle, keywords).
+    pub fn with_hay(mut self, hay: String) -> Self {
+        self.hay = hay;
+        self
+    }
+
+    /// The Ctrl+K action panel, labelled: primary action first, then secondary ones.
+    pub fn actions(&self) -> Vec<(String, Act)> {
+        if !self.extra.is_empty() {
+            return self.extra.clone();
+        }
         let mut acts = vec![self.act.clone()];
         match &self.act {
             Act::App(id) => acts.extend([Act::RunAsAdmin(id.clone()), Act::Copy(self.title.clone())]),
@@ -108,7 +138,7 @@ impl Item {
             Act::Clip(text) => acts.extend([Act::Copy(text.clone()), Act::DeleteClip(text.clone())]),
             _ => {}
         }
-        acts
+        acts.into_iter().map(|a| (a.label().to_string(), a)).collect()
     }
 
     fn keyed(mut self, key: String) -> Self {
@@ -159,7 +189,7 @@ impl Frecency {
 }
 
 /// Everything root search can find. Rebuilt when apps or config change.
-pub fn catalog(apps: &[App], scripts: &[Script], cfg: &Config) -> Vec<Item> {
+pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
@@ -191,7 +221,24 @@ pub fn catalog(apps: &[App], scripts: &[Script], cfg: &Config) -> Vec<Item> {
         let icon = Icon::glyph(s.icon.clone().unwrap_or_else(|| "⌨".into()));
         items.push(Item::new(&s.title, sub, icon, Act::Script(i)).keyed(format!("sc:{}", s.path)));
     }
+    for (e, (ext, icon)) in exts.iter().enumerate() {
+        // Menu-bar commands need a tray UI akscast doesn't have yet.
+        for (c, cmd) in ext.commands.iter().enumerate().filter(|(_, c)| c.mode != "menu-bar") {
+            let mut it = Item::new(&cmd.title, &ext.title, icon.clone(), Act::ExtRun(e, c)).keyed(format!("ext:{}/{}", ext.name, cmd.name)).words(&ext.title);
+            it.extra = vec![("Run Command".into(), Act::ExtRun(e, c)), (format!("Uninstall {}", ext.title), Act::UninstallExt(ext.name.clone()))];
+            items.push(it);
+        }
+    }
     items
+}
+
+/// Fuzzy-filters rows by their searchable text, best first (extension lists without
+/// their own search handler).
+pub fn filter(q: &str, rows: Vec<Item>, matcher: &mut Matcher) -> Vec<Item> {
+    if q.trim().is_empty() {
+        return rows;
+    }
+    fuzzy(q.trim(), rows.iter(), &Frecency::default(), matcher).into_iter().map(|(_, it)| it.clone()).collect()
 }
 
 fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, matcher: &mut Matcher) -> Vec<(f64, &'a Item)> {
@@ -358,11 +405,23 @@ mod tests {
         .unwrap();
         cfg.max_results = 5;
         let scripts = [crate::scripts::parse("C:\\s\\deploy.ps1", "# @raycast.title Deploy Site\n# @raycast.packageName Web").unwrap()];
-        let cat = catalog(&apps, &scripts, &cfg);
+        let ext = crate::ext::parse_manifest(
+            std::path::Path::new("C:\\e"),
+            &serde_json::json!({"name": "notes", "title": "Notes", "commands": [
+                {"name": "search", "title": "Search Notes", "mode": "view"},
+                {"name": "bar", "title": "Notes Bar", "mode": "menu-bar"}]}),
+        )
+        .unwrap();
+        let cat = catalog(&apps, &scripts, &[(ext, Icon::glyph("•"))], &cfg);
+        let notes: Vec<_> = cat.iter().filter(|i| i.subtitle == "Notes").collect();
+        assert_eq!(notes.len(), 1, "menu-bar commands are not listed");
+        assert_eq!((notes[0].title.as_str(), &notes[0].act), ("Search Notes", &Act::ExtRun(0, 0)));
+        assert_eq!(notes[0].actions()[1], ("Uninstall Notes".to_string(), Act::UninstallExt("notes".into())));
         let deploy = &root("deploy", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT))[0];
         assert_eq!((deploy.act.clone(), deploy.subtitle.as_str()), (Act::Script(0), "Web"));
         let file = Item::new("a.txt", "~", Icon::glyph("📄"), Act::File("C:\\a.txt".into()));
-        assert_eq!(file.actions(), [Act::File("C:\\a.txt".into()), Act::Reveal("C:\\a.txt".into()), Act::Copy("C:\\a.txt".into())]);
+        let acts: Vec<Act> = file.actions().into_iter().map(|a| a.1).collect();
+        assert_eq!(acts, [Act::File("C:\\a.txt".into()), Act::Reveal("C:\\a.txt".into()), Act::Copy("C:\\a.txt".into())]);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let mut frec = Frecency::default();
 
@@ -397,7 +456,7 @@ mod tests {
         let clips = [Entry { text: "fn main() {}".into(), at: now() }, Entry { text: "hello world".into(), at: now() - 7200 }];
         let c = clipboard("hel", &clips, 5, &mut m);
         assert_eq!(c[0].act, Act::Clip("hello world".into()));
-        assert_eq!(c[0].actions().last(), Some(&Act::DeleteClip("hello world".into())));
+        assert_eq!(c[0].actions().last().map(|a| &a.1), Some(&Act::DeleteClip("hello world".into())));
         assert_eq!(clipboard("", &clips, 5, &mut m)[1].subtitle, "2 h ago");
 
         assert!(emoji("thumbs up", 5, &mut m)[0].title.starts_with('👍'));

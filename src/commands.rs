@@ -42,6 +42,7 @@ pub enum Cmd {
     Snap(Snap),
     EditConfig,
     ReloadApps,
+    InstallExtension,
     Quit,
 }
 
@@ -92,6 +93,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", "🖥"),
     (Cmd::EditConfig, "Edit akscast Settings", "config preferences toml", "⚙"),
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", "↻"),
+    (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", "🧩"),
     (Cmd::Quit, "Quit akscast", "exit close", "✕"),
 ];
 
@@ -109,7 +111,7 @@ impl Cmd {
         match self {
             Cmd::Snap(_) => "Window Management",
             Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "Command",
-            Cmd::EditConfig | Cmd::ReloadApps | Cmd::Quit => "akscast",
+            Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::Quit => "akscast",
             _ => "System",
         }
     }
@@ -128,7 +130,7 @@ pub fn run(cmd: Cmd, target: HWND) {
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::EditConfig | Cmd::ReloadApps | Cmd::Quit => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::Quit => {}
         }
     }
 }

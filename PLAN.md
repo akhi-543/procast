@@ -187,8 +187,9 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | File search | ✅ own in-memory index of `[files] roots`, worker thread + generation counter | Phase 2b. Live index (USN/watcher): later |
 | Script commands | ✅ Raycast headers, silent/compact/fullOutput, arguments, needsConfirmation | Phase 2b. Inline/refresh-interval: later |
 | AI (Claude Code / Agent SDK) | research only: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
-| Extensions + store (Raycast API) | spike works (cdnjs) | Phase 3 |
-| Menu-bar extras → tray | ❌ | Phase 3 |
+| Extensions (Raycast API, unmodified store extensions) | ✅ own runtime (`exthost/`), List / Grid / Detail / Form / ActionPanel / navigation / toasts / confirm / storage / prefs, interval background commands | Phase 3 |
+| Extension install | ✅ "Install Extension": store name or local folder, built with `ray build` | Phase 3. Store browser UI: later |
+| Menu-bar extras → tray | ❌ (menu-bar commands are hidden) | Phase 4 |
 | Settings window | config.toml only | Phase 4 |
 | Themes / theme studio | follows system light/dark | Phase 4 |
 | Calendar, contacts, translator, dictionary, timer, focus sessions, screenshots search, typing practice, games, taskbar widget | ❌ | Phase 4+, most of these are good extension candidates |
@@ -242,6 +243,67 @@ Not run live: Run as Administrator (it shows a UAC prompt).
 AI research for a later phase is in [docs/ai-research.md](docs/ai-research.md):
 - **Recommendation:** run the Agent SDK (TypeScript) in the Node sidecar, with akscast's own tools exposed as an in-process MCP server and the built-in tools removed.
 - **Licence:** personal use on your own Claude login is fine. Distributing the app needs per-user API keys.
+
+### Phase 3 status (2026-11-03): Raycast extensions
+
+**Approach: run the real store extensions; don't rewrite them.** All the extensions you actually use declare Windows support and run unmodified on akscast's own `@raycast/api` runtime. Rewriting them would cost weeks and buy nothing. Native rebuilds are only worth it for an extension that's macOS-only or needs an API akscast can't provide.
+
+**Your extensions** (from 4 weeks of Raycast logs):
+
+| Extension | Opens | Status in akscast |
+|---|---|---|
+| Theme Scheduler (your own, `D:\Pro\lightswtch`) | 29 opens + 126 background runs | ✅ installed from the folder; view works; `apply-themes` runs every 5 min |
+| Obsidian | 9 | ✅ 13 commands; forms work (Quick Capture). Menu bar hidden |
+| Urban Dictionary Search | 4 | ✅ live search |
+| Port Manager | 2 | ✅ Open Ports lists real ports. Menu bar hidden |
+| Agent Usage | 1 | ✅ view; refresh runs every 1 min |
+| YouTube | 1 | ✅ renders; needs `[extension.youtube] apikey` |
+| Mozaika | 1 | ✅ |
+
+Not installed: toggl-track, remove-paywall, speedtest, skills and ~15 more. They were installed in Raycast but never run in 4 weeks; install any of them later with "Install Extension".
+
+**How it works**
+- `exthost/` (Node):
+  - `host.mjs` runs one worker per command.
+  - `runtime.js` is akscast's own `@raycast/api`.
+  - `install.mjs` fetches an extension and runs `ray build`.
+  - `smoke.mjs` is the regression gate.
+- **Wire format:** newline-delimited JSON over stdio. Every Raycast action kind becomes an `onAction` handler, and handler IDs come from tree position.
+- **Rust side** (`src/ext.rs` + `main.rs`):
+  - manifest scan, preference values from `[extension.<name>]`
+  - view model for List / Grid / Detail / Form
+  - Ctrl+K actions, navigation pop, confirm dialogs
+  - interval scheduler (checked every 10 s)
+- **Install:** "Install Extension", then a store name or a local folder.
+  - Uses one shared sparse clone of `raycast/extensions`.
+  - `npm ci --ignore-scripts`, so no third-party install scripts run.
+  - Local folders are built from a copy, so your repo is never touched.
+
+**Verified**
+- `smoke.mjs`: 22/22 view commands of the 7 installed extensions render, with no unsupported APIs.
+- `spikes/e2e.py`: **17/17**. New this phase:
+  - Urban Dictionary live search for "yeet", with the query intact
+  - Ctrl+K → the extension's own Copy action
+  - Port Manager listing real ports
+  - your Theme Schedules list
+  - Obsidian Quick Capture form, with Tab moving between fields (nothing submitted)
+- Background: `agent-usage/refresh-agent-usage` and `theme-scheduler/apply-themes` ran on schedule with no errors (`%APPDATA%\akscast\extensions.log`).
+
+Bugs found and fixed while testing:
+- Text typed before an extension's first render was never sent to it.
+- A late echo of the extension's own controlled `searchText` overwrote newer keystrokes.
+
+**Memory:** akscast 65.7 MB; the Node extension host 90.4 MB while extensions run. It only starts when an extension runs, but background interval commands keep it alive.
+
+**Known gaps (later)**
+- Menu-bar commands (tray menus)
+- Network images (thumbnails, favicons) show a placeholder
+- Password fields show text in clear
+- TextArea is single-line
+- A view ends when the window hides (Raycast keeps it about 90 s)
+- No store browser (install by name)
+- OAuth, AI, `getSelectedText`, BrowserExtension throw "not supported"
+- Theme Scheduler now runs from both Raycast and akscast. It's idempotent, but turn it off in Raycast once you switch.
 
 ## 6. Build plan
 

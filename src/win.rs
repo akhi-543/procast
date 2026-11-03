@@ -52,6 +52,12 @@ pub enum Msg {
     FilesIndexed,
     /// A script finished: (script index, succeeded, output).
     ScriptDone(usize, bool, String),
+    /// A line from the extension host.
+    Ext(serde_json::Value),
+    /// Extension install progress: (message, Some(ok) when finished).
+    Install(String, Option<bool>),
+    /// Time to check for extension commands with an `interval`.
+    Tick,
 }
 
 pub enum TrayCmd {

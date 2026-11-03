@@ -11,7 +11,7 @@ futures = "0.3"
 gpui-ce = "=0.3.0"
 gpui_ce_elements = "=0.3.0"
 gpui_ce_platform = "=0.3.0"
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 jwalk = "0.8"
 nucleo-matcher = "0.3"
 raw-window-handle = "0.6"
