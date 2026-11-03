@@ -1,18 +1,25 @@
 //! Everything that talks to Win32 directly.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use futures::channel::mpsc::UnboundedSender;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
         Graphics::{
             Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
                 MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ReleaseDC,
             },
+        },
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+            FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree},
@@ -50,6 +57,8 @@ pub enum Msg {
     /// File search results for one query generation.
     Files(u64, Vec<crate::search::Item>),
     FilesIndexed,
+    /// Something was installed or removed: the app list should be rescanned.
+    AppsChanged,
     /// A script finished: (script index, succeeded, output).
     ScriptDone(usize, bool, String),
     /// A line from the extension host.
@@ -163,6 +172,13 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
+/// Windows 11 rounded corners (no-op on Windows 10).
+pub fn round_corners(hwnd: HWND) {
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: i32 = 2;
+    unsafe { _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE as i32), &DWMWCP_ROUND as *const _ as _, 4) };
+}
+
 /// Cloaked windows keep their swap chain, so un-cloaking shows the next frame
 /// (~15 ms) instead of re-creating the surface (~45 ms) like ShowWindow does.
 pub fn cloak(hwnd: HWND, on: bool) {
@@ -245,15 +261,16 @@ pub fn scan_apps() -> Vec<App> {
     apps
 }
 
-/// Fills in icons. Extraction is ~70 ms per app, so it's split over a few COM threads
-/// and done after the names are already searchable.
+/// Fills in missing icons. Extraction is ~70 ms per app, so it's split over a few COM
+/// threads and done after the names are already searchable.
 pub fn load_icons(apps: &mut [App]) {
-    let chunk = apps.len().div_ceil(4).max(1);
+    let mut missing: Vec<&mut App> = apps.iter_mut().filter(|a| a.icon.is_none()).collect();
+    let chunk = missing.len().div_ceil(4).max(1);
     std::thread::scope(|s| {
-        for part in apps.chunks_mut(chunk) {
+        for part in missing.chunks_mut(chunk) {
             s.spawn(move || unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                for app in part {
+                for app in part.iter_mut() {
                     let path = HSTRING::from(format!("shell:AppsFolder\\{}", app.id));
                     if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
                         app.icon = icon(&item, ICON_PX);
@@ -303,6 +320,128 @@ fn icon(item: &IShellItem, px: i32) -> Option<Arc<gpui::RenderImage>> {
         }
         let frame = image::Frame::new(image::RgbaImage::from_raw(px as u32, px as u32, buf)?);
         Some(Arc::new(gpui::RenderImage::new(vec![frame])))
+    }
+}
+
+/// The app list with icons, cached so apps are searchable the moment akscast starts.
+/// Layout: per app, name and id as u32-length strings, then a flag and 48×48 RGBA.
+pub fn save_apps(path: &Path, apps: &[App]) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(apps.len() * (ICON_PX * ICON_PX * 4 + 64) as usize);
+    for a in apps {
+        for s in [&a.name, &a.id] {
+            out.extend((s.len() as u32).to_le_bytes());
+            out.extend(s.as_bytes());
+        }
+        match a.icon.as_ref().and_then(|i| i.as_bytes(0)).filter(|b| b.len() == (ICON_PX * ICON_PX * 4) as usize) {
+            Some(px) => {
+                out.push(1);
+                out.extend(px);
+            }
+            None => out.push(0),
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, path)
+}
+
+/// The cached app list; empty when there's no cache or it doesn't parse.
+pub fn load_apps(path: &Path) -> Vec<App> {
+    let Ok(data) = std::fs::read(path) else { return vec![] };
+    let mut at = 0;
+    let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+        let b = data.get(*at..*at + n)?;
+        *at += n;
+        Some(b)
+    };
+    let text = |at: &mut usize| -> Option<String> {
+        let len = u32::from_le_bytes(take(at, 4)?.try_into().ok()?) as usize;
+        String::from_utf8(take(at, len)?.to_vec()).ok()
+    };
+    let mut apps = vec![];
+    while at < data.len() {
+        let (Some(name), Some(id)) = (text(&mut at), text(&mut at)) else { return vec![] };
+        let icon = match take(&mut at, 1) {
+            Some([1]) => {
+                let Some(px) = take(&mut at, (ICON_PX * ICON_PX * 4) as usize) else { return vec![] };
+                let frame = image::Frame::new(image::RgbaImage::from_raw(ICON_PX as u32, ICON_PX as u32, px.to_vec()).unwrap());
+                Some(Arc::new(gpui::RenderImage::new(vec![frame])))
+            }
+            Some([0]) => None,
+            _ => return vec![],
+        };
+        apps.push(App { name, id, icon });
+    }
+    apps
+}
+
+/// Where installs and uninstalls show up: Start Menu shortcuts and Store packages.
+pub fn app_dirs() -> Vec<(PathBuf, bool)> {
+    let env = |k: &str| std::env::var(k).map(PathBuf::from).ok();
+    let menu = |base: PathBuf| base.join("Microsoft").join("Windows").join("Start Menu").join("Programs");
+    [env("APPDATA").map(menu).map(|p| (p, true)), env("ProgramData").map(menu).map(|p| (p, true)), env("LOCALAPPDATA").map(|p| (p.join("Packages"), false))]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Blocks, calling `on_change` with each batch of paths (relative to `dir`) whose file or
+/// folder was created, deleted or renamed.
+/// An empty batch means changes were lost (buffer overflow): rescan everything.
+/// Returns when the folder can't be watched or `on_change` returns false.
+// ponytail: synchronous, so a watcher only notices it should stop at the next change.
+pub fn watch_dir(dir: &Path, recursive: bool, mut on_change: impl FnMut(Vec<PathBuf>) -> bool) {
+    unsafe {
+        let Ok(handle) = CreateFileW(
+            &HSTRING::from(dir),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) else {
+            return;
+        };
+        // u32 elements keep FILE_NOTIFY_INFORMATION records aligned.
+        let mut buf = vec![0u32; 16 * 1024];
+        loop {
+            let mut got = 0u32;
+            let ok = ReadDirectoryChangesW(
+                handle,
+                buf.as_mut_ptr() as _,
+                (buf.len() * 4) as u32,
+                recursive,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                Some(&mut got),
+                None,
+                None,
+            );
+            if ok.is_err() {
+                break;
+            }
+            let mut changes = vec![];
+            let mut at = 0usize;
+            while got > 0 {
+                let rec = &*((buf.as_ptr() as *const u8).add(at) as *const FILE_NOTIFY_INFORMATION);
+                let name = std::slice::from_raw_parts(rec.FileName.as_ptr(), rec.FileNameLength as usize / 2);
+                // 1 added, 2 removed, 4 renamed from, 5 renamed to (3, modified, can't occur with these filters).
+                if rec.Action.0 != 3 {
+                    changes.push(PathBuf::from(String::from_utf16_lossy(name)));
+                }
+                if rec.NextEntryOffset == 0 {
+                    break;
+                }
+                at += rec.NextEntryOffset as usize;
+            }
+            if got > 0 && changes.is_empty() {
+                continue;
+            }
+            if !on_change(changes) {
+                break;
+            }
+        }
+        let _ = CloseHandle(handle);
     }
 }
 

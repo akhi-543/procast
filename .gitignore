@@ -11,3 +11,6 @@ spikes/build/
 
 # Python
 __pycache__/
+
+# Screenshots of third-party apps used as design reference (not redistributed)
+docs/design/reference/

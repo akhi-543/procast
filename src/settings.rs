@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
-    prelude::*, px, rgb, rgb_to_hsla,
+    prelude::*, px,
 };
 use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, text_input};
 
@@ -295,7 +295,7 @@ impl Settings {
         }
     }
 
-    fn control(&self, r: &Row, on: bool, colors: &gpui::colors::Colors) -> AnyElement {
+    fn control(&self, r: &Row, on: bool, t: &crate::design::Tokens) -> AnyElement {
         let value = config::read_value(&self.text, &r.path);
         let pill = |text: String, active: bool| {
             div()
@@ -303,8 +303,8 @@ impl Settings {
                 .py_1()
                 .rounded_md()
                 .border_1()
-                .border_color(if on { colors.selected } else { colors.border })
-                .when(active, |d| d.bg(colors.selected).text_color(colors.selected_text))
+                .border_color(if on { t.accent } else { t.border })
+                .when(active, |d| d.bg(t.accent).text_color(t.accent_text))
                 .child(text)
                 .into_any_element()
         };
@@ -313,23 +313,34 @@ impl Settings {
                 Some(input) => text_input(SharedString::from(format!("set-{}", r.path.join("."))))
                     .state(input.downgrade())
                     .placeholder(if r.kind == Kind::List { "a; b; c" } else { "" })
-                    .placeholder_color(colors.disabled)
-                    .caret_color(rgb_to_hsla(colors.text))
+                    .placeholder_color(t.text_muted)
+                    .caret_color(t.accent)
                     .w_full()
                     .whitespace_nowrap()
                     .px_2()
                     .py_1()
                     .rounded_md()
                     .border_1()
-                    .border_color(if on { colors.selected } else { colors.border })
-                    .bg(colors.container)
+                    .border_color(if on { t.accent } else { t.border })
+                    .bg(t.surface)
                     .into_any_element(),
                 None => div().into_any_element(),
             },
-            Kind::Bool => pill(if value == "true" { "On".into() } else { "Off".into() }, value == "true"),
-            Kind::Choice(_) => pill(format!("{value}  ▸"), false),
-            Kind::Hotkey if self.recording && on => pill("Recording…".into(), true),
-            Kind::Hotkey => pill(if value.is_empty() { "None".into() } else { value }, false),
+            Kind::Bool => crate::design::toggle(value == "true", t).into_any_element(),
+            Kind::Choice(opts) => div()
+                .flex()
+                .p(px(2.))
+                .gap(px(2.))
+                .rounded(px(6.))
+                .bg(t.surface)
+                .children(opts.iter().map(|o| {
+                    let cur = *o == value;
+                    div().px(px(10.)).py(px(3.)).rounded(px(4.)).text_size(px(13.)).when(cur, |d| d.bg(t.accent).text_color(t.accent_text)).when(!cur, |d| d.text_color(t.text_muted)).child(o.to_string())
+                }))
+                .into_any_element(),
+            Kind::Hotkey if self.recording && on => pill("Press keys…".into(), true),
+            Kind::Hotkey if value.is_empty() => pill("Record".into(), false),
+            Kind::Hotkey => div().flex().gap(px(4.)).children(value.split('+').map(|k| crate::design::key_cap(k, t))).into_any_element(),
             Kind::Open(_) => pill("Open".into(), false),
         }
     }
@@ -344,7 +355,7 @@ impl Focusable for Settings {
 impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
-        let colors = crate::theme_colors(&theme, window);
+        let t = crate::design::Tokens::from_theme(&theme, window);
         let rows = self.rows();
         let me = cx.weak_entity();
         crate::dump_ui(
@@ -360,8 +371,10 @@ impl Render for Settings {
         div()
             .size_full()
             .flex()
-            .bg(colors.background)
-            .text_color(colors.text)
+            .font_family(crate::design::FONT_UI)
+            .text_size(px(14.))
+            .bg(t.bg)
+            .text_color(t.text)
             .key_context("Settings")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
@@ -388,10 +401,10 @@ impl Render for Settings {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .bg(colors.container)
+                    .bg(t.surface)
                     .border_r_1()
-                    .border_color(colors.separator)
-                    .child(div().px_2().pb_3().font_weight(FontWeight::SEMIBOLD).child("akscast Settings"))
+                    .border_color(t.hairline)
+                    .child(div().px_2().pb_3().flex().items_center().gap(px(8.)).child(crate::design::fluent(crate::design::g::SETTING, 16., t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("akscast")))
                     .children(SECTIONS.iter().enumerate().map(|(i, name)| {
                         let me = me.clone();
                         div()
@@ -399,12 +412,14 @@ impl Render for Settings {
                             .px_3()
                             .py_1p5()
                             .rounded_md()
-                            .when(i == self.section, |d| d.bg(colors.selected).text_color(colors.selected_text))
+                            .relative()
+                            .when(i == self.section, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(8.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)))
+                            .when(i != self.section, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.surface)))
                             .on_click(move |_, window, cx| drop(me.update(cx, |this, cx| this.set_section(i, window, cx))))
                             .child(*name)
                     }))
                     .child(div().flex_1())
-                    .child(div().px_2().text_xs().text_color(colors.disabled).child("↑↓ rows · Ctrl+↑↓ sections · ↵ change · Esc close")),
+                    .child(div().px_2().text_xs().text_color(t.text_muted).child("↑↓ rows · Ctrl+↑↓ sections · ↵ change · Esc close")),
             )
             .child(
                 div()
@@ -422,7 +437,7 @@ impl Render for Settings {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
+                            .child(div().font_family(crate::design::FONT_DISPLAY).text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
                             .children(rows.iter().enumerate().map(|(i, r)| {
                                 let on = i == self.selected;
                                 let me = me.clone();
@@ -434,7 +449,7 @@ impl Render for Settings {
                                     .px_3()
                                     .py_2()
                                     .rounded_md()
-                                    .when(on, |d| d.bg(colors.container))
+                                    .when(on, |d| d.bg(t.surface))
                                     .on_click(move |_, window, cx| {
                                         drop(me.update(cx, |this, cx| {
                                             let again = this.selected == i;
@@ -451,11 +466,11 @@ impl Render for Settings {
                                             .flex()
                                             .flex_col()
                                             .child(div().truncate().child(r.label.clone()))
-                                            .children((!r.help.is_empty()).then(|| div().text_xs().text_color(colors.disabled).truncate().child(r.help.clone()))),
+                                            .children((!r.help.is_empty()).then(|| div().text_xs().text_color(t.text_muted).truncate().child(r.help.clone()))),
                                     )
-                                    .child(div().flex_1().min_w_0().child(self.control(r, on, &colors)))
+                                    .child(div().flex_1().min_w_0().child(self.control(r, on, &t)))
                             }))
-                            .children(rows.is_empty().then(|| div().text_color(colors.disabled).child("Nothing to configure here yet."))),
+                            .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
                     )
                     .child(
                         div()
@@ -465,11 +480,11 @@ impl Render for Settings {
                             .flex()
                             .items_center()
                             .border_t_1()
-                            .border_color(colors.separator)
+                            .border_color(t.hairline)
                             .text_xs()
                             .text_color(match self.status.as_deref() {
-                                Some(s) if !(s.starts_with("Saved") || s.starts_with("Press") || s == "Cancelled") => rgb(0xff6b6b),
-                                _ => colors.disabled,
+                                Some(s) if !(s.starts_with("Saved") || s.starts_with("Press") || s == "Cancelled") => t.danger,
+                                _ => t.text_muted,
                             })
                             .child(self.status.clone().unwrap_or_else(|| format!("Changes save to {} and apply within 2 s", config::path().display()))),
                     ),

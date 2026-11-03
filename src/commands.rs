@@ -17,7 +17,7 @@ use windows::{
         UI::{
             Shell::{SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW},
             WindowsAndMessaging::{
-                GetWindowRect, HWND_BROADCAST, IsIconic, IsWindow, IsZoomed, SMTO_ABORTIFHUNG, SW_MAXIMIZE, SW_RESTORE,
+                GetClassNameW, GetWindowRect, HWND_BROADCAST, IsIconic, IsWindow, IsZoomed, SMTO_ABORTIFHUNG, SW_MAXIMIZE, SW_RESTORE,
                 SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageTimeoutW, SetWindowPos, ShowWindow,
                 WM_SETTINGCHANGE,
             },
@@ -66,39 +66,41 @@ pub enum Snap {
     NextDisplay,
 }
 
-/// (command, title, extra search words, glyph)
-pub const ALL: &[(Cmd, &str, &str, &str)] = &[
-    (Cmd::SearchFiles, "Search Files", "find documents folders", "📂"),
-    (Cmd::ClipboardHistory, "Clipboard History", "paste copy", "📋"),
-    (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", "🧹"),
-    (Cmd::Emoji, "Search Emoji", "emoji symbols", "😀"),
-    (Cmd::Lock, "Lock Screen", "lock", "🔒"),
-    (Cmd::Sleep, "Sleep", "suspend", "🌙"),
-    (Cmd::Restart, "Restart", "reboot", "🔄"),
-    (Cmd::ShutDown, "Shut Down", "power off", "⏻"),
-    (Cmd::SignOut, "Sign Out", "log out logoff", "🚪"),
-    (Cmd::EmptyBin, "Empty Recycle Bin", "trash", "🗑"),
-    (Cmd::ToggleDarkMode, "Toggle Dark Mode", "theme appearance light", "🌓"),
-    (Cmd::Snap(Snap::LeftHalf), "Left Half", "window", "◧"),
-    (Cmd::Snap(Snap::RightHalf), "Right Half", "window", "◨"),
-    (Cmd::Snap(Snap::TopHalf), "Top Half", "window", "⬒"),
-    (Cmd::Snap(Snap::BottomHalf), "Bottom Half", "window", "⬓"),
-    (Cmd::Snap(Snap::LeftThird), "First Third", "window left", "▏"),
-    (Cmd::Snap(Snap::CenterThird), "Center Third", "window middle", "▕"),
-    (Cmd::Snap(Snap::RightThird), "Last Third", "window right", "▕"),
-    (Cmd::Snap(Snap::FirstTwoThirds), "First Two Thirds", "window left", "◧"),
-    (Cmd::Snap(Snap::LastTwoThirds), "Last Two Thirds", "window right", "◨"),
-    (Cmd::Snap(Snap::Maximize), "Maximize", "window full", "⬜"),
-    (Cmd::Snap(Snap::AlmostMaximize), "Almost Maximize", "window", "▣"),
-    (Cmd::Snap(Snap::Center), "Center Window", "window middle", "⊡"),
-    (Cmd::Snap(Snap::Restore), "Restore Window", "window", "↩"),
-    (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", "🖥"),
-    (Cmd::Settings, "akscast Settings", "preferences options configure", "⚙"),
-    (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", "📝"),
-    (Cmd::ReloadApps, "Reload Apps", "rescan refresh", "↻"),
-    (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", "🧩"),
-    (Cmd::BrowseStore, "Browse Extension Store", "raycast store extensions catalog install", "🛍"),
-    (Cmd::Quit, "Quit akscast", "exit close", "✕"),
+use crate::design::g;
+
+/// (command, title, extra search words, Fluent icon)
+pub const ALL: &[(Cmd, &str, &str, char)] = &[
+    (Cmd::SearchFiles, "Search Files", "find documents folders", g::FOLDER),
+    (Cmd::ClipboardHistory, "Clipboard History", "paste copy", g::PASTE),
+    (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", g::DELETE),
+    (Cmd::Emoji, "Search Emoji", "emoji symbols", g::EMOJI),
+    (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
+    (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
+    (Cmd::Restart, "Restart", "reboot", g::REFRESH),
+    (Cmd::ShutDown, "Shut Down", "power off", g::POWER),
+    (Cmd::SignOut, "Sign Out", "log out logoff", g::SIGN_OUT),
+    (Cmd::EmptyBin, "Empty Recycle Bin", "trash", g::DELETE),
+    (Cmd::ToggleDarkMode, "Toggle Dark Mode", "theme appearance light", g::PERSONALIZE),
+    (Cmd::Snap(Snap::LeftHalf), "Left Half", "window", g::DOCK_LEFT),
+    (Cmd::Snap(Snap::RightHalf), "Right Half", "window", g::DOCK_RIGHT),
+    (Cmd::Snap(Snap::TopHalf), "Top Half", "window", g::UP),
+    (Cmd::Snap(Snap::BottomHalf), "Bottom Half", "window", g::DOCK_BOTTOM),
+    (Cmd::Snap(Snap::LeftThird), "First Third", "window left", g::DOCK_LEFT),
+    (Cmd::Snap(Snap::CenterThird), "Center Third", "window middle", g::TILES),
+    (Cmd::Snap(Snap::RightThird), "Last Third", "window right", g::DOCK_RIGHT),
+    (Cmd::Snap(Snap::FirstTwoThirds), "First Two Thirds", "window left", g::DOCK_LEFT),
+    (Cmd::Snap(Snap::LastTwoThirds), "Last Two Thirds", "window right", g::DOCK_RIGHT),
+    (Cmd::Snap(Snap::Maximize), "Maximize", "window full", g::FULL_SCREEN),
+    (Cmd::Snap(Snap::AlmostMaximize), "Almost Maximize", "window", g::FULL_SCREEN),
+    (Cmd::Snap(Snap::Center), "Center Window", "window middle", g::TILES),
+    (Cmd::Snap(Snap::Restore), "Restore Window", "window", g::RESTORE),
+    (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", g::SWITCH_APPS),
+    (Cmd::Settings, "akscast Settings", "preferences options configure", g::SETTING),
+    (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", g::EDIT),
+    (Cmd::ReloadApps, "Reload Apps", "rescan refresh", g::REFRESH),
+    (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", g::DOWNLOAD),
+    (Cmd::BrowseStore, "Browse Extension Store", "raycast store extensions catalog install", g::SHOP),
+    (Cmd::Quit, "Quit akscast", "exit close", g::CANCEL),
 ];
 
 impl Cmd {
@@ -114,7 +116,7 @@ impl Cmd {
     pub fn subtitle(self) -> &'static str {
         match self {
             Cmd::Snap(_) => "Window Management",
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "Command",
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "akscast",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => "akscast",
             _ => "System",
         }
@@ -195,9 +197,16 @@ pub fn layout(s: Snap, wa: RECT, cur: RECT) -> RECT {
     }
 }
 
+/// The desktop and taskbar: opening akscast from them leaves no window to move.
+fn is_shell(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    matches!(String::from_utf16_lossy(&buf[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
 fn snap(hwnd: HWND, s: Snap) {
     unsafe {
-        if hwnd.is_invalid() || !IsWindow(Some(hwnd)).as_bool() {
+        if hwnd.is_invalid() || !IsWindow(Some(hwnd)).as_bool() || is_shell(hwnd) {
             return;
         }
         match s {

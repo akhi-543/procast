@@ -134,7 +134,7 @@ pub struct Extensions {
 
 impl Default for Extensions {
     fn default() -> Self {
-        Self { node: "node".into(), memory_mb: 256, background: true, menu_bar: true }
+        Self { node: "node".into(), memory_mb: 256, background: true, menu_bar: false }
     }
 }
 
@@ -264,7 +264,7 @@ dirs = []
 node = "node"                 # Node.js 22+ runs the extension host
 memory_mb = 256               # heap limit per running command
 background = true             # run commands that declare an interval (e.g. every 5m)
-menu_bar = true               # show menu-bar commands as tray icons
+menu_bar = false              # also show menu-bar commands as tray icons
 
 [theme]
 mode = "system"               # system | dark | light

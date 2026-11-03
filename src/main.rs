@@ -3,6 +3,7 @@
 mod clipboard;
 mod commands;
 mod config;
+mod design;
 mod ext;
 mod files;
 mod net;
@@ -27,7 +28,7 @@ use futures::{
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
     ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
-    actions, colors::Colors, div, img, prelude::*, px, rgb, rgb_to_hsla, size, uniform_list,
+    actions, div, prelude::*, px, size, uniform_list,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -44,6 +45,7 @@ use windows::Win32::Foundation::HWND;
 
 use commands::Cmd;
 use config::Config;
+use design::{Tokens, g};
 use ext::FieldKind;
 use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
@@ -94,6 +96,31 @@ fn hotkey_specs(cfg: &Config) -> [String; 4] {
 
 fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> {
     cfg.files.enabled.then(|| files::Files::start(cfg.files.roots(), cfg.files.exclude.clone(), tx.clone()))
+}
+
+/// Section marker for a row that stands in for an empty view (drawn as an empty state).
+const EMPTY: &str = "\u{0}empty";
+
+/// List slots for items: None = a section header, Some(i) = item i. Consecutive items
+/// with the same section share one header.
+fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
+    let mut out = Vec::with_capacity(items.len() + 4);
+    let mut last: Option<&str> = None;
+    for (i, it) in items.iter().enumerate() {
+        let sec = it.section.as_deref().filter(|s| *s != EMPTY);
+        if sec.is_some() && sec != last {
+            out.push(None);
+        }
+        last = sec;
+        out.push(Some(i));
+    }
+    out
+}
+
+fn empty_row(glyph: char, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
+    let mut it = Item::new(title, hint, Icon::Fluent(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
+    it.extra = actions;
+    it
 }
 
 /// The extension command currently on screen.
@@ -188,6 +215,10 @@ impl Launcher {
         ];
         // ponytail: ignore_apps is read once at start; changing it needs a restart.
         clipboard::watch(cfg.clipboard.ignore_apps.clone(), tx.clone());
+        for (dir, recursive) in win::app_dirs() {
+            let tx = tx.clone();
+            std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
+        }
         let mut this = Self {
             input,
             hotkeys: win::Hotkeys::spawn(hotkey_specs(&cfg), tx.clone()),
@@ -272,21 +303,21 @@ impl Launcher {
 
     /// An extension icon value: "icon:Name", an emoji, an asset file or a URL.
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
-        let Some(icon) = icon else { return Icon::glyph("•") };
+        let Some(icon) = icon else { return Icon::Fluent(g::BULLETS) };
         if let Some(name) = icon.strip_prefix("icon:") {
-            return Icon::glyph(ext::icon_glyph(name));
+            return Icon::Fluent(ext::icon_glyph(name));
         }
         if icon.starts_with("http") {
             // Web images: drawn from the cache once downloaded; a globe until then.
             let cached = net::image_path(icon);
             if cached.exists() {
-                return self.image(cached).map(Icon::Image).unwrap_or(Icon::glyph("🌐"));
+                return self.image(cached).map(Icon::Image).unwrap_or(Icon::Fluent(g::GLOBE));
             }
             net::fetch_image(icon, &self.tx);
-            return Icon::glyph("🌐");
+            return Icon::Fluent(g::GLOBE);
         }
         if icon.starts_with("data:") {
-            return Icon::glyph("🖼");
+            return Icon::Fluent(g::DOCUMENT);
         }
         if icon.chars().count() <= 4 && !icon.contains('.') {
             return Icon::glyph(icon.to_string());
@@ -295,7 +326,7 @@ impl Launcher {
         let path = if std::path::Path::new(icon).is_absolute() { PathBuf::from(icon) } else { dir.join(icon) };
         match self.image(path) {
             Some(i) => Icon::Image(i),
-            None => Icon::glyph("•"),
+            None => Icon::Fluent(g::BULLETS),
         }
     }
 
@@ -303,7 +334,7 @@ impl Launcher {
         let exts = ext::scan();
         let mut out = Vec::with_capacity(exts.len());
         for e in exts {
-            let icon = e.icon.clone().and_then(|p| self.image(p)).map(Icon::Image).unwrap_or(Icon::glyph("🧩"));
+            let icon = e.icon.clone().and_then(|p| self.image(p)).map(Icon::Image).unwrap_or(Icon::Fluent(g::PUZZLE));
             out.push((e, icon));
         }
         self.exts = out;
@@ -320,9 +351,10 @@ impl Launcher {
 
     fn ext_rows(&mut self, query: &str) -> Vec<Item> {
         if let Some(c) = &self.confirm {
-            let mut ok = Item::new(c.primary.clone(), c.message.clone(), Icon::glyph("?"), Act::Confirm(true));
+            // Drawn as a dialog; these two rows only drive selection and Enter.
+            let mut ok = Item::new(c.primary.clone(), "", Icon::Fluent(g::CHECK), Act::Confirm(true));
             ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
-            return vec![ok, Item::new("Cancel", "", Icon::glyph("✕"), Act::Confirm(false))];
+            return vec![ok, Item::new("Cancel", "", Icon::Fluent(g::CANCEL), Act::Confirm(false))];
         }
         let Some(ev) = &self.extv else { return vec![] };
         let (ext, view) = (ev.ext, ev.view.clone());
@@ -337,9 +369,9 @@ impl Launcher {
                         let acts: Vec<(String, Act)> =
                             it.actions.iter().filter_map(|a| Some((a.title.clone(), Act::ExtFn(a.on_action.clone()?)))).collect();
                         let primary = acts.first().map(|a| a.1.clone()).unwrap_or(Act::None);
-                        let sub: Vec<&str> = std::iter::once(it.subtitle.as_str()).chain(it.accessories.iter().map(String::as_str)).filter(|s| !s.is_empty()).collect();
                         let hay = [it.title.as_str(), it.subtitle.as_str(), &it.keywords.join(" "), it.section.as_deref().unwrap_or("")].join(" ");
-                        let mut row = Item::new(&it.title, sub.join("  ·  "), self.ext_icon(ext, it.icon.as_deref()), primary).with_hay(hay);
+                        let mut row = Item::new(&it.title, &it.subtitle, self.ext_icon(ext, it.icon.as_deref()), primary).acc(it.accessories.join("  ·  ")).with_hay(hay);
+                        row.section = it.section.clone();
                         row.extra = acts;
                         row
                     })
@@ -350,25 +382,23 @@ impl Launcher {
                 // The search-bar dropdown's options are reachable from Ctrl+K on any row.
                 if let Some((opts, cur, Some(f))) = &view.dropdown {
                     for row in &mut rows {
-                        row.extra.extend(opts.iter().map(|(v, t)| (format!("{} {t}", if v == cur { "●" } else { "Filter:" }), Act::ExtSet(f.clone(), v.clone()))));
+                        row.extra.extend(opts.iter().map(|(v, t)| (format!("{} {t}", if v == cur { "Showing:" } else { "Show:" }), Act::ExtSet(f.clone(), v.clone()))));
                     }
                 }
                 if rows.is_empty() {
-                    let (title, sub) = match &view.empty {
-                        _ if view.loading => ("Loading…".to_string(), String::new()),
-                        Some((t, d)) if !t.is_empty() => (t.clone(), d.clone()),
-                        _ => ("No results".to_string(), String::new()),
+                    let (glyph, title, sub) = match &view.empty {
+                        _ if view.loading => (g::CLOCK, "Loading…".to_string(), String::new()),
+                        Some((t, d)) if !t.is_empty() => (g::SEARCH, t.clone(), d.clone()),
+                        _ => (g::SEARCH, "No results".to_string(), String::new()),
                     };
-                    let mut row = Item::new(title, sub, Icon::glyph(if view.loading { "⏳" } else { "∅" }), view_actions.first().map(|a| a.1.clone()).unwrap_or(Act::None));
-                    row.extra = view_actions;
-                    rows.push(row);
+                    rows.push(empty_row(glyph, title, sub, view_actions));
                 }
                 rows
             }
-            "" => vec![Item::new("Loading…", "", Icon::glyph("⏳"), Act::None)],
+            "" => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
             // Detail and Form draw their own body; Enter and Ctrl+K use the view's actions.
             _ => {
-                let mut row = Item::new(view.title.clone().unwrap_or_default(), "", Icon::glyph("•"), view_actions.first().map(|a| a.1.clone()).unwrap_or(Act::None));
+                let mut row = Item::new(view.title.clone().unwrap_or_default(), "", Icon::Fluent(g::BULLETS), view_actions.first().map(|a| a.1.clone()).unwrap_or(Act::None));
                 row.extra = view_actions;
                 vec![row]
             }
@@ -390,28 +420,32 @@ impl Launcher {
                 if let Some(f) = &self.files {
                     f.search(self.file_gen, &query, 50);
                 }
-                if query.trim().is_empty() { vec![] } else { std::mem::take(&mut self.items) }
+                if query.trim().is_empty() {
+                    vec![empty_row(g::SEARCH, "Search your files".into(), "Type a name; include \\ to match a path".into(), vec![])]
+                } else {
+                    std::mem::take(&mut self.items)
+                }
             }
             Mode::Args => match &self.pending {
                 Some((i, got)) => {
                     let s = &self.scripts[*i];
                     let n = s.args.len();
-                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::glyph("⌨"), Act::Script(*i))]
+                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Fluent(g::COMMAND), Act::Script(*i))]
                 }
                 None => vec![],
             },
             Mode::Output => match &self.output {
-                Some((_, _, true)) => vec![Item::new("Running…", "", Icon::glyph("⏳"), Act::Copy(String::new()))],
+                Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
                     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                     let shown = if lines.is_empty() { vec!["(no output)"] } else { lines };
-                    shown.iter().map(|l| Item::new(*l, "", Icon::glyph("›"), Act::Copy(text.clone()))).collect()
+                    shown.iter().map(|l| Item::new(*l, "", Icon::Fluent(g::COMMAND), Act::Copy(text.clone())).sec("Output")).collect()
                 }
                 None => vec![],
             },
             Mode::Ext => self.ext_rows(&query),
             Mode::Store => match &self.store {
-                None => vec![Item::new("Loading the store index…", "first time clones raycast/extensions manifests (~1 min)", Icon::glyph("⏳"), Act::None)],
+                None => vec![empty_row(g::DOWNLOAD, "Loading the store index…".into(), "The first time fetches every extension's manifest (~1 min)".into(), vec![])],
                 Some(entries) => {
                     let installed: Vec<&str> = self.exts.iter().map(|(x, _)| x.name.as_str()).collect();
                     let rows: Vec<Item> = entries
@@ -419,8 +453,8 @@ impl Launcher {
                         .filter(|s| s.windows)
                         .map(|s| {
                             let done = installed.contains(&s.name.as_str());
-                            let sub = format!("{}{} · {}", if done { "Installed · " } else { "" }, s.author, s.description);
-                            let mut it = Item::new(&s.title, sub, Icon::glyph(if done { "✓" } else { "🧩" }), Act::Install(s.name.clone()))
+                            let mut it = Item::new(&s.title, &s.description, Icon::Fluent(if done { g::CHECK } else { g::PUZZLE }), Act::Install(s.name.clone()))
+                                .acc(if done { "Installed".to_string() } else { s.author.clone() })
                                 .with_hay(format!("{} {} {} {}", s.title, s.name, s.author, s.description));
                             it.extra = vec![
                                 ((if done { "Reinstall / Update" } else { "Install" }).to_string(), Act::Install(s.name.clone())),
@@ -436,14 +470,23 @@ impl Launcher {
             },
             Mode::Install => {
                 let what = query.trim();
-                let title = if what.is_empty() { "Type a store name (e.g. obsidian) or a folder path".to_string() } else { format!("Install {what}") };
-                vec![Item::new(title, "builds with ray build; needs git, Node and npm", Icon::glyph("🧩"), Act::None)]
+                let title = if what.is_empty() { "Install an extension".to_string() } else { format!("Install {what}") };
+                vec![empty_row(g::DOWNLOAD, title, "A store name (e.g. obsidian) or a folder path, then Enter · needs git, Node and npm".into(), vec![])]
             }
         };
+        if self.items.is_empty() && self.mode == Mode::Clipboard {
+            self.items = vec![empty_row(g::PASTE, "Nothing copied yet".into(), "Text you copy shows up here".into(), vec![])];
+        }
         let _ = max;
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
-        self.scroll.scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        self.scroll_to_selected();
         cx.notify();
+    }
+
+    /// Scrolls the selected row into view (section headers take list slots too).
+    fn scroll_to_selected(&self) {
+        let at = display_rows(&self.items).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
+        self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
     }
 
     fn rebuild_catalog(&mut self, cx: &mut Context<Self>) {
@@ -453,19 +496,37 @@ impl Launcher {
         }
     }
 
-    /// Off-thread: names arrive first (~1 s), icons follow.
-    // ponytail: no disk cache, so the app list is empty for the first second after start.
-    fn scan_apps(&mut self, force: bool) {
+    /// Off-thread. The cached list (with icons) is used at once; a fresh scan of names
+    /// follows (~1 s), and only apps without a known icon get one extracted.
+    /// `fresh_icons` re-extracts every icon (Reload Apps).
+    fn scan_apps(&mut self, force: bool, fresh_icons: bool) {
         if !force && self.scanned.is_some_and(|t| t.elapsed() < Duration::from_secs(300)) {
             return;
         }
         self.scanned = Some(Instant::now());
         let tx = self.tx.clone();
+        let cache = config::dir().join("apps.bin");
+        let mut known = if fresh_icons { vec![] } else { self.apps.clone() };
         std::thread::spawn(move || {
+            if known.is_empty() && !fresh_icons {
+                known = win::load_apps(&cache);
+                if !known.is_empty() {
+                    let _ = tx.unbounded_send(Msg::Apps(known.clone()));
+                }
+            }
             let mut apps = win::scan_apps();
+            for app in &mut apps {
+                app.icon = known.iter().find(|k| k.id == app.id).and_then(|k| k.icon.clone());
+            }
+            let same = |a: &[win::App], b: &[win::App]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.id == y.id && x.name == y.name);
+            if apps.iter().any(|a| a.icon.is_none()) {
+                let _ = tx.unbounded_send(Msg::Apps(apps.clone()));
+                win::load_icons(&mut apps);
+            } else if same(&apps, &known) {
+                return;
+            }
             let _ = tx.unbounded_send(Msg::Apps(apps.clone()));
-            win::load_icons(&mut apps);
-            let _ = tx.unbounded_send(Msg::Apps(apps));
+            let _ = win::save_apps(&cache, &apps);
         });
     }
 
@@ -478,7 +539,7 @@ impl Launcher {
         if mode == Mode::Files
             && let Some(f) = &self.files
         {
-            f.refresh_if_stale(Duration::from_secs(120));
+            f.refresh_if_stale(Duration::from_secs(3600));
         }
         if mode == Mode::Store {
             self.load_store();
@@ -506,7 +567,7 @@ impl Launcher {
         window.activate();
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
-        self.scan_apps(false);
+        self.scan_apps(false, false);
     }
 
     /// `restore` hands focus back to the window that was active before we opened;
@@ -580,7 +641,7 @@ impl Launcher {
         }
         self.next_run += 1;
         let run = self.next_run;
-        let view = cmd.mode == "view" && !background;
+        let view = (cmd.mode == "view" || cmd.mode == "menu-bar") && !background;
         self.send(ext::run_msg(run, &ext, &cmd, prefs, args, background, self.cfg.extensions.memory_mb));
         if view {
             self.stop_ext_view();
@@ -1083,7 +1144,7 @@ impl Launcher {
                 return self.open_settings(cx);
             }
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
-            Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true),
+            Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true, true),
             Act::Cmd(Cmd::Quit) => return cx.quit(),
             Act::Cmd(cmd) => {
                 // Hide first so window commands act on the window you came from.
@@ -1109,6 +1170,7 @@ impl Launcher {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(gpui::TitlebarOptions { title: Some("akscast Settings".into()), ..Default::default() }),
+            windows_window_background: gpui::WindowsWindowBackground::MicaBackdrop,
             ..Default::default()
         };
         self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(window, cx))).ok();
@@ -1262,9 +1324,9 @@ impl Launcher {
             }
             Msg::Files(generation, items) => {
                 if self.mode == Mode::Files && generation == self.file_gen && !self.query(cx).trim().is_empty() {
-                    self.items = items;
+                    self.items = if items.is_empty() { vec![empty_row(g::SEARCH, "No matching files".into(), "Try fewer letters, or add folders in Settings → Files".into(), vec![])] } else { items };
                     self.selected = 0;
-                    self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    self.scroll_to_selected();
                     cx.notify();
                 }
             }
@@ -1309,7 +1371,14 @@ impl Launcher {
                 }
                 cx.notify();
             }
-            Msg::Tick => self.tick(cx),
+            // Rescanned on the next tick, so a burst of changes from one install is one scan.
+            Msg::AppsChanged => self.scanned = None,
+            Msg::Tick => {
+                if self.scanned.is_none() {
+                    self.scan_apps(true, false);
+                }
+                self.tick(cx);
+            }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
                 if self.visible && self.mode == Mode::Ext {
@@ -1361,12 +1430,12 @@ impl Launcher {
 
     fn placeholder(&self) -> SharedString {
         match self.mode {
-            Mode::Root => "Search apps and commands, calculate, > to run".into(),
-            Mode::Clipboard => "Search clipboard history".into(),
-            Mode::Emoji => "Search emoji".into(),
-            Mode::Files => "Search files by name, or a path with \\".into(),
-            Mode::Install => "Extension name (e.g. obsidian) or folder path".into(),
-            Mode::Store => "Search Windows-capable store extensions".into(),
+            Mode::Root => "Search apps and commands…".into(),
+            Mode::Clipboard => "Search clipboard history…".into(),
+            Mode::Emoji => "Search emoji…".into(),
+            Mode::Files => "Search files…".into(),
+            Mode::Install => "Extension name or folder…".into(),
+            Mode::Store => "Search the extension store…".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self
                 .pending
@@ -1381,6 +1450,7 @@ impl Launcher {
         }
     }
 
+    /// Text on the left of the action bar: a toast, index status, or where you are.
     fn footer_left(&self) -> String {
         if let Some(s) = &self.status {
             return s.clone();
@@ -1389,7 +1459,7 @@ impl Launcher {
             && let Some(f) = &self.files
         {
             let n = f.count.load(std::sync::atomic::Ordering::SeqCst);
-            return if f.indexing.load(std::sync::atomic::Ordering::SeqCst) { format!("Indexing… ({n} so far)") } else { format!("{n} files indexed") };
+            return if f.indexing.load(std::sync::atomic::Ordering::SeqCst) { format!("Indexing… {n} so far") } else { format!("{n} files indexed") };
         }
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
@@ -1397,110 +1467,168 @@ impl Launcher {
         self.label().unwrap_or_else(|| "akscast".into())
     }
 
-    fn render_form(&self, colors: &Colors) -> gpui::AnyElement {
+    /// The icon on the left of the action bar.
+    fn context_icon(&self) -> Icon {
+        match self.mode {
+            Mode::Ext => self.extv.as_ref().map(|e| self.exts[e.ext].1.clone()).unwrap_or(Icon::Fluent(g::PUZZLE)),
+            Mode::Root => Icon::Fluent(g::SEARCH),
+            Mode::Clipboard => Icon::Fluent(g::PASTE),
+            Mode::Emoji => Icon::Fluent(g::EMOJI),
+            Mode::Files => Icon::Fluent(g::FOLDER),
+            Mode::Store => Icon::Fluent(g::SHOP),
+            Mode::Install => Icon::Fluent(g::DOWNLOAD),
+            Mode::Args | Mode::Output => Icon::Fluent(g::COMMAND),
+        }
+    }
+
+    /// Esc: close a popover/dialog, pop a pushed view, leave a mode, or hide.
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.take().is_some() {
+            cx.notify();
+            if self.is_form() {
+                self.focus_field(window, cx);
+            }
+        } else if let Some(c) = self.confirm.take() {
+            self.reply(c.run, c.id, Ok(json!(false)));
+            self.refresh(cx);
+        } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
+            let run = self.extv.as_ref().unwrap().run;
+            self.send(json!({"t": "pop", "run": run}));
+        } else if self.mode == Mode::Root {
+            self.hide(true, cx)
+        } else {
+            self.pending = None;
+            self.set_mode(Mode::Root, cx);
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
+    }
+
+    fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
         let Some(ev) = &self.extv else { return div().into_any_element() };
+        let field_box = |on: bool| div().w_full().h(px(34.)).px(px(10.)).flex().items_center().rounded(px(6.)).bg(t.surface).border_1().border_color(if on { t.accent } else { t.border });
         div()
             .id("form")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p_2()
             .flex()
-            .flex_col()
-            .gap_1()
-            .children(ev.view.fields.iter().enumerate().map(|(i, f)| {
+            .justify_center()
+            .pt(px(28.))
+            .child(div().w(px(540.)).flex().flex_col().gap(px(14.)).children(ev.view.fields.iter().enumerate().map(|(i, f)| {
                 let on = i == ev.field;
                 let value = ev.values.get(&f.id).cloned().unwrap_or(Value::Null);
                 let control = match &f.kind {
                     FieldKind::Text | FieldKind::Password | FieldKind::TextArea => match ev.inputs.get(&f.id) {
-                        Some(input) => text_input(SharedString::from(format!("field-{}", f.id)))
-                            .state(input.downgrade())
-                            .placeholder(f.placeholder.clone())
-                            .placeholder_color(colors.disabled)
-                            .caret_color(rgb_to_hsla(colors.text))
-                            .w_full()
-                            .whitespace_nowrap()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if on { colors.selected } else { colors.border })
-                            .bg(colors.container)
+                        Some(input) => field_box(on)
+                            .when(f.kind == FieldKind::TextArea, |d| d.h(px(64.)).items_start().py(px(8.)))
+                            .child(
+                                text_input(SharedString::from(format!("field-{}", f.id)))
+                                    .state(input.downgrade())
+                                    .placeholder(f.placeholder.clone())
+                                    .placeholder_color(t.text_faint)
+                                    .caret_color(t.accent)
+                                    .w_full()
+                                    .whitespace_nowrap(),
+                            )
                             .into_any_element(),
                         None => div().into_any_element(),
                     },
-                    FieldKind::Checkbox => div().child(format!("{}  {}", if value.as_bool().unwrap_or(false) { "☑" } else { "☐" }, f.title)).into_any_element(),
+                    FieldKind::Checkbox => {
+                        let checked = value.as_bool().unwrap_or(false);
+                        div()
+                            .h(px(34.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(design::fluent(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, 16., if checked { t.accent } else { t.text_muted }))
+                            .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.title.clone()))
+                            .into_any_element()
+                    }
                     FieldKind::Dropdown(opts) => {
                         let cur = value.as_str().unwrap_or_default();
                         let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        div().px_2().py_1().rounded_md().border_1().border_color(if on { colors.selected } else { colors.border }).child(format!("{title}  ▾")).into_any_element()
+                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::fluent(g::CHEVRON_DOWN, 11., t.text_muted)).into_any_element()
                     }
-                    FieldKind::Description => div().text_sm().text_color(colors.disabled).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
-                    FieldKind::Separator => div().h(px(1.)).w_full().bg(colors.separator).into_any_element(),
+                    FieldKind::Description => div().text_size(px(13.)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
+                    FieldKind::Separator => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
                 };
                 let label = if matches!(f.kind, FieldKind::Checkbox | FieldKind::Separator) { String::new() } else { f.title.clone() };
                 div()
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .when(on && matches!(f.kind, FieldKind::Checkbox | FieldKind::Dropdown(_)), |d| d.bg(colors.container))
-                    .child(div().w(px(150.)).flex_none().text_sm().text_color(colors.disabled).truncate().child(label))
-                    .child(div().flex_1().min_w_0().child(control))
-                    .children(f.error.clone().map(|e| div().flex_none().text_xs().text_color(rgb(0xff6b6b)).child(e)))
-            }))
+                    .items_start()
+                    .gap(px(14.))
+                    .child(div().w(px(130.)).flex_none().h(px(34.)).flex().items_center().justify_end().text_size(px(13.)).text_color(t.text_muted).child(label))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(control)
+                            .children(f.error.clone().map(|e| div().text_size(px(12.)).text_color(t.danger).child(e))),
+                    )
+            })))
             .into_any_element()
     }
 
-    fn render_markdown(md: &str, metadata: &[(String, String)], colors: &Colors, id: &'static str) -> gpui::AnyElement {
+    fn render_markdown(md: &str, metadata: &[(String, String)], t: &Tokens, id: &'static str) -> gpui::AnyElement {
         div()
             .id(id)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_4()
-            .py_2()
+            .px(px(20.))
+            .py(px(16.))
             .flex()
             .flex_col()
-            .gap_1()
+            .gap(px(6.))
             .children(ext::markdown_lines(md).into_iter().map(|(level, text)| {
-                let line = div().child(if text.is_empty() { " ".to_string() } else { text });
+                let line = div().line_height(px(21.)).child(if text.is_empty() { " ".to_string() } else { text });
                 match level {
-                    1 => line.text_xl().font_weight(FontWeight::SEMIBOLD),
-                    2 => line.text_lg().font_weight(FontWeight::SEMIBOLD),
+                    1 => line.pt(px(4.)).font_family(design::FONT_DISPLAY).text_size(px(20.)).font_weight(FontWeight::SEMIBOLD),
+                    2 => line.pt(px(4.)).text_size(px(16.)).font_weight(FontWeight::SEMIBOLD),
                     3 => line.font_weight(FontWeight::SEMIBOLD),
-                    9 => line.font_family("Consolas").text_sm(),
-                    _ => line,
+                    9 => line.font_family(design::FONT_MONO).text_size(px(13.)).px(px(10.)).bg(t.surface).rounded(px(4.)),
+                    _ => line.text_color(t.text),
                 }
             }))
-            .children(metadata.iter().map(|(t, v)| div().flex().gap_3().text_sm().child(div().w(px(140.)).text_color(colors.disabled).child(t.clone())).child(v.clone())))
+            .when(!metadata.is_empty(), |d| {
+                d.child(div().mt(px(14.)).pt(px(12.)).border_t_1().border_color(t.hairline).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information"))
+                    .children(metadata.iter().map(|(k, v)| {
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap(px(16.))
+                            .py(px(8.))
+                            .border_b_1()
+                            .border_color(t.hairline)
+                            .text_size(px(13.))
+                            .child(div().flex_none().text_color(t.text_muted).child(k.clone()))
+                            .child(div().min_w_0().truncate().child(v.clone()))
+                    }))
+            })
             .into_any_element()
     }
 }
 
-/// The palette from `[theme]`: base by mode, then per-colour overrides.
-fn theme_colors(t: &config::Theme, window: &Window) -> Colors {
-    let mut c = match t.mode.as_str() {
-        "dark" => Colors::dark(),
-        "light" => Colors::light(),
-        _ => Colors::for_appearance(window),
-    };
-    let set = |slot: &mut gpui::Rgba, v: &Option<String>| {
-        if let Some(hex) = v.as_deref().and_then(config::parse_hex) {
-            *slot = gpui::rgba(hex);
-        }
-    };
-    set(&mut c.background, &t.background);
-    set(&mut c.text, &t.text);
-    set(&mut c.disabled, &t.muted);
-    set(&mut c.selected, &t.selected);
-    set(&mut c.selected_text, &t.selected_text);
-    set(&mut c.border, &t.border);
-    set(&mut c.separator, &t.separator);
-    set(&mut c.container, &t.container);
-    c
+/// Fluent glyph for an action in the Ctrl+K panel.
+fn act_glyph(act: &Act) -> char {
+    match act {
+        Act::Copy(_) => g::COPY,
+        Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => g::PASTE,
+        Act::Open(_) => g::GLOBE,
+        Act::File(_) => g::DOCUMENT,
+        Act::Reveal(_) => g::FOLDER,
+        Act::RunAsAdmin(_) => g::SHIELD,
+        Act::DeleteClip(_) | Act::UninstallExt(_) => g::DELETE,
+        Act::Install(_) => g::DOWNLOAD,
+        Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::ExtRun(..) => g::PLAY,
+        Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
+        Act::Confirm(true) => g::CHECK,
+        Act::Confirm(false) => g::CANCEL,
+        _ => g::PLAY,
+    }
 }
 
 /// Test seam: with AKSCAST_E2E=1, each render writes what's on screen to
@@ -1520,78 +1648,135 @@ fn ext_log(who: &str, text: &str) {
     }
 }
 
+/// One slot in the results list.
+#[derive(Clone)]
+enum Slot {
+    Header(String, Option<usize>),
+    Row { idx: usize, title: String, subtitle: String, accessory: String, icon: Icon },
+}
+
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = theme_colors(&self.cfg.theme, window);
+        let t = Tokens::from_theme(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
-        // Rows to draw: the Ctrl+K panel replaces the results while it's open.
-        let (rows, selected): (Vec<(String, String, Icon)>, usize) = match &self.panel {
-            Some((item, i)) => (item.actions().into_iter().map(|(label, _)| (label, String::new(), Icon::glyph("▸"))).collect(), *i),
-            None => (self.items.iter().map(|it| (it.title.clone(), it.subtitle.clone(), it.icon.clone())).collect(), self.selected),
-        };
-        let footer_action = match (&self.panel, self.items.get(self.selected)) {
+        let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
+        let selected_item = self.items.get(self.selected);
+        let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
+        let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());
+
+        // Footer right side, also dumped for tests.
+        let footer_action = match (&self.panel, selected_item) {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
-            _ if self.is_form() => "Next  ↵    Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
+            _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
             (None, Some(it)) if self.armed == Some(self.selected) => format!("Press ↵ again to {}", it.title),
-            (None, Some(it)) => {
-                let acts = it.actions();
-                let label = acts.first().map(|a| a.0.clone()).unwrap_or_default();
-                if label.is_empty() { String::new() } else if acts.len() > 1 { format!("{label}  ↵    Actions  Ctrl+K") } else { format!("{label}  ↵") }
-            }
+            (None, Some(_)) => match &primary {
+                Some(p) if actions.len() > 1 => format!("{p}  ↵    Actions  Ctrl+K"),
+                Some(p) => format!("{p}  ↵"),
+                None => String::new(),
+            },
             (None, None) => String::new(),
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
-        dump_ui("akscast-ui.json", json!({
-            "visible": self.visible,
-            "bg": format!("{:?}", colors.background),
-            "query": self.query(cx),
-            "label": self.label(),
-            "rows": rows.iter().map(|r| &r.0).collect::<Vec<_>>(),
-            "selected": selected,
-            "panel": self.panel.is_some(),
-            "footer": [self.footer_left(), footer_action.clone()],
-            "notice": self.notice,
-            "view": view.as_ref().map(|v| &v.kind),
-            "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
-            "field": self.extv.as_ref().map(|e| e.field),
-            "trays": self.trays.keys().collect::<Vec<_>>(),
-        }));
+        dump_ui(
+            "akscast-ui.json",
+            json!({
+                "visible": self.visible,
+                "bg": format!("{:?}", t.bg),
+                "query": self.query(cx),
+                "label": self.label(),
+                "rows": match &self.panel {
+                    Some((item, _)) => item.actions().into_iter().map(|a| a.0).collect::<Vec<_>>(),
+                    None => self.items.iter().filter(|it| it.section.as_deref() != Some(EMPTY)).map(|it| it.title.clone()).collect(),
+                },
+                "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
+                "panel": self.panel.is_some(),
+                "footer": [self.footer_left(), footer_action.clone()],
+                "notice": self.notice,
+                "view": view.as_ref().map(|v| &v.kind),
+                "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
+                "field": self.extv.as_ref().map(|e| e.field),
+                "trays": self.trays.keys().collect::<Vec<_>>(),
+            }),
+        );
+
+        // ---- results list ----
+        let slots: Vec<Slot> = {
+            let mut out = vec![];
+            let rows = display_rows(&self.items);
+            let count = |sec: &Option<String>| self.items.iter().filter(|it| &it.section == sec).count();
+            for (k, r) in rows.iter().enumerate() {
+                match r {
+                    None => {
+                        let it = &self.items[rows[k + 1].unwrap_or(0)];
+                        let sec = it.section.clone();
+                        out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root).then(|| count(&sec))));
+                    }
+                    Some(i) => {
+                        let it = &self.items[*i];
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory: it.accessory.clone(), icon: it.icon.clone() });
+                    }
+                }
+            }
+            out
+        };
+        let selected = self.selected;
         let me = cx.weak_entity();
-        let rows = Rc::new(rows);
+        let slots = Rc::new(slots);
+        // Narrow split lists (detail on the right) get a tighter accessory column.
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) { 110. } else { 220. };
         let list = {
-            let rows = rows.clone();
-            uniform_list("rows", rows.len(), move |range, _, _| {
+            let slots = slots.clone();
+            uniform_list("rows", slots.len(), move |range, _, _| {
                 range
-                    .map(|i| {
-                        let (title, subtitle, icon) = rows[i].clone();
-                        let on = i == selected;
-                        let icon = match icon {
-                            Icon::Image(image) => img(image).size(px(24.)).into_any_element(),
-                            Icon::Glyph(g) => div().size(px(24.)).flex().items_center().justify_center().child(g).into_any_element(),
-                        };
-                        let me = me.clone();
-                        div()
-                            .id(i)
-                            .h(px(ROW))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .rounded_md()
-                            .when(on, |d| d.bg(colors.selected).text_color(colors.selected_text))
-                            .on_click(move |_, window, cx| {
-                                me.update(cx, |this, cx| {
-                                    match &mut this.panel {
-                                        Some((_, p)) => *p = i,
-                                        None => this.selected = i,
-                                    }
-                                    this.launch(window, cx);
-                                })
-                                .ok();
-                            })
-                            .child(div().flex_none().child(icon))
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .child(div().flex_none().max_w(px(300.)).truncate().text_sm().text_color(if on { colors.selected_text } else { colors.disabled }).child(subtitle))
+                    .map(|k| match &slots[k] {
+                        Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
+                        Slot::Row { idx, title, subtitle, accessory, icon } => {
+                            let (i, on) = (*idx, *idx == selected);
+                            let me = me.clone();
+                            div()
+                                .id(k)
+                                .h(px(design::ROW))
+                                .w_full()
+                                .px(px(6.))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .h(px(36.))
+                                        .w_full()
+                                        .px(px(10.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .rounded(px(8.))
+                                        .when(on, |d| d.bg(t.surface))
+                                        .when(!on, |d| d.hover(|s| s.bg(t.surface)))
+                                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                            me.update(cx, |this, cx| {
+                                                this.selected = i;
+                                                this.launch(window, cx);
+                                            })
+                                            .ok();
+                                        })
+                                        // Fluent selection pill.
+                                        .child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(16.)).rounded_full().when(on, |d| d.bg(t.accent)))
+                                        .child(design::icon_view(icon, &t, on))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(10.))
+                                                // Title keeps priority; the subtitle gives way first.
+                                                .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.clone()))
+                                                .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(13.)).text_color(t.text_muted).child(subtitle.clone()))),
+                                        )
+                                        .when(!accessory.is_empty(), |d| d.child(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(13.)).text_color(t.text_muted).child(accessory.clone()))),
+                                )
+                                .into_any_element()
+                        }
                     })
                     .collect()
             })
@@ -1599,37 +1784,261 @@ impl Render for Launcher {
             .w_full()
             .flex_1()
             .min_h_0()
-            .p_1p5()
+            .py(px(4.))
         };
-        let body = match &view {
-            Some(v) if v.kind == "Form" => self.render_form(&colors),
-            Some(v) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &colors, "detail"),
-            Some(v) if v.show_detail && !v.items.is_empty() => {
-                let md = self
-                    .items
-                    .get(self.selected)
-                    .and_then(|row| v.items.iter().find(|it| it.title == row.title))
-                    .and_then(|it| it.detail.clone())
-                    .unwrap_or_default();
+
+        // ---- body ----
+        let body = match (&empty, &view) {
+            (Some(e), _) => {
+                let glyph = if let Icon::Fluent(c) = e.icon { c } else { g::SEARCH };
+                design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
+            }
+            (_, Some(v)) if v.kind == "Form" => self.render_form(&t),
+            (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail"),
+            (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
+                let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
+                let md = it.and_then(|it| it.detail.clone()).unwrap_or_default();
+                let meta = it.map(|it| it.detail_meta.clone()).unwrap_or_default();
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(div().w(px(self.cfg.width * 0.42)).flex_none().flex().flex_col().min_h_0().child(list))
-                    .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(colors.separator).child(Self::render_markdown(&md, &[], &colors, "item-detail")))
+                    .child(div().w(px(self.cfg.width * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
+                    .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(Self::render_markdown(&md, &meta, &t, "item-detail")))
                     .into_any_element()
             }
+            _ if self.confirm.is_some() => div().flex_1().into_any_element(),
             _ => list.into_any_element(),
         };
+
+        // ---- search bar ----
+        let at_root = self.mode == Mode::Root;
+        let leading = if at_root {
+            div().size(px(28.)).flex_none().flex().items_center().justify_center().child(design::fluent(g::SEARCH, 17., t.accent)).into_any_element()
+        } else {
+            div()
+                .id("back")
+                .size(px(28.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .bg(t.surface)
+                .hover(|s| s.bg(t.surface_strong))
+                .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
+                .child(design::fluent(g::BACK, 13., t.text))
+                .into_any_element()
+        };
+        let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
+            let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
+            div()
+                .flex_none()
+                .h(px(32.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(t.border)
+                .text_size(px(13.))
+                .child(design::fluent(g::FILTER, 12., t.text_muted))
+                .child(div().max_w(px(180.)).truncate().child(title))
+                .child(design::fluent(g::CHEVRON_DOWN, 10., t.text_muted))
+        });
+        let search_bar = div()
+            .h(px(design::BAR))
+            .flex_none()
+            .px(px(14.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .border_b_1()
+            .border_color(t.hairline)
+            .child(leading)
+            .child(
+                text_input("query")
+                    .state(self.input.downgrade())
+                    .placeholder(self.placeholder())
+                    .placeholder_color(t.text_faint)
+                    .caret_color(t.accent)
+                    .caret_blink_interval_500ms()
+                    .flex_1()
+                    .font_family(design::FONT_DISPLAY)
+                    .text_size(px(17.))
+                    .whitespace_nowrap(),
+            )
+            .children(dropdown);
+
+        // ---- action bar ----
+        let tone = match self.status.as_deref() {
+            Some(s) if s.contains("failed") || s.contains("error") || s.contains("not supported") => Some(t.danger),
+            Some(_) => Some(t.success),
+            None => None,
+        };
+        let footer = div()
+            .h(px(design::FOOTER))
+            .flex_none()
+            .px(px(14.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.))
+            .border_t_1()
+            .border_color(t.hairline)
+            .text_size(px(13.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(match tone {
+                        Some(c) => div().size(px(8.)).mx(px(4.)).rounded_full().bg(c).into_any_element(),
+                        None => match self.context_icon() {
+                            Icon::Fluent(ch) => design::fluent(ch, 14., if at_root { t.accent } else { t.text_muted }).into_any_element(),
+                            other => div().size(px(16.)).flex().items_center().justify_center().child(design::icon_view(&other, &t, false)).into_any_element(),
+                        },
+                    })
+                    .child(div().min_w_0().truncate().text_color(if tone.is_some() { t.text } else { t.text_muted }).child(self.footer_left())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .map(|d| {
+                        if self.panel.is_some() {
+                            d.child(design::shortcut("Run", &["↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Close", &["Esc"], &t))
+                        } else if self.is_form() {
+                            d.child(design::shortcut("Submit", &["Ctrl", "↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Actions", &["Ctrl", "K"], &t))
+                        } else if self.armed == Some(self.selected) {
+                            d.child(div().text_color(t.warning).child("Press ↵ again to confirm"))
+                        } else if let Some(p) = &primary {
+                            let d = d.child(design::shortcut(p, &["↵"], &t));
+                            if actions.len() > 1 { d.child(design::vdivider(&t)).child(design::shortcut("Actions", &["Ctrl", "K"], &t)) } else { d }
+                        } else {
+                            d
+                        }
+                    }),
+            );
+
+        // ---- overlays ----
+        let popover = self.panel.as_ref().map(|(item, sel)| {
+            let acts = item.actions();
+            let me = cx.weak_entity();
+            div()
+                .absolute()
+                .right(px(10.))
+                .bottom(px(design::FOOTER + 6.))
+                .w(px(330.))
+                .max_h(px(320.))
+                .p(px(6.))
+                .flex()
+                .flex_col()
+                .rounded(px(10.))
+                .bg(t.bg_elevated)
+                .border_1()
+                .border_color(t.border)
+                .shadow_lg()
+                .child(div().px(px(10.)).pt(px(4.)).pb(px(6.)).text_size(px(12.)).text_color(t.text_faint).truncate().child(item.title.clone()))
+                .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(acts.into_iter().enumerate().map(|(i, (label, act))| {
+                    let on = i == *sel;
+                    let me = me.clone();
+                    let keys: &[&str] = match i {
+                        0 => &["↵"],
+                        1 => &["Ctrl", "↵"],
+                        _ => &[],
+                    };
+                    div()
+                        .id(("act", i))
+                        .relative()
+                        .h(px(34.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .rounded(px(6.))
+                        .when(on, |d| d.bg(t.surface))
+                        .hover(|s| s.bg(t.surface))
+                        .on_click(move |_, window, cx| {
+                            me.update(cx, |this, cx| {
+                                if let Some((_, p)) = &mut this.panel {
+                                    *p = i;
+                                }
+                                this.launch(window, cx);
+                            })
+                            .ok();
+                        })
+                        .child(div().absolute().left(px(0.)).top(px(9.)).w(px(3.)).h(px(16.)).rounded_full().when(on, |d| d.bg(t.accent)))
+                        .child(design::fluent(act_glyph(&act), 14., if on { t.text } else { t.text_muted }))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| design::key_cap(k, &t))))
+                })))
+        });
+        let dialog = self.confirm.as_ref().map(|c| {
+            let me = cx.weak_entity();
+            let button = |i: usize, label: String, danger: bool| {
+                let on = i == selected;
+                let me = me.clone();
+                div()
+                    .id(("dialog", i))
+                    .h(px(34.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if on { if danger { t.danger } else { t.accent } } else { t.border })
+                    .bg(if on && i == 0 { if danger { t.danger } else { t.accent } } else { t.surface })
+                    .text_color(if on && i == 0 { t.accent_text } else { t.text })
+                    .on_click(move |_, window, cx| {
+                        me.update(cx, |this, cx| {
+                            this.selected = i;
+                            this.launch(window, cx);
+                        })
+                        .ok();
+                    })
+                    .child(label)
+            };
+            let danger = c.primary.to_lowercase().contains("delete") || c.primary.to_lowercase().contains("remove");
+            div().absolute().inset_0().flex().items_center().justify_center().bg(gpui::hsla(0., 0., 0., 0.35)).child(
+                div()
+                    .w(px(340.))
+                    .p(px(18.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(12.))
+                    .bg(t.bg_elevated)
+                    .border_1()
+                    .border_color(t.border)
+                    .shadow_lg()
+                    .child(design::fluent(if danger { g::WARNING } else { g::INFO }, 26., if danger { t.danger } else { t.accent }))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_center().child(c.title.clone()))
+                    .children((!c.message.is_empty()).then(|| div().text_size(px(13.)).text_color(t.text_muted).text_center().child(c.message.clone())))
+                    .child(div().w_full().pt(px(6.)).flex().flex_col().gap(px(8.)).child(button(0, c.primary.clone(), danger)).child(button(1, "Cancel".into(), false))),
+            )
+        });
+
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(colors.background)
-            .text_color(colors.text)
+            .font_family(design::FONT_UI)
+            .text_size(px(14.))
+            .bg(t.bg)
+            .text_color(t.text)
             .border_1()
-            .border_color(colors.border)
+            .border_color(t.border)
+            .rounded(px(8.))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
                 if this.panel.is_none() && this.is_form() {
                     return this.move_field(1, window, cx);
@@ -1639,8 +2048,7 @@ impl Render for Launcher {
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
                 }
                 this.armed = None;
-                let at = this.panel.as_ref().map_or(this.selected, |p| p.1);
-                this.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
+                this.scroll_to_selected();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
@@ -1652,87 +2060,52 @@ impl Render for Launcher {
                     None => this.selected = this.selected.saturating_sub(1),
                 }
                 this.armed = None;
-                let at = this.panel.as_ref().map_or(this.selected, |p| p.1);
-                this.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
+                this.scroll_to_selected();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleActions, _, cx| {
                 this.panel = match this.panel.take() {
                     Some(_) => None,
-                    None => this.items.get(this.selected).cloned().filter(|it| !it.actions().is_empty() && it.act != Act::None || !it.extra.is_empty()).map(|it| (it, 0)),
+                    None => this.items.get(this.selected).cloned().filter(|it| it.section.as_deref() != Some(EMPTY) || !it.extra.is_empty()).filter(|it| it.act != Act::None || !it.extra.is_empty()).map(|it| (it, 0)),
                 };
-                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
-                if this.panel.take().is_some() {
-                    cx.notify();
-                    if this.is_form() {
-                        this.focus_field(window, cx);
-                    }
-                } else if let Some(c) = this.confirm.take() {
-                    this.reply(c.run, c.id, Ok(json!(false)));
-                    this.refresh(cx);
-                } else if this.mode == Mode::Ext && this.extv.as_ref().is_some_and(|e| e.depth > 1) {
-                    let run = this.extv.as_ref().unwrap().run;
-                    this.send(json!({"t": "pop", "run": run}));
-                } else if this.mode == Mode::Root {
-                    this.hide(true, cx)
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| this.launch(window, cx)))
+            .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                if this.is_form() && this.panel.is_none() {
+                    this.submit_form(cx)
+                } else if this.panel.is_none()
+                    && let Some(item) = this.items.get(this.selected).cloned()
+                    && item.actions().len() > 1
+                {
+                    // Ctrl+Enter: the secondary action, as shown in the action panel.
+                    this.panel = Some((item, 1));
+                    this.launch(window, cx);
                 } else {
-                    this.pending = None;
-                    this.set_mode(Mode::Root, cx);
-                    window.focus(&this.input.focus_handle(cx), cx);
+                    this.launch(window, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &Launch, window, cx| this.launch(window, cx)))
-            .on_action(cx.listener(|this, _: &Submit, window, cx| if this.is_form() && this.panel.is_none() { this.submit_form(cx) } else { this.launch(window, cx) }))
-            .child(
+            .child(search_bar)
+            .children(notices.into_iter().map(|n| {
                 div()
-                    .h(px(BAR))
-                    .flex_none()
-                    .px_4()
+                    .mx(px(14.))
+                    .mt(px(8.))
+                    .px(px(10.))
+                    .py(px(6.))
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(colors.separator)
-                    .child(
-                        text_input("query")
-                            .state(self.input.downgrade())
-                            .placeholder(self.placeholder())
-                            .placeholder_color(colors.disabled)
-                            .caret_color(rgb_to_hsla(colors.text))
-                            .caret_blink_interval_500ms()
-                            .flex_1()
-                            .text_lg()
-                            .whitespace_nowrap(),
-                    )
-                    .children(self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
-                        let t = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        div().flex_none().px_2().py_0p5().rounded_md().text_xs().border_1().border_color(colors.border).child(format!("{t} ▾"))
-                    }))
-                    .children(self.label().map(|l| {
-                        div().flex_none().max_w(px(220.)).truncate().px_2().py_0p5().rounded_md().text_xs().bg(colors.container).text_color(colors.disabled).child(l)
-                    })),
-            )
-            .children(notices.into_iter().map(|n| div().px_4().py_1().text_sm().text_color(rgb(0xff6b6b)).child(n)))
+                    .gap(px(8.))
+                    .rounded(px(6.))
+                    .bg(t.surface)
+                    .text_size(px(13.))
+                    .child(design::fluent(g::WARNING, 13., t.warning))
+                    .child(div().min_w_0().child(n))
+            }))
             .child(body)
-            .child(
-                div()
-                    .h(px(FOOTER))
-                    .flex_none()
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .border_t_1()
-                    .border_color(colors.separator)
-                    .text_xs()
-                    .text_color(colors.disabled)
-                    .child(div().flex_1().min_w_0().truncate().child(self.footer_left()))
-                    .child(div().flex_none().child(footer_action)),
-            )
+            .child(footer)
+            .children(popover)
+            .children(dialog)
     }
 }
 
@@ -1835,6 +2208,8 @@ fn main() {
             kind: WindowKind::PopUp,
             show: false,
             focus: false,
+            // Acrylic: the translucent g token lets the blurred desktop show through.
+            windows_window_background: gpui::WindowsWindowBackground::Blurred,
             ..Default::default()
         };
         let handle = cx.open_window(options, |window, cx| cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))).unwrap();
@@ -1843,9 +2218,10 @@ fn main() {
         let _ = handle.update(cx, |this, window, _| {
             this.hwnd = win::hwnd(window);
             win::make_tool_window(this.hwnd);
+            win::round_corners(this.hwnd);
             win::cloak(this.hwnd, true);
             window.set_visible(true);
-            this.scan_apps(true);
+            this.scan_apps(true, false);
         });
 
         cx.spawn(async move |cx| {

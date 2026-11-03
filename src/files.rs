@@ -1,11 +1,13 @@
 //! File search: an in-memory index of file and folder names under the configured roots,
 //! searched on a worker thread. Only the newest query's results are ever delivered
 //! (generation counter), so typing never waits on a slow match.
-// ponytail: full re-crawl to refresh (on entering file search, at most every 2 min);
-// switch to the USN journal or ReadDirectoryChangesW if crawls get slow or stale.
+// The index is saved to disk after each crawl and loaded at start, re-crawled once in the
+// background, then kept current by a ReadDirectoryChangesW watcher per root.
+// ponytail: changes made while a crawl runs can be lost until the next crawl (hourly at most).
 
 use std::{
-    path::Path,
+    collections::HashSet,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -33,6 +35,11 @@ pub struct Entry {
 }
 
 impl Entry {
+    fn new(path: Box<str>, dir: bool) -> Self {
+        let name_at = path.rfind('\\').map_or(0, |i| i + 1) as u32;
+        Self { path, name_at, dir }
+    }
+
     pub fn name(&self) -> &str {
         &self.path[self.name_at as usize..]
     }
@@ -70,10 +77,14 @@ impl Files {
                 }
             }
         });
+        // Searchable at once from the saved index; the crawl below refreshes it.
+        let saved = load(&cache_path(), &cache_key(&roots, &exclude)).unwrap_or_default();
+        let count = saved.len();
+        *index.write().unwrap() = saved;
         let files = Self {
             index,
             queries,
-            count: Arc::new(AtomicUsize::new(0)),
+            count: Arc::new(AtomicUsize::new(count)),
             indexing: Arc::new(AtomicBool::new(false)),
             built: Arc::new(RwLock::new(None)),
             roots,
@@ -81,6 +92,7 @@ impl Files {
             tx,
         };
         files.refresh_if_stale(Duration::ZERO);
+        files.watch();
         files
     }
 
@@ -99,12 +111,37 @@ impl Files {
         let (roots, exclude, tx) = (self.roots.clone(), self.exclude.clone(), self.tx.clone());
         std::thread::spawn(move || {
             let entries = crawl(&roots, &exclude);
+            let _ = save(&cache_path(), &cache_key(&roots, &exclude), &entries);
             count.store(entries.len(), Ordering::SeqCst);
             *index.write().unwrap() = entries;
             *built.write().unwrap() = Some(Instant::now());
             indexing.store(false, Ordering::SeqCst);
             let _ = tx.unbounded_send(Msg::FilesIndexed);
         });
+    }
+
+    /// One watcher thread per root. Each ends at the first change after `Files` is dropped.
+    fn watch(&self) {
+        for root in &self.roots {
+            let (root, exclude, tx) = (root.clone(), self.exclude.clone(), self.tx.clone());
+            let (index, count, built) = (Arc::downgrade(&self.index), self.count.clone(), self.built.clone());
+            std::thread::spawn(move || {
+                crate::win::watch_dir(Path::new(&root), true, |changes| {
+                    let Some(index) = index.upgrade() else { return false };
+                    if changes.is_empty() {
+                        // Changes were lost: the next File Search re-crawls.
+                        *built.write().unwrap() = None;
+                        return true;
+                    }
+                    let mut index = index.write().unwrap();
+                    if !apply(&mut index, &root, &exclude, changes) {
+                        return true;
+                    }
+                    count.store(index.len(), Ordering::SeqCst);
+                    tx.unbounded_send(Msg::FilesIndexed).is_ok()
+                })
+            });
+        }
     }
 
     pub fn same_roots(&self, roots: &[String], exclude: &[String]) -> bool {
@@ -121,13 +158,100 @@ pub fn crawl(roots: &[String], exclude: &[String]) -> Vec<Entry> {
             children.retain(|c| c.as_ref().is_ok_and(|e| !skip.contains(&e.file_name.to_string_lossy().to_lowercase())));
         });
         for entry in walk.into_iter().flatten().skip(1) {
-            let path: Box<str> = entry.path().to_string_lossy().into();
-            let name_at = path.rfind('\\').map_or(0, |i| i + 1) as u32;
-            out.push(Entry { path, name_at, dir: entry.file_type.is_dir() });
+            out.push(Entry::new(entry.path().to_string_lossy().into(), entry.file_type.is_dir()));
         }
     }
     out.shrink_to_fit();
     out
+}
+
+/// Applies one batch of watcher changes (paths relative to `root`). Returns whether the
+/// index changed. Each changed path is dropped with everything under it, then added back
+/// (a folder with its contents) if it exists now, so renames, moves and repeats come out right.
+pub fn apply(index: &mut Vec<Entry>, root: &str, exclude: &[String], changes: Vec<PathBuf>) -> bool {
+    let exclude: Vec<String> = exclude.iter().map(|e| e.to_lowercase()).collect();
+    let mut dropped: HashSet<String> = HashSet::new();
+    let mut added = vec![];
+    for c in changes {
+        if c.components().any(|p| exclude.contains(&p.as_os_str().to_string_lossy().to_lowercase())) {
+            continue;
+        }
+        let full = Path::new(root).join(&c).to_string_lossy().into_owned();
+        if !dropped.insert(full.clone()) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&full) {
+            if meta.is_dir() {
+                added.extend(crawl(std::slice::from_ref(&full), &exclude));
+            }
+            added.push(Entry::new(full.into(), meta.is_dir()));
+        }
+    }
+    if dropped.is_empty() {
+        return false;
+    }
+    dropped.extend(added.iter().map(|e| e.path.to_string()));
+    let under_dropped = |path: &str| {
+        let mut p = path;
+        loop {
+            if dropped.contains(p) {
+                return true;
+            }
+            match p.rfind('\\') {
+                Some(i) if p.len() > root.len() => p = &p[..i],
+                _ => return false,
+            }
+        }
+    };
+    index.retain(|e| !under_dropped(&e.path));
+    index.extend(added);
+    true
+}
+
+fn cache_path() -> PathBuf {
+    crate::config::dir().join("files.bin")
+}
+
+/// The cache is only used for the same roots and exclusions.
+fn cache_key(roots: &[String], exclude: &[String]) -> String {
+    format!("akscast-files-1\n{}\n{}", roots.join("|"), exclude.join("|"))
+}
+
+/// Layout: the key, then per entry a dir flag and the path, strings as u32 length + UTF-8.
+pub fn save(path: &Path, key: &str, entries: &[Entry]) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(entries.iter().map(|e| e.path.len() + 5).sum::<usize>() + key.len() + 4);
+    out.extend((key.len() as u32).to_le_bytes());
+    out.extend(key.as_bytes());
+    for e in entries {
+        out.push(e.dir as u8);
+        out.extend((e.path.len() as u32).to_le_bytes());
+        out.extend(e.path.as_bytes());
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(tmp, path)
+}
+
+/// The saved index, if it was saved for `key` and parses.
+pub fn load(path: &Path, key: &str) -> Option<Vec<Entry>> {
+    let data = std::fs::read(path).ok()?;
+    let mut at = 0;
+    let text = |at: &mut usize| -> Option<&str> {
+        let len = u32::from_le_bytes(data.get(*at..*at + 4)?.try_into().ok()?) as usize;
+        let s = std::str::from_utf8(data.get(*at + 4..*at + 4 + len)?).ok()?;
+        *at += 4 + len;
+        Some(s)
+    };
+    if text(&mut at)? != key {
+        return None;
+    }
+    let mut out = vec![];
+    while at < data.len() {
+        let dir = data[at] == 1;
+        at += 1;
+        out.push(Entry::new(text(&mut at)?.into(), dir));
+    }
+    Some(out)
 }
 
 /// Matches file names; a query with a path separator matches the whole path instead.
@@ -150,7 +274,8 @@ pub fn search(index: &[Entry], query: &str, max: usize, matcher: &mut Matcher) -
         .map(|(_, e)| {
             let parent = Path::new(&*e.path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
             let parent = if !home.is_empty() && parent.starts_with(&home) { format!("~{}", &parent[home.len()..]) } else { parent };
-            Item::new(e.name(), parent, Icon::glyph(if e.dir { "📁" } else { "📄" }), Act::File(e.path.to_string()))
+            let (glyph, kind) = if e.dir { (crate::design::g::FOLDER, "Folder") } else { (crate::design::g::DOCUMENT, "File") };
+            Item::new(e.name(), parent, Icon::Fluent(glyph), Act::File(e.path.to_string())).acc(kind)
         })
         .collect()
 }
@@ -179,5 +304,56 @@ mod tests {
         assert!(hits.iter().all(|h| matches!(&h.act, Act::File(p) if p.contains("docs"))));
         assert_eq!(search(&index, "photos\\beach", 10, &mut m)[0].title, "beach.jpg");
         assert!(search(&index, "  ", 10, &mut m).is_empty());
+    }
+
+    #[test]
+    fn saved_index_round_trips_and_watcher_changes_apply() {
+        let root = std::env::temp_dir().join(format!("akscast-live-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for p in ["a/one.txt", "a/sub/two.txt", "b.txt", "skip/x.txt"] {
+            let p = root.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+        }
+        let r = root.to_string_lossy().into_owned();
+        let ex = vec!["skip".to_string()];
+        let mut index = crawl(std::slice::from_ref(&r), &ex);
+        let names = |ix: &[Entry]| {
+            let mut v: Vec<String> = ix.iter().map(|e| e.path[r.len() + 1..].replace('\\', "/")).collect();
+            v.sort();
+            v
+        };
+
+        let file = root.with_extension("bin");
+        save(&file, "k", &index).unwrap();
+        assert_eq!(names(&load(&file, "k").unwrap()), names(&index));
+        assert!(load(&file, "other roots").is_none());
+        let _ = std::fs::remove_file(&file);
+
+        // Folder renamed (its contents move with it), file deleted, file created twice.
+        std::fs::rename(root.join("a"), root.join("c")).unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        std::fs::write(root.join("new.txt"), "").unwrap();
+        std::fs::write(root.join("skip/y.txt"), "").unwrap();
+        let ch = PathBuf::from;
+        let changed = apply(&mut index, &r, &ex, vec![ch("a"), ch("c"), ch("b.txt"), ch("new.txt"), ch("new.txt")]);
+        assert!(changed);
+        assert!(!apply(&mut index, &r, &ex, vec![ch("skip\\y.txt")]), "excluded folders are ignored");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(names(&index), ["c", "c/one.txt", "c/sub", "c/sub/two.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn watcher_reports_new_files() {
+        let root = std::env::temp_dir().join(format!("akscast-watch-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("deep")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let dir = root.clone();
+        std::thread::spawn(move || crate::win::watch_dir(&dir, true, |c| tx.send(c).is_ok()));
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(root.join("deep").join("hello.txt"), "").unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("a change batch");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(got.contains(&PathBuf::from("deep\\hello.txt")), "{got:?}");
     }
 }

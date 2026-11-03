@@ -20,6 +20,7 @@ use crate::{
     clipboard::Entry,
     commands::{self, Cmd},
     config::Config,
+    design::g,
     scripts::Script,
     win::App,
 };
@@ -91,6 +92,9 @@ impl Act {
 #[derive(Clone)]
 pub enum Icon {
     Image(Arc<RenderImage>),
+    /// A Segoe Fluent Icons glyph, drawn in a tile.
+    Fluent(char),
+    /// Emoji or other content text.
     Glyph(SharedString),
 }
 
@@ -103,7 +107,12 @@ impl Icon {
 #[derive(Clone)]
 pub struct Item {
     pub title: String,
+    /// Muted text right after the title.
     pub subtitle: String,
+    /// Right-aligned muted text ("Application", "Command", "3 min ago").
+    pub accessory: String,
+    /// Section header this row sits under, if any.
+    pub section: Option<String>,
     pub icon: Icon,
     pub act: Act,
     /// Frecency key; None for rows that aren't learned (calculator, web, clipboard).
@@ -117,7 +126,17 @@ pub struct Item {
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), icon, act, key: None, extra: vec![] }
+        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![] }
+    }
+
+    pub fn acc(mut self, accessory: impl Into<String>) -> Self {
+        self.accessory = accessory.into();
+        self
+    }
+
+    pub fn sec(mut self, section: impl Into<String>) -> Self {
+        self.section = Some(section.into());
+        self
     }
 
     /// Searchable text beyond the title (subtitle, keywords).
@@ -196,8 +215,8 @@ pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension,
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
-            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::glyph("▫"));
-            Item::new(&a.name, "Application", icon, Act::App(a.id.clone())).keyed(a.id.clone())
+            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP));
+            Item::new(&a.name, "", icon, Act::App(a.id.clone())).acc("Application").keyed(a.id.clone())
         })
         .collect();
     for &(cmd, title, words, glyph) in commands::ALL {
@@ -206,7 +225,7 @@ pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension,
         {
             continue;
         }
-        items.push(Item::new(title, cmd.subtitle(), Icon::glyph(glyph), Act::Cmd(cmd)).keyed(cmd.key()).words(words));
+        items.push(Item::new(title, cmd.subtitle(), Icon::Fluent(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words));
     }
     for q in &cfg.quicklink {
         let act = if q.url.contains("{query}") {
@@ -214,20 +233,18 @@ pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension,
         } else {
             Act::Open(q.url.clone())
         };
-        items.push(Item::new(q.title(), "Quicklink", Icon::glyph("↗"), act).keyed(format!("ql:{}", q.title())).words(&q.keyword));
+        items.push(Item::new(q.title(), &q.keyword, Icon::Fluent(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword));
     }
     for s in &cfg.snippet {
-        items.push(Item::new(&s.name, "Snippet", Icon::glyph("✎"), Act::Snippet(s.text.clone())).keyed(format!("sn:{}", s.name)).words(&s.keyword));
+        items.push(Item::new(&s.name, &s.keyword, Icon::Fluent(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword));
     }
     for (i, s) in scripts.iter().enumerate() {
-        let sub = if s.package.is_empty() { "Script Command".to_string() } else { s.package.clone() };
-        let icon = Icon::glyph(s.icon.clone().unwrap_or_else(|| "⌨".into()));
-        items.push(Item::new(&s.title, sub, icon, Act::Script(i)).keyed(format!("sc:{}", s.path)));
+        let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Fluent(g::COMMAND));
+        items.push(Item::new(&s.title, &s.package, icon, Act::Script(i)).acc("Script Command").keyed(format!("sc:{}", s.path)));
     }
     for (e, (ext, icon)) in exts.iter().enumerate() {
-        // Menu-bar commands need a tray UI akscast doesn't have yet.
-        for (c, cmd) in ext.commands.iter().enumerate().filter(|(_, c)| c.mode != "menu-bar") {
-            let mut it = Item::new(&cmd.title, &ext.title, icon.clone(), Act::ExtRun(e, c)).keyed(format!("ext:{}/{}", ext.name, cmd.name)).words(&ext.title);
+        for (c, cmd) in ext.commands.iter().enumerate() {
+            let mut it = Item::new(&cmd.title, &ext.title, icon.clone(), Act::ExtRun(e, c)).acc("Command").keyed(format!("ext:{}/{}", ext.name, cmd.name)).words(&ext.title);
             it.extra = vec![("Run Command".into(), Act::ExtRun(e, c)), (format!("Uninstall {}", ext.title), Act::UninstallExt(ext.name.clone()))];
             items.push(it);
         }
@@ -251,9 +268,11 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
     let mut hits: Vec<(f64, &Item)> = items
         .filter_map(|it| {
             let s = pattern.score(Utf32Str::new(&it.hay, &mut buf), matcher)?;
+            // Extra search words only help find an item; a match on the visible title ranks higher.
+            let in_title = pattern.score(Utf32Str::new(&it.title, &mut buf), matcher).map_or(0., |t| t as f64 / 2.);
             let boost = it.key.as_deref().map_or(0., |k| frec.score(k, now).min(10.));
             // ponytail: fixed weight; tune once there is real launch history.
-            Some((s as f64 + 25. * boost, it))
+            Some((s as f64 + in_title + 25. * boost, it))
         })
         .collect();
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.title.len().cmp(&b.1.title.len())));
@@ -271,34 +290,39 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         recent.sort_by(|a, b| b.0.total_cmp(&a.0));
         if recent.is_empty() {
             // First run: point at a few things worth knowing about.
-            let starters = [Cmd::ClipboardHistory, Cmd::Emoji, Cmd::EditConfig];
-            return catalog.iter().filter(|it| matches!(it.act, Act::Cmd(c) if starters.contains(&c))).cloned().collect();
+            let starters = [Cmd::ClipboardHistory, Cmd::SearchFiles, Cmd::Emoji, Cmd::BrowseStore, Cmd::Settings];
+            return catalog.iter().filter(|it| matches!(it.act, Act::Cmd(c) if starters.contains(&c))).map(|it| it.clone().sec("Suggestions")).collect();
         }
-        return recent.into_iter().take(max).map(|(_, it)| it.clone()).collect();
+        return recent.into_iter().take(max).map(|(_, it)| it.clone().sec("Recent")).collect();
     }
 
     let mut top = Vec::new();
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
-        top.push(Item::new(format!("Run {cmdline}"), "Windows Run", Icon::glyph("›"), Act::Run(cmdline.to_string())));
+        top.push(Item::new(cmdline, "", Icon::Fluent(g::COMMAND), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
     if let Some((kw, rest)) = q.split_once(' ')
         && let Some(link) = cfg.quicklink.iter().find(|l| !l.keyword.is_empty() && l.keyword.eq_ignore_ascii_case(kw))
         && !rest.trim().is_empty()
     {
         let url = link.url.replace("{query}", &url_encode(rest.trim()));
-        top.push(Item::new(format!("{}: {}", link.title(), rest.trim()), "Quicklink", Icon::glyph("↗"), Act::Open(url)).keyed(format!("ql:{}", link.title())));
+        top.push(Item::new(rest.trim(), link.title(), Icon::Fluent(g::LINK), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
-        top.push(Item::new(format!("= {result}"), "Calculator · Enter copies", Icon::glyph("="), Act::Copy(result)));
+        top.push(Item::new(&result, format!("{q} ="), Icon::Fluent(g::CALCULATOR), Act::Copy(result.clone())).acc("Calculator"));
     }
 
     let fallback = (!cfg.search.fallback.is_empty()).then(|| {
-        Item::new(format!("Search the web for \"{q}\""), "Web", Icon::glyph("🔍"), Act::Open(cfg.search.fallback.replace("{query}", &url_encode(q))))
+        Item::new("Search the web", "", Icon::Fluent(g::GLOBE), Act::Open(cfg.search.fallback.replace("{query}", &url_encode(q))))
+            .acc("Web")
+            .sec(format!("Use \"{q}\" with"))
     });
     let room = max.saturating_sub(top.len() + fallback.is_some() as usize);
     top.extend(fuzzy(q, catalog.iter(), frec, matcher).into_iter().take(room).map(|(_, it)| it.clone()));
+    for it in &mut top {
+        it.section = Some("Results".into());
+    }
     top.extend(fallback);
     top.truncate(max);
     top
@@ -316,7 +340,7 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
             3600..86400 => format!("{} h ago", age / 3600),
             _ => format!("{} d ago", age / 86400),
         };
-        let mut it = Item::new(title, when, Icon::glyph("📋"), Act::Clip(e.text.clone()));
+        let mut it = Item::new(title, "", Icon::Fluent(g::DOCUMENT), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" });
         it.hay = e.text.chars().take(500).collect();
         it
     };
@@ -342,13 +366,13 @@ pub fn emoji(query: &str, max: usize, matcher: &mut Matcher) -> Vec<Item> {
             G::Symbols => "Symbols",
             G::Flags => "Flags",
         };
-        let mut it = Item::new(format!("{}  {}", e.as_str(), e.name()), group, Icon::glyph(e.as_str()), Act::Paste(e.as_str().into()));
+        let mut it = Item::new(e.name(), "", Icon::glyph(e.as_str()), Act::Paste(e.as_str().into())).acc(group);
         it.hay = std::iter::once(e.name()).chain(e.shortcodes()).collect::<Vec<_>>().join(" ");
         it
     };
     let q = query.trim();
     if q.is_empty() {
-        return emojis::iter().take(max).map(row).collect();
+        return emojis::iter().take(max).map(|e| { let it = row(e); let s = it.accessory.clone(); it.sec(s) }).collect();
     }
     let rows: Vec<Item> = emojis::iter().map(row).collect();
     fuzzy(q, rows.iter(), &Frecency::default(), matcher).into_iter().take(max).map(|(_, it)| it.clone()).collect()
@@ -427,7 +451,7 @@ mod tests {
         .unwrap();
         let cat = catalog(&apps, &scripts, &[(ext, Icon::glyph("•"))], &cfg);
         let notes: Vec<_> = cat.iter().filter(|i| i.subtitle == "Notes").collect();
-        assert_eq!(notes.len(), 1, "menu-bar commands are not listed");
+        assert_eq!(notes.len(), 2, "menu-bar commands open in the launcher");
         assert_eq!((notes[0].title.as_str(), &notes[0].act), ("Search Notes", &Act::ExtRun(0, 0)));
         assert_eq!(notes[0].actions()[1], ("Uninstall Notes".to_string(), Act::UninstallExt("notes".into())));
         let deploy = &root("deploy", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT))[0];
@@ -440,7 +464,9 @@ mod tests {
 
         let r = root("vsc", &cat, &cfg, &frec, &mut m);
         assert_eq!(r[0].title, "Visual Studio Code");
-        assert_eq!(r.last().unwrap().subtitle, "Web");
+        assert_eq!(r.last().unwrap().accessory, "Web");
+        assert_eq!(r[0].section.as_deref(), Some("Results"));
+        assert_eq!(r.last().unwrap().section.as_deref(), Some("Use \"vsc\" with"));
         assert!(r.len() <= 5);
 
         // Launch history breaks near-ties: "code" matches two apps.
@@ -473,9 +499,9 @@ mod tests {
         let c = clipboard("hel", &clips, 5, &mut m);
         assert_eq!(c[0].act, Act::Clip("hello world".into()));
         assert_eq!(c[0].actions().last().map(|a| &a.1), Some(&Act::DeleteClip("hello world".into())));
-        assert_eq!(clipboard("", &clips, 5, &mut m)[1].subtitle, "2 h ago");
+        assert_eq!(clipboard("", &clips, 5, &mut m)[1].accessory, "2 h ago");
 
-        assert!(emoji("thumbs up", 5, &mut m)[0].title.starts_with('👍'));
+        assert_eq!(emoji("thumbs up", 5, &mut m)[0].act, Act::Paste("👍".into()));
     }
 
     #[test]
@@ -492,5 +518,16 @@ mod tests {
         assert_eq!((thirds[0].right, thirds[1].left, thirds[1].right, thirds[2].left, thirds[2].right), (640, 640, 1280, 1280, 1920));
         let c = layout(Snap::Center, wa, cur);
         assert_eq!((c.right - c.left, c.left), (800, 560));
+    }
+
+    #[test]
+    fn every_builtin_command_is_found_by_its_title() {
+        let cfg = crate::config::parse("").unwrap();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        for &(cmd, title, ..) in commands::ALL {
+            let hits = root(title, &cat, &cfg, &Frecency::default(), &mut m);
+            assert_eq!(hits.first().map(|h| &h.act), Some(&Act::Cmd(cmd)), "{title}");
+        }
     }
 }

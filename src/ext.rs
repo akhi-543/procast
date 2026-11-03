@@ -255,6 +255,8 @@ pub struct ExtItem {
     pub icon: Option<String>,
     pub section: Option<String>,
     pub detail: Option<String>,
+    /// List.Item.Detail metadata labels: (title, text).
+    pub detail_meta: Vec<(String, String)>,
     pub actions: Vec<ExtAction>,
 }
 
@@ -362,10 +364,31 @@ fn accessory(a: &Value) -> Option<String> {
     a["date"].as_str().map(|d| d.chars().take(10).collect())
 }
 
+/// Metadata.Label / Link / TagList rows -> (title, text).
+fn metadata(m: &Value) -> Vec<(String, String)> {
+    kids(m)
+        .filter_map(|c| {
+            let p = &c["props"];
+            let title = s(&p["title"]);
+            if title.is_empty() {
+                return None;
+            }
+            let text = match c["type"].as_str()? {
+                "Metadata.TagList" => kids(c).map(|t| s(&t["props"]["text"])).collect::<Vec<_>>().join(", "),
+                _ => s(&p["text"]),
+            };
+            Some((title, text))
+        })
+        .collect()
+}
+
 fn item(n: &Value, section: Option<&str>) -> ExtItem {
     let p = &n["props"];
-    let detail = slot(n, "detail").map(|d| s(&d["props"]["markdown"]));
+    let detail_node = slot(n, "detail");
+    let detail = detail_node.map(|d| s(&d["props"]["markdown"]));
+    let detail_meta = detail_node.and_then(|d| slot(d, "metadata")).map(metadata).unwrap_or_default();
     ExtItem {
+        detail_meta,
         title: s(&p["title"]),
         subtitle: s(&p["subtitle"]),
         accessories: p["accessories"].as_array().into_iter().flatten().filter_map(accessory).collect(),
@@ -477,15 +500,34 @@ pub fn parse_view(tree: &Value) -> View {
         "Detail" => {
             v.markdown = s(&p["markdown"]);
             if let Some(m) = slot(root, "metadata") {
-                for c in kids(m) {
-                    let (t, x) = (s(&c["props"]["title"]), s(&c["props"]["text"]));
-                    if !t.is_empty() {
-                        v.metadata.push((t, x));
-                    }
-                }
+                v.metadata = metadata(m);
             }
         }
         "Form" => v.fields = kids(root).filter_map(field).collect(),
+        // A menu-bar command opened in akscast: its menu becomes a list.
+        "MenuBarExtra" => {
+            fn flat(nodes: &[MenuNode], section: Option<&str>, v: &mut View) {
+                for n in nodes {
+                    match n {
+                        MenuNode::Item { title, on_action } => v.items.push(ExtItem {
+                            title: title.clone(),
+                            section: section.map(str::to_string),
+                            actions: vec![ExtAction { title: title.clone(), on_action: on_action.clone() }],
+                            ..ExtItem::default()
+                        }),
+                        MenuNode::Section { title, children } | MenuNode::Submenu { title, children } => {
+                            flat(children, Some(title).filter(|t| !t.is_empty()).map(String::as_str).or(section), v)
+                        }
+                        MenuNode::Separator => {}
+                    }
+                }
+            }
+            if let Some(bar) = parse_menubar(tree) {
+                v.kind = "List".into();
+                v.title = Some(bar.title).filter(|t| !t.is_empty());
+                flat(&bar.items, None, &mut v);
+            }
+        }
         _ => {}
     }
     v
@@ -591,42 +633,47 @@ pub fn load_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     Some((img.into_raw(), 32, 32))
 }
 
-/// Raycast icon names the launcher can draw as a symbol; anything else gets a dot.
-pub fn icon_glyph(name: &str) -> &'static str {
+/// Raycast icon names -> Segoe Fluent Icons glyphs; anything unknown gets a neutral dot.
+pub fn icon_glyph(name: &str) -> char {
+    use crate::design::g;
     match name {
-        "Checkmark" | "CheckCircle" | "Check" => "✓",
-        "XMarkCircle" | "XMarkCircleFilled" | "Xmark" | "XMark" => "✕",
-        "Star" | "StarFilled" => "★",
-        "Document" | "Text" | "TextDocument" | "Paragraph" => "📄",
-        "Folder" => "📁",
-        "Link" | "Globe" => "🌐",
-        "MagnifyingGlass" => "🔍",
-        "Clock" | "Calendar" => "🕒",
-        "Trash" => "🗑",
-        "Pencil" => "✎",
-        "Plus" | "PlusCircle" => "+",
-        "Minus" | "MinusCircle" => "−",
-        "Gear" | "Cog" => "⚙",
-        "Moon" => "🌙",
-        "Sun" => "☀",
-        "Play" | "PlayFilled" => "▶",
-        "Pause" => "⏸",
-        "Terminal" | "Code" => "⌨",
-        "Network" | "Wifi" => "📶",
-        "Person" | "PersonCircle" => "👤",
-        "Video" | "Camera" => "🎬",
-        "Book" => "📖",
-        "Tag" => "🏷",
-        "Bolt" => "⚡",
-        "Info" | "QuestionMark" => "ℹ",
-        "Warning" | "ExclamationMark" => "⚠",
-        "Lock" => "🔒",
-        "Clipboard" | "CopyClipboard" => "📋",
-        "Window" | "AppWindow" => "▣",
-        _ => "•",
+        "Checkmark" | "CheckCircle" | "Check" | "CheckList" => g::CHECK,
+        "XMarkCircle" | "XMarkCircleFilled" | "Xmark" | "XMark" | "Stop" => g::CANCEL,
+        "Star" | "StarFilled" => g::STAR,
+        "Document" | "Text" | "TextDocument" | "Paragraph" | "BlankDocument" => g::DOCUMENT,
+        "Folder" | "Finder" => g::FOLDER,
+        "Link" => g::LINK,
+        "Globe" | "Network" => g::GLOBE,
+        "MagnifyingGlass" => g::SEARCH,
+        "Clock" | "Hourglass" | "Stopwatch" => g::CLOCK,
+        "Calendar" => g::CALENDAR,
+        "Trash" => g::DELETE,
+        "Pencil" | "Pen" => g::EDIT,
+        "Plus" | "PlusCircle" | "Download" => g::DOWNLOAD,
+        "Gear" | "Cog" | "Gauge" => g::SETTING,
+        "Moon" => g::SLEEP,
+        "Sun" | "Brush" | "Swatch" => g::PERSONALIZE,
+        "Play" | "PlayFilled" => g::PLAY,
+        "Terminal" => g::COMMAND,
+        "Code" | "CodeBlock" => g::CODE,
+        "Wifi" | "Plug" => g::NETWORK,
+        "Info" | "QuestionMark" | "QuestionMarkCircle" => g::INFO,
+        "Warning" | "ExclamationMark" => g::WARNING,
+        "Lock" | "LockUnlocked" | "Key" => g::LOCK,
+        "Shield" => g::SHIELD,
+        "Clipboard" | "CopyClipboard" => g::PASTE,
+        "Window" | "AppWindow" | "AppWindowGrid3x3" => g::TILES,
+        "Keyboard" => g::KEYBOARD,
+        "Envelope" => g::MAIL,
+        "Pin" | "Tack" => g::PIN,
+        "List" | "BulletPoints" => g::BULLETS,
+        "Filter" => g::FILTER,
+        "ArrowClockwise" | "RotateClockwise" => g::REFRESH,
+        "Power" => g::POWER,
+        "Person" | "PersonCircle" | "TwoPeople" => g::SIGN_OUT,
+        _ => g::BULLETS,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +753,10 @@ mod tests {
         assert_eq!(mb.items[0], MenuNode::Section { title: "Listening".into(), children: vec![MenuNode::Item { title: "node  :3000".into(), on_action: Some("k:onAction".into()) }] });
         assert_eq!(mb.items[1], MenuNode::Separator);
         assert!(matches!(&mb.items[2], MenuNode::Submenu { children, .. } if children.len() == 1));
+        let v = parse_view(&bar);
+        assert_eq!((v.kind.as_str(), v.title.as_deref(), v.items.len()), ("List", Some("3 ports"), 2));
+        assert_eq!((v.items[0].section.as_deref(), v.items[0].actions[0].on_action.as_deref()), (Some("Listening"), Some("k:onAction")));
+        assert_eq!(v.items[1].section.as_deref(), Some("More"));
 
         let md = markdown_lines("# Title\nSee [docs](https://x.y) and **bold**\n![img](a.png)\n- item\n```\ncode\n```");
         assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (0, "".into()), (0, "• item".into()), (9, "code".into())]);

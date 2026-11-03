@@ -184,7 +184,7 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | Emoji picker | ✅ (search + paste) | Phase 2a. Inline `:` autocomplete: Phase 1b |
 | Windows Run | ✅ `>` prefix | Phase 2a |
 | Action panel (Ctrl+K secondary actions) | ✅ (run as admin, reveal, copy path/name, delete clipboard entry) | Phase 2b |
-| File search | ✅ own in-memory index of `[files] roots`, worker thread + generation counter | Phase 2b. Live index (USN/watcher): later |
+| File search | ✅ own index of `[files] roots`, saved to disk, kept live by `ReadDirectoryChangesW`; worker thread + generation counter | Phase 2b. Live index + disk cache: done (roadmap A3/A4). Whole-drive MFT/USN: roadmap A6 |
 | Script commands | ✅ Raycast headers, silent/compact/fullOutput, arguments, needsConfirmation | Phase 2b. Inline/refresh-interval: later |
 | AI (Claude Code / Agent SDK) | research only: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
 | Extensions (Raycast API, unmodified store extensions) | ✅ own runtime (`exthost/`), List / Grid / Detail / Form / ActionPanel / navigation / toasts / confirm / storage / prefs, interval background commands | Phase 3 |
