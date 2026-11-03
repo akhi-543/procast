@@ -13,8 +13,17 @@ pub const FONT_MONO: &str = "Cascadia Mono";
 pub const FONT_ICON: &str = "Segoe Fluent Icons";
 pub const FONT_EMOJI: &str = "Segoe UI Emoji";
 
-/// Interface size (Settings → General): every length goes through `px`, which scales it.
-static SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+// Every length goes through `px`, which scales it. The launcher scales by interface size
+// (Settings → General) times the screen factor (window width as a share of the screen);
+// the settings window by interface size alone. Each sets the scale at the top of render.
+const ONE: u32 = 0x3f80_0000; // 1.0f32
+static SIZE: AtomicU32 = AtomicU32::new(ONE);
+static SCREEN: AtomicU32 = AtomicU32::new(ONE);
+static SCALE: AtomicU32 = AtomicU32::new(ONE);
+
+fn load(a: &AtomicU32) -> f32 {
+    f32::from_bits(a.load(Ordering::Relaxed))
+}
 
 pub fn set_size(size: &str) {
     let s: f32 = match size {
@@ -22,11 +31,28 @@ pub fn set_size(size: &str) {
         "large" => 1.15,
         _ => 1.,
     };
-    SCALE.store(s.to_bits(), Ordering::Relaxed);
+    SIZE.store(s.to_bits(), Ordering::Relaxed);
+}
+
+/// How much bigger than its base size the launcher is drawn on the screen it opens on.
+pub fn set_screen(factor: f32) {
+    SCREEN.store(factor.clamp(0.5, 3.).to_bits(), Ordering::Relaxed);
+}
+
+pub fn launcher_scale() -> f32 {
+    load(&SIZE) * load(&SCREEN)
+}
+
+pub fn scale_launcher() {
+    SCALE.store(launcher_scale().to_bits(), Ordering::Relaxed);
+}
+
+pub fn scale_settings() {
+    SCALE.store(SIZE.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 pub fn scale() -> f32 {
-    f32::from_bits(SCALE.load(Ordering::Relaxed))
+    load(&SCALE)
 }
 
 /// Logical pixels at the chosen interface size. Use this, not `gpui::px`.

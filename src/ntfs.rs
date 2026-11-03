@@ -403,9 +403,22 @@ const DEAD: u8 = 2;
 const EXCLUDED: u8 = 4;
 const NONE: u32 = u32::MAX;
 
-/// Every file and folder on the NTFS drives. Names live in one arena; a node points at its
-/// parent by MFT record, so records can arrive in any order.
-// ponytail: renamed/deleted names stay in the arena until the next snapshot (reconnect).
+/// What whole-drive search leaves out (Settings → Files). Left-out entries aren't kept in
+/// memory at all, so skipping big system folders shrinks the index.
+#[derive(Clone, Default)]
+pub struct Filter {
+    /// Folder or file names skipped anywhere (AppData, node_modules, …).
+    pub exclude: Vec<String>,
+    /// Full paths skipped with everything under them (C:\Windows, …).
+    pub skip: Vec<String>,
+    /// Drive letters to index; empty = every NTFS drive.
+    pub drives: Vec<String>,
+}
+
+/// Every kept file and folder on the NTFS drives. Names live in one arena; a node points
+/// at its parent by MFT record, so records can arrive in any order. Each full pass drops
+/// whatever is filtered out and compacts the rest.
+// ponytail: deleted entries stay (marked dead) until the next full pass or reconnect.
 #[derive(Default)]
 pub struct Index {
     nodes: Vec<Node>,
@@ -413,16 +426,30 @@ pub struct Index {
     /// Per drive letter: MFT record -> node.
     slots: Vec<Vec<u32>>,
     exclude: Vec<String>,
+    /// Skipped full paths, lowercase, and their last parts (to find candidates cheaply).
+    skip: Vec<String>,
+    skip_names: Vec<String>,
+    /// Drive letters kept; empty = all.
+    drives: Vec<u8>,
     live: usize,
     /// Exclusion flags need a full pass: before the first one, or after a folder moved.
     dirty: bool,
-    /// The first full pass has run, so single changes can be flagged on their own.
-    flagged: bool,
+    /// Drives whose snapshot is complete: their changes are filtered one by one. Until then
+    /// records arrive in MFT order (children before parents), so nothing is judged early.
+    complete: Vec<u8>,
 }
 
 impl Index {
-    pub fn new(exclude: &[String]) -> Self {
-        Self { slots: vec![vec![]; 26], exclude: exclude.iter().map(|e| e.to_lowercase()).collect(), ..Self::default() }
+    pub fn new(f: &Filter) -> Self {
+        let skip: Vec<String> = f.skip.iter().map(|p| p.trim().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase()).filter(|p| p.len() > 2).collect();
+        Self {
+            slots: vec![vec![]; 26],
+            exclude: f.exclude.iter().map(|e| e.to_lowercase()).collect(),
+            skip_names: skip.iter().filter_map(|p| p.rsplit('\\').next().map(str::to_string)).collect(),
+            skip,
+            drives: f.drives.iter().filter_map(|d| d.trim().bytes().next()).map(|b| b.to_ascii_uppercase()).collect(),
+            ..Self::default()
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -439,17 +466,27 @@ impl Index {
     }
 
     fn upsert(&mut self, drive: u8, rec: u64, parent: u64, dir: bool, name: &str) {
+        let node = Node { name_at: self.names.len() as u32, name_len: name.len() as u16, flags: if dir { DIR } else { 0 }, drive, parent };
+        // After the first pass, something filtered out (or under a dropped folder) isn't kept.
+        if self.complete.contains(&drive) {
+            let orphan = parent != ROOT && self.slot(drive, parent).is_none();
+            if orphan || self.left_out(&node, name) {
+                if self.slot(drive, rec).is_some() {
+                    self.delete(drive, rec);
+                    self.dirty |= dir;
+                }
+                return;
+            }
+        }
         let Some(slots) = self.slots.get_mut((drive.wrapping_sub(b'A')) as usize) else { return };
         if rec as usize >= slots.len() {
             slots.resize(rec as usize + 1, NONE);
         }
-        let node = Node { name_at: self.names.len() as u32, name_len: name.len() as u16, flags: if dir { DIR } else { 0 }, drive, parent };
-        let i = match slots[rec as usize] {
+        match slots[rec as usize] {
             NONE => {
                 slots[rec as usize] = self.nodes.len() as u32;
                 self.nodes.push(node);
                 self.live += 1;
-                self.nodes.len() - 1
             }
             i => {
                 let old = self.nodes[i as usize];
@@ -460,24 +497,29 @@ impl Index {
                 // A folder that moved or was renamed changes what's under it.
                 self.dirty |= dir;
                 self.nodes[i as usize] = node;
-                i as usize
             }
-        };
+        }
         self.names.push_str(name);
-        if !self.flagged {
+        if !self.complete.contains(&drive) {
             self.dirty = true;
-        } else if !self.dirty {
-            // Everything else only needs its own flag, from its name and its parent's.
-            let parent_out = node.parent != ROOT && self.slot(drive, node.parent).is_some_and(|p| self.nodes[p].flags & EXCLUDED != 0);
-            if parent_out || self.excluded_name(&node) {
-                self.nodes[i].flags |= EXCLUDED;
-            }
         }
     }
 
-    fn excluded_name(&self, n: &Node) -> bool {
-        let name = self.name(n);
-        self.exclude.iter().any(|e| name.eq_ignore_ascii_case(e)) || (n.parent == ROOT && name.starts_with('$'))
+    /// Filtered out by name (AppData, NTFS's own `$` files) or by full path (C:\Windows).
+    fn left_out(&self, n: &Node, name: &str) -> bool {
+        if self.exclude.iter().any(|e| name.eq_ignore_ascii_case(e)) || (n.parent == ROOT && name.starts_with('$')) {
+            return true;
+        }
+        let lower = name.to_lowercase();
+        self.skip_names.contains(&lower) && self.skip.contains(&format!("{}\\{lower}", self.folder_of(n).to_lowercase()))
+    }
+
+    /// The folder a node is in, e.g. "C:\Users\me" ("C:" at the root).
+    fn folder_of(&self, n: &Node) -> String {
+        match self.slot(n.drive, n.parent) {
+            Some(p) if n.parent != ROOT => self.path(p),
+            _ => format!("{}:", n.drive as char),
+        }
     }
 
     fn delete(&mut self, drive: u8, rec: u64) {
@@ -502,10 +544,16 @@ impl Index {
             let rec = u64::from_le_bytes(b[2..10].try_into().unwrap());
             let parent = u64::from_le_bytes(b[10..18].try_into().unwrap());
             let name = std::str::from_utf8(&b[HEADER..HEADER + len]).unwrap_or("");
+            let wanted = self.drives.is_empty() || self.drives.contains(&drive);
             match kind {
+                UPSERT | DELETE if !wanted => {}
                 UPSERT => self.upsert(drive, rec, parent, b[18] == 1, name),
                 DELETE => self.delete(drive, rec),
-                READY => ready.push(drive),
+                READY => {
+                    self.complete.push(drive);
+                    self.dirty = true;
+                    ready.push(drive);
+                }
                 _ => {}
             }
             at += HEADER + len;
@@ -513,16 +561,15 @@ impl Index {
         (at, ready)
     }
 
-    /// Marks everything under an excluded name (AppData, node_modules, …) and NTFS's own
-    /// `$` files, so searches skip them without walking parents.
+    /// Drops everything filtered out (by name or path, and anything under it), plus entries
+    /// whose folder is unknown, then compacts what's left.
     fn refresh_excluded(&mut self) {
         if !self.dirty {
             return;
         }
         self.dirty = false;
-        self.flagged = true;
-        // 0 unknown, 1 kept, 2 excluded.
-        let mut state = vec![0u8; self.nodes.len()];
+        // 0 unknown, 1 kept, 2 excluded. Drives still loading are left alone.
+        let mut state: Vec<u8> = self.nodes.iter().map(|n| if self.complete.contains(&n.drive) { 0 } else { 1 }).collect();
         let mut chain = vec![];
         for start in 0..self.nodes.len() {
             let mut i = start;
@@ -531,26 +578,54 @@ impl Index {
                     break state[i];
                 }
                 let n = self.nodes[i];
-                if n.flags & DEAD == 0 && self.excluded_name(&n) {
+                if n.flags & DEAD != 0 || self.left_out(&n, self.name(&n)) {
                     state[i] = 2;
                     break 2;
                 }
                 chain.push(i);
                 match self.slot(n.drive, n.parent) {
-                    Some(p) if n.parent != ROOT && !chain.contains(&p) => i = p,
-                    _ => break 1,
+                    _ if n.parent == ROOT => break 1,
+                    Some(p) if !chain.contains(&p) => i = p,
+                    Some(_) => break 1,
+                    // Its folder isn't in the index: unreachable, so not searchable.
+                    None => break 2,
                 }
             };
             for c in chain.drain(..) {
                 state[c] = verdict;
             }
         }
-        for (n, s) in self.nodes.iter_mut().zip(state) {
-            n.flags = if s == 2 { n.flags | EXCLUDED } else { n.flags & !EXCLUDED };
-        }
+        self.compact(&state);
     }
 
-    fn path(&self, i: usize) -> String {
+    /// Keeps only nodes whose state is 1, with a fresh name arena; slots are remapped.
+    fn compact(&mut self, state: &[u8]) {
+        let kept = state.iter().filter(|s| **s == 1).count();
+        let mut remap = vec![NONE; self.nodes.len()];
+        let mut nodes = Vec::with_capacity(kept);
+        let mut names = String::with_capacity(self.names.len().min(kept * 24));
+        for (i, n) in self.nodes.iter().enumerate() {
+            if state[i] == 1 {
+                remap[i] = nodes.len() as u32;
+                let name = self.name(n);
+                nodes.push(Node { name_at: names.len() as u32, ..*n });
+                names.push_str(name);
+            }
+        }
+        for slots in &mut self.slots {
+            for s in slots.iter_mut().filter(|s| **s != NONE) {
+                *s = remap[*s as usize];
+            }
+            while slots.last() == Some(&NONE) {
+                slots.pop();
+            }
+            slots.shrink_to_fit();
+        }
+        names.shrink_to_fit();
+        (self.nodes, self.names, self.live) = (nodes, names, kept);
+    }
+
+    pub fn path(&self, i: usize) -> String {
         let n = self.nodes[i];
         let mut parts = vec![self.name(&n)];
         let mut cur = n;
@@ -659,11 +734,10 @@ pub struct Client {
 
 /// Keeps a connection to the helper for as long as akscast runs, reconnecting (and
 /// restarting the helper's task) as needed.
-pub fn connect(exclude: &[String], count: Arc<AtomicUsize>, indexing: Arc<AtomicBool>, tx: UnboundedSender<Msg>) -> Client {
-    let index = Arc::new(RwLock::new(Index::new(exclude)));
+pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool>, tx: UnboundedSender<Msg>) -> Client {
+    let index = Arc::new(RwLock::new(Index::new(&filter)));
     let ready = Arc::new(AtomicBool::new(false));
     let client = Client { index: index.clone(), ready: ready.clone() };
-    let exclude = exclude.to_vec();
     std::thread::spawn(move || {
         let mut fails = 0u32;
         loop {
@@ -677,9 +751,11 @@ pub fn connect(exclude: &[String], count: Arc<AtomicUsize>, indexing: Arc<Atomic
                 continue;
             };
             fails = 0;
+            let started = Instant::now();
+            crate::ext_log("file index", "connected to the whole-drive helper");
             ready.store(false, Ordering::SeqCst);
             indexing.store(true, Ordering::SeqCst);
-            *index.write().unwrap() = Index::new(&exclude);
+            *index.write().unwrap() = Index::new(&filter);
             let mut buf = vec![0u8; 4 << 20];
             let mut have = 0;
             let mut last_note = Instant::now();
@@ -699,6 +775,8 @@ pub fn connect(exclude: &[String], count: Arc<AtomicUsize>, indexing: Arc<Atomic
                 count.store(ix.len(), Ordering::SeqCst);
                 drop(ix);
                 if !done.is_empty() {
+                    let n = index.read().unwrap().len();
+                    crate::ext_log("file index", &format!("drive {} ready: {n} entries kept after {:.1?}", done.iter().map(|d| *d as char).collect::<String>(), started.elapsed()));
                     ready.store(true, Ordering::SeqCst);
                     indexing.store(false, Ordering::SeqCst);
                 }
@@ -710,6 +788,7 @@ pub fn connect(exclude: &[String], count: Arc<AtomicUsize>, indexing: Arc<Atomic
                 }
             }
             ready.store(false, Ordering::SeqCst);
+            crate::ext_log("file index", "helper disconnected; reconnecting");
         }
     });
     client
@@ -745,16 +824,36 @@ mod tests {
         put(&mut wire, UPSERT, b'C', 50, 20, true, "AppData");
         put(&mut wire, UPSERT, b'C', 51, 50, false, "report-cache.tmp");
         put(&mut wire, UPSERT, b'C', 60, ROOT, false, "$Secure");
+        put(&mut wire, UPSERT, b'C', 70, ROOT, true, "Windows");
+        put(&mut wire, UPSERT, b'C', 71, 70, false, "report-system.log");
+        put(&mut wire, UPSERT, b'C', 80, 999, false, "report-orphan.txt");
+        put(&mut wire, UPSERT, b'E', 40, ROOT, false, "report-on-e.txt");
+        // D: is still loading when C: finishes; its child arrives before its parent.
+        put(&mut wire, UPSERT, b'D', 91, 90, false, "report-on-d.txt");
         put(&mut wire, READY, b'C', 0, 0, false, "");
-        let mut ix = Index::new(&["AppData".into()]);
+        let filter = Filter { exclude: vec!["AppData".into()], skip: vec![r"C:\Windows\".into()], drives: vec!["c".into(), "D".into()] };
+        let mut ix = Index::new(&filter);
         // Split mid-record: the tail is kept for the next read.
         let (used, ready) = ix.apply(&wire[..wire.len() - 3]);
         assert!(ready.is_empty() && used < wire.len());
         let (_, ready) = ix.apply(&wire[used..]);
         assert_eq!(ready, [b'C']);
         ix.refresh_excluded();
-        let titles = |ix: &Index, q: &str| ix.search(q, 10).into_iter().map(|i| i.title).collect::<Vec<_>>();
-        assert_eq!(titles(&ix, "report"), ["Quarterly Report.docx"], "AppData is excluded");
+        // D: finishes later; its records survived C:'s pass and its parent now arrives.
+        let mut d = vec![];
+        put(&mut d, UPSERT, b'D', 90, ROOT, true, "Notes");
+        put(&mut d, READY, b'D', 0, 0, false, "");
+        ix.apply(&d);
+        ix.refresh_excluded();
+        assert_eq!(ix.path(ix.slot(b'D', 91).unwrap()), r"D:\Notes\report-on-d.txt");
+        // Kept: Users, Docs, the report, and D:'s two; nothing that was filtered out.
+        assert_eq!(ix.len(), 5, r"AppData, $Secure, C:\Windows, the orphan and drive E: are dropped from memory");
+        let titles = |ix: &Index, q: &str| {
+            let mut t: Vec<String> = ix.search(q, 10).into_iter().map(|i| i.title).collect();
+            t.sort();
+            t
+        };
+        assert_eq!(titles(&ix, "report"), ["Quarterly Report.docx", "report-on-d.txt"], "AppData is excluded");
         assert!(titles(&ix, "secure").is_empty(), "NTFS metadata is hidden");
         assert_eq!(ix.path(ix.slot(b'C', 40).unwrap()), r"C:\Users\Docs\Quarterly Report.docx");
         assert_eq!(titles(&ix, r"docs\quarterly"), ["Quarterly Report.docx"]);
@@ -766,16 +865,16 @@ mod tests {
         put(&mut live, UPSERT, b'C', 41, 30, false, "report v2.txt");
         ix.apply(&live);
         ix.refresh_excluded();
-        assert_eq!(titles(&ix, "report"), ["report v2.txt"]);
+        assert_eq!(titles(&ix, "report"), ["report v2.txt", "report-on-d.txt"]);
         assert_eq!(ix.path(ix.slot(b'C', 41).unwrap()), r"C:\Users\Papers\report v2.txt");
-        assert_eq!(ix.len(), 6);
+        assert_eq!(ix.len(), 5, "Users, Papers, report v2.txt, Notes, report-on-d.txt");
 
-        // After the first pass, a new file is flagged on its own (no full pass needed).
+        // After the drive is complete, a new file is judged on its own (no full pass needed).
         let mut more = vec![];
         put(&mut more, UPSERT, b'C', 52, 50, false, "report-new.tmp");
         ix.apply(&more);
         assert!(!ix.dirty, "a new file doesn't trigger a full pass");
-        assert_eq!(titles(&ix, "report"), ["report v2.txt"], "still excluded under AppData");
+        assert_eq!(titles(&ix, "report"), ["report v2.txt", "report-on-d.txt"], "still excluded under AppData");
     }
 
     #[test]

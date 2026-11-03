@@ -56,14 +56,18 @@ pub struct Files {
     tx: UnboundedSender<Msg>,
     /// Whole-drive index from the admin helper; used instead of the folder index once ready.
     ntfs: Option<crate::ntfs::Client>,
+    /// The settings this index was built for.
+    cfg: crate::config::Files,
 }
 
 impl Files {
-    pub fn start(roots: Vec<String>, exclude: Vec<String>, ntfs: bool, tx: UnboundedSender<Msg>) -> Self {
+    pub fn start(cfg: &crate::config::Files, tx: UnboundedSender<Msg>) -> Self {
+        let (roots, exclude) = (cfg.roots(), cfg.exclude.clone());
+        let filter = crate::ntfs::Filter { exclude: exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
         let index = Arc::new(RwLock::new(Vec::new()));
         let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
         let (count, indexing) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
-        let ntfs = ntfs.then(|| crate::ntfs::connect(&exclude, count.clone(), indexing.clone(), tx.clone()));
+        let ntfs = cfg.ntfs.then(|| crate::ntfs::connect(filter, count.clone(), indexing.clone(), tx.clone()));
         let worker_ntfs = ntfs.as_ref().map(|c| (c.index.clone(), c.ready.clone()));
         let worker_index = index.clone();
         let worker_tx = tx.clone();
@@ -95,6 +99,7 @@ impl Files {
             exclude,
             tx,
             ntfs,
+            cfg: cfg.clone(),
         };
         // With the helper installed its whole-drive index takes over; the folder index is
         // only built if the helper doesn't answer (on the next File Search).
@@ -160,8 +165,10 @@ impl Files {
         }
     }
 
-    pub fn same_roots(&self, roots: &[String], exclude: &[String], ntfs: bool) -> bool {
-        self.roots == roots && self.exclude == exclude && self.ntfs.is_some() == ntfs
+    /// Built for these settings (the hotkey doesn't matter to the index).
+    pub fn same_settings(&self, cfg: &crate::config::Files) -> bool {
+        let strip = |c: &crate::config::Files| crate::config::Files { hotkey: String::new(), ..c.clone() };
+        strip(&self.cfg) == strip(cfg)
     }
 
     /// Searching every NTFS drive (the admin helper is connected).

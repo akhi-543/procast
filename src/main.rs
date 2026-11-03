@@ -65,6 +65,14 @@ fn window_height(cfg: &Config) -> f32 {
 /// Compact mode's favourites strip under the search bar.
 const FAV_ROW: f32 = 48.;
 
+/// The launcher's width before scaling. `width` ≤ 1 is a share of the screen: the window
+/// keeps that share (and its proportions) on every monitor, and its content scales with it.
+const BASE_WIDTH: f32 = 750.;
+
+fn base_width(cfg: &Config) -> f32 {
+    if cfg.width <= 1. { BASE_WIDTH } else { cfg.width }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Root,
@@ -99,7 +107,7 @@ fn hotkey_specs(cfg: &Config) -> [String; 4] {
 }
 
 fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> {
-    cfg.files.enabled.then(|| files::Files::start(cfg.files.roots(), cfg.files.exclude.clone(), cfg.files.ntfs, tx.clone()))
+    cfg.files.enabled.then(|| files::Files::start(&cfg.files, tx.clone()))
 }
 
 /// Section marker for a row that stands in for an empty view (drawn as an empty state).
@@ -1438,7 +1446,7 @@ impl Launcher {
                 }
                 design::set_size(&cfg.size);
                 let same_files = cfg.files.enabled == self.files.is_some()
-                    && self.files.as_ref().is_none_or(|f| f.same_roots(&cfg.files.roots(), &cfg.files.exclude, cfg.files.ntfs));
+                    && self.files.as_ref().is_none_or(|f| f.same_settings(&cfg.files));
                 if !same_files {
                     self.files = start_files(&cfg, &self.tx);
                 }
@@ -1818,7 +1826,8 @@ enum Slot {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Rem-based spacing follows the interface size too.
+        design::scale_launcher();
+        // Rem-based spacing follows the scale too.
         window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
@@ -1966,7 +1975,7 @@ impl Render for Launcher {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(div().w(px(self.cfg.width * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
+                    .child(div().w(px(base_width(&self.cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
                     .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(Self::render_markdown(&md, &meta, &t, "item-detail")))
                     .into_any_element()
             }
@@ -2410,7 +2419,7 @@ fn main() {
         let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
 
-        let bounds = Bounds::centered(None, size(px(cfg.width), px(window_height(&cfg))), cx);
+        let bounds = Bounds::centered(None, size(px(base_width(&cfg)), px(window_height(&cfg))), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
@@ -2438,7 +2447,7 @@ fn main() {
             while let Some(msg) = rx.next().await {
                 if let Msg::Resize = msg {
                     if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
-                        win::resize(hwnd, h * design::scale());
+                        win::resize(hwnd, h * design::launcher_scale());
                     }
                     continue;
                 }
@@ -2450,10 +2459,13 @@ fn main() {
                     // Opening compact root search: just the bar, unless the last search is kept.
                     let compact = opens_root && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
                     let height = if compact { BAR + if this.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&this.cfg) };
-                    (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width * design::scale(), height * design::scale()))
+                    (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width, base_width(&this.cfg), height))
                 });
-                if opens && let Ok(Some((hwnd, monitor, width, height))) = geometry {
-                    win::place(hwnd, &monitor, width, height);
+                if opens && let Ok(Some((hwnd, monitor, width, base, height))) = geometry {
+                    let screen = win::screen(&monitor);
+                    design::set_screen(if width <= 1. { width * screen.width() / BASE_WIDTH } else { 1. });
+                    let s = design::launcher_scale();
+                    win::place(hwnd, &screen, base * s, height * s);
                 }
                 let _ = handle.update(cx, |this, window, cx| this.on_msg(msg, window, cx));
             }

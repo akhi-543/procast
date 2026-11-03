@@ -110,6 +110,10 @@ pub struct Files {
     pub hotkey: String,
     /// Search every NTFS drive through the admin helper, when it's installed.
     pub ntfs: bool,
+    /// Whole-drive search: drive letters to index (empty = every NTFS drive).
+    pub drives: Vec<String>,
+    /// Whole-drive search: full paths left out, with everything under them.
+    pub skip: Vec<String>,
 }
 
 impl Default for Files {
@@ -122,6 +126,8 @@ impl Default for Files {
                 .to_vec(),
             hotkey: String::new(),
             ntfs: true,
+            drives: vec![],
+            skip: [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData"].map(String::from).to_vec(),
         }
     }
 }
@@ -269,7 +275,7 @@ impl Default for Config {
         Self {
             hotkey: "Alt+Space".into(),
             monitor: "cursor".into(),
-            width: 750.,
+            width: 0.5,
             max_results: 8,
             start_at_login: true,
             tray: true,
@@ -299,7 +305,7 @@ impl Default for Search {
 const TEMPLATE: &str = r##"# akscast settings. Saved changes apply within ~2 seconds.
 hotkey = "Alt+Space"          # e.g. "Ctrl+Shift+Space", "Alt+F1"
 monitor = "cursor"            # cursor | active (screen of the focused window) | primary
-width = 750
+width = 0.5                   # share of the screen's width (same look on every monitor); above 1 = pixels
 max_results = 8
 start_at_login = true
 tray = true                   # icon in the notification area
@@ -335,6 +341,8 @@ roots = []                    # empty = your user folder; e.g. ["C:\\Users\\you"
 exclude = ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
 hotkey = ""
 ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
+drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = every NTFS drive
+skip = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData']  # left out of whole-drive search (and memory)
 
 [scripts]
 # Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\akscast\scripts
@@ -408,12 +416,13 @@ pub fn load() -> Result<Config, String> {
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
-    toml::from_str(text).map_err(|e| format!("config.toml: {}", e.message()))
+    // Notepad and PowerShell can save with a byte-order mark; TOML doesn't allow one.
+    toml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("config.toml: {}", e.message()))
 }
 
 /// One setting's value as the settings window shows it ("" when unset).
 pub fn read_value(text: &str, path: &[String]) -> String {
-    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return String::new() };
+    let Ok(doc) = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>() else { return String::new() };
     let mut item = doc.as_item();
     for key in path {
         match item.get(key) {
@@ -432,7 +441,7 @@ pub fn read_value(text: &str, path: &[String]) -> String {
 /// Sets one setting in the config text, keeping every comment and the layout; missing
 /// tables (e.g. `[extension.youtube]`) are created.
 pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Result<String, String> {
-    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
+    let mut doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
     let (last, tables) = path.split_last().ok_or("empty setting path")?;
     let mut table = doc.as_table_mut();
     for key in tables {
@@ -525,6 +534,8 @@ mod tests {
     fn template_parses_and_hotkeys() {
         let c = parse(TEMPLATE).unwrap();
         assert_eq!(c.hotkey, "Alt+Space");
+        assert_eq!(parse(&format!("\u{feff}{TEMPLATE}")).unwrap(), c, "a byte-order mark is ignored");
+        assert_eq!(c.files.skip.first().map(String::as_str), Some(r"C:\Windows"));
         assert_eq!(c.quicklink.len(), 2);
         assert_eq!(c.snippet.len(), 1);
         assert_eq!(c.clipboard.hotkey, "Ctrl+Shift+V");

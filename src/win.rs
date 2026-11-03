@@ -196,35 +196,57 @@ pub fn focus(hwnd: HWND) {
     unsafe { _ = SetForegroundWindow(hwnd) };
 }
 
-/// Places the window horizontally centred, a quarter down the monitor's work area.
-/// Physical size follows the monitor's DPI. Returns the monitor handle used.
-pub fn place(hwnd: HWND, monitor: &str, width: f32, height: f32) -> isize {
+/// The monitor the launcher opens on: its work area (physical pixels) and DPI scale.
+pub struct Screen {
+    pub work: RECT,
+    pub dpi: f32,
+}
+
+impl Screen {
+    /// Work-area width in logical pixels.
+    pub fn width(&self) -> f32 {
+        (self.work.right - self.work.left) as f32 / self.dpi
+    }
+}
+
+/// `cursor` (under the mouse), `active` (the focused window's) or `primary`.
+pub fn screen(pref: &str) -> Screen {
     unsafe {
         let mut pt = POINT::default();
-        let mon = if monitor == "primary" {
-            MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY)
-        } else if monitor == "active" {
-            MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
-        } else {
-            let _ = GetCursorPos(&mut pt);
-            MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+        let mon = match pref {
+            "primary" => MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY),
+            "active" => MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST),
+            _ => {
+                let _ = GetCursorPos(&mut pt);
+                MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            }
         };
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(mon, &mut info);
         let (mut dx, mut dy) = (96, 96);
         let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-        let scale = dx as f32 / 96.;
-        let (w, h) = ((width * scale) as i32, (height * scale) as i32);
-        let RECT { left, top, right, bottom } = info.rcWork;
-        let x = left + (right - left - w) / 2;
-        let y = top + (bottom - top) / 4;
-        // Moving/resizing makes GPUI rebuild its surface; skip it when nothing changed.
-        let mut cur = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut cur);
-        if (cur.left, cur.top, cur.right - cur.left, cur.bottom - cur.top) != (x, y, w, h) {
+        Screen { work: info.rcWork, dpi: dx as f32 / 96. }
+    }
+}
+
+/// Places the window horizontally centred, a quarter down the screen's work area, at
+/// `width` × `height` logical pixels.
+pub fn place(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
+    let (w, h) = ((width * screen.dpi) as i32, (height * screen.dpi) as i32);
+    let RECT { left, top, right, bottom } = screen.work;
+    let (x, y) = (left + (right - left - w) / 2, top + (bottom - top) / 4);
+    unsafe {
+        // Crossing onto a monitor with another DPI makes Windows (via GPUI) resize the window
+        // to its own suggestion; setting the size again afterwards makes ours stick.
+        for _ in 0..2 {
+            let mut cur = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut cur);
+            // Moving/resizing makes GPUI rebuild its surface; skip it when nothing changed.
+            if (cur.left, cur.top, cur.right - cur.left, cur.bottom - cur.top) == (x, y, w, h) {
+                break;
+            }
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        mon.0 as isize
     }
 }
 

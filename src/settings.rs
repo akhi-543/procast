@@ -50,7 +50,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Text, rows and window"),
             row("Window mode", "window_mode", Kind::Choice(&["expanded", "compact"]), "Compact: only the search bar until you type"),
             row("Favourites in compact mode", "launcher.compact_favorites", Kind::Bool, "Icons under the search bar"),
-            row("Width", "width", Kind::Number, "Window width in pixels"),
+            row("Width", "width", Kind::Number, "Share of the screen, e.g. 0.5 (same look on every monitor); above 1 = pixels"),
         ],
         "Launcher" => vec![
             row("Show akscast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Screen with the mouse, with the focused window, or the main one"),
@@ -77,6 +77,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             row("Folders", "files.roots", Kind::List, "Empty = your user folder"),
             row("Skip names", "files.exclude", Kind::List, "Folder or file names skipped anywhere"),
             row("Whole-drive search", "files.ntfs", Kind::Bool, "Every NTFS drive, live. Needs \"Enable Fast File Search\" once (admin)"),
+            row("Drives", "files.drives", Kind::List, "Whole-drive search: letters, e.g. C; D. Empty = every NTFS drive"),
+            row("Skip folders", "files.skip", Kind::List, "Whole-drive search: full paths left out (saves memory)"),
         ],
         "Theme" => {
             let mut r = vec![row("Mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "")];
@@ -229,8 +231,10 @@ impl Settings {
             return;
         }
         let value: toml_edit::Value = match r.kind {
-            Kind::Number => match typed.parse::<i64>() {
-                Ok(n) if n > 0 => n.into(),
+            Kind::Number => match typed.parse::<f64>() {
+                // Whole numbers stay integers in the file; fractions (e.g. width 0.5) are floats.
+                Ok(n) if n > 0. && n.fract() == 0. => (n as i64).into(),
+                Ok(n) if n > 0. => n.into(),
                 _ => {
                     self.status = Some(format!("{} must be a positive number", r.label));
                     return cx.notify();
@@ -385,6 +389,7 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
         let t = crate::design::Tokens::from_theme(&theme, window);
+        crate::design::scale_settings();
         window.set_rem_size(px(16.));
         let rows = self.rows();
         let me = cx.weak_entity();
