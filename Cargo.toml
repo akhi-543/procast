@@ -5,11 +5,13 @@ edition = "2024"
 description = "Fast keyboard launcher for Windows"
 
 [dependencies]
+emojis = "0.9"
 fend-core = "1.5"
 futures = "0.3"
 gpui-ce = "=0.3.0"
 gpui_ce_elements = "=0.3.0"
 gpui_ce_platform = "=0.3.0"
+image = { version = "0.25", default-features = false }
 nucleo-matcher = "0.3"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
@@ -20,8 +22,15 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
     "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Power",
     "Win32_System_Registry",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

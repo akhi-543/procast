@@ -15,7 +15,65 @@ pub struct Config {
     pub max_results: usize,
     pub start_at_login: bool,
     pub search: Search,
-    pub alias: Vec<Alias>,
+    pub clipboard: Clipboard,
+    pub emoji: Emoji,
+    /// `[[alias]]` from Phase 1 configs still works.
+    #[serde(alias = "alias")]
+    pub quicklink: Vec<Quicklink>,
+    pub snippet: Vec<Snippet>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Clipboard {
+    pub enabled: bool,
+    pub history: usize,
+    /// Opens straight into clipboard history, e.g. "Ctrl+Shift+V". Empty = none.
+    pub hotkey: String,
+    /// Executable names whose copies are never recorded.
+    pub ignore_apps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Emoji {
+    pub hotkey: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Quicklink {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub keyword: String,
+    /// May contain `{query}`.
+    pub url: String,
+}
+
+impl Quicklink {
+    pub fn title(&self) -> &str {
+        if self.name.is_empty() { &self.keyword } else { &self.name }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Snippet {
+    pub name: String,
+    #[serde(default)]
+    pub keyword: String,
+    /// Placeholders: {clipboard}, {date}, {time}.
+    pub text: String,
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            history: 500,
+            hotkey: String::new(),
+            ignore_apps: ["keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe"].map(String::from).to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -24,12 +82,6 @@ pub struct Search {
     pub calculator: bool,
     /// `{query}` is replaced with the URL-encoded query. Empty disables the fallback row.
     pub fallback: String,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Alias {
-    pub keyword: String,
-    pub url: String,
 }
 
 impl Default for Config {
@@ -41,7 +93,10 @@ impl Default for Config {
             max_results: 8,
             start_at_login: true,
             search: Search::default(),
-            alias: vec![],
+            clipboard: Clipboard::default(),
+            emoji: Emoji::default(),
+            quicklink: vec![],
+            snippet: vec![],
         }
     }
 }
@@ -63,14 +118,31 @@ start_at_login = true
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
 
-# Type the keyword, a space, then your query.
-[[alias]]
+[clipboard]
+enabled = true                # text history, encrypted at rest for your Windows account
+history = 500
+hotkey = "Ctrl+Shift+V"       # opens clipboard history directly; "" for none
+ignore_apps = ["keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe"]
+
+[emoji]
+hotkey = ""                   # e.g. "Ctrl+Alt+E"
+
+# Quicklinks: search by name, or type the keyword, a space, then your query.
+[[quicklink]]
+name = "GitHub Search"
 keyword = "gh"
 url = "https://github.com/search?q={query}"
 
-[[alias]]
+[[quicklink]]
+name = "YouTube"
 keyword = "yt"
 url = "https://www.youtube.com/results?search_query={query}"
+
+# Snippets: search by name, Enter pastes. Placeholders: {clipboard} {date} {time}
+[[snippet]]
+name = "Today's date"
+keyword = ";date"
+text = "{date}"
 "#;
 
 pub fn dir() -> PathBuf {
@@ -172,9 +244,12 @@ mod tests {
     fn template_parses_and_hotkeys() {
         let c = parse(TEMPLATE).unwrap();
         assert_eq!(c.hotkey, "Alt+Space");
-        assert_eq!(c.alias.len(), 2);
-        // Plan-only sections (files, clipboard, extensions) are ignored, not errors.
-        assert!(parse("[clipboard]\nenabled = true\n[extensions]\nnode = \"auto\"").is_ok());
+        assert_eq!(c.quicklink.len(), 2);
+        assert_eq!(c.snippet.len(), 1);
+        assert_eq!(c.clipboard.hotkey, "Ctrl+Shift+V");
+        // Phase 1 `[[alias]]` configs keep working; sections for later phases are ignored.
+        let old = parse("[[alias]]\nkeyword = \"gh\"\nurl = \"u\"\n[extensions]\nnode = \"auto\"").unwrap();
+        assert_eq!(old.quicklink[0].title(), "gh");
         assert_eq!(parse_hotkey("Alt+Space"), Ok((0x1, 0x20)));
         assert_eq!(parse_hotkey("ctrl+shift+k"), Ok((0x2 | 0x4, b'K' as u32)));
         assert_eq!(parse_hotkey("F9"), Ok((0, 0x78)));

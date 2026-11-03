@@ -161,7 +161,66 @@ Implementation order (extension count): ActionPanel 929 · Action 927 · Icon 85
 
 ---
 
-## 5. Build plan
+## 5. Parity with Raycast for Windows
+
+Source: the settings pages and feature modules in the installed v2.10.1 frontend (568 modules). "Same" means the same capability and keyboard flow. The visual design is akscast's own; Raycast's look, icons and branding are not copied.
+
+| Raycast feature | akscast | When |
+|---|---|---|
+| Root search: apps, fuzzy match, frecency | ✅ | Phase 1 |
+| App icons in results | ✅ | Phase 2a |
+| Global hotkey, conflict error | ✅ (RegisterHotKey) | Phase 1 |
+| Modifier-only hotkeys (double-tap Win), Hyper key | ❌ needs `WH_KEYBOARD_LL` | Phase 1b |
+| Per-command hotkeys | ✅ main + clipboard hotkeys | Phase 2a. Arbitrary commands: Phase 3 |
+| Aliases on commands | partial (quicklink keywords) | Phase 3 |
+| Fallback commands (web search) | ✅ | Phase 1 |
+| Calculator (units, math) | ✅ `fend` | Phase 1. Currencies need a rate feed: Phase 4 |
+| Clipboard history (text, filters, sensitive-app skip, encrypted at rest) | ✅ text + DPAPI at rest | Phase 2a. Images/files: Phase 4 |
+| Snippets: search + paste | ✅ | Phase 2a |
+| Snippets: auto-expand while typing anywhere | ❌ needs LL keyboard hook | Phase 1b |
+| Quicklinks with `{query}` argument | ✅ | Phase 2a |
+| System actions (lock, sleep, restart, shut down, sign out, empty bin) | ✅ with confirm on destructive ones | Phase 2a |
+| Window management (halves, thirds, maximize, centre, next display) | ✅ | Phase 2a |
+| Emoji picker | ✅ (search + paste) | Phase 2a. Inline `:` autocomplete: Phase 1b |
+| Windows Run | ✅ `>` prefix | Phase 2a |
+| Action panel (Ctrl+K secondary actions) | ❌ | Phase 2b |
+| File search | ❌ | Phase 2b |
+| Script commands | ❌ | Phase 2b |
+| Extensions + store (Raycast API) | spike works (cdnjs) | Phase 3 |
+| Menu-bar extras → tray | ❌ | Phase 3 |
+| Settings window | config.toml only | Phase 4 |
+| Themes / theme studio | follows system light/dark | Phase 4 |
+| Calendar, contacts, translator, dictionary, timer, focus sessions, screenshots search, typing practice, games, taskbar widget | ❌ | Phase 4+, most of these are good extension candidates |
+| AI chat/commands/agents/MCP, dictation, notes, cloud sync, accounts, organizations | ❌ by design (paid cloud services) | bring-your-own-key AI could come later |
+
+### Phase 2a status (2026-11-03)
+Built: app icons, commands (system + window management), clipboard history, snippets, quicklinks, emoji, Windows Run, a footer showing what Enter does, and a second Enter for destructive commands.
+
+Verified live by `spikes/e2e.py`, **9/9 pass**:
+- hotkey shows + focuses the launcher
+- the calculator copies its result
+- focus returns to the previous window
+- Left Half snaps the real window
+- clipboard hotkey → search → paste
+- emoji mode → paste
+- `{date}` snippet → paste
+- Escape goes mode → root → hidden
+- the hotkey toggles the window closed
+
+| Metric | Value |
+|---|---|
+| hotkey → on-screen pixel (external harness) | **20.0 ms p50**, 21.1 max |
+| app scan: names searchable | 0.97 s |
+| app scan: icons loaded (207/208) | 4.2 s |
+| idle private memory | 41.5 MB (icons, emoji table and clipboard history in memory) |
+
+Not run live on purpose:
+- shut down, restart, sign out, sleep, lock, empty bin, dark mode (they change your session or system)
+- quicklinks and Run (they open your browser or programs)
+
+These are covered by unit tests up to the Win32 call.
+
+## 6. Build plan
 
 One Rust crate (`src/`) plus `exthost/` (grown from `spikes/exthost`).
 

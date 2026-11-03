@@ -6,41 +6,47 @@ use futures::channel::mpsc::UnboundedSender;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT},
+        Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
         Graphics::{
             Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
-            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint},
+            Gdi::{
+                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
+                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, ReleaseDC,
+            },
         },
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree},
             Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW},
+            SystemInformation::GetLocalTime,
             Threading::{CreateMutexW, GetCurrentThreadId},
         },
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey},
             Shell::{
-                BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT, SHGetKnownFolderItem,
-                SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, ShellExecuteW,
+                BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory, KF_FLAG_DEFAULT,
+                SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+                SIIGBF_ICONONLY, ShellExecuteW,
             },
             WindowsAndMessaging::{
-                ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW,
+                ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
                 GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
                 SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_EX_TOOLWINDOW,
             },
         },
     },
-    core::{HSTRING, PCWSTR, w},
+    core::{HSTRING, Interface, PCWSTR, w},
 };
 
 use crate::config::parse_hotkey;
 
-/// Messages from Win32 threads (hotkey, tray, app scan) to the UI thread.
+/// Messages from Win32 threads (hotkeys, tray, app scan, clipboard) to the UI thread.
 pub enum Msg {
-    Hotkey,
-    HotkeyStatus(Result<(), String>),
+    Hotkey(Bind),
+    HotkeyStatus(Bind, Result<(), String>),
     Apps(Vec<App>),
     Tray(TrayCmd),
+    Clip(String),
 }
 
 pub enum TrayCmd {
@@ -49,43 +55,64 @@ pub enum TrayCmd {
     Quit,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct App {
     pub name: String,
     /// Parsing name inside shell:AppsFolder (an AUMID or a path/known-folder id).
     pub id: String,
+    pub icon: Option<Arc<gpui::RenderImage>>,
 }
 
-// ---- hotkey -------------------------------------------------------------------------
+// ---- hotkeys ------------------------------------------------------------------------
+
+/// What a global hotkey opens. The discriminant is the RegisterHotKey id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bind {
+    Launcher = 1,
+    Clipboard = 2,
+    Emoji = 3,
+}
+
+const BINDS: [Bind; 3] = [Bind::Launcher, Bind::Clipboard, Bind::Emoji];
 
 /// Owns RegisterHotKey on a dedicated thread with its own message loop.
-/// `set` re-registers from the shared string; failures are reported, never fatal.
-pub struct Hotkey {
+/// `set` re-registers everything; failures are reported, never fatal. Empty spec = unbound.
+pub struct Hotkeys {
     thread: u32,
-    wanted: Arc<Mutex<String>>,
+    wanted: Arc<Mutex<[String; 3]>>,
 }
 
-impl Hotkey {
-    pub fn spawn(hotkey: String, tx: UnboundedSender<Msg>) -> Self {
-        let wanted = Arc::new(Mutex::new(hotkey));
+impl Hotkeys {
+    pub fn spawn(specs: [String; 3], tx: UnboundedSender<Msg>) -> Self {
+        let wanted = Arc::new(Mutex::new(specs));
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let shared = wanted.clone();
         std::thread::spawn(move || unsafe {
             let _ = tid_tx.send(GetCurrentThreadId());
             let register = || {
-                let _ = UnregisterHotKey(None, 1);
-                let spec = shared.lock().unwrap().clone();
-                let status = parse_hotkey(&spec).and_then(|(mods, vk)| {
-                    RegisterHotKey(None, 1, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk)
-                        .map_err(|_| format!("hotkey {spec} is already used by another app; change it in config.toml"))
-                });
-                let _ = tx.unbounded_send(Msg::HotkeyStatus(status));
+                let specs = shared.lock().unwrap().clone();
+                for (bind, spec) in BINDS.into_iter().zip(specs) {
+                    let id = bind as i32;
+                    let _ = UnregisterHotKey(None, id);
+                    if spec.trim().is_empty() {
+                        continue;
+                    }
+                    let status = parse_hotkey(&spec).and_then(|(mods, vk)| {
+                        RegisterHotKey(None, id, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk)
+                            .map_err(|_| format!("hotkey {spec} is already used by another app; change it in config.toml"))
+                    });
+                    let _ = tx.unbounded_send(Msg::HotkeyStatus(bind, status));
+                }
             };
             register();
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 match msg.message {
-                    WM_HOTKEY => drop(tx.unbounded_send(Msg::Hotkey)),
+                    WM_HOTKEY => {
+                        if let Some(&bind) = BINDS.iter().find(|b| **b as usize == msg.wParam.0) {
+                            let _ = tx.unbounded_send(Msg::Hotkey(bind));
+                        }
+                    }
                     WM_APP => register(),
                     _ => {}
                 }
@@ -94,8 +121,8 @@ impl Hotkey {
         Self { thread: tid_rx.recv().unwrap_or(0), wanted }
     }
 
-    pub fn set(&self, hotkey: &str) {
-        *self.wanted.lock().unwrap() = hotkey.to_string();
+    pub fn set(&self, specs: [String; 3]) {
+        *self.wanted.lock().unwrap() = specs;
         unsafe { _ = PostThreadMessageW(self.thread, WM_APP, Default::default(), Default::default()) };
     }
 }
@@ -152,7 +179,12 @@ pub fn place(hwnd: HWND, monitor: &str, width: f32, height: f32) -> isize {
         let RECT { left, top, right, bottom } = info.rcWork;
         let x = left + (right - left - w) / 2;
         let y = top + (bottom - top) / 4;
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        // Moving/resizing makes GPUI rebuild its surface; skip it when nothing changed.
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut cur);
+        if (cur.left, cur.top, cur.right - cur.left, cur.bottom - cur.top) != (x, y, w, h) {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         mon.0 as isize
     }
 }
@@ -180,12 +212,12 @@ pub fn scan_apps() -> Vec<App> {
             let (Ok(name), Ok(id)) = (item.GetDisplayName(SIGDN_NORMALDISPLAY), item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING)) else {
                 continue;
             };
-            let app = App { name: name.to_string().unwrap_or_default(), id: id.to_string().unwrap_or_default() };
+            let (name_s, id_s) = (name.to_string().unwrap_or_default(), id.to_string().unwrap_or_default());
             CoTaskMemFree(Some(name.0 as _));
             CoTaskMemFree(Some(id.0 as _));
-            let lower = app.name.to_lowercase();
-            if !app.name.is_empty() && !lower.starts_with("uninstall") && !lower.ends_with("uninstall") {
-                apps.push(app);
+            let lower = name_s.to_lowercase();
+            if !name_s.is_empty() && !lower.starts_with("uninstall") && !lower.ends_with("uninstall") {
+                apps.push(App { name: name_s, id: id_s, icon: None });
             }
         }
     }
@@ -194,14 +226,94 @@ pub fn scan_apps() -> Vec<App> {
     apps
 }
 
+/// Fills in icons. Extraction is ~70 ms per app, so it's split over a few COM threads
+/// and done after the names are already searchable.
+pub fn load_icons(apps: &mut [App]) {
+    let chunk = apps.len().div_ceil(4).max(1);
+    std::thread::scope(|s| {
+        for part in apps.chunks_mut(chunk) {
+            s.spawn(move || unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                for app in part {
+                    let path = HSTRING::from(format!("shell:AppsFolder\\{}", app.id));
+                    if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
+                        app.icon = icon(&item, ICON_PX);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Source pixels for list icons: 24 logical px look sharp up to 200% scaling.
+const ICON_PX: i32 = 48;
+
+/// The shell's icon for an item, as straight-alpha BGRA (what GPUI's RenderImage wants).
+fn icon(item: &IShellItem, px: i32) -> Option<Arc<gpui::RenderImage>> {
+    unsafe {
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+        let bmp = factory.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY).ok()?;
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: px,
+                biHeight: -px, // top-down rows
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (px * px * 4) as usize];
+        let dc = GetDC(None);
+        let rows = GetDIBits(dc, bmp, 0, px as u32, Some(buf.as_mut_ptr() as _), &mut info, DIB_RGB_COLORS);
+        ReleaseDC(None, dc);
+        let _ = DeleteObject(bmp.into());
+        if rows == 0 {
+            return None;
+        }
+        // Shell bitmaps are premultiplied.
+        for p in buf.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if a != 0 && a != 255 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+        let frame = image::Frame::new(image::RgbaImage::from_raw(px as u32, px as u32, buf)?);
+        Some(Arc::new(gpui::RenderImage::new(vec![frame])))
+    }
+}
+
+/// "YYYY-MM-DD", "HH:MM" in local time, for snippet placeholders.
+pub fn local_date_time() -> (String, String) {
+    let t = unsafe { GetLocalTime() };
+    (format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay), format!("{:02}:{:02}", t.wHour, t.wMinute))
+}
+
+/// Windows Run: first token is the program, the rest its arguments.
+pub fn run(cmdline: &str) {
+    let (file, args) = cmdline.split_once(' ').unwrap_or((cmdline, ""));
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        ShellExecuteW(None, w!("open"), &HSTRING::from(file), &HSTRING::from(args), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 #[cfg(test)]
 #[test]
 #[ignore = "reads this machine's Start menu; run with --ignored"]
 fn scan_lists_installed_apps() {
     let t = std::time::Instant::now();
-    let apps = scan_apps();
-    println!("{} apps in {:?}; e.g. {:?}", apps.len(), t.elapsed(), apps.iter().take(8).map(|a| &a.name).collect::<Vec<_>>());
+    let mut apps = scan_apps();
+    let names = t.elapsed();
+    load_icons(&mut apps);
+    let with_icon = apps.iter().filter(|a| a.icon.is_some()).count();
+    println!("{} apps: names in {names:?}, {with_icon} icons by {:?}; e.g. {:?}", apps.len(), t.elapsed(), apps.iter().take(8).map(|a| &a.name).collect::<Vec<_>>());
     assert!(apps.len() > 10);
+    assert!(with_icon * 10 >= apps.len() * 9, "at least 90% of apps should have icons");
 }
 
 pub fn launch_app(id: &str) {
