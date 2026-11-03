@@ -20,6 +20,7 @@ pub struct Config {
     pub files: Files,
     pub scripts: Scripts,
     pub extensions: Extensions,
+    pub theme: Theme,
     /// Per-extension preference values: `[extension.obsidian] notePath = "..."`.
     pub extension: std::collections::HashMap<String, toml::Table>,
     /// `[[alias]]` from Phase 1 configs still works.
@@ -75,6 +76,49 @@ impl Files {
     }
 }
 
+/// `mode` picks the base palette; any colour can be overridden with "#rrggbb" or "#rrggbbaa".
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Theme {
+    /// system | dark | light
+    pub mode: String,
+    pub background: Option<String>,
+    pub text: Option<String>,
+    pub muted: Option<String>,
+    pub selected: Option<String>,
+    pub selected_text: Option<String>,
+    pub border: Option<String>,
+    pub separator: Option<String>,
+    pub container: Option<String>,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            mode: "system".into(),
+            background: None,
+            text: None,
+            muted: None,
+            selected: None,
+            selected_text: None,
+            border: None,
+            separator: None,
+            container: None,
+        }
+    }
+}
+
+/// "#rrggbb" / "#rrggbbaa" -> 0xRRGGBBAA.
+pub fn parse_hex(s: &str) -> Option<u32> {
+    let h = s.trim().strip_prefix('#')?;
+    let v = u32::from_str_radix(h, 16).ok()?;
+    match h.len() {
+        6 => Some(v << 8 | 0xff),
+        8 => Some(v),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Extensions {
@@ -84,11 +128,13 @@ pub struct Extensions {
     pub memory_mb: u32,
     /// Run commands that declare an `interval` (e.g. every 5m) in the background.
     pub background: bool,
+    /// Show menu-bar commands as tray icons.
+    pub menu_bar: bool,
 }
 
 impl Default for Extensions {
     fn default() -> Self {
-        Self { node: "node".into(), memory_mb: 256, background: true }
+        Self { node: "node".into(), memory_mb: 256, background: true, menu_bar: true }
     }
 }
 
@@ -169,6 +215,7 @@ impl Default for Config {
             files: Files::default(),
             scripts: Scripts::default(),
             extensions: Extensions::default(),
+            theme: Theme::default(),
             extension: Default::default(),
             quicklink: vec![],
             snippet: vec![],
@@ -182,7 +229,7 @@ impl Default for Search {
     }
 }
 
-const TEMPLATE: &str = r#"# akscast settings. Saved changes apply within ~2 seconds.
+const TEMPLATE: &str = r##"# akscast settings. Saved changes apply within ~2 seconds.
 hotkey = "Alt+Space"          # e.g. "Ctrl+Shift+Space", "Alt+F1"
 monitor = "cursor"            # cursor | primary
 width = 750
@@ -217,6 +264,19 @@ dirs = []
 node = "node"                 # Node.js 22+ runs the extension host
 memory_mb = 256               # heap limit per running command
 background = true             # run commands that declare an interval (e.g. every 5m)
+menu_bar = true               # show menu-bar commands as tray icons
+
+[theme]
+mode = "system"               # system | dark | light
+# Any colour can be overridden ("#rrggbb" or "#rrggbbaa"):
+# background = "#1e1e2e"
+# text = "#cdd6f4"
+# muted = "#7f849c"
+# selected = "#89b4fa"
+# selected_text = "#11111b"
+# border = "#313244"
+# separator = "#313244"
+# container = "#181825"
 
 # Preference values per extension, by the names in its package.json:
 # [extension.obsidian]
@@ -238,7 +298,7 @@ url = "https://www.youtube.com/results?search_query={query}"
 name = "Today's date"
 keyword = ";date"
 text = "{date}"
-"#;
+"##;
 
 pub fn dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
@@ -266,6 +326,49 @@ pub fn load() -> Result<Config, String> {
 
 pub fn parse(text: &str) -> Result<Config, String> {
     toml::from_str(text).map_err(|e| format!("config.toml: {}", e.message()))
+}
+
+/// One setting's value as the settings window shows it ("" when unset).
+pub fn read_value(text: &str, path: &[String]) -> String {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { return String::new() };
+    let mut item = doc.as_item();
+    for key in path {
+        match item.get(key) {
+            Some(i) => item = i,
+            None => return String::new(),
+        }
+    }
+    match item.as_value() {
+        Some(toml_edit::Value::String(s)) => s.value().clone(),
+        Some(toml_edit::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; "),
+        Some(v) => v.to_string().trim().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Sets one setting in the config text, keeping every comment and the layout; missing
+/// tables (e.g. `[extension.youtube]`) are created.
+pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Result<String, String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
+    let (last, tables) = path.split_last().ok_or("empty setting path")?;
+    let mut table = doc.as_table_mut();
+    for key in tables {
+        if !table.contains_key(key) {
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            table.insert(key, toml_edit::Item::Table(t));
+        }
+        table = table[key.as_str()].as_table_mut().ok_or(format!("{key} is not a table in config.toml"))?;
+    }
+    // Replace in place: the key keeps comments above it, the value its trailing comment.
+    if let Some(old) = table.get_mut(last).and_then(|i| i.as_value_mut()) {
+        let decor = old.decor().clone();
+        *old = value;
+        *old.decor_mut() = decor;
+    } else {
+        table.insert(last, toml_edit::Item::Value(value));
+    }
+    Ok(doc.to_string())
 }
 
 /// "Ctrl+Alt+Space" -> (MOD_* bits, virtual-key code).
@@ -351,5 +454,24 @@ mod tests {
         assert!(parse_hotkey("Space").is_err());
         assert!(parse_hotkey("Ctrl+A+B").is_err());
         assert!(parse_hotkey("DoubleTap+Win").is_err());
+        assert_eq!(parse_hex("#1e1e2e"), Some(0x1e1e2eff));
+        assert_eq!(parse_hex("#11223344"), Some(0x11223344));
+        assert_eq!(parse_hex("1e1e2e"), None);
+        // Settings window writes keep comments and create missing tables.
+        let p = |s: &str| s.split('.').map(String::from).collect::<Vec<_>>();
+        let edited = write_value(TEMPLATE, &p("hotkey"), "Ctrl+Alt+K".into()).unwrap();
+        let edited = write_value(&edited, &p("clipboard.history"), 100i64.into()).unwrap();
+        let edited = write_value(&edited, &p("extension.youtube.apikey"), "abc".into()).unwrap();
+        assert!(edited.contains("hotkey = \"Ctrl+Alt+K\"          # e.g."), "trailing comment kept:\n{edited}");
+        assert!(edited.contains("# akscast settings."));
+        let c = parse(&edited).unwrap();
+        assert_eq!((c.hotkey.as_str(), c.clipboard.history), ("Ctrl+Alt+K", 100));
+        assert_eq!(c.extension["youtube"]["apikey"].as_str(), Some("abc"));
+        assert_eq!(read_value(&edited, &p("extension.youtube.apikey")), "abc");
+        assert_eq!(read_value(&edited, &p("files.exclude")).split("; ").next(), Some("AppData"));
+        assert_eq!(read_value(&edited, &p("nope.missing")), "");
+
+        let t = parse("[theme]\nmode = 'dark'\nselected = '#ff0000'").unwrap().theme;
+        assert_eq!((t.mode.as_str(), t.selected.as_deref()), ("dark", Some("#ff0000")));
     }
 }

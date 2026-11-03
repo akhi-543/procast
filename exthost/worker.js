@@ -21,7 +21,8 @@ const mod = require(workerData.entry);
 const command = mod.default ?? mod;
 const props = { arguments: workerData.arguments, launchType: workerData.launchType, launchContext: workerData.context };
 
-if (workerData.mode === "view") {
+// Menu-bar commands are components too; akscast draws their tree as a tray menu.
+if (workerData.mode === "view" || workerData.mode === "menu-bar") {
   api.__mount(command, props);
 } else {
   // no-view (and background interval) commands are plain async functions.

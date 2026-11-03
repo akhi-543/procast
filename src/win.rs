@@ -58,10 +58,17 @@ pub enum Msg {
     Install(String, Option<bool>),
     /// Time to check for extension commands with an `interval`.
     Tick,
+    /// A web image finished downloading into the cache.
+    ImageReady(std::path::PathBuf),
+    /// The store index finished loading.
+    Store(Vec<crate::ext::StoreEntry>),
+    /// A tray menu item of a menu-bar command was clicked: (run, handler).
+    TrayExt(u64, String),
 }
 
 pub enum TrayCmd {
     Open,
+    Settings,
     EditConfig,
     Quit,
 }

@@ -1,6 +1,7 @@
 // Installs a Raycast extension into akscast: from the raycast/extensions repo by name, or
 // from a local folder (your own extensions). Builds with Raycast's `ray build` (MIT CLI).
 // usage: node install.mjs <name | local folder> <extensions dir>
+//        node install.mjs --sync <extensions dir>   (just refresh the store index)
 // Prints one JSON status line per step: {step, ok, message}.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -11,8 +12,27 @@ const say = (step, message, ok = true) => console.log(JSON.stringify({ step, ok,
 const run = (cmd, args, cwd) =>
   execFileSync(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", encoding: "utf8" });
 
+// One shared sparse clone holding every extension's package.json; installs add their folder.
+function syncRepo() {
+  const repo = path.join(extDir, ".src", "raycast-extensions");
+  if (!fs.existsSync(path.join(repo, ".git"))) {
+    say("clone", "cloning raycast/extensions (sparse, first time only)");
+    run("git", ["clone", "--filter=blob:none", "--no-checkout", "--depth", "1", "--sparse", "https://github.com/raycast/extensions", repo]);
+    run("git", ["sparse-checkout", "set", "--no-cone", "/extensions/*/package.json"], repo);
+    run("git", ["checkout", "main"], repo);
+  } else {
+    run("git", ["pull", "--depth", "1", "--ff-only"], repo);
+  }
+  return repo;
+}
+
 try {
   if (!source || !extDir) throw new Error("usage: install.mjs <name | folder> <extensions dir>");
+  if (source === "--sync") {
+    syncRepo();
+    say("sync", "store index up to date");
+    process.exit(0);
+  }
   let src;
   if (fs.existsSync(source) && fs.statSync(source).isDirectory()) {
     // Build from a copy so the original folder (maybe your git repo) is never touched.
@@ -22,16 +42,7 @@ try {
     say("copy", `copied ${source}`);
   } else {
     if (!/^[a-z0-9][a-z0-9-]*$/i.test(source)) throw new Error(`not a store extension name: ${source}`);
-    // One shared sparse clone; each install only adds its folder.
-    const repo = path.join(extDir, ".src", "raycast-extensions");
-    if (!fs.existsSync(path.join(repo, ".git"))) {
-      say("clone", "cloning raycast/extensions (sparse, first install only)");
-      run("git", ["clone", "--filter=blob:none", "--no-checkout", "--depth", "1", "--sparse", "https://github.com/raycast/extensions", repo]);
-      run("git", ["sparse-checkout", "set", "--no-cone", "/extensions/*/package.json"], repo);
-      run("git", ["checkout", "main"], repo);
-    } else {
-      run("git", ["pull", "--depth", "1", "--ff-only"], repo);
-    }
+    const repo = syncRepo();
     run("git", ["sparse-checkout", "add", `/extensions/${source}/`], repo);
     src = path.join(repo, "extensions", source);
     if (!fs.existsSync(path.join(src, "package.json"))) throw new Error(`no extension named "${source}" in raycast/extensions`);

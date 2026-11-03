@@ -5,8 +5,10 @@ mod commands;
 mod config;
 mod ext;
 mod files;
+mod net;
 mod scripts;
 mod search;
+mod settings;
 mod win;
 
 use std::{
@@ -47,7 +49,7 @@ use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
 use win::{Bind, Msg, TrayCmd};
 
-actions!(akscast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit]);
+actions!(akscast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
 
 const BAR: f32 = 56.;
 const ROW: f32 = 44.;
@@ -71,6 +73,8 @@ enum Mode {
     Ext,
     /// Asking what to install.
     Install,
+    /// Browsing the Raycast store index.
+    Store,
 }
 
 impl Mode {
@@ -139,8 +143,14 @@ struct Launcher {
     /// Background runs by id -> "ext/cmd", and when each command last started.
     bg_runs: HashMap<u64, String>,
     bg_last: HashMap<String, Instant>,
+    /// Menu-bar commands drawn as tray icons: "ext/cmd" -> (run, icon).
+    trays: HashMap<String, (u64, TrayIcon)>,
     confirm: Option<Confirm>,
     images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
+    /// Store index (None until loaded) and whether a load is running.
+    store: Option<Vec<ext::StoreEntry>>,
+    store_loading: bool,
+    settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
     mode: Mode,
     items: Vec<Item>,
@@ -197,8 +207,12 @@ impl Launcher {
             extv: None,
             bg_runs: HashMap::new(),
             bg_last: HashMap::new(),
+            trays: HashMap::new(),
             confirm: None,
             images: HashMap::new(),
+            store: None,
+            store_loading: false,
+            settings_window: None,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
             items: vec![],
@@ -262,8 +276,17 @@ impl Launcher {
         if let Some(name) = icon.strip_prefix("icon:") {
             return Icon::glyph(ext::icon_glyph(name));
         }
-        if icon.starts_with("http") || icon.starts_with("data:") {
+        if icon.starts_with("http") {
+            // Web images: drawn from the cache once downloaded; a globe until then.
+            let cached = net::image_path(icon);
+            if cached.exists() {
+                return self.image(cached).map(Icon::Image).unwrap_or(Icon::glyph("🌐"));
+            }
+            net::fetch_image(icon, &self.tx);
             return Icon::glyph("🌐");
+        }
+        if icon.starts_with("data:") {
+            return Icon::glyph("🖼");
         }
         if icon.chars().count() <= 4 && !icon.contains('.') {
             return Icon::glyph(icon.to_string());
@@ -285,6 +308,14 @@ impl Launcher {
         }
         self.exts = out;
         self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
+        // Drop tray icons (and their runs) for menu-bar commands that are gone.
+        let alive: Vec<String> = self.exts.iter().flat_map(|(x, _)| x.commands.iter().map(move |c| format!("{}/{}", x.name, c.name))).collect();
+        let gone: Vec<(String, u64)> = self.trays.iter().filter(|(k, _)| !alive.contains(k)).map(|(k, (r, _))| (k.clone(), *r)).collect();
+        for (key, run) in gone {
+            self.trays.remove(&key);
+            self.bg_runs.remove(&run);
+            self.send(json!({"t": "stop", "run": run}));
+        }
     }
 
     fn ext_rows(&mut self, query: &str) -> Vec<Item> {
@@ -379,6 +410,30 @@ impl Launcher {
                 None => vec![],
             },
             Mode::Ext => self.ext_rows(&query),
+            Mode::Store => match &self.store {
+                None => vec![Item::new("Loading the store index…", "first time clones raycast/extensions manifests (~1 min)", Icon::glyph("⏳"), Act::None)],
+                Some(entries) => {
+                    let installed: Vec<&str> = self.exts.iter().map(|(x, _)| x.name.as_str()).collect();
+                    let rows: Vec<Item> = entries
+                        .iter()
+                        .filter(|s| s.windows)
+                        .map(|s| {
+                            let done = installed.contains(&s.name.as_str());
+                            let sub = format!("{}{} · {}", if done { "Installed · " } else { "" }, s.author, s.description);
+                            let mut it = Item::new(&s.title, sub, Icon::glyph(if done { "✓" } else { "🧩" }), Act::Install(s.name.clone()))
+                                .with_hay(format!("{} {} {} {}", s.title, s.name, s.author, s.description));
+                            it.extra = vec![
+                                ((if done { "Reinstall / Update" } else { "Install" }).to_string(), Act::Install(s.name.clone())),
+                                ("Open Store Page".into(), Act::Open(format!("https://www.raycast.com/{}/{}", s.author, s.name))),
+                                ("Open Source on GitHub".into(), Act::Open(format!("https://github.com/raycast/extensions/tree/main/extensions/{}", s.name))),
+                            ];
+                            it
+                        })
+                        .collect();
+                    // ponytail: alphabetical; the index has no download counts to rank by.
+                    search::filter(&query, rows, &mut self.matcher)
+                }
+            },
             Mode::Install => {
                 let what = query.trim();
                 let title = if what.is_empty() { "Type a store name (e.g. obsidian) or a folder path".to_string() } else { format!("Install {what}") };
@@ -424,6 +479,9 @@ impl Launcher {
             && let Some(f) = &self.files
         {
             f.refresh_if_stale(Duration::from_secs(120));
+        }
+        if mode == Mode::Store {
+            self.load_store();
         }
         self.input.update(cx, |s, cx| s.emplace("", cx));
         self.selected = 0;
@@ -517,7 +575,7 @@ impl Launcher {
                 return;
             }
         };
-        if cmd.mode == "menu-bar" || !self.ensure_host() {
+        if !self.ensure_host() {
             return cx.notify();
         }
         self.next_run += 1;
@@ -540,28 +598,101 @@ impl Launcher {
         }
     }
 
-    /// Starts interval commands that are due (and not already running).
+    /// Starts background work that is due: interval no-view commands, and menu-bar
+    /// commands (started once, re-run on their interval to refresh the tray menu).
     fn tick(&mut self, cx: &mut Context<Self>) {
-        if !self.cfg.extensions.background {
-            return;
-        }
-        let due: Vec<(usize, usize)> = self
-            .exts
-            .iter()
-            .enumerate()
-            .flat_map(|(e, (x, _))| x.commands.iter().enumerate().map(move |(c, cmd)| (e, c, x, cmd)))
-            .filter(|(_, _, x, cmd)| {
+        let running = |this: &Self, key: &str| this.bg_runs.iter().find(|(_, k)| *k == key).map(|(r, _)| *r);
+        let mut due = vec![];
+        for (e, (x, _)) in self.exts.iter().enumerate() {
+            for (c, cmd) in x.commands.iter().enumerate() {
                 let key = format!("{}/{}", x.name, cmd.name);
-                cmd.mode == "no-view"
-                    && cmd.interval.is_some_and(|i| self.bg_last.get(&key).is_none_or(|t| t.elapsed() >= i))
-                    && !self.bg_runs.values().any(|k| *k == key)
-            })
-            .map(|(e, c, _, _)| (e, c))
-            .collect();
-        for (e, c) in due {
-            let key = format!("{}/{}", self.exts[e].0.name, self.exts[e].0.commands[c].name);
+                let elapsed = |i: Duration| self.bg_last.get(&key).is_none_or(|t| t.elapsed() >= i);
+                let wanted = match cmd.mode.as_str() {
+                    "no-view" => self.cfg.extensions.background && cmd.interval.is_some_and(elapsed) && running(self, &key).is_none(),
+                    "menu-bar" => self.cfg.extensions.menu_bar && (running(self, &key).is_none() || cmd.interval.is_some_and(elapsed)),
+                    _ => false,
+                };
+                if wanted {
+                    due.push((e, c, key));
+                }
+            }
+        }
+        for (e, c, key) in due {
+            // A menu-bar command is re-run fresh; its tray icon stays and gets the new menu.
+            if let Some(old) = running(self, &key) {
+                self.bg_runs.remove(&old);
+                self.send(json!({"t": "stop", "run": old}));
+            }
             self.bg_last.insert(key, Instant::now());
             self.start_ext(e, c, true, json!({}), cx);
+        }
+    }
+
+    /// Draws a menu-bar command's render as its tray icon + menu.
+    fn update_tray(&mut self, run: u64, key: String, tree: &Value) {
+        use tray_icon::menu::{IsMenuItem, MenuId, PredefinedMenuItem, Submenu};
+        let Some(bar) = ext::parse_menubar(tree) else { return };
+        let Some(e) = self.exts.iter().position(|(x, _)| key.starts_with(&format!("{}/", x.name))) else { return };
+        let ext = &self.exts[e].0;
+        let cmd_title = ext.commands.iter().find(|c| key.ends_with(&format!("/{}", c.name))).map(|c| c.title.clone()).unwrap_or_default();
+
+        fn add(nodes: &[ext::MenuNode], run: u64, push: &dyn Fn(&dyn IsMenuItem)) {
+            for (i, n) in nodes.iter().enumerate() {
+                match n {
+                    ext::MenuNode::Item { title, on_action } => {
+                        let id = MenuId::new(format!("ext|{run}|{}", on_action.clone().unwrap_or_default()));
+                        push(&MenuItem::with_id(id, title, on_action.is_some(), None));
+                    }
+                    ext::MenuNode::Separator => push(&PredefinedMenuItem::separator()),
+                    ext::MenuNode::Section { title, children } => {
+                        if i > 0 {
+                            push(&PredefinedMenuItem::separator());
+                        }
+                        if !title.is_empty() {
+                            push(&MenuItem::new(title, false, None));
+                        }
+                        add(children, run, push);
+                    }
+                    ext::MenuNode::Submenu { title, children } => {
+                        let sub = Submenu::new(title, true);
+                        add(children, run, &|item| drop(sub.append(item)));
+                        push(&sub);
+                    }
+                }
+            }
+        }
+        let menu = Menu::new();
+        if !bar.title.is_empty() {
+            let _ = menu.append(&MenuItem::new(&bar.title, false, None));
+            let _ = menu.append(&PredefinedMenuItem::separator());
+        }
+        add(&bar.items, run, &|item| drop(menu.append(item)));
+
+        let icon_path = bar
+            .icon
+            .as_deref()
+            .filter(|i| !i.starts_with("icon:") && !i.starts_with("http") && i.contains('.'))
+            .map(|i| ext.dir.join("assets").join(i))
+            .filter(|p| p.exists())
+            .or_else(|| ext.icon.clone());
+        let icon = icon_path.and_then(|p| ext::load_rgba(&p)).and_then(|(rgba, w, h)| TrayImage::from_rgba(rgba, w, h).ok());
+        let tooltip = [bar.tooltip.as_str(), bar.title.as_str(), cmd_title.as_str()].into_iter().find(|t| !t.is_empty()).unwrap_or("akscast").to_string();
+
+        match self.trays.get_mut(&key) {
+            Some((r, tray)) => {
+                *r = run;
+                tray.set_menu(Some(Box::new(menu)));
+                let _ = tray.set_tooltip(Some(&tooltip));
+                if let Some(i) = icon {
+                    let _ = tray.set_icon(Some(i));
+                }
+            }
+            None => {
+                let built = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip(&tooltip).with_icon(icon.unwrap_or_else(tray_icon_image)).build();
+                if let Ok(tray) = built {
+                    self.trays.insert(key, (run, tray));
+                }
+            }
         }
     }
 
@@ -608,6 +739,14 @@ impl Launcher {
                 }
                 self.send_search(cx);
                 self.refresh(cx);
+            }
+            "render" => {
+                if let Some(key) = self.bg_runs.get(&run).cloned()
+                    && self.exts.iter().any(|(x, _)| x.commands.iter().any(|c| c.mode == "menu-bar" && key == format!("{}/{}", x.name, c.name)))
+                {
+                    self.update_tray(run, key, &v["tree"]);
+                    cx.notify();
+                }
             }
             "call" => self.on_call(run, ui, v["method"].as_str().unwrap_or_default(), &v["params"], cx),
             "request" => {
@@ -816,7 +955,8 @@ impl Launcher {
             return self.run(act, item.key.clone(), window, cx);
         }
         if self.mode == Mode::Install {
-            return self.install(cx);
+            let what = self.query(cx).trim().to_string();
+            return self.install(what, cx);
         }
         if self.is_form() {
             let ev = self.extv.as_mut().unwrap();
@@ -935,7 +1075,13 @@ impl Launcher {
             Act::Cmd(Cmd::ClipboardHistory) => return self.set_mode(Mode::Clipboard, cx),
             Act::Cmd(Cmd::Emoji) => return self.set_mode(Mode::Emoji, cx),
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
+            Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
+            Act::Install(name) => return self.install(name, cx),
             Act::Cmd(Cmd::ClearClipboardHistory) => self.history.clear(),
+            Act::Cmd(Cmd::Settings) => {
+                self.hide(false, cx);
+                return self.open_settings(cx);
+            }
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true),
             Act::Cmd(Cmd::Quit) => return cx.quit(),
@@ -952,8 +1098,52 @@ impl Launcher {
         self.hide(true, cx);
     }
 
-    fn install(&mut self, cx: &mut Context<Self>) {
-        let what = self.query(cx).trim().to_string();
+    /// Brings up the settings window, reusing it if it's already open.
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.settings_window
+            && h.update(cx, |_, window, _| window.activate()).is_ok()
+        {
+            return;
+        }
+        let bounds = Bounds::centered(None, size(px(880.), px(620.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(gpui::TitlebarOptions { title: Some("akscast Settings".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(window, cx))).ok();
+    }
+
+    /// Reads the store index in the background, syncing the sparse clone first when it's
+    /// missing or more than a day old.
+    fn load_store(&mut self) {
+        if self.store_loading || self.store.is_some() {
+            return;
+        }
+        let Some(host_dir) = ext::host_dir() else { return };
+        self.store_loading = true;
+        let (node, tx, dir) = (self.cfg.extensions.node.clone(), self.tx.clone(), ext::dir());
+        std::thread::spawn(move || {
+            use std::os::windows::process::CommandExt;
+            let repo = ext::store_repo();
+            let fresh = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).or_else(|_| std::fs::metadata(repo.join(".git").join("HEAD")))
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(86400)));
+            if !fresh {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::process::Command::new(node)
+                    .arg(host_dir.join("install.mjs"))
+                    .args(["--sync", &dir.to_string_lossy()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(0x0800_0000)
+                    .status();
+            }
+            let _ = tx.unbounded_send(Msg::Store(ext::read_store(&repo)));
+        });
+    }
+
+    fn install(&mut self, what: String, cx: &mut Context<Self>) {
         if what.is_empty() {
             return;
         }
@@ -1055,6 +1245,7 @@ impl Launcher {
             Msg::Hotkey(bind) if self.visible && self.mode == Mode::of(bind) => self.hide(true, cx),
             Msg::Hotkey(bind) => self.show(Mode::of(bind), window, cx),
             Msg::Tray(TrayCmd::Open) => self.show(Mode::Root, window, cx),
+            Msg::Tray(TrayCmd::Settings) => self.open_settings(cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Msg::Tray(TrayCmd::Quit) => cx.quit(),
             Msg::Apps(apps) => {
@@ -1119,6 +1310,25 @@ impl Launcher {
                 cx.notify();
             }
             Msg::Tick => self.tick(cx),
+            Msg::ImageReady(path) => {
+                self.images.remove(&path);
+                if self.visible && self.mode == Mode::Ext {
+                    self.refresh(cx);
+                }
+            }
+            Msg::Store(entries) => {
+                self.store_loading = false;
+                self.status = Some(format!("{} Windows-capable extensions", entries.iter().filter(|s| s.windows).count()));
+                self.store = Some(entries);
+                if self.mode == Mode::Store {
+                    self.refresh(cx);
+                }
+            }
+            Msg::TrayExt(run, f) => {
+                if !f.is_empty() {
+                    self.send(json!({"t": "event", "run": run, "fn": f, "args": [{"type": "left-click"}]}));
+                }
+            }
             Msg::HotkeyStatus(bind, status) => {
                 self.hotkey_errors[bind as usize - 1] = status.err();
                 // Without a working main hotkey the user can't reach us, so open and say why.
@@ -1139,6 +1349,7 @@ impl Launcher {
             Mode::Emoji => Some("Emoji".into()),
             Mode::Files => Some("Search Files".into()),
             Mode::Install => Some("Install Extension".into()),
+            Mode::Store => Some("Extension Store".into()),
             Mode::Args => self.pending.as_ref().map(|(i, _)| self.scripts[*i].title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -1155,6 +1366,7 @@ impl Launcher {
             Mode::Emoji => "Search emoji".into(),
             Mode::Files => "Search files by name, or a path with \\".into(),
             Mode::Install => "Extension name (e.g. obsidian) or folder path".into(),
+            Mode::Store => "Search Windows-capable store extensions".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self
                 .pending
@@ -1268,12 +1480,35 @@ impl Launcher {
     }
 }
 
+/// The palette from `[theme]`: base by mode, then per-colour overrides.
+fn theme_colors(t: &config::Theme, window: &Window) -> Colors {
+    let mut c = match t.mode.as_str() {
+        "dark" => Colors::dark(),
+        "light" => Colors::light(),
+        _ => Colors::for_appearance(window),
+    };
+    let set = |slot: &mut gpui::Rgba, v: &Option<String>| {
+        if let Some(hex) = v.as_deref().and_then(config::parse_hex) {
+            *slot = gpui::rgba(hex);
+        }
+    };
+    set(&mut c.background, &t.background);
+    set(&mut c.text, &t.text);
+    set(&mut c.disabled, &t.muted);
+    set(&mut c.selected, &t.selected);
+    set(&mut c.selected_text, &t.selected_text);
+    set(&mut c.border, &t.border);
+    set(&mut c.separator, &t.separator);
+    set(&mut c.container, &t.container);
+    c
+}
+
 /// Test seam: with AKSCAST_E2E=1, each render writes what's on screen to
-/// %TEMP%\akscast-ui.json so spikes/e2e.py can assert on it.
-fn dump_ui(state: Value) {
+/// %TEMP%\<file> so spikes/e2e.py can assert on it.
+fn dump_ui(file: &str, state: Value) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("AKSCAST_E2E").is_some()) {
-        let _ = std::fs::write(std::env::temp_dir().join("akscast-ui.json"), state.to_string());
+        let _ = std::fs::write(std::env::temp_dir().join(file), state.to_string());
     }
 }
 
@@ -1287,7 +1522,7 @@ fn ext_log(who: &str, text: &str) {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_appearance(window);
+        let colors = theme_colors(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         // Rows to draw: the Ctrl+K panel replaces the results while it's open.
         let (rows, selected): (Vec<(String, String, Icon)>, usize) = match &self.panel {
@@ -1306,8 +1541,9 @@ impl Render for Launcher {
             (None, None) => String::new(),
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
-        dump_ui(json!({
+        dump_ui("akscast-ui.json", json!({
             "visible": self.visible,
+            "bg": format!("{:?}", colors.background),
             "query": self.query(cx),
             "label": self.label(),
             "rows": rows.iter().map(|r| &r.0).collect::<Vec<_>>(),
@@ -1318,6 +1554,7 @@ impl Render for Launcher {
             "view": view.as_ref().map(|v| &v.kind),
             "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
             "field": self.extv.as_ref().map(|e| e.field),
+            "trays": self.trays.keys().collect::<Vec<_>>(),
         }));
         let me = cx.weak_entity();
         let rows = Rc::new(rows);
@@ -1516,27 +1753,39 @@ fn tray_icon_image() -> TrayImage {
 
 fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
     let open = MenuItem::new("Open akscast", true, None);
+    let settings = MenuItem::new("Settings…", true, None);
     let edit = MenuItem::new("Edit config.toml", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&open, &edit, &quit]).ok()?;
-    let ids = (open.id().clone(), edit.id().clone(), quit.id().clone());
+    menu.append_items(&[&open, &settings, &edit, &quit]).ok()?;
+    let ids = (open.id().clone(), settings.id().clone(), edit.id().clone(), quit.id().clone());
     let menu_tx = tx.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        // Items of extension tray menus carry "ext|<run>|<handler>" ids.
+        if let Some((run, f)) = e.id.0.strip_prefix("ext|").and_then(|r| r.split_once('|')) {
+            if let Ok(run) = run.parse() {
+                let _ = menu_tx.unbounded_send(Msg::TrayExt(run, f.to_string()));
+            }
+            return;
+        }
         let cmd = match &e.id {
             id if *id == ids.0 => TrayCmd::Open,
-            id if *id == ids.1 => TrayCmd::EditConfig,
-            id if *id == ids.2 => TrayCmd::Quit,
+            id if *id == ids.1 => TrayCmd::Settings,
+            id if *id == ids.2 => TrayCmd::EditConfig,
+            id if *id == ids.3 => TrayCmd::Quit,
             _ => return,
         };
         let _ = menu_tx.unbounded_send(Msg::Tray(cmd));
     }));
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+        // Only akscast's own icon opens the launcher; extension icons just show their menu.
+        if let TrayIconEvent::Click { id, button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e
+            && id.0 == "akscast"
+        {
             let _ = tx.unbounded_send(Msg::Tray(TrayCmd::Open));
         }
     }));
-    TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("akscast").with_icon(tray_icon_image()).build().ok()
+    TrayIconBuilder::new().with_id("akscast").with_menu(Box::new(menu)).with_tooltip("akscast").with_icon(tray_icon_image()).build().ok()
 }
 
 fn main() {
@@ -1556,6 +1805,17 @@ fn main() {
             KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
+            // The settings window when no text field has focus.
+            KeyBinding::new("up", SelectPrev, Some("Settings")),
+            KeyBinding::new("down", SelectNext, Some("Settings")),
+            KeyBinding::new("tab", SelectNext, Some("Settings")),
+            KeyBinding::new("shift-tab", SelectPrev, Some("Settings")),
+            KeyBinding::new("enter", Launch, Some("Settings")),
+            KeyBinding::new("escape", Dismiss, Some("Settings")),
+            KeyBinding::new("ctrl-down", NextSection, Some("Settings")),
+            KeyBinding::new("ctrl-up", PrevSection, Some("Settings")),
         ]);
 
         let (cfg, notice) = match config::load() {
@@ -1563,6 +1823,7 @@ fn main() {
             Err(e) => (Config::default(), Some(e)),
         };
         win::set_start_at_login(cfg.start_at_login);
+        net::load_rates();
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
         let tray = tray(tx.clone());
         let tick_tx = tx.clone();

@@ -40,9 +40,11 @@ pub enum Cmd {
     EmptyBin,
     ToggleDarkMode,
     Snap(Snap),
+    Settings,
     EditConfig,
     ReloadApps,
     InstallExtension,
+    BrowseStore,
     Quit,
 }
 
@@ -91,9 +93,11 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Snap(Snap::Center), "Center Window", "window middle", "⊡"),
     (Cmd::Snap(Snap::Restore), "Restore Window", "window", "↩"),
     (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", "🖥"),
-    (Cmd::EditConfig, "Edit akscast Settings", "config preferences toml", "⚙"),
+    (Cmd::Settings, "akscast Settings", "preferences options configure", "⚙"),
+    (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", "📝"),
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", "↻"),
     (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", "🧩"),
+    (Cmd::BrowseStore, "Browse Extension Store", "raycast store extensions catalog install", "🛍"),
     (Cmd::Quit, "Quit akscast", "exit close", "✕"),
 ];
 
@@ -111,7 +115,7 @@ impl Cmd {
         match self {
             Cmd::Snap(_) => "Window Management",
             Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "Command",
-            Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::Quit => "akscast",
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => "akscast",
             _ => "System",
         }
     }
@@ -130,7 +134,7 @@ pub fn run(cmd: Cmd, target: HWND) {
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::Quit => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => {}
         }
     }
 }

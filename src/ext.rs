@@ -135,6 +135,47 @@ pub fn preference_values(ext: &Extension, cmd: &ExtCommand, configured: Option<&
     if missing.is_empty() { Ok(Value::Object(out)) } else { Err(missing) }
 }
 
+// ---- store --------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoreEntry {
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    pub windows: bool,
+    pub commands: usize,
+}
+
+/// The shared sparse clone of raycast/extensions that installs and the store use.
+pub fn store_repo() -> PathBuf {
+    dir().join(".src").join("raycast-extensions")
+}
+
+/// Every extension manifest in the store index, sorted by title.
+pub fn read_store(repo: &Path) -> Vec<StoreEntry> {
+    let mut out: Vec<StoreEntry> = std::fs::read_dir(repo.join("extensions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(e.path().join("package.json")).ok()?).ok()?;
+            let platforms: Vec<String> = v["platforms"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(str::to_lowercase)).collect();
+            Some(StoreEntry {
+                name: v["name"].as_str()?.into(),
+                title: v["title"].as_str().unwrap_or_default().into(),
+                description: v["description"].as_str().unwrap_or_default().into(),
+                author: v["author"].as_str().unwrap_or_default().into(),
+                // A missing `platforms` field means macOS only.
+                windows: platforms.iter().any(|p| p == "windows"),
+                commands: v["commands"].as_array().map_or(0, Vec::len),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    out
+}
+
 // ---- host process -------------------------------------------------------------------
 
 /// Where exthost/ lives: next to the exe (installed), or the repo root (dev builds).
@@ -450,6 +491,44 @@ pub fn parse_view(tree: &Value) -> View {
     v
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuNode {
+    Item { title: String, on_action: Option<String> },
+    Section { title: String, children: Vec<MenuNode> },
+    Submenu { title: String, children: Vec<MenuNode> },
+    Separator,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct MenuBar {
+    pub title: String,
+    pub tooltip: String,
+    pub icon: Option<String>,
+    pub items: Vec<MenuNode>,
+}
+
+/// A rendered `MenuBarExtra` tree -> tray menu model.
+pub fn parse_menubar(tree: &Value) -> Option<MenuBar> {
+    let root = tree.as_array()?.iter().find(|n| n["type"] == "MenuBarExtra")?;
+    fn nodes(n: &Value) -> Vec<MenuNode> {
+        kids(n)
+            .filter_map(|c| {
+                let p = &c["props"];
+                let (t, sub) = (s(&p["title"]), s(&p["subtitle"]));
+                Some(match c["type"].as_str()? {
+                    "MenuBarExtra.Item" => MenuNode::Item { title: if sub.is_empty() { t } else { format!("{t}  {sub}") }, on_action: fn_id(&p["onAction"]) },
+                    "MenuBarExtra.Section" => MenuNode::Section { title: s(&p["title"]), children: nodes(c) },
+                    "MenuBarExtra.Submenu" => MenuNode::Submenu { title: s(&p["title"]), children: nodes(c) },
+                    "MenuBarExtra.Separator" => MenuNode::Separator,
+                    _ => return None,
+                })
+            })
+            .collect()
+    }
+    let p = &root["props"];
+    Some(MenuBar { title: s(&p["title"]), tooltip: s(&p["tooltip"]), icon: icon(&p["icon"]), items: nodes(root) })
+}
+
 /// Markdown -> display lines (heading level, text). Images dropped, links keep their text.
 pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
     let mut out = vec![];
@@ -493,7 +572,8 @@ pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
 
 /// A PNG asset as a GPUI image (BGRA), shrunk to icon size.
 pub fn load_image(path: &Path) -> Option<std::sync::Arc<gpui::RenderImage>> {
-    let img = image::open(path).ok()?.to_rgba8();
+    // Format from the bytes: cached web images have no extension.
+    let img = image::load_from_memory(&std::fs::read(path).ok()?).ok()?.to_rgba8();
     let img = if img.width() > 64 || img.height() > 64 { image::imageops::thumbnail(&img, 64, 64) } else { img };
     let (w, h) = img.dimensions();
     let mut buf = img.into_raw();
@@ -502,6 +582,13 @@ pub fn load_image(path: &Path) -> Option<std::sync::Arc<gpui::RenderImage>> {
     }
     let frame = image::Frame::new(image::RgbaImage::from_raw(w, h, buf)?);
     Some(std::sync::Arc::new(gpui::RenderImage::new(vec![frame])))
+}
+
+/// A PNG as straight RGBA at tray size (32 px), for tray-icon.
+pub fn load_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let img = image::imageops::resize(&img, 32, 32, image::imageops::FilterType::Triangle);
+    Some((img.into_raw(), 32, 32))
 }
 
 /// Raycast icon names the launcher can draw as a symbol; anything else gets a dot.
@@ -594,6 +681,31 @@ mod tests {
         assert_eq!(f[0].value, json!("v1"), "dropdown defaults to its first option");
         assert!(f[1].controlled && f[1].value == json!("hi"));
         assert_eq!((f[2].title.as_str(), &f[2].value), ("Pin it", &json!(false)));
+
+        let repo = std::env::temp_dir().join(format!("akscast-store-test-{}", std::process::id()));
+        for (name, manifest) in [
+            ("b-ext", json!({"name": "b-ext", "title": "Beta", "author": "ann", "platforms": ["macOS", "Windows"], "commands": [{}, {}]})),
+            ("a-ext", json!({"name": "a-ext", "title": "alpha", "description": "mac only"})),
+        ] {
+            std::fs::create_dir_all(repo.join("extensions").join(name)).unwrap();
+            std::fs::write(repo.join("extensions").join(name).join("package.json"), manifest.to_string()).unwrap();
+        }
+        let store = read_store(&repo);
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(store.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["alpha", "Beta"]);
+        assert_eq!((store[0].windows, store[1].windows, store[1].commands), (false, true, 2));
+
+        let bar = json!([{"type": "MenuBarExtra", "props": {"title": "3 ports", "icon": "icon:Network"}, "children": [
+            {"type": "MenuBarExtra.Section", "props": {"title": "Listening"}, "children": [
+                {"type": "MenuBarExtra.Item", "props": {"title": "node", "subtitle": ":3000", "onAction": {"$fn": "k:onAction"}}}]},
+            {"type": "MenuBarExtra.Separator", "props": {}},
+            {"type": "MenuBarExtra.Submenu", "props": {"title": "More"}, "children": [{"type": "MenuBarExtra.Item", "props": {"title": "Refresh"}}]}
+        ]}]);
+        let mb = parse_menubar(&bar).unwrap();
+        assert_eq!((mb.title.as_str(), mb.icon.as_deref()), ("3 ports", Some("icon:Network")));
+        assert_eq!(mb.items[0], MenuNode::Section { title: "Listening".into(), children: vec![MenuNode::Item { title: "node  :3000".into(), on_action: Some("k:onAction".into()) }] });
+        assert_eq!(mb.items[1], MenuNode::Separator);
+        assert!(matches!(&mb.items[2], MenuNode::Submenu { children, .. } if children.len() == 1));
 
         let md = markdown_lines("# Title\nSee [docs](https://x.y) and **bold**\n![img](a.png)\n- item\n```\ncode\n```");
         assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (0, "".into()), (0, "• item".into()), (9, "code".into())]);

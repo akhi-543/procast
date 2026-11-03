@@ -1,0 +1,478 @@
+//! The settings window. Every row edits one key of config.toml in place (comments and
+//! layout kept); the launcher picks the change up through its usual reload.
+
+use std::collections::HashMap;
+
+use gpui::{
+    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
+    prelude::*, px, rgb, rgb_to_hsla,
+};
+use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, text_input};
+
+use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, ext};
+
+#[derive(Clone, PartialEq)]
+enum Kind {
+    Text,
+    Number,
+    Bool,
+    Hotkey,
+    Choice(&'static [&'static str]),
+    /// A list of strings, edited as "a; b; c".
+    List,
+    /// Opens a file.
+    Open(&'static str),
+}
+
+struct Row {
+    label: String,
+    help: String,
+    path: Vec<String>,
+    kind: Kind,
+}
+
+const SECTIONS: [&str; 7] = ["General", "Search", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+
+fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
+    Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind }
+}
+
+fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
+    match SECTIONS[section] {
+        "General" => vec![
+            row("Launcher hotkey", "hotkey", Kind::Hotkey, "Opens akscast"),
+            row("Emoji hotkey", "emoji.hotkey", Kind::Hotkey, "Opens emoji search directly"),
+            row("Monitor", "monitor", Kind::Choice(&["cursor", "primary"]), "Where the window opens"),
+            row("Width", "width", Kind::Number, "Window width in pixels (at 100% scaling)"),
+            row("Rows", "max_results", Kind::Number, "Results shown in root search"),
+            row("Start at login", "start_at_login", Kind::Bool, ""),
+        ],
+        "Search" => vec![
+            row("Calculator", "search.calculator", Kind::Bool, "Math and unit conversion in root search"),
+            row("Web fallback", "search.fallback", Kind::Text, "{query} is replaced; empty hides the row"),
+        ],
+        "Clipboard" => vec![
+            row("Clipboard history", "clipboard.enabled", Kind::Bool, "Text only, encrypted for your Windows account"),
+            row("Entries kept", "clipboard.history", Kind::Number, ""),
+            row("Hotkey", "clipboard.hotkey", Kind::Hotkey, "Opens clipboard history directly"),
+            row("Ignored apps", "clipboard.ignore_apps", Kind::List, "Executable names; their copies are never saved"),
+        ],
+        "Files" => vec![
+            row("File search", "files.enabled", Kind::Bool, ""),
+            row("Hotkey", "files.hotkey", Kind::Hotkey, "Opens file search directly"),
+            row("Folders", "files.roots", Kind::List, "Empty = your user folder"),
+            row("Skip names", "files.exclude", Kind::List, "Folder or file names skipped anywhere"),
+        ],
+        "Theme" => {
+            let mut r = vec![row("Mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "")];
+            for (label, key) in [
+                ("Background", "background"),
+                ("Text", "text"),
+                ("Muted text", "muted"),
+                ("Selection", "selected"),
+                ("Selected text", "selected_text"),
+                ("Border", "border"),
+                ("Separator", "separator"),
+                ("Panels", "container"),
+            ] {
+                r.push(row(label, &format!("theme.{key}"), Kind::Text, "#rrggbb, empty = from mode"));
+            }
+            r
+        }
+        "Extensions" => {
+            let mut r = vec![
+                row("Background commands", "extensions.background", Kind::Bool, "Run commands that declare an interval"),
+                row("Tray icons", "extensions.menu_bar", Kind::Bool, "Show menu-bar commands in the tray"),
+                row("Node.js", "extensions.node", Kind::Text, "Runs the extension host"),
+                row("Memory per command (MB)", "extensions.memory_mb", Kind::Number, ""),
+            ];
+            for x in exts {
+                let mut seen = vec![];
+                for p in x.prefs.iter().chain(x.commands.iter().flat_map(|c| c.prefs.iter())) {
+                    if seen.contains(&p.name) {
+                        continue;
+                    }
+                    seen.push(p.name.clone());
+                    let title = if p.title.is_empty() { &p.name } else { &p.title };
+                    let kind = if p.kind == "checkbox" { Kind::Bool } else { Kind::Text };
+                    let help = match (p.required, p.kind.as_str()) {
+                        (true, k) => format!("required · {k}"),
+                        (false, k) => k.to_string(),
+                    };
+                    r.push(Row {
+                        label: format!("{} › {title}", x.title),
+                        help,
+                        path: vec!["extension".into(), x.name.clone(), p.name.clone()],
+                        kind,
+                    });
+                }
+            }
+            r
+        }
+        _ => vec![
+            Row { label: "Open config.toml".into(), help: "Every setting, with comments".into(), path: vec![], kind: Kind::Open("config.toml") },
+            Row { label: "Open extensions log".into(), help: "Extension errors and console output".into(), path: vec![], kind: Kind::Open("extensions.log") },
+        ],
+    }
+}
+
+/// A GPUI keystroke -> the hotkey syntax config.toml uses ("Ctrl+Alt+K").
+fn hotkey_from(ev: &KeyDownEvent) -> Option<String> {
+    let k = &ev.keystroke;
+    let key = match k.key.as_str() {
+        "control" | "shift" | "alt" | "platform" | "function" => return None,
+        "space" => "Space".to_string(),
+        "pageup" => "PageUp".into(),
+        "pagedown" => "PageDown".into(),
+        "capslock" => "CapsLock".into(),
+        s if s.len() == 1 => s.to_uppercase(),
+        s => {
+            let mut c = s.chars();
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        }
+    };
+    let m = &k.modifiers;
+    let parts: Vec<&str> = [(m.control, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.platform, "Win")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect();
+    Some(parts.into_iter().chain([key.as_str()]).collect::<Vec<_>>().join("+"))
+}
+
+pub struct Settings {
+    text: String,
+    exts: Vec<ext::Extension>,
+    section: usize,
+    selected: usize,
+    inputs: HashMap<String, Entity<EditableTextState>>,
+    recording: bool,
+    status: Option<String>,
+    focus: FocusHandle,
+    _subs: Vec<Subscription>,
+}
+
+impl Settings {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self {
+            text: std::fs::read_to_string(config::path()).unwrap_or_default(),
+            exts: ext::scan(),
+            section: 0,
+            selected: 0,
+            inputs: HashMap::new(),
+            recording: false,
+            status: None,
+            focus: cx.focus_handle(),
+            _subs: vec![],
+        };
+        this.build_inputs(cx);
+        this.focus_row(window, cx);
+        this
+    }
+
+    fn rows(&self) -> Vec<Row> {
+        rows(self.section, &self.exts)
+    }
+
+    fn build_inputs(&mut self, cx: &mut Context<Self>) {
+        self.inputs.clear();
+        for r in self.rows() {
+            if matches!(r.kind, Kind::Text | Kind::Number | Kind::List) {
+                let value = config::read_value(&self.text, &r.path);
+                let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+                input.update(cx, |s, cx| s.emplace(&value, cx));
+                self.inputs.insert(r.path.join("."), input);
+            }
+        }
+    }
+
+    fn focus_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        let handle = rows.get(self.selected).and_then(|r| self.inputs.get(&r.path.join("."))).map(|i| i.focus_handle(cx)).unwrap_or_else(|| self.focus.clone());
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn save(&mut self, path: &[String], value: toml_edit::Value, cx: &mut Context<Self>) {
+        let current = std::fs::read_to_string(config::path()).unwrap_or_else(|_| self.text.clone());
+        match config::write_value(&current, path, value).and_then(|t| config::parse(&t).map(|_| t)) {
+            Ok(text) => match std::fs::write(config::path(), &text) {
+                Ok(()) => {
+                    self.text = text;
+                    self.status = Some(format!("Saved {}", path.join(".")));
+                }
+                Err(e) => self.status = Some(format!("Could not write config.toml: {e}")),
+            },
+            Err(e) => self.status = Some(e),
+        }
+        cx.notify();
+    }
+
+    /// Saves the selected text-like row if its input differs from the file.
+    fn commit(&mut self, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        let Some(r) = rows.get(self.selected) else { return };
+        let Some(input) = self.inputs.get(&r.path.join(".")) else { return };
+        let typed = input.read(cx).as_str().trim().to_string();
+        if typed == config::read_value(&self.text, &r.path) {
+            return;
+        }
+        let value: toml_edit::Value = match r.kind {
+            Kind::Number => match typed.parse::<i64>() {
+                Ok(n) if n > 0 => n.into(),
+                _ => {
+                    self.status = Some(format!("{} must be a positive number", r.label));
+                    return cx.notify();
+                }
+            },
+            Kind::List => {
+                let mut a = toml_edit::Array::new();
+                for part in typed.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+                    a.push(part);
+                }
+                a.into()
+            }
+            _ => typed.into(),
+        };
+        let path = r.path.clone();
+        self.save(&path, value, cx);
+    }
+
+    fn select(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit(cx);
+        self.recording = false;
+        self.selected = i.min(self.rows().len().saturating_sub(1));
+        self.focus_row(window, cx);
+    }
+
+    fn set_section(&mut self, s: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit(cx);
+        self.recording = false;
+        self.section = s % SECTIONS.len();
+        self.selected = 0;
+        self.build_inputs(cx);
+        self.focus_row(window, cx);
+    }
+
+    /// Enter / click on a row.
+    fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        let Some(r) = rows.get(self.selected) else { return };
+        let current = config::read_value(&self.text, &r.path);
+        match &r.kind {
+            Kind::Bool => {
+                let on = current == "true";
+                self.save(&r.path, (!on).into(), cx);
+            }
+            Kind::Choice(opts) => {
+                let i = opts.iter().position(|o| *o == current).map_or(0, |i| (i + 1) % opts.len());
+                self.save(&r.path, opts[i].into(), cx);
+            }
+            Kind::Hotkey => {
+                self.recording = true;
+                self.status = Some("Press the new shortcut (Esc cancels)".into());
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            Kind::Open(file) => crate::win::open(&config::dir().join(file).to_string_lossy()),
+            Kind::Text | Kind::Number | Kind::List => self.commit(cx),
+        }
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.recording {
+            return;
+        }
+        let Some(spec) = hotkey_from(ev) else { return };
+        let rows = self.rows();
+        let Some(r) = rows.get(self.selected) else { return };
+        self.recording = false;
+        match config::parse_hotkey(&spec) {
+            Ok(_) => {
+                let path = r.path.clone();
+                self.save(&path, spec.into(), cx);
+            }
+            Err(e) => {
+                self.status = Some(e);
+                cx.notify();
+            }
+        }
+    }
+
+    fn control(&self, r: &Row, on: bool, colors: &gpui::colors::Colors) -> AnyElement {
+        let value = config::read_value(&self.text, &r.path);
+        let pill = |text: String, active: bool| {
+            div()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if on { colors.selected } else { colors.border })
+                .when(active, |d| d.bg(colors.selected).text_color(colors.selected_text))
+                .child(text)
+                .into_any_element()
+        };
+        match &r.kind {
+            Kind::Text | Kind::Number | Kind::List => match self.inputs.get(&r.path.join(".")) {
+                Some(input) => text_input(SharedString::from(format!("set-{}", r.path.join("."))))
+                    .state(input.downgrade())
+                    .placeholder(if r.kind == Kind::List { "a; b; c" } else { "" })
+                    .placeholder_color(colors.disabled)
+                    .caret_color(rgb_to_hsla(colors.text))
+                    .w_full()
+                    .whitespace_nowrap()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if on { colors.selected } else { colors.border })
+                    .bg(colors.container)
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            Kind::Bool => pill(if value == "true" { "On".into() } else { "Off".into() }, value == "true"),
+            Kind::Choice(_) => pill(format!("{value}  ▸"), false),
+            Kind::Hotkey if self.recording && on => pill("Recording…".into(), true),
+            Kind::Hotkey => pill(if value.is_empty() { "None".into() } else { value }, false),
+            Kind::Open(_) => pill("Open".into(), false),
+        }
+    }
+}
+
+impl Focusable for Settings {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for Settings {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
+        let colors = crate::theme_colors(&theme, window);
+        let rows = self.rows();
+        let me = cx.weak_entity();
+        crate::dump_ui(
+            "akscast-settings.json",
+            serde_json::json!({
+                "section": SECTIONS[self.section],
+                "selected": self.selected,
+                "rows": rows.iter().map(|r| &r.label).collect::<Vec<_>>(),
+                "recording": self.recording,
+                "status": self.status,
+            }),
+        );
+        div()
+            .size_full()
+            .flex()
+            .bg(colors.background)
+            .text_color(colors.text)
+            .key_context("Settings")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.select(this.selected + 1, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, window, cx| this.select(this.selected.saturating_sub(1), window, cx)))
+            .on_action(cx.listener(|this, _: &NextSection, window, cx| this.set_section(this.section + 1, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevSection, window, cx| this.set_section(this.section + SECTIONS.len() - 1, window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| this.activate(window, cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                if this.recording {
+                    this.recording = false;
+                    this.status = Some("Cancelled".into());
+                    cx.notify();
+                } else {
+                    this.commit(cx);
+                    window.remove_window();
+                }
+            }))
+            .child(
+                div()
+                    .w(px(190.))
+                    .flex_none()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(colors.container)
+                    .border_r_1()
+                    .border_color(colors.separator)
+                    .child(div().px_2().pb_3().font_weight(FontWeight::SEMIBOLD).child("akscast Settings"))
+                    .children(SECTIONS.iter().enumerate().map(|(i, name)| {
+                        let me = me.clone();
+                        div()
+                            .id(("section", i))
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .when(i == self.section, |d| d.bg(colors.selected).text_color(colors.selected_text))
+                            .on_click(move |_, window, cx| drop(me.update(cx, |this, cx| this.set_section(i, window, cx))))
+                            .child(*name)
+                    }))
+                    .child(div().flex_1())
+                    .child(div().px_2().text_xs().text_color(colors.disabled).child("↑↓ rows · Ctrl+↑↓ sections · ↵ change · Esc close")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("rows")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
+                            .children(rows.iter().enumerate().map(|(i, r)| {
+                                let on = i == self.selected;
+                                let me = me.clone();
+                                div()
+                                    .id(("row", i))
+                                    .flex()
+                                    .items_center()
+                                    .gap_4()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .when(on, |d| d.bg(colors.container))
+                                    .on_click(move |_, window, cx| {
+                                        drop(me.update(cx, |this, cx| {
+                                            let again = this.selected == i;
+                                            this.select(i, window, cx);
+                                            if again || !matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List) {
+                                                this.activate(window, cx);
+                                            }
+                                        }))
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(240.))
+                                            .flex_none()
+                                            .flex()
+                                            .flex_col()
+                                            .child(div().truncate().child(r.label.clone()))
+                                            .children((!r.help.is_empty()).then(|| div().text_xs().text_color(colors.disabled).truncate().child(r.help.clone()))),
+                                    )
+                                    .child(div().flex_1().min_w_0().child(self.control(r, on, &colors)))
+                            }))
+                            .children(rows.is_empty().then(|| div().text_color(colors.disabled).child("Nothing to configure here yet."))),
+                    )
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .flex_none()
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(colors.separator)
+                            .text_xs()
+                            .text_color(match self.status.as_deref() {
+                                Some(s) if !(s.starts_with("Saved") || s.starts_with("Press") || s == "Cancelled") => rgb(0xff6b6b),
+                                _ => colors.disabled,
+                            })
+                            .child(self.status.clone().unwrap_or_else(|| format!("Changes save to {} and apply within 2 s", config::path().display()))),
+                    ),
+            )
+    }
+}

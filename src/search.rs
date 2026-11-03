@@ -57,6 +57,8 @@ pub enum Act {
     /// Answer an extension's confirmAlert.
     Confirm(bool),
     UninstallExt(String),
+    /// Install a store extension by name.
+    Install(String),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -72,7 +74,8 @@ impl Act {
             Act::Copy(_) => "Copy",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore) => "Open",
+            Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) => "Run Command",
             Act::ExtFn(_) => "Run Action",
             Act::ExtSet(..) | Act::FormSet(..) => "Choose",
@@ -364,12 +367,22 @@ impl fend_core::Interrupt for Deadline {
     }
 }
 
+struct Rates;
+
+impl fend_core::ExchangeRateFnV2 for Rates {
+    fn relative_to_base_currency(&self, currency: &str, _: &fend_core::ExchangeRateFnV2Options) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        crate::net::rate_of(currency)
+    }
+}
+
 /// Only for input with a digit; time-boxed so `9^9^9` can't freeze the UI.
 fn calculate(q: &str) -> Option<String> {
     if !q.bytes().any(|b| b.is_ascii_digit()) || q.starts_with('>') {
         return None;
     }
     let mut ctx = fend_core::Context::new();
+    // Currencies (e.g. "50 usd to inr") use the cached daily ECB rates.
+    ctx.set_exchange_rate_handler_v2(Rates);
     let deadline = Deadline(Instant::now() + Duration::from_millis(50));
     let result = fend_core::evaluate_with_interrupt(q, &mut ctx, &deadline).ok()?;
     let main = result.get_main_result().trim().to_string();
@@ -441,6 +454,9 @@ mod tests {
         assert_eq!(root("left half", &cat, &cfg, &frec, &mut m)[0].act, Act::Cmd(Cmd::Snap(commands::Snap::LeftHalf)));
 
         assert_eq!(root("2+2*3", &cat, &cfg, &frec, &mut m)[0].act, Act::Copy("8".into()));
+        crate::net::set_rates([("EUR".to_string(), 1.0), ("USD".to_string(), 1.1216), ("INR".to_string(), 98.5)].into());
+        let fx = calculate("10 eur to usd").unwrap_or_default();
+        assert!(fx.starts_with("11.21") && fx.contains("USD"), "currency conversion: {fx}");
         assert!(root("chrome", &cat, &cfg, &frec, &mut m).iter().all(|i| !matches!(i.act, Act::Copy(_))));
         let t = Instant::now();
         calculate("9^9^9^9");

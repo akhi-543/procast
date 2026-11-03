@@ -174,7 +174,7 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | Per-command hotkeys | ✅ main + clipboard hotkeys | Phase 2a. Arbitrary commands: Phase 3 |
 | Aliases on commands | partial (quicklink keywords) | Phase 3 |
 | Fallback commands (web search) | ✅ | Phase 1 |
-| Calculator (units, math) | ✅ `fend` | Phase 1. Currencies need a rate feed: Phase 4 |
+| Calculator (units, math, currencies) | ✅ `fend` + daily ECB rates (cached, offline-safe) | Phase 1 / Phase 4 |
 | Clipboard history (text, filters, sensitive-app skip, encrypted at rest) | ✅ text + DPAPI at rest | Phase 2a. Images/files: Phase 4 |
 | Snippets: search + paste | ✅ | Phase 2a |
 | Snippets: auto-expand while typing anywhere | ❌ needs LL keyboard hook | Phase 1b |
@@ -188,10 +188,10 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | Script commands | ✅ Raycast headers, silent/compact/fullOutput, arguments, needsConfirmation | Phase 2b. Inline/refresh-interval: later |
 | AI (Claude Code / Agent SDK) | research only: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
 | Extensions (Raycast API, unmodified store extensions) | ✅ own runtime (`exthost/`), List / Grid / Detail / Form / ActionPanel / navigation / toasts / confirm / storage / prefs, interval background commands | Phase 3 |
-| Extension install | ✅ "Install Extension": store name or local folder, built with `ray build` | Phase 3. Store browser UI: later |
-| Menu-bar extras → tray | ❌ (menu-bar commands are hidden) | Phase 4 |
-| Settings window | config.toml only | Phase 4 |
-| Themes / theme studio | follows system light/dark | Phase 4 |
+| Extension install + store | ✅ "Install Extension" (name or folder) and "Browse Extension Store" (996 Windows-capable) | Phase 3 / Phase 4 |
+| Menu-bar extras → tray | ✅ one tray icon per menu-bar command, live menu, interval refresh | Phase 4 |
+| Settings window | ✅ sections, toggles, hotkey recorder, extension preferences; writes config.toml keeping comments | Phase 4 |
+| Themes / theme studio | ✅ system/dark/light + per-colour overrides (no visual editor) | Phase 4 |
 | Calendar, contacts, translator, dictionary, timer, focus sessions, screenshots search, typing practice, games, taskbar widget | ❌ | Phase 4+, most of these are good extension candidates |
 | AI chat/commands/agents/MCP, dictation, notes, cloud sync, accounts, organizations | ❌ by design (paid cloud services) | bring-your-own-key AI could come later |
 
@@ -304,6 +304,46 @@ Bugs found and fixed while testing:
 - No store browser (install by name)
 - OAuth, AI, `getSelectedText`, BrowserExtension throw "not supported"
 - Theme Scheduler now runs from both Raycast and akscast. It's idempotent, but turn it off in Raycast once you switch.
+
+### Phase 4 status (2026-11-03): polish
+
+Built:
+- **Tray menus for menu-bar commands.** Obsidian, Port Manager and Agent Usage each get a tray icon whose menu is their live `MenuBarExtra` tree.
+  - Clicks call the extension's handler.
+  - Commands with an interval re-run fresh and keep their icon.
+- **Settings window** ("akscast Settings", or tray → Settings…).
+  - Sections: General, Search, Clipboard, Files, Theme, Extensions, Advanced.
+  - Toggles, choices and text, number and list fields, plus a hotkey recorder.
+  - Every installed extension's preferences are editable (required ones marked).
+  - Edits go into `config.toml` via `toml_edit`, so comments and layout are kept; the launcher reloads within 2 s.
+- **Themes:** `[theme] mode = system | dark | light` plus per-colour hex overrides. Used by both windows.
+- **Store browser** ("Browse Extension Store"):
+  - lists the 996 Windows-capable extensions from the shared sparse clone, which refreshes daily
+  - Enter installs; Ctrl+K opens the store page or the GitHub source
+- **Calculator currencies:** ECB reference rates, cached in `rates.xml` and refreshed daily (`10 eur to usd`, `500 inr in usd`).
+- **Web images for extensions** (thumbnails, favicons): downloaded once into `image-cache`, max 5 MB each, 10 s timeout.
+
+Verified:
+- `spikes/e2e.py` **25/25**. New this phase:
+  - 3 tray icons
+  - the store lists 996 and finds Obsidian
+  - live currency conversion
+  - web thumbnails cached
+  - the settings window opens
+  - a number field saves with comments kept
+  - the hotkey recorder saves Ctrl+Alt+E
+  - switching to light restyles the launcher
+
+  `config.toml` was byte-identical after the run.
+- `smoke.mjs` 23/23; 7 unit tests.
+- Hotkey → on-screen in 17.2 ms p50.
+
+Not done:
+- **Auto-update:** there are no published releases to update from. Add it once the repo has GitHub releases.
+- **Clipboard images and files:** text only for now.
+- **No visual theme editor:** colours are hex fields in Settings.
+- **Tray clicks** haven't been exercised by the automated test; menu building is unit-tested.
+- **Extension host memory: 195 MB** while 3 menu-bar commands stay loaded, so tray clicks can reach a live worker. `[extensions] menu_bar = false` frees that memory.
 
 ## 6. Build plan
 
