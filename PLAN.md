@@ -1,0 +1,218 @@
+# akscast: plan
+
+A keyboard launcher for Windows that runs Raycast store extensions. It is your own product, with its own name, look and settings. Raycast's code, icons, art and branding are not copied. Compatibility comes from implementing the **public** extension API (MIT type definitions) in our own runtime.
+
+Status: **Phase 0 done (2026-11-03).** Results are in §4, and the spikes live in `spikes/`.
+
+---
+
+## 1. How Raycast for Windows works (installed app, v2.10.1)
+
+Sources: `C:\Program Files\WindowsApps\Raycast.Raycast_2.10.1.0_x64__qypenmj9wpt2a\`, `%LOCALAPPDATA%\Raycast`, logs, and the running processes.
+
+```
+Raycast.exe  (.NET 10 WPF host, Wpf.Ui, CommunityToolkit.Mvvm, Serilog, Sentry)
+ ├─ msedgewebview2.exe x7   frontend: React + TanStack Query (Vite build)
+ │     bridge: chrome.webview.hostObjects.ipcRequest + webview "message" events
+ ├─ node.exe backend\index.mjs   (115 MB node.exe, 8 MB bundle)
+ │     ├─ Rust napi addons: data, indexer, calculator-rs, fs-utils, process-utils
+ │     ├─ Swift on Windows: swiftCore, Foundation, SoulverCore (calculator)
+ │     ├─ vscode-jsonrpc over \\.\pipe\vscode-jsonrpc-*
+ │     └─ extension host: worker_thread per command, heap limit per worker
+ ├─ Raycast.UIAccess.exe   low-level keyboard hook + SetForegroundWindow
+ └─ SystemService / NetworkMonitor / TraceRecorder / CrashHelper / StartupLauncher
+```
+
+| Observed fact | Evidence |
+|---|---|
+| ~980 MB private memory in total (host 308, node 272, WebView2 ~392) | process list |
+| ~12 SQLite DBs, **encrypted at rest** | read-only open fails ("file is not a database"), `last_key` file |
+| Window recentred and DPI-rescaled on every show (~900×/day) | logs |
+| USN indexer fails on `E:\` (883×/day) and has no fallback. Indexer refers to `SystemService` over a pipe, and the manifest has `allowElevation`, so volume reads probably go through an elevated helper (inferred) | logs, strings |
+| **Main hotkey = double-tap Win**, dispatched by a low-level keyboard hook in the UIAccess process. Other bindings use `RegisterHotKey`. The hook **ignores injected input**: synthetic double-taps do nothing | logs (`Binding 0 (DoubleTap…) dispatches via the keyboard hook`), test |
+| Extension runtime (`api/node_modules/@raycast/api/index.js`, 744 KB, react-reconciler inside) **ships only inside the app** and has no license file. npm `@raycast/api@2.10.1` (MIT) contains **only the `ray` CLI + `types/index.d.ts`** | tarball inventory |
+
+Hot path: keypress → WPF → WebView2/React → COM host object → JSON-RPC pipe → Node → napi/Swift and back. That's four boundaries per keystroke.
+
+---
+
+## 2. Design
+
+| | Raycast (Windows) | akscast | Phase 0 evidence |
+|---|---|---|---|
+| UI | WPF + WebView2 + React | **Rust + GPUI** (`gpui-ce` 0.3.0, Win32 + DirectX) | spike builds and runs |
+| Core | Node + Rust napi + Swift | same Rust process as the UI, no IPC on the hot path | — |
+| Show/hide | hide → re-show, recentre, DPI rescale | **one window, toggled with DWM cloak** (`DWMWA_CLOAK`), swap chain stays alive | hide: 46 ms p50 → cloak: **14.6 ms p50**, 16.7 p95 |
+| Focus | UIAccess helper | `RegisterHotKey` + `SetForegroundWindow` | **20/20 foreground** |
+| Modifier-only hotkeys (double-tap Win/Ctrl) | LL hook in UIAccess | `WH_KEYBOARD_LL` in-process (Phase 1b) | not built yet |
+| Extensions | private runtime in a worker | **our own `@raycast/api` runtime** (react-reconciler → JSON tree) in a lazily started Node sidecar | unmodified store extension runs |
+| Settings | encrypted SQLite | one `config.toml`, hot-reloaded | — |
+| File search | USN via elevated helper | Everything SDK → USN (needs elevation) → `jwalk` | — |
+| Calculator | SoulverCore | `fend-core` | — |
+| Idle RAM | ~980 MB | **21 MB** measured, plus ~70 MB while the Node sidecar runs | measured |
+
+Core patterns taken from [open-raycast](https://github.com/JingHao-Leon/open-raycast) (MIT, macOS, no extensions):
+- generation counter, so stale keystroke results never display
+- a sync `isRelevant(query)` gate per source before doing any work
+- a push-only coordinator with a ~33 ms flush throttle
+- a failing source shows an error row and never blanks the other sources
+- a sensitive-content filter for clipboard history
+
+---
+
+## 3. Settings (yours, plain text)
+
+`%APPDATA%\akscast\config.toml`:
+
+```toml
+hotkey = "Alt+Space"          # or "DoubleTap+Ctrl"; conflicts are reported, not fatal
+monitor = "cursor"            # cursor | primary | 1 | 2
+width = 750
+max_results = 8
+theme = "dark"
+
+[search]
+apps = true
+files = { enabled = true, backend = "auto", roots = ["C:\\", "D:\\", "E:\\"], exclude = ["node_modules", ".git"] }
+calculator = true
+fallback = "https://www.google.com/search?q={query}"
+
+[clipboard]
+enabled = true
+history = 500
+ignore_apps = ["KeePassXC.exe", "1Password.exe"]
+
+[[alias]]
+keyword = "gh"
+url = "https://github.com/search?q={query}"
+
+[[hotkey_command]]
+keys = "Shift+CapsLock"
+command = "theme-scheduler/apply-themes"
+
+[extensions]
+node = "auto"
+dir = "%APPDATA%\\akscast\\extensions"
+memory_mb = 256
+idle_kill_secs = 300
+```
+
+---
+
+## 4. Phase 0 results
+
+### 4.1 Extension compatibility
+- **Built with `ray build -e dist`**, with the network blackholed via a dead proxy: exit 0 in 7.5 s, no login needed. Output is one CommonJS file per command.
+- That output keeps exactly three modules external: **`@raycast/api`, `react`, `react/jsx-runtime`**. `@raycast/utils` (`useFetch`, `useCachedPromise`, …) is bundled into every extension, so we get it for free.
+- **Ran unmodified `cdnjs` on `spikes/exthost`** (~200 lines: shim + worker + host). `Module._resolveFilename` redirects the three externals to our copies. Results:
+  - first render at 102–568 ms. Worker start and module load vary with disk cache.
+  - typing reaches the handler and fetches; 20 items rendered at ~830 ms (network-bound)
+  - `unsupported=[]`
+  - 11 element types hit: List, List.Item, List.Item.Detail, Metadata.*, ActionPanel, Action.CopyToClipboard/OpenInBrowser
+- Gotcha found: `@raycast/utils` passes `cache.subscribe` **unbound** to `useSyncExternalStore`, so every API method must be an arrow or bound.
+- Wire format is ours: `{type:"render", tree}` (full tree, ~30 KB for 20 items) and `{type:"event", id, args}`, with function props replaced by `{$fn:id}`. Diffing isn't needed yet.
+
+### 4.2 Store reality (`raycast/extensions`, 3,505 extensions)
+
+| `platforms` | Count |
+|---|---|
+| declares Windows | **995** |
+| macOS only | 1,283 |
+| no field (treated as macOS) | 1,227 |
+
+Among the 995, 123 still contain AppleScript, `osascript` or `/Applications` paths.
+
+Command modes in the Windows set: view 2,549, no-view 685, menu-bar 118.
+
+**Coverage by the number of `@raycast/api` names implemented** (an extension counts once every name it imports exists):
+
+| Top N names | Extensions fully covered |
+|---|---|
+| 10 | 7% |
+| 20 | 27% |
+| 30 | **65%** |
+| 40 | **91%** |
+| 58 (all) | 100% |
+
+Implementation order (extension count): ActionPanel 929 · Action 927 · Icon 854 · List 806 · showToast 751 · Toast 742 · getPreferenceValues 680 · Color 505 · Detail 479 · Form 461 · Keyboard 377 · useNavigation 374 · Clipboard 348 · LocalStorage 328 · confirmAlert 305 · open 276 · environment 275 · Alert 268 · showHUD 260 · LaunchProps 233 · openExtensionPreferences 202 · Image 175 · LaunchType 168 · popToRoot 167 · launchCommand 144 · Cache 142 · closeMainWindow 142 · Grid 129 · MenuBarExtra 101 · getSelectedText 76 · OAuth 63 · openCommandPreferences 62 · Tool 58 · showInFinder 51 · AI 49 · …
+
+`@raycast/utils` names worth testing first: useCachedPromise 286, showFailureToast 220, usePromise 185, useForm 176, useFetch 171, useCachedState 147.
+
+### 4.3 GPUI window (`spikes/gpui-window`)
+- `gpui-ce` 0.3.0 with `gpui_ce_platform` 0.3.0 builds on Rust 1.95 + MSVC 2022 + SDK 26100. The first release build takes ~10+ min; incremental builds take 7–15 s. The exe is 22.8 MB.
+- API gotcha: the inherent `Window::window_handle()` shadows the raw-window-handle trait, so call `HasWindowHandle::window_handle(window)`.
+- **Ctrl+Alt+Space was already taken on this machine.** `RegisterHotKey` failure must surface in the UI, not panic.
+
+| Metric | Measured | Target |
+|---|---|---|
+| hotkey → UI thread | 0.3 ms p50 | — |
+| hotkey → GPUI frame (cloak) | 14.6 ms p50, 16.7 ms p95 | < 16 ms ✓ |
+| hotkey → composited pixel (external harness) | 24.7 ms p50, 33.6 max | resolution limited by `GetPixel` ~1 vsync |
+| foreground acquired | 20/20 | — |
+| idle private memory | 21 MB | < 40 MB ✓ |
+| cold start → window created | 188–240 ms | < 150 ms ✗. Acceptable: start-at-login makes it rare. Revisit with a lazy font/atlas init |
+
+### 4.4 Still open
+- **Raycast hotkey baseline**: it ignores injected keys, so it needs your physical double-taps. Run:
+  `python -I spikes/latency.py raycast.exe manual+win 10`
+- **Elevated foreground windows** (UIPI): hotkey and focus behaviour is untested. Test by opening an admin terminal and pressing the hotkey.
+- Navigation (`useNavigation` / `Action.Push`), `Form`, `Grid`, OAuth: not in the shim yet. These are Phase 3 items.
+- Double-tap modifier hotkeys via `WH_KEYBOARD_LL`: not built.
+
+---
+
+## 5. Build plan
+
+One Rust crate (`src/`) plus `exthost/` (grown from `spikes/exthost`).
+
+### Phase 1: launcher core: **built 2026-11-03** (`src/`, ~900 lines)
+
+Done:
+- GPUI window with DWM cloak toggle, out of taskbar and Alt+Tab
+- `RegisterHotKey` (errors open the window with a notice)
+- shell:AppsFolder scan (208 apps, 1.7 s, off-thread)
+- `nucleo` + frecency, `fend` calculator (50 ms time box)
+- aliases, web fallback
+- `config.toml` with 2 s reload
+- tray (Open / Edit config / Quit), start at login, single instance
+
+Measured: 23 MB private memory idle. Two self-check tests (`cargo test`). The end-to-end check `spikes/e2e.py` passed show, type and copy-result; its focus-return checks were inconclusive with the machine in use.
+
+Deviations from the original list:
+- **no async coordinator**, because every source is sync and sub-ms (added when files or extensions arrive)
+- **frecency in JSON**, not SQLite
+- **no app icons yet**
+- mtime poll instead of a file watcher
+- no app-list disk cache
+
+Lesson: any Win32 call that synchronously sends messages to our window (`SetWindowPos`) must run between GPUI updates. GPUI's window proc re-borrows the app and panics with `RefCell already borrowed`.
+
+Original Phase 1 scope:
+- Window: GPUI, one window, cloak toggle, per-monitor placement on `WM_DISPLAYCHANGE` / `WM_DPICHANGED` only.
+- Hotkey: `RegisterHotKey`, with conflict reported in the UI.
+- Coordinator with a generation counter, `isRelevant` gates, push + 33 ms throttle.
+- App index: Start Menu `.lnk` + `shell:AppsFolder`, cached in SQLite (`rusqlite`).
+- `nucleo` fuzzy matching, frecency `Σ exp(-age_days/14)`, `fend-core` calculator, web fallback, aliases.
+- `config.toml` + hot reload, tray icon, start at login.
+
+### Phase 1b: modifier-only hotkeys
+`WH_KEYBOARD_LL` for double-tap Win/Ctrl. Document that it doesn't fire while an elevated window has focus, unless we later ship a signed UIAccess helper.
+
+### Phase 2: built-ins (2 weeks)
+- File search (Everything SDK → elevated USN helper → `jwalk`).
+- Clipboard history (`AddClipboardFormatListener`, sensitive filter, `ignore_apps`).
+- Snippets, quicklinks, Raycast script commands (`@raycast.*` headers), window snapping.
+
+### Phase 3: extension host (3–4 weeks). Order comes from the §4.2 coverage data
+1. Grow the shim to the top 30 names (65% of Windows extensions): navigation stack, `Form` + `useForm`, `Keyboard` shortcuts, `confirmAlert`/`Alert`, `Image`, `Color`, preferences UI, `launchCommand`, `openExtensionPreferences`.
+2. Top 40 (91%): `Grid`, `MenuBarExtra` (tray), `getSelectedText`, `OAuth` (PKCE + loopback), `showInFinder` → Explorer, `getApplications`.
+3. Rust renderer for the JSON tree, with function props → event messages.
+4. Persist `LocalStorage` and `Cache` to disk per extension, plus `supportPath`.
+5. Install = sparse-clone the extension from `raycast/extensions`, run `npm ci --ignore-scripts && ray build -e dist`, then read the manifest. Show only `platforms` ∋ Windows by default.
+6. Run every Windows extension headless through the host as a smoke test, and record which API names hit `unsupported`. That becomes the regression gate.
+
+### Phase 4: polish
+Settings UI (writes `config.toml`), themes, extension browser, auto-update.
+
+### Skipped on purpose
+AI chat, cloud sync, notes, org features, browser companion extension.

@@ -1,0 +1,13 @@
+# Rust
+/target/
+spikes/gpui-window/target/
+
+# Node
+node_modules/
+
+# Third-party clones and build output used by the Phase 0 spikes
+spikes/vendor/
+spikes/build/
+
+# Python
+__pycache__/
