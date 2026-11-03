@@ -1,7 +1,6 @@
-//! Query -> rows. Every source is in-process and synchronous; a search over a few hundred
-//! catalog items runs in well under a millisecond, so there is no async coordinator.
-// ponytail: sync search on the UI thread. Add a generation-counted async coordinator
-// (open-raycast pattern) when slow sources arrive: files (Phase 2b), extensions (Phase 3).
+//! Query -> rows. Root, clipboard and emoji search run synchronously: a few hundred
+//! catalog items match in well under a millisecond. File search, the one slow source,
+//! runs on its own worker with a generation counter (files.rs).
 
 use std::{
     collections::HashMap,
@@ -11,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use gpui::RenderImage;
+use gpui::{RenderImage, SharedString};
 use nucleo_matcher::{
     Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -21,28 +20,62 @@ use crate::{
     clipboard::Entry,
     commands::{self, Cmd},
     config::Config,
+    scripts::Script,
     win::App,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Act {
     App(String),
+    RunAsAdmin(String),
     Open(String),
+    /// Opens a file or folder; secondary actions reveal or copy its path.
+    File(String),
+    Reveal(String),
     /// Windows Run: a command line.
     Run(String),
     Copy(String),
     Paste(String),
+    /// A clipboard history entry (paste, or delete from history).
+    Clip(String),
+    DeleteClip(String),
     /// Snippet template, expanded at paste time.
     Snippet(String),
+    /// Index into the launcher's script list.
+    Script(usize),
     Cmd(Cmd),
     /// Put text in the search box (quicklink waiting for its argument).
     Fill(String),
 }
 
+impl Act {
+    /// What Enter does, as shown in the footer.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Act::App(_) | Act::Open(_) | Act::File(_) => "Open",
+            Act::RunAsAdmin(_) => "Run as Administrator",
+            Act::Reveal(_) => "Show in Explorer",
+            Act::Run(_) | Act::Script(_) => "Run",
+            Act::Copy(_) => "Copy",
+            Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
+            Act::DeleteClip(_) => "Delete Entry",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji) => "Open",
+            Act::Cmd(_) => "Run Command",
+            Act::Fill(_) => "Type Query",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum Icon {
     Image(Arc<RenderImage>),
-    Glyph(&'static str),
+    Glyph(SharedString),
+}
+
+impl Icon {
+    pub fn glyph(s: impl Into<SharedString>) -> Self {
+        Icon::Glyph(s.into())
+    }
 }
 
 #[derive(Clone)]
@@ -58,9 +91,24 @@ pub struct Item {
 }
 
 impl Item {
-    fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
+    pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
         Self { hay: title.clone(), title, subtitle: subtitle.into(), icon, act, key: None }
+    }
+
+    /// The Ctrl+K action panel: primary action first, then secondary ones.
+    pub fn actions(&self) -> Vec<Act> {
+        let mut acts = vec![self.act.clone()];
+        match &self.act {
+            Act::App(id) => acts.extend([Act::RunAsAdmin(id.clone()), Act::Copy(self.title.clone())]),
+            Act::File(path) => acts.extend([Act::Reveal(path.clone()), Act::Copy(path.clone())]),
+            Act::Open(url) | Act::Run(url) => acts.push(Act::Copy(url.clone())),
+            Act::Copy(text) => acts.push(Act::Paste(text.clone())),
+            Act::Paste(text) => acts.push(Act::Copy(text.clone())),
+            Act::Clip(text) => acts.extend([Act::Copy(text.clone()), Act::DeleteClip(text.clone())]),
+            _ => {}
+        }
+        acts
     }
 
     fn keyed(mut self, key: String) -> Self {
@@ -111,19 +159,21 @@ impl Frecency {
 }
 
 /// Everything root search can find. Rebuilt when apps or config change.
-pub fn catalog(apps: &[App], cfg: &Config) -> Vec<Item> {
+pub fn catalog(apps: &[App], scripts: &[Script], cfg: &Config) -> Vec<Item> {
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
-            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::Glyph("▫"));
+            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::glyph("▫"));
             Item::new(&a.name, "Application", icon, Act::App(a.id.clone())).keyed(a.id.clone())
         })
         .collect();
     for &(cmd, title, words, glyph) in commands::ALL {
-        if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled {
+        if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled
+            || cmd == Cmd::SearchFiles && !cfg.files.enabled
+        {
             continue;
         }
-        items.push(Item::new(title, cmd.subtitle(), Icon::Glyph(glyph), Act::Cmd(cmd)).keyed(cmd.key()).words(words));
+        items.push(Item::new(title, cmd.subtitle(), Icon::glyph(glyph), Act::Cmd(cmd)).keyed(cmd.key()).words(words));
     }
     for q in &cfg.quicklink {
         let act = if q.url.contains("{query}") {
@@ -131,10 +181,15 @@ pub fn catalog(apps: &[App], cfg: &Config) -> Vec<Item> {
         } else {
             Act::Open(q.url.clone())
         };
-        items.push(Item::new(q.title(), "Quicklink", Icon::Glyph("↗"), act).keyed(format!("ql:{}", q.title())).words(&q.keyword));
+        items.push(Item::new(q.title(), "Quicklink", Icon::glyph("↗"), act).keyed(format!("ql:{}", q.title())).words(&q.keyword));
     }
     for s in &cfg.snippet {
-        items.push(Item::new(&s.name, "Snippet", Icon::Glyph("✎"), Act::Snippet(s.text.clone())).keyed(format!("sn:{}", s.name)).words(&s.keyword));
+        items.push(Item::new(&s.name, "Snippet", Icon::glyph("✎"), Act::Snippet(s.text.clone())).keyed(format!("sn:{}", s.name)).words(&s.keyword));
+    }
+    for (i, s) in scripts.iter().enumerate() {
+        let sub = if s.package.is_empty() { "Script Command".to_string() } else { s.package.clone() };
+        let icon = Icon::glyph(s.icon.clone().unwrap_or_else(|| "⌨".into()));
+        items.push(Item::new(&s.title, sub, icon, Act::Script(i)).keyed(format!("sc:{}", s.path)));
     }
     items
 }
@@ -174,23 +229,23 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
 
     let mut top = Vec::new();
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
-        top.push(Item::new(format!("Run {cmdline}"), "Windows Run", Icon::Glyph("›"), Act::Run(cmdline.to_string())));
+        top.push(Item::new(format!("Run {cmdline}"), "Windows Run", Icon::glyph("›"), Act::Run(cmdline.to_string())));
     }
     if let Some((kw, rest)) = q.split_once(' ')
         && let Some(link) = cfg.quicklink.iter().find(|l| !l.keyword.is_empty() && l.keyword.eq_ignore_ascii_case(kw))
         && !rest.trim().is_empty()
     {
         let url = link.url.replace("{query}", &url_encode(rest.trim()));
-        top.push(Item::new(format!("{}: {}", link.title(), rest.trim()), "Quicklink", Icon::Glyph("↗"), Act::Open(url)).keyed(format!("ql:{}", link.title())));
+        top.push(Item::new(format!("{}: {}", link.title(), rest.trim()), "Quicklink", Icon::glyph("↗"), Act::Open(url)).keyed(format!("ql:{}", link.title())));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
-        top.push(Item::new(format!("= {result}"), "Calculator · Enter copies", Icon::Glyph("="), Act::Copy(result)));
+        top.push(Item::new(format!("= {result}"), "Calculator · Enter copies", Icon::glyph("="), Act::Copy(result)));
     }
 
     let fallback = (!cfg.search.fallback.is_empty()).then(|| {
-        Item::new(format!("Search the web for \"{q}\""), "Web", Icon::Glyph("🔍"), Act::Open(cfg.search.fallback.replace("{query}", &url_encode(q))))
+        Item::new(format!("Search the web for \"{q}\""), "Web", Icon::glyph("🔍"), Act::Open(cfg.search.fallback.replace("{query}", &url_encode(q))))
     });
     let room = max.saturating_sub(top.len() + fallback.is_some() as usize);
     top.extend(fuzzy(q, catalog.iter(), frec, matcher).into_iter().take(room).map(|(_, it)| it.clone()));
@@ -211,7 +266,7 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
             3600..86400 => format!("{} h ago", age / 3600),
             _ => format!("{} d ago", age / 86400),
         };
-        let mut it = Item::new(title, when, Icon::Glyph("📋"), Act::Paste(e.text.clone()));
+        let mut it = Item::new(title, when, Icon::glyph("📋"), Act::Clip(e.text.clone()));
         it.hay = e.text.chars().take(500).collect();
         it
     };
@@ -237,7 +292,7 @@ pub fn emoji(query: &str, max: usize, matcher: &mut Matcher) -> Vec<Item> {
             G::Symbols => "Symbols",
             G::Flags => "Flags",
         };
-        let mut it = Item::new(format!("{}  {}", e.as_str(), e.name()), group, Icon::Glyph(e.as_str()), Act::Paste(e.as_str().into()));
+        let mut it = Item::new(format!("{}  {}", e.as_str(), e.name()), group, Icon::glyph(e.as_str()), Act::Paste(e.as_str().into()));
         it.hay = std::iter::once(e.name()).chain(e.shortcodes()).collect::<Vec<_>>().join(" ");
         it
     };
@@ -302,7 +357,12 @@ mod tests {
         )
         .unwrap();
         cfg.max_results = 5;
-        let cat = catalog(&apps, &cfg);
+        let scripts = [crate::scripts::parse("C:\\s\\deploy.ps1", "# @raycast.title Deploy Site\n# @raycast.packageName Web").unwrap()];
+        let cat = catalog(&apps, &scripts, &cfg);
+        let deploy = &root("deploy", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT))[0];
+        assert_eq!((deploy.act.clone(), deploy.subtitle.as_str()), (Act::Script(0), "Web"));
+        let file = Item::new("a.txt", "~", Icon::glyph("📄"), Act::File("C:\\a.txt".into()));
+        assert_eq!(file.actions(), [Act::File("C:\\a.txt".into()), Act::Reveal("C:\\a.txt".into()), Act::Copy("C:\\a.txt".into())]);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let mut frec = Frecency::default();
 
@@ -336,7 +396,8 @@ mod tests {
 
         let clips = [Entry { text: "fn main() {}".into(), at: now() }, Entry { text: "hello world".into(), at: now() - 7200 }];
         let c = clipboard("hel", &clips, 5, &mut m);
-        assert_eq!(c[0].act, Act::Paste("hello world".into()));
+        assert_eq!(c[0].act, Act::Clip("hello world".into()));
+        assert_eq!(c[0].actions().last(), Some(&Act::DeleteClip("hello world".into())));
         assert_eq!(clipboard("", &clips, 5, &mut m)[1].subtitle, "2 h ago");
 
         assert!(emoji("thumbs up", 5, &mut m)[0].title.starts_with('👍'));

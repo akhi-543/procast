@@ -28,6 +28,7 @@ use windows::{
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Cmd {
+    SearchFiles,
     ClipboardHistory,
     ClearClipboardHistory,
     Emoji,
@@ -64,6 +65,7 @@ pub enum Snap {
 
 /// (command, title, extra search words, glyph)
 pub const ALL: &[(Cmd, &str, &str, &str)] = &[
+    (Cmd::SearchFiles, "Search Files", "find documents folders", "📂"),
     (Cmd::ClipboardHistory, "Clipboard History", "paste copy", "📋"),
     (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", "🧹"),
     (Cmd::Emoji, "Search Emoji", "emoji symbols", "😀"),
@@ -106,7 +108,7 @@ impl Cmd {
     pub fn subtitle(self) -> &'static str {
         match self {
             Cmd::Snap(_) => "Window Management",
-            Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "Command",
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji => "Command",
             Cmd::EditConfig | Cmd::ReloadApps | Cmd::Quit => "akscast",
             _ => "System",
         }
@@ -126,7 +128,7 @@ pub fn run(cmd: Cmd, target: HWND) {
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s),
             // Handled on the UI thread.
-            Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::EditConfig | Cmd::ReloadApps | Cmd::Quit => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::Emoji | Cmd::EditConfig | Cmd::ReloadApps | Cmd::Quit => {}
         }
     }
 }

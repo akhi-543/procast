@@ -57,6 +57,11 @@ impl History {
         self.save();
     }
 
+    pub fn remove(&mut self, text: &str) {
+        self.entries.retain(|e| e.text != text);
+        self.save();
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.save();

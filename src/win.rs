@@ -47,6 +47,11 @@ pub enum Msg {
     Apps(Vec<App>),
     Tray(TrayCmd),
     Clip(String),
+    /// File search results for one query generation.
+    Files(u64, Vec<crate::search::Item>),
+    FilesIndexed,
+    /// A script finished: (script index, succeeded, output).
+    ScriptDone(usize, bool, String),
 }
 
 pub enum TrayCmd {
@@ -71,19 +76,20 @@ pub enum Bind {
     Launcher = 1,
     Clipboard = 2,
     Emoji = 3,
+    Files = 4,
 }
 
-const BINDS: [Bind; 3] = [Bind::Launcher, Bind::Clipboard, Bind::Emoji];
+pub const BINDS: [Bind; 4] = [Bind::Launcher, Bind::Clipboard, Bind::Emoji, Bind::Files];
 
 /// Owns RegisterHotKey on a dedicated thread with its own message loop.
 /// `set` re-registers everything; failures are reported, never fatal. Empty spec = unbound.
 pub struct Hotkeys {
     thread: u32,
-    wanted: Arc<Mutex<[String; 3]>>,
+    wanted: Arc<Mutex<[String; 4]>>,
 }
 
 impl Hotkeys {
-    pub fn spawn(specs: [String; 3], tx: UnboundedSender<Msg>) -> Self {
+    pub fn spawn(specs: [String; 4], tx: UnboundedSender<Msg>) -> Self {
         let wanted = Arc::new(Mutex::new(specs));
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let shared = wanted.clone();
@@ -121,7 +127,7 @@ impl Hotkeys {
         Self { thread: tid_rx.recv().unwrap_or(0), wanted }
     }
 
-    pub fn set(&self, specs: [String; 3]) {
+    pub fn set(&self, specs: [String; 4]) {
         *self.wanted.lock().unwrap() = specs;
         unsafe { _ = PostThreadMessageW(self.thread, WM_APP, Default::default(), Default::default()) };
     }
@@ -318,6 +324,23 @@ fn scan_lists_installed_apps() {
 
 pub fn launch_app(id: &str) {
     open(&format!("shell:AppsFolder\\{id}"));
+}
+
+/// Elevated launch (UAC prompt). Works for desktop apps; Store apps can't be elevated.
+pub fn run_as_admin(id: &str) {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        ShellExecuteW(None, w!("runas"), &HSTRING::from(format!("shell:AppsFolder\\{id}")), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Opens Explorer with the item selected.
+pub fn reveal(path: &str) {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let args = HSTRING::from(format!("/select,\"{path}\""));
+        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
+    }
 }
 
 /// ShellExecute for paths, URLs and shell: targets. Lets the started app take focus.

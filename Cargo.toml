@@ -12,6 +12,7 @@ gpui-ce = "=0.3.0"
 gpui_ce_elements = "=0.3.0"
 gpui_ce_platform = "=0.3.0"
 image = { version = "0.25", default-features = false }
+jwalk = "0.8"
 nucleo-matcher = "0.3"
 raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }

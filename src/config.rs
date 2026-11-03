@@ -17,6 +17,8 @@ pub struct Config {
     pub search: Search,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
+    pub files: Files,
+    pub scripts: Scripts,
     /// `[[alias]]` from Phase 1 configs still works.
     #[serde(alias = "alias")]
     pub quicklink: Vec<Quicklink>,
@@ -38,6 +40,55 @@ pub struct Clipboard {
 #[serde(default)]
 pub struct Emoji {
     pub hotkey: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Files {
+    pub enabled: bool,
+    /// Folders to index. Empty = your user folder.
+    pub roots: Vec<String>,
+    /// File or folder names skipped anywhere in the tree.
+    pub exclude: Vec<String>,
+    pub hotkey: String,
+}
+
+impl Default for Files {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            roots: vec![],
+            exclude: ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
+                .map(String::from)
+                .to_vec(),
+            hotkey: String::new(),
+        }
+    }
+}
+
+impl Files {
+    pub fn roots(&self) -> Vec<String> {
+        if self.roots.is_empty() { std::env::var("USERPROFILE").into_iter().collect() } else { self.roots.clone() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct Scripts {
+    /// Folders holding Raycast-format script commands. Empty = %APPDATA%\akscast\scripts.
+    pub dirs: Vec<String>,
+}
+
+impl Scripts {
+    pub fn dirs(&self) -> Vec<String> {
+        if self.dirs.is_empty() {
+            let d = dir().join("scripts");
+            let _ = std::fs::create_dir_all(&d);
+            vec![d.to_string_lossy().into_owned()]
+        } else {
+            self.dirs.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -95,6 +146,8 @@ impl Default for Config {
             search: Search::default(),
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
+            files: Files::default(),
+            scripts: Scripts::default(),
             quicklink: vec![],
             snippet: vec![],
         }
@@ -126,6 +179,16 @@ ignore_apps = ["keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe"]
 
 [emoji]
 hotkey = ""                   # e.g. "Ctrl+Alt+E"
+
+[files]
+enabled = true
+roots = []                    # empty = your user folder; e.g. ["C:\\Users\\you", "D:\\Projects"]
+exclude = ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
+hotkey = ""
+
+[scripts]
+# Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\akscast\scripts
+dirs = []
 
 # Quicklinks: search by name, or type the keyword, a space, then your query.
 [[quicklink]]

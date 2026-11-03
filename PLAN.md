@@ -183,9 +183,10 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | Window management (halves, thirds, maximize, centre, next display) | ✅ | Phase 2a |
 | Emoji picker | ✅ (search + paste) | Phase 2a. Inline `:` autocomplete: Phase 1b |
 | Windows Run | ✅ `>` prefix | Phase 2a |
-| Action panel (Ctrl+K secondary actions) | ❌ | Phase 2b |
-| File search | ❌ | Phase 2b |
-| Script commands | ❌ | Phase 2b |
+| Action panel (Ctrl+K secondary actions) | ✅ (run as admin, reveal, copy path/name, delete clipboard entry) | Phase 2b |
+| File search | ✅ own in-memory index of `[files] roots`, worker thread + generation counter | Phase 2b. Live index (USN/watcher): later |
+| Script commands | ✅ Raycast headers, silent/compact/fullOutput, arguments, needsConfirmation | Phase 2b. Inline/refresh-interval: later |
+| AI (Claude Code / Agent SDK) | research only: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
 | Extensions + store (Raycast API) | spike works (cdnjs) | Phase 3 |
 | Menu-bar extras → tray | ❌ | Phase 3 |
 | Settings window | config.toml only | Phase 4 |
@@ -219,6 +220,28 @@ Not run live on purpose:
 - quicklinks and Run (they open your browser or programs)
 
 These are covered by unit tests up to the Win32 call.
+
+### Phase 2b status (2026-11-03)
+
+Built:
+- **Ctrl+K action panel**: the selected item's actions replace the list; Esc closes it.
+- **File search mode**: a `jwalk` crawl of `[files] roots` (default: your user folder minus AppData, node_modules, .git, …) into memory. A worker thread searches it, only the newest query's results are shown, and the index re-crawls when you open file search and it's more than 2 minutes old.
+- **Script commands**: from `%APPDATA%\akscast\scripts`, with argument prompts and an output view.
+
+Verified:
+- **12/12 e2e checks pass** (`spikes/e2e.py`). New since Phase 2a: file search → Ctrl+K → Copy Path, a fullOutput script, a script with an argument.
+- That run used the previous index layout. After the index was compacted, unit tests pass but the e2e suite has not been rerun.
+- 6 unit tests pass.
+
+Measured:
+- Idle memory is 59.6 MB with ~140k indexed entries; it was 75–79 MB before the index stored each path once.
+- The rest of the index cost scales with `[files] roots`.
+
+Not run live: Run as Administrator (it shows a UAC prompt).
+
+AI research for a later phase is in [docs/ai-research.md](docs/ai-research.md):
+- **Recommendation:** run the Agent SDK (TypeScript) in the Node sidecar, with akscast's own tools exposed as an in-process MCP server and the built-in tools removed.
+- **Licence:** personal use on your own Claude login is fine. Distributing the app needs per-user API keys.
 
 ## 6. Build plan
 
