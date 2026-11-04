@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod apps;
 mod clipboard;
 mod commands;
 mod config;
 mod design;
 mod ext;
 mod files;
+mod keys;
 mod net;
 mod ntfs;
 mod scripts;
@@ -91,6 +93,8 @@ enum Mode {
     Install,
     /// Browsing the Raycast store index.
     Store,
+    /// Running apps, to quit.
+    Running,
 }
 
 impl Mode {
@@ -192,6 +196,11 @@ struct Launcher {
     images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
     /// Store index (None until loaded) and whether a load is running.
     store: Option<Vec<ext::StoreEntry>>,
+    /// Quit Applications: the running apps, once listed (None while loading).
+    running: Option<Vec<(apps::Running, Option<Arc<RenderImage>>)>>,
+    /// Program icons by path, so the running list fills in at once next time.
+    exe_icons: HashMap<String, Option<Arc<RenderImage>>>,
+    autoquit: apps::AutoQuit,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -248,7 +257,10 @@ impl Launcher {
         }
         let mut this = Self {
             input,
-            hotkeys: win::Hotkeys::spawn(hotkey_specs(&cfg), tx.clone()),
+            hotkeys: {
+                keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, tx.clone());
+                win::Hotkeys::spawn(hotkey_specs(&cfg), tx.clone())
+            },
             history: clipboard::History::load(config::dir().join("clipboard.bin"), cfg.clipboard.history),
             files: start_files(&cfg, &tx),
             scripts: scripts::scan(&cfg.scripts.dirs()),
@@ -258,6 +270,9 @@ impl Launcher {
             tx,
             apps: vec![],
             scanned: None,
+            running: None,
+            exe_icons: HashMap::new(),
+            autoquit: apps::AutoQuit::default(),
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -587,6 +602,22 @@ impl Launcher {
                     search::filter(&query, rows, &mut self.matcher)
                 }
             },
+            Mode::Running => match &self.running {
+                None => vec![empty_row(g::CLOCK, "Looking for running apps…".into(), String::new(), vec![])],
+                Some(list) => {
+                    let rows: Vec<Item> = list
+                        .iter()
+                        .map(|(r, icon)| {
+                            let file = std::path::Path::new(&r.exe).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                            let windows = if r.windows.len() > 1 { format!("{} windows", r.windows.len()) } else { String::new() };
+                            Item::new(&r.title, &file, icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP)), Act::QuitApp(r.pid))
+                                .acc(windows)
+                                .with_hay(format!("{} {file}", r.title))
+                        })
+                        .collect();
+                    search::filter(&query, rows, &mut self.matcher)
+                }
+            },
             Mode::Install => {
                 let what = query.trim();
                 let title = if what.is_empty() { "Install an extension".to_string() } else { format!("Install {what}") };
@@ -626,6 +657,7 @@ impl Launcher {
         self.scanned = Some(Instant::now());
         let tx = self.tx.clone();
         let cache = config::dir().join("apps.bin");
+        let (folders, deep) = (self.cfg.apps.folders.clone(), self.cfg.apps.deep);
         let mut known = if fresh_icons { vec![] } else { self.apps.clone() };
         std::thread::spawn(move || {
             if known.is_empty() && !fresh_icons {
@@ -635,6 +667,7 @@ impl Launcher {
                 }
             }
             let mut apps = win::scan_apps();
+            apps.extend(apps::folder_apps(&folders, deep));
             for app in &mut apps {
                 app.icon = known.iter().find(|k| k.id == app.id).and_then(|k| k.icon.clone());
             }
@@ -663,6 +696,9 @@ impl Launcher {
         }
         if mode == Mode::Store {
             self.load_store();
+        }
+        if mode == Mode::Running {
+            self.load_running();
         }
         self.input.update(cx, |s, cx| s.emplace("", cx));
         self.selected = 0;
@@ -1294,6 +1330,16 @@ impl Launcher {
             Act::Cmd(Cmd::Emoji) => return self.set_mode(Mode::Emoji, cx),
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
+            Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
+            Act::QuitApp(pid) => {
+                apps::quit(pid);
+                self.status = Some("Asked to quit; it may ask to save first".into());
+                return self.load_running_after(Duration::from_millis(700));
+            }
+            Act::ForceQuit(pid) => {
+                self.status = Some(if apps::force_quit(pid) { "Force quit".into() } else { "Could not end it (it may run as administrator)".to_string() });
+                return self.load_running_after(Duration::from_millis(300));
+            }
             Act::Install(name) => return self.install(name, cx),
             Act::Cmd(Cmd::ClearClipboardHistory) => self.history.clear(),
             Act::Cmd(Cmd::Settings) => {
@@ -1316,6 +1362,26 @@ impl Launcher {
         self.hide(true, cx);
     }
 
+    /// Lists running apps in the background; icons come from the cache or are read once.
+    fn load_running(&mut self) {
+        self.load_running_after(Duration::ZERO);
+    }
+
+    fn load_running_after(&mut self, delay: Duration) {
+        let (tx, known) = (self.tx.clone(), self.exe_icons.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let list = apps::running().into_iter().map(|r| {
+                let icon = match known.get(&r.exe) {
+                    Some(i) => i.clone(),
+                    None => win::file_icon(&r.exe),
+                };
+                (r, icon)
+            });
+            let _ = tx.unbounded_send(Msg::Running(list.collect()));
+        });
+    }
+
     /// The command a hotkey past `BINDS` runs (None if it's switched off or gone).
     fn hotkey_item(&self, i: usize) -> Option<&Item> {
         let key = self.cfg.launcher.command_hotkeys().nth(i.checked_sub(BINDS.len())?)?.0;
@@ -1325,7 +1391,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -1339,6 +1405,22 @@ impl Launcher {
     /// A command's own hotkey: runs it straight away, opening the launcher only when it must.
     fn run_hotkey(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(it) = self.hotkey_item(i).cloned() else { return };
+        // An app's hotkey brings its open window forward (or hides it) instead of starting another.
+        if let Act::App(id) = &it.act
+            && self.cfg.apps.hotkey_action != "launch"
+        {
+            let open = apps::windows_of(id, win::app_target(id).as_deref());
+            let fg = win::foreground();
+            if self.cfg.apps.hotkey_action == "toggle" && open.contains(&fg) {
+                return apps::minimize(fg);
+            }
+            if let Some(&w) = open.first() {
+                if self.visible {
+                    self.hide(false, cx);
+                }
+                return apps::bring_forward(w);
+            }
+        }
         if self.needs_window(&it.act) {
             self.show(Mode::Root, window, cx);
         } else if !self.visible {
@@ -1482,6 +1564,12 @@ impl Launcher {
                     self.hotkey_errors.clear();
                     self.hotkeys.set(hotkey_specs(&cfg));
                 }
+                if cfg.keyboard != self.cfg.keyboard {
+                    keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, self.tx.clone());
+                }
+                if cfg.apps.folders != self.cfg.apps.folders || cfg.apps.deep != self.cfg.apps.deep {
+                    self.scanned = None;
+                }
                 if cfg.start_at_login != self.cfg.start_at_login {
                     win::set_start_at_login(cfg.start_at_login);
                 }
@@ -1589,11 +1677,22 @@ impl Launcher {
                 if self.scanned.is_none() {
                     self.scan_apps(true, false);
                 }
+                let idle = Duration::from_secs(self.cfg.apps.auto_quit_minutes.max(1) * 60);
+                self.autoquit.tick(&self.cfg.apps.auto_quit, idle, win::foreground());
                 self.tick(cx);
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
                 if self.visible && self.mode == Mode::Ext {
+                    self.refresh(cx);
+                }
+            }
+            Msg::Running(list) => {
+                for (r, icon) in &list {
+                    self.exe_icons.insert(r.exe.clone(), icon.clone());
+                }
+                self.running = Some(list);
+                if self.mode == Mode::Running {
                     self.refresh(cx);
                 }
             }
@@ -1635,6 +1734,7 @@ impl Launcher {
             Mode::Files => Some("Search Files".into()),
             Mode::Install => Some("Install Extension".into()),
             Mode::Store => Some("Extension Store".into()),
+            Mode::Running => Some("Quit Applications".into()),
             Mode::Args => self.pending.as_ref().map(|(i, _)| self.scripts[*i].title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -1652,6 +1752,7 @@ impl Launcher {
             Mode::Files => "Search files…".into(),
             Mode::Install => "Extension name or folder…".into(),
             Mode::Store => "Search the extension store…".into(),
+            Mode::Running => "Search running apps…".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self
                 .pending
@@ -1694,6 +1795,7 @@ impl Launcher {
             Mode::Files => Icon::Fluent(g::FOLDER),
             Mode::Store => Icon::Fluent(g::SHOP),
             Mode::Install => Icon::Fluent(g::DOWNLOAD),
+            Mode::Running => Icon::Fluent(g::CANCEL),
             Mode::Args | Mode::Output => Icon::Fluent(g::COMMAND),
         }
     }

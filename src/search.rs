@@ -64,6 +64,10 @@ pub enum Act {
     Favorite(String, bool),
     /// Leave a root item out of root search, by key.
     Hide(String),
+    /// Ask a running app (by process id) to close its windows.
+    QuitApp(u32),
+    /// End a running app's process.
+    ForceQuit(u32),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -79,7 +83,7 @@ impl Act {
             Act::Copy(_) => "Copy",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps) => "Open",
             Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) => "Run Command",
             Act::ExtFn(_) => "Run Action",
@@ -91,6 +95,8 @@ impl Act {
             Act::Favorite(_, true) => "Add to Favorites",
             Act::Favorite(_, false) => "Remove from Favorites",
             Act::Hide(_) => "Hide from Root Search",
+            Act::QuitApp(_) => "Quit",
+            Act::ForceQuit(_) => "Force Quit",
             Act::None => "",
         }
     }
@@ -179,6 +185,7 @@ impl Item {
             Act::Copy(text) => acts.push(Act::Paste(text.clone())),
             Act::Paste(text) => acts.push(Act::Copy(text.clone())),
             Act::Clip(text) => acts.extend([Act::Copy(text.clone()), Act::DeleteClip(text.clone())]),
+            Act::QuitApp(pid) => acts.push(Act::ForceQuit(*pid)),
             _ => {}
         }
         acts.into_iter().map(|a| (a.label().to_string(), a)).collect()

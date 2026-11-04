@@ -74,6 +74,8 @@ pub enum Msg {
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.
     Store(Vec<crate::ext::StoreEntry>),
+    /// Quit Applications: running apps with their icons.
+    Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
 }
@@ -328,7 +330,7 @@ pub fn load_icons(apps: &mut [App]) {
             s.spawn(move || unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 for app in part.iter_mut() {
-                    let path = HSTRING::from(format!("shell:AppsFolder\\{}", app.id));
+                    let path = HSTRING::from(if Path::new(&app.id).is_absolute() { app.id.clone() } else { format!("shell:AppsFolder\\{}", app.id) });
                     if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&path, None) {
                         app.icon = icon(&item, ICON_PX);
                     }
@@ -336,6 +338,15 @@ pub fn load_icons(apps: &mut [App]) {
             });
         }
     });
+}
+
+/// A file's shell icon (programs, documents).
+pub fn file_icon(path: &str) -> Option<Arc<gpui::RenderImage>> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None).ok()?;
+        icon(&item, ICON_PX)
+    }
 }
 
 /// Source pixels for list icons: 24 logical px look sharp up to 200% scaling.
@@ -532,7 +543,27 @@ fn scan_lists_installed_apps() {
 }
 
 pub fn launch_app(id: &str) {
+    // Apps from extra folders are plain paths.
+    if Path::new(id).is_absolute() {
+        return open(id);
+    }
     open(&format!("shell:AppsFolder\\{id}"));
+}
+
+/// The program a Start menu entry's shortcut points at (None for Store apps).
+pub fn app_target(id: &str) -> Option<String> {
+    use windows::Win32::{Storage::EnhancedStorage::PKEY_Link_TargetParsingPath, UI::Shell::IShellItem2};
+    if Path::new(id).is_absolute() {
+        return Some(id.to_string());
+    }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let item: IShellItem2 = SHCreateItemFromParsingName(&HSTRING::from(format!("shell:AppsFolder\\{id}")), None).ok()?;
+        let s = item.GetString(&PKEY_Link_TargetParsingPath).ok()?;
+        let out = s.to_string().ok();
+        CoTaskMemFree(Some(s.0 as _));
+        out.filter(|p| p.to_lowercase().ends_with(".exe"))
+    }
 }
 
 /// Elevated launch (UAC prompt). Works for desktop apps; Store apps can't be elevated.

@@ -63,18 +63,18 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 |---|---|---|---|---|---|
 | [x] | E1 | Escape: go back vs close window and pop to root | ✅ | S | |
 | [x] | E2 | Navigation bindings: Emacs (Alt+B/F/P/N) or Vim (Alt+H/J/K/L) | ✅ move + back (F/L, open, left out on purpose) | S | |
-| [ ] | E3 | **Hyper key:** Caps Lock (or another key) becomes Ctrl+Alt+Shift+Win | ✗ | M | |
-| [ ] | E4 | Double-tap a modifier to open (Raycast's default is double-tap Win) | ✗ | M | |
+| [x] | E3 | **Hyper key:** Caps Lock (or another key) becomes Ctrl+Alt+Shift+Win | ✅ Caps Lock / Right Alt / Right Ctrl / Scroll Lock; `Hyper+K` hotkeys | M | |
+| [x] | E4 | Double-tap a modifier to open (Raycast's default is double-tap Win) | ✅ Ctrl / Shift / Alt (Win left out: its tap opens Start) | M | |
 | [x] | E5 | Game mode: hotkeys off while a full-screen game is focused | ✅ | S | |
 
 ## F. Applications
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | F1 | App hotkey action: launch new / focus existing / toggle (hide if focused) | ✗ | S | needs D2 |
-| [ ] | F2 | Extra app folders (portable apps), optional deep search | ✗ | S | which folders |
-| [ ] | F3 | Auto-quit apps you haven't used for N minutes | ✗ | M | |
-| [ ] | F4 | "Quit app" / "Force kill process" commands | ✗ | S | |
+| [x] | F1 | App hotkey action: launch new / focus existing / toggle (hide if focused) | ✅ Store apps by app ID, others by program path | S | |
+| [x] | F2 | Extra app folders (portable apps), optional deep search | ✅ Settings → Apps | S | |
+| [x] | F3 | Auto-quit apps you haven't used for N minutes | ✅ listed programs, polite close | M | |
+| [x] | F4 | "Quit app" / "Force kill process" commands | ✅ Quit Applications: Enter quits, Ctrl+K → Force Quit | S | |
 
 ## G. Clipboard history
 

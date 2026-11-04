@@ -59,7 +59,7 @@ struct Row {
     group: &'static str,
 }
 
-const SECTIONS: [&str; 8] = ["General", "Launcher", "Shortcuts", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 9] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
     Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: "" }
@@ -84,6 +84,14 @@ fn choice_label(v: &str) -> String {
         "system" => "Follow Windows".into(),
         "expanded" => "Full list".into(),
         "compact" => "Search bar only".into(),
+        "off" => "Off".into(),
+        "capslock" => "Caps Lock".into(),
+        "rightalt" => "Right Alt".into(),
+        "rightctrl" => "Right Ctrl".into(),
+        "scrolllock" => "Scroll Lock".into(),
+        "launch" => "Start a new one".into(),
+        "focus" => "Switch to its window".into(),
+        "toggle" => "Switch, or hide if in front".into(),
         s if s.ends_with('s') && s[..s.len() - 1].parse::<u32>().is_ok() => format!("{} s", &s[..s.len() - 1]),
         s => {
             let mut c = s.chars();
@@ -107,6 +115,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 vec![
                     row("Open akscast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
                     row("Emoji picker", "emoji.hotkey", Kind::Hotkey, "Opens emoji search straight away. Other commands get hotkeys under Shortcuts."),
+                    row("Double-tap to open", "keyboard.double_tap", Kind::Choice(crate::keys::TAP_KEYS), "Press this key twice quickly to open akscast, besides the hotkey above."),
+                    row("Hyper key", "keyboard.hyper", Kind::Choice(crate::keys::HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
                 ],
             ),
             (
@@ -165,6 +175,31 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 vec![
                     row("Fallback commands", "search.fallbacks", Kind::List, "Offered below every search, in this order. \"web\" or the name of a quicklink with {query}."),
                     row("Web search URL", "search.fallback", Kind::Text, "Used by the \"web\" fallback; {query} becomes what you typed."),
+                ],
+            ),
+        ]),
+        "Apps" => groups(vec![
+            (
+                "Hotkeys",
+                vec![row(
+                    "An app's hotkey",
+                    "apps.hotkey_action",
+                    Kind::Choice(&["launch", "focus", "toggle"]),
+                    "What a hotkey set under Shortcuts does when the app is already open.",
+                )],
+            ),
+            (
+                "More apps",
+                vec![
+                    row("Extra folders", "apps.folders", Kind::List, "Programs and shortcuts in these folders are listed as apps, e.g. D:\\Portable."),
+                    row("Include subfolders", "apps.deep", Kind::Bool, "Also look up to four folders deep."),
+                ],
+            ),
+            (
+                "Quit when unused",
+                vec![
+                    row("Apps to quit", "apps.auto_quit", Kind::List, "Program file names, e.g. teams.exe. They're asked to close once they haven't been in front for a while."),
+                    row("After (minutes)", "apps.auto_quit_minutes", Kind::Number, "How long an app may stay unused, e.g. 60."),
                 ],
             ),
         ]),
@@ -275,6 +310,9 @@ fn hotkey_from(ev: &KeyDownEvent) -> Option<String> {
         }
     };
     let m = &k.modifiers;
+    if m.control && m.alt && m.shift && m.platform {
+        return Some(format!("Hyper+{key}"));
+    }
     let parts: Vec<&str> = [(m.control, "Ctrl"), (m.alt, "Alt"), (m.shift, "Shift"), (m.platform, "Win")].into_iter().filter(|(on, _)| *on).map(|(_, n)| n).collect();
     Some(parts.into_iter().chain([key.as_str()]).collect::<Vec<_>>().join("+"))
 }

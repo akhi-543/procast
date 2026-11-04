@@ -28,6 +28,8 @@ pub struct Config {
     pub scripts: Scripts,
     pub extensions: Extensions,
     pub theme: Theme,
+    pub keyboard: Keyboard,
+    pub apps: Apps,
     /// Per-extension preference values: `[extension.obsidian] notePath = "..."`.
     pub extension: std::collections::HashMap<String, toml::Table>,
     /// `[[alias]]` from Phase 1 configs still works.
@@ -120,6 +122,43 @@ impl Launcher {
 }
 
 pub const POP_TO_ROOT: &[&str] = &["immediately", "5s", "15s", "30s", "60s", "90s", "120s", "180s", "never"];
+
+/// Keys handled by akscast's keyboard hook.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Keyboard {
+    /// A key that acts as Ctrl+Alt+Shift+Win while held: off | capslock | rightalt | rightctrl | scrolllock.
+    pub hyper: String,
+    /// Double-tap this modifier to open akscast: off | ctrl | shift | alt.
+    pub double_tap: String,
+}
+
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self { hyper: "off".into(), double_tap: "off".into() }
+    }
+}
+
+/// Applications in root search.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Apps {
+    /// An app's own hotkey: launch (always a new one) | focus (an open window first) | toggle (hide it if focused).
+    pub hotkey_action: String,
+    /// Extra folders whose programs and shortcuts are listed as apps (portable apps).
+    pub folders: Vec<String>,
+    /// Also look inside subfolders of `folders`.
+    pub deep: bool,
+    /// Program file names closed after this many idle minutes, e.g. ["teams.exe"].
+    pub auto_quit: Vec<String>,
+    pub auto_quit_minutes: u64,
+}
+
+impl Default for Apps {
+    fn default() -> Self {
+        Self { hotkey_action: "focus".into(), folders: vec![], deep: false, auto_quit: vec![], auto_quit_minutes: 60 }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -317,6 +356,8 @@ impl Default for Config {
             scripts: Scripts::default(),
             extensions: Extensions::default(),
             theme: Theme::default(),
+            keyboard: Keyboard::default(),
+            apps: Apps::default(),
             extension: Default::default(),
             quicklink: vec![],
             snippet: vec![],
@@ -355,6 +396,17 @@ game_mode = false             # hotkeys do nothing while a full-screen app or ga
 # Aliases and hotkeys for any item, by key (Settings → Shortcuts edits these):
 # aliases = { "cmd:ClipboardHistory" = "cl" }
 # hotkeys = { "cmd:Snap(LeftHalf)" = "Ctrl+Alt+Left" }
+
+[keyboard]
+hyper = "off"                 # a key that acts as Ctrl+Alt+Shift+Win while held: off | capslock | rightalt | rightctrl | scrolllock
+double_tap = "off"            # double-tap a modifier to open akscast: off | ctrl | shift | alt
+
+[apps]
+hotkey_action = "focus"       # an app's hotkey: launch (new window) | focus (open window first) | toggle (hide if focused)
+folders = []                  # extra folders listed as apps, e.g. ["D:\\Portable"]
+deep = false                  # also look in their subfolders
+auto_quit = []                # program names closed when unused, e.g. ["teams.exe"]
+auto_quit_minutes = 60
 
 [search]
 calculator = true
@@ -517,7 +569,8 @@ pub fn parse_hotkey(s: &str) -> Result<(u32, u32), String> {
             "alt" => mods |= ALT,
             "shift" => mods |= SHIFT,
             "win" | "super" => mods |= WIN,
-            "doubletap" => return Err("double-tap hotkeys are not supported yet (Phase 1b)".into()),
+            "hyper" => mods |= CTRL | ALT | SHIFT | WIN,
+            "doubletap" => return Err("for a double tap, use Settings → General → Double-tap to open".into()),
             key => {
                 if vk.is_some() {
                     return Err(format!("hotkey \"{s}\" has more than one main key"));

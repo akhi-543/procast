@@ -48,6 +48,8 @@ pub enum Cmd {
     BrowseStore,
     /// Install (true) or remove the admin helper for whole-drive file search.
     FastFileSearch(bool),
+    /// List running apps to quit or force-quit.
+    QuitApps,
     Quit,
 }
 
@@ -78,6 +80,7 @@ pub const ALL: &[(Cmd, &str, &str, char)] = &[
     (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", g::DELETE),
     (Cmd::ClearSearchHistory, "Clear Search History", "recent queries up arrow forget", g::DELETE),
     (Cmd::Emoji, "Search Emoji", "emoji symbols", g::EMOJI),
+    (Cmd::QuitApps, "Quit Applications", "close kill force end task running processes", g::CANCEL),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::REFRESH),
@@ -123,7 +126,7 @@ impl Cmd {
         match self {
             Cmd::Snap(_) => "Window Management",
             Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji => "akscast",
-            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "akscast",
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit | Cmd::QuitApps => "akscast",
             _ => "System",
         }
     }
@@ -144,7 +147,7 @@ pub fn run(cmd: Cmd, target: HWND) {
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps => {}
         }
     }
 }
