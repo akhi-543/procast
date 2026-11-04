@@ -156,6 +156,7 @@ pub mod g {
     pub const COMMAND: char = '\u{E756}';
     pub const CALCULATOR: char = '\u{E8EF}';
     pub const GLOBE: char = '\u{E774}';
+    pub const LIGHTBULB: char = '\u{E82F}';
     pub const LINK: char = '\u{E71B}';
     pub const EDIT: char = '\u{E70F}';
     pub const INFO: char = '\u{E946}';

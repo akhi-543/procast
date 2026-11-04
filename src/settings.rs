@@ -172,8 +172,9 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "When nothing matches",
                 vec![
-                    row("Fallback commands", "search.fallbacks", Kind::List, "Offered below every search, in this order. \"web\" or the name of a quicklink with {query}."),
+                    row("Fallback commands", "search.fallbacks", Kind::List, "Offered below every search, in this order. \"web\", \"chatgpt\", \"ai\", or the name of a quicklink with {query}."),
                     row("Web search URL", "search.fallback", Kind::Text, "Used by the \"web\" fallback; {query} becomes what you typed."),
+                    row("Ask AI model", "ai.model", Kind::Choice(&["haiku", "sonnet", "opus"]), "Used by the \"ai\" fallback, on your Claude Code login. Haiku answers fastest."),
                 ],
             ),
         ]),

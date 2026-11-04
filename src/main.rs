@@ -30,7 +30,7 @@ use futures::{
 };
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
+    ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
     actions, div, prelude::*, size, uniform_list,
 };
 use gpui_ce_elements::editable_text::{
@@ -103,6 +103,16 @@ enum Mode {
     Store,
     /// Running apps, to quit.
     Running,
+    /// A Quick AI answer (see `Launcher::ai`).
+    Ai,
+}
+
+/// One Quick AI answer, streaming until `busy` clears.
+struct AiAnswer {
+    id: u64,
+    prompt: String,
+    text: String,
+    busy: bool,
 }
 
 impl Mode {
@@ -232,6 +242,8 @@ struct Launcher {
     pending: Option<(usize, Vec<String>)>,
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
+    ai: Option<AiAnswer>,
+    ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
     status: Option<(Tone, String)>,
@@ -312,6 +324,8 @@ impl Launcher {
             armed: None,
             pending: None,
             output: None,
+            ai: None,
+            ai_scroll: ScrollHandle::new(),
             status: None,
             notice,
             hotkey_errors: vec![],
@@ -589,6 +603,7 @@ impl Launcher {
                 }
                 None => vec![],
             },
+            Mode::Ai => self.ai.iter().filter(|a| !a.text.is_empty()).map(|a| Item::new("Copy answer", "", Icon::Fluent(g::COPY), Act::Copy(a.text.clone()))).collect(),
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
@@ -719,6 +734,9 @@ impl Launcher {
         if mode != Mode::Ext {
             self.stop_ext_view();
         }
+        if mode != Mode::Ai && self.ai.take().is_some() {
+            self.send(json!({"t": "aiStop"}));
+        }
         self.mode = mode;
         self.panel = None;
         if mode == Mode::Files
@@ -805,6 +823,42 @@ impl Launcher {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.hide(true, cx);
         clipboard::paste_soon();
+    }
+
+    // ---- Quick AI -------------------------------------------------------------------
+
+    fn ask(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if !self.ensure_host() {
+            return self.refresh(cx);
+        }
+        self.next_run += 1;
+        let id = self.next_run;
+        self.send(json!({"t": "ai", "id": id, "prompt": prompt, "model": self.cfg.ai.model}));
+        self.ai = Some(AiAnswer { id, prompt, text: String::new(), busy: true });
+        self.ai_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        self.set_mode(Mode::Ai, cx);
+    }
+
+    fn on_ai(&mut self, v: &Value, cx: &mut Context<Self>) {
+        let Some(answer) = self.ai.as_mut().filter(|a| Some(a.id) == v["id"].as_u64()) else { return };
+        if let Some(text) = v["text"].as_str() {
+            answer.text.push_str(text);
+        }
+        if v["t"] == "aiDone" {
+            answer.busy = false;
+            if let Some(e) = v["error"].as_str() {
+                self.status = Some((Tone::Error, e.to_string()));
+            }
+        }
+        self.refresh(cx);
+    }
+
+    /// Up and Down read a long answer.
+    fn scroll_ai(&mut self, dy: f32, cx: &mut Context<Self>) {
+        let (offset, max) = (self.ai_scroll.offset(), self.ai_scroll.max_offset());
+        let y = (offset.y - px(dy)).min(px(0.)).max(-max.y);
+        self.ai_scroll.set_offset(gpui::point(offset.x, y));
+        cx.notify();
     }
 
     // ---- extensions -----------------------------------------------------------------
@@ -1072,9 +1126,15 @@ impl Launcher {
                     }
                 }
             }
+            "aiDelta" | "aiDone" => self.on_ai(&v, cx),
             "hostExit" => {
                 self.host = None;
                 self.bg_runs.clear();
+                if let Some(answer) = self.ai.as_mut().filter(|a| a.busy) {
+                    answer.busy = false;
+                    self.status = Some((Tone::Error, "The extension host stopped".into()));
+                    self.refresh(cx);
+                }
                 if self.extv.take().is_some() {
                     self.notice = Some("The extension host stopped".into());
                     self.set_mode(Mode::Root, cx);
@@ -1385,6 +1445,7 @@ impl Launcher {
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
+            Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
                 apps::quit(pid);
                 self.status = Some((Tone::Info, "Asked to quit; it may ask to save first".into()));
@@ -1791,6 +1852,7 @@ impl Launcher {
             Mode::Running => Some("Quit Applications".into()),
             Mode::Args => self.pending.as_ref().map(|(i, _)| self.scripts[*i].title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
+            Mode::Ai => self.ai.as_ref().map(|a| a.prompt.clone()),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
                 e.view.title.clone().unwrap_or_else(|| x.title.clone())
@@ -1818,6 +1880,7 @@ impl Launcher {
                 .unwrap_or_default()
                 .into(),
             Mode::Output => "Enter copies the output".into(),
+            Mode::Ai => "Enter copies the answer, Esc goes back".into(),
         }
     }
 
@@ -1857,6 +1920,7 @@ impl Launcher {
             Mode::Install => Icon::Fluent(g::DOWNLOAD),
             Mode::Running => Icon::Fluent(g::CANCEL),
             Mode::Args | Mode::Output => Icon::Fluent(g::COMMAND),
+            Mode::Ai => Icon::Fluent(g::LIGHTBULB),
         }
     }
 
@@ -1964,9 +2028,10 @@ impl Launcher {
             .into_any_element()
     }
 
-    fn render_markdown(md: &str, metadata: &[(String, String)], t: &Tokens, id: &'static str) -> gpui::AnyElement {
+    fn render_markdown(md: &str, metadata: &[(String, String)], t: &Tokens, id: &'static str, scroll: Option<&ScrollHandle>) -> gpui::AnyElement {
         div()
             .id(id)
+            .when_some(scroll, |d, h| d.track_scroll(h))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -2088,6 +2153,7 @@ impl Render for Launcher {
                 "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
                 "panel": self.panel.is_some(),
                 "footer": [self.footer_left(), footer_action.clone()],
+                "ai": self.ai.as_ref().map(|a| json!({"text": a.text, "busy": a.busy})),
                 "notice": self.notice,
                 "view": view.as_ref().map(|v| &v.kind),
                 "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
@@ -2230,12 +2296,17 @@ impl Render for Launcher {
 
         // ---- body ----
         let body = match (&empty, &view) {
+            _ if self.mode == Mode::Ai => {
+                let answer = self.ai.as_ref();
+                let md = answer.filter(|a| !a.text.is_empty() || !a.busy).map_or("Thinking…", |a| &a.text);
+                Self::render_markdown(md, &[], &t, "ai", Some(&self.ai_scroll))
+            }
             (Some(e), _) => {
                 let glyph = if let Icon::Fluent(c) = e.icon { c } else { g::SEARCH };
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
             (_, Some(v)) if v.kind == "Form" => self.render_form(&t),
-            (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail"),
+            (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail", None),
             (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
                 let md = it.and_then(|it| it.detail.clone()).unwrap_or_default();
@@ -2245,7 +2316,7 @@ impl Render for Launcher {
                     .min_h_0()
                     .flex()
                     .child(div().w(px(base_width(&self.cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
-                    .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(Self::render_markdown(&md, &meta, &t, "item-detail")))
+                    .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(Self::render_markdown(&md, &meta, &t, "item-detail", None)))
                     .into_any_element()
             }
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
@@ -2506,6 +2577,9 @@ impl Render for Launcher {
             .border_color(t.border)
             .rounded(px(8.))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                if this.panel.is_none() && this.mode == Mode::Ai {
+                    return this.scroll_ai(ROW * 3., cx);
+                }
                 if this.panel.is_none() && this.is_form() {
                     return this.move_field(1, window, cx);
                 }
@@ -2522,6 +2596,9 @@ impl Render for Launcher {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
+                if this.panel.is_none() && this.mode == Mode::Ai {
+                    return this.scroll_ai(-ROW * 3., cx);
+                }
                 if this.panel.is_none() && this.is_form() {
                     return this.move_field(-1, window, cx);
                 }

@@ -45,6 +45,8 @@ pub enum Act {
     /// Index into the launcher's script list.
     Script(usize),
     Cmd(Cmd),
+    /// Ask Claude; the answer streams into its own view.
+    Ask(String),
     /// Put text in the search box (quicklink waiting for its argument).
     Fill(String),
     /// Start extension command (extension index, command index).
@@ -80,6 +82,7 @@ impl Act {
             Act::RunAsAdmin(_) => "Run as Administrator",
             Act::Reveal(_) => "Show in Explorer",
             Act::Run(_) | Act::Script(_) => "Run",
+            Act::Ask(_) => "Ask",
             Act::Copy(_) => "Copy",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
@@ -416,8 +419,13 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         .fallbacks
         .iter()
         .filter_map(|name| {
+            if name.eq_ignore_ascii_case("ai") {
+                return Some(Item::new("Ask AI", "", Icon::Fluent(g::LIGHTBULB), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
+            }
             let (title, url, glyph, kind) = if name.eq_ignore_ascii_case("web") {
                 (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), g::GLOBE, "Web"))?
+            } else if name.eq_ignore_ascii_case("chatgpt") {
+                ("Search with ChatGPT".to_string(), "https://chatgpt.com/?q={query}".to_string(), g::SEARCH, "Web")
             } else {
                 let l = cfg.quicklink.iter().find(|l| l.title().eq_ignore_ascii_case(name) && l.url.contains("{query}"))?;
                 (l.title().to_string(), l.url.clone(), g::LINK, "Quicklink")
@@ -614,7 +622,7 @@ mod tests {
 
         let r = root("vsc", &cat, &cfg, &frec, &mut m);
         assert_eq!(r[0].title, "Visual Studio Code");
-        assert_eq!(r.last().unwrap().accessory, "Web");
+        assert_eq!(r.last().unwrap().accessory, "AI");
         assert_eq!(r[0].section.as_deref(), Some("Results"));
         assert_eq!(r.last().unwrap().section.as_deref(), Some("Use \"vsc\" with"));
         assert!(r.len() <= 5);
@@ -676,7 +684,7 @@ mod tests {
         let mut cfg = crate::config::parse(
             "[launcher]\nfavorites = [\"app:Photos\"]\nhidden = [\"app:Paint\"]\ndisabled = [\"cmd:Lock\", \"ext:todo\"]\n\
              aliases = { \"app:Paint\" = \"pt\", \"cmd:Emoji\" = \"em\" }\n\
-             [search]\nfallbacks = [\"GitHub\", \"web\"]\n\
+             [search]\nfallbacks = [\"GitHub\", \"chatgpt\", \"web\", \"ai\"]\n\
              [[quicklink]]\nname = \"GitHub\"\nurl = \"https://github.com/search?q={query}\"",
         )
         .unwrap();
@@ -697,7 +705,10 @@ mod tests {
         let hits = root("ntpd", &cat, &cfg, &frec, &mut m);
         assert_eq!(hits[0].title, "Notepad");
         let tail: Vec<&str> = hits.iter().filter(|h| h.section.as_deref() == Some("Use \"ntpd\" with")).map(|h| h.title.as_str()).collect();
-        assert_eq!(tail, ["GitHub", "Search the web"], "fallbacks in configured order");
+        assert_eq!(tail, ["GitHub", "Search with ChatGPT", "Search the web", "Ask AI"], "fallbacks in configured order");
+        let gpt = root("a b", &cat, &cfg, &frec, &mut m).into_iter().find(|h| h.title == "Search with ChatGPT").unwrap();
+        assert_eq!(gpt.act, Act::Open("https://chatgpt.com/?q=a%20b".into()), "the query is encoded into the URL");
+        assert!(root("a b", &cat, &cfg, &frec, &mut m).iter().any(|h| h.act == Act::Ask("a b".into())), "Ask AI takes the query as typed");
 
         cfg.launcher.sensitivity = "low".into();
         assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");

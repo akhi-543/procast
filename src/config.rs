@@ -22,6 +22,7 @@ pub struct Config {
     pub window_mode: String,
     pub launcher: Launcher,
     pub search: Search,
+    pub ai: Ai,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
     pub files: Files,
@@ -333,7 +334,7 @@ pub struct Search {
     pub calculator: bool,
     /// `{query}` is replaced with the URL-encoded query. Empty disables the web row.
     pub fallback: String,
-    /// Rows offered for any query, in order: "web" (the URL above) or a quicklink's name.
+    /// Rows offered for any query, in order: "web" (the URL above), "chatgpt", "ai", or a quicklink's name.
     pub fallbacks: Vec<String>,
 }
 
@@ -350,6 +351,7 @@ impl Default for Config {
             window_mode: "expanded".into(),
             launcher: Launcher::default(),
             search: Search::default(),
+            ai: Ai::default(),
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
             files: Files::default(),
@@ -365,9 +367,22 @@ impl Default for Config {
     }
 }
 
+/// Quick AI, offered by the "ai" fallback row.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Ai {
+    pub model: String,
+}
+
+impl Default for Ai {
+    fn default() -> Self {
+        Self { model: "haiku".into() }
+    }
+}
+
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: vec!["web".into()] }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec() }
     }
 }
 
@@ -411,7 +426,10 @@ auto_quit_minutes = 60
 [search]
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
-fallbacks = ["web"]           # rows for any query, in order: "web" or a quicklink name with {query}
+fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", or a quicklink name with {query}
+
+[ai]
+model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus
 
 [clipboard]
 enabled = true                # text history, encrypted at rest for your Windows account

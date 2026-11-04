@@ -189,6 +189,22 @@ api.anthropic.com  (your claude.ai login for personal use; API key if distribute
 6. **Agents** (subagents), later.
 7. **Distribution gate:** legal review and bring-your-own API key before sharing.
 
+## Spike results (2026-11-04)
+
+`spikes/ai/latency.mjs`, `@anthropic-ai/claude-agent-sdk` 0.3.318, Windows 11, subscription login, haiku, prompt "Reply with exactly: ok".
+
+| Setup | First token | Notes |
+|---|---|---|
+| SDK, cold (bundled binary) | 4.7–6.5 s | `init` at 2.8–4.3 s, then about 2 s to the API |
+| SDK, cold (installed `claude.exe`) | 4.8–9.5 s | no gain |
+| `claude -p`, same flags | 5.5–6.3 s | no gain |
+| `prewarm()` then claim, after 3 s idle | 2.9 s | `prewarm()` itself takes 3.8 s; about 240 MB parked; `@alpha` |
+
+- **`tools: []` is not enough.** With a claude.ai login, connectors still reached the model on some runs (Calendar, Docs, ...; `mcp=10`), racing startup. `strictMcpConfig: true` plus `ENABLE_CLAUDEAI_MCP_SERVERS=false` gave `tools=[] mcp=0` on 6 of 6 runs. Keep both on every call.
+- The `result` message lands about 4 s after `message_stop` because of a `post_turn_summary` step. Treat `message_stop` as done.
+- `AbortController.abort()` works on Windows: the `claude.exe` is gone within 4.5 s.
+- `apiKeySource=none`: the subscription is used. The bundled binary is 327 MB of the 381 MB install.
+
 ## Risks and unknowns
 
 - **Distribution terms** (§2). This is the biggest risk.

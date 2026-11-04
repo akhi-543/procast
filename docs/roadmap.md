@@ -187,7 +187,7 @@ Each of these could also be a store extension instead of built-in code.
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | U1 | Quick AI: ask from the search bar, answer streams into a detail view | ✗ | M | **backend:** Claude Code CLI (your subscription) or API key |
+| [x] | U1 | Quick AI: ask from the search bar, answer streams into a detail view | ✅ "Ask AI" fallback row, Agent SDK on your Claude Code login, no tools; first token about 5–13 s (cold) | M | |
 | [ ] | U2 | AI commands: saved prompts over selected text / clipboard | ✗ | M | your prompts |
 | [ ] | U3 | AI chat window with history | ✗ | L | |
 | [ ] | U4 | Dictation (speech to text) | ✗ | L | local (Whisper) or cloud |
