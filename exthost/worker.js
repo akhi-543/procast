@@ -1,4 +1,4 @@
-// Runs one extension command. Redirects @raycast/api and react to akscast's copies.
+// Runs one extension command. Redirects @raycast/api and react to procast's copies.
 const Module = require("node:module");
 const path = require("node:path");
 const { parentPort, workerData } = require("node:worker_threads");
@@ -21,7 +21,7 @@ const mod = require(workerData.entry);
 const command = mod.default ?? mod;
 const props = { arguments: workerData.arguments, launchType: workerData.launchType, launchContext: workerData.context };
 
-// Menu-bar commands are components too; akscast draws their tree as a tray menu.
+// Menu-bar commands are components too; procast draws their tree as a tray menu.
 if (workerData.mode === "view" || workerData.mode === "menu-bar") {
   api.__mount(command, props);
 } else {

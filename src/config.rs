@@ -1,4 +1,4 @@
-//! `%APPDATA%\akscast\config.toml`: the only settings store. Unknown keys are ignored,
+//! `%APPDATA%\procast\config.toml`: the only settings store. Unknown keys are ignored,
 //! so settings for later phases can already live in the file.
 
 use std::{collections::BTreeMap, fs, path::PathBuf, time::SystemTime};
@@ -14,7 +14,7 @@ pub struct Config {
     pub width: f32,
     pub max_results: usize,
     pub start_at_login: bool,
-    /// The akscast icon in the notification area.
+    /// The procast icon in the notification area.
     pub tray: bool,
     /// Interface size: small | default | large.
     pub size: String,
@@ -123,13 +123,13 @@ impl Launcher {
 
 pub const POP_TO_ROOT: &[&str] = &["immediately", "15s", "30s", "60s", "120s", "180s", "never"];
 
-/// Keys handled by akscast's keyboard hook.
+/// Keys handled by procast's keyboard hook.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Keyboard {
     /// A key that acts as Ctrl+Alt+Shift+Win while held: off | capslock | rightalt | rightctrl | scrolllock.
     pub hyper: String,
-    /// Double-tap this modifier to open akscast: off | ctrl | shift | alt.
+    /// Double-tap this modifier to open procast: off | ctrl | shift | alt.
     pub double_tap: String,
 }
 
@@ -228,8 +228,8 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             mode: "system".into(),
-            dark: "akscast Dark".into(),
-            light: "akscast Light".into(),
+            dark: "procast Dark".into(),
+            light: "procast Light".into(),
             background: None,
             text: None,
             muted: None,
@@ -275,7 +275,7 @@ impl Default for Extensions {
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Scripts {
-    /// Folders holding Raycast-format script commands. Empty = %APPDATA%\akscast\scripts.
+    /// Folders holding Raycast-format script commands. Empty = %APPDATA%\procast\scripts.
     pub dirs: Vec<String>,
 }
 
@@ -371,7 +371,7 @@ impl Default for Search {
     }
 }
 
-const TEMPLATE: &str = r##"# akscast settings. Saved changes apply within ~2 seconds.
+const TEMPLATE: &str = r##"# procast settings. Saved changes apply within ~2 seconds.
 hotkey = "Alt+Space"          # e.g. "Ctrl+Shift+Space", "Alt+F1"
 monitor = "cursor"            # cursor | active (screen of the focused window) | primary
 width = 0.5                   # share of the screen's width (same look on every monitor); above 1 = pixels
@@ -399,7 +399,7 @@ game_mode = false             # hotkeys do nothing while a full-screen app or ga
 
 [keyboard]
 hyper = "off"                 # a key that acts as Ctrl+Alt+Shift+Win while held: off | capslock | rightalt | rightctrl | scrolllock
-double_tap = "off"            # double-tap a modifier to open akscast: off | ctrl | shift | alt
+double_tap = "off"            # double-tap a modifier to open procast: off | ctrl | shift | alt
 
 [apps]
 hotkey_action = "focus"       # an app's hotkey: launch (new window) | focus (open window first) | toggle (hide if focused)
@@ -432,7 +432,7 @@ drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = eve
 skip = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData']  # left out of whole-drive search (and memory)
 
 [scripts]
-# Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\akscast\scripts
+# Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\procast\scripts
 dirs = []
 
 # Raycast extensions: run "Install Extension" and type a store name (e.g. obsidian) or a folder.
@@ -444,8 +444,8 @@ menu_bar = false              # also show menu-bar commands as tray icons
 
 [theme]
 mode = "system"               # system (follow Windows) | dark | light
-dark = "akscast Dark"         # akscast Dark | Midnight | Graphite | Forest
-light = "akscast Light"       # akscast Light | Paper | Mist
+dark = "procast Dark"         # procast Dark | Midnight | Graphite | Forest
+light = "procast Light"       # procast Light | Paper | Mist
 # Any colour can be overridden ("#rrggbb" or "#rrggbbaa"):
 # background = "#1e1e2e"
 # text = "#cdd6f4"
@@ -478,9 +478,55 @@ keyword = ";date"
 text = "{date}"
 "##;
 
+fn appdata() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into())
+}
+
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
-    base.join("akscast")
+    appdata().join("procast")
+}
+
+/// The product's name before it became procast. Only migration code uses it.
+pub const OLD_NAME: &str = "akscast";
+
+/// First start after the rename: the old data folder (settings, clipboard history,
+/// extensions, caches) becomes procast's, and settings that named the old folder or the old
+/// theme names are updated. Nothing happens once the new folder exists.
+pub fn migrate_old_data() {
+    let (old, new) = (appdata().join(OLD_NAME), dir());
+    if new.exists() || !old.exists() {
+        return;
+    }
+    // Renaming fails while the old app still has files open; copy instead then.
+    if fs::rename(&old, &new).is_err() && copy_dir(&old, &new).is_err() {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path()) else { return };
+    let (old_s, new_s) = (old.to_string_lossy().into_owned(), new.to_string_lossy().into_owned());
+    let fixed = text
+        .replace(&format!("\"{OLD_NAME} Dark\""), "\"procast Dark\"")
+        .replace(&format!("\"{OLD_NAME} Light\""), "\"procast Light\"")
+        .replace(&format!("# {OLD_NAME} settings."), "# procast settings.")
+        // Paths are written either escaped ("C:\\Users\\...") or literal ('C:\Users\...').
+        .replace(&old_s.replace('\\', "\\\\"), &new_s.replace('\\', "\\\\"))
+        .replace(&old_s, &new_s);
+    if fixed != text {
+        let _ = fs::write(path(), fixed);
+    }
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for e in fs::read_dir(from)?.flatten() {
+        let target = to.join(e.file_name());
+        if e.path().is_dir() {
+            copy_dir(&e.path(), &target)?;
+        } else {
+            // A locked file (e.g. an open log) is skipped rather than stopping the move.
+            let _ = fs::copy(e.path(), target);
+        }
+    }
+    Ok(())
 }
 
 pub fn path() -> PathBuf {
@@ -654,7 +700,7 @@ mod tests {
         let edited = write_value(&edited, &p("clipboard.history"), 100i64.into()).unwrap();
         let edited = write_value(&edited, &p("extension.youtube.apikey"), "abc".into()).unwrap();
         assert!(edited.contains("hotkey = \"Ctrl+Alt+K\"          # e.g."), "trailing comment kept:\n{edited}");
-        assert!(edited.contains("# akscast settings."));
+        assert!(edited.contains("# procast settings."));
         let c = parse(&edited).unwrap();
         assert_eq!((c.hotkey.as_str(), c.clipboard.history), ("Ctrl+Alt+K", 100));
         assert_eq!(c.extension["youtube"]["apikey"].as_str(), Some("abc"));

@@ -86,7 +86,7 @@ fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
 
 fn protect(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = CRYPT_INTEGER_BLOB::default();
-    unsafe { CryptProtectData(&blob(data), w!("akscast clipboard"), None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out).ok()? };
+    unsafe { CryptProtectData(&blob(data), w!("procast clipboard"), None, None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out).ok()? };
     Some(take(out))
 }
 

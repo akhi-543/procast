@@ -54,9 +54,9 @@ use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
 use win::{BINDS, Bind, Msg, TrayCmd};
 
-actions!(akscast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
+actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
-actions!(akscast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
+actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
 use design::{BAR, FOOTER, LIST_PAD, ROW};
 
@@ -241,7 +241,7 @@ struct Launcher {
     hwnd: HWND,
     prev: HWND,
     visible: bool,
-    /// The akscast notification-area icon (Settings → General → Show in tray).
+    /// The procast notification-area icon (Settings → General → Show in tray).
     tray_icon: Option<TrayIcon>,
     /// When the window last closed, for "pop to root" after a timeout.
     hidden_at: Option<Instant>,
@@ -757,7 +757,7 @@ impl Launcher {
             self.search_pos = None;
             self.set_mode(mode, cx);
         }
-        if let Ok(view) = std::env::var("AKSCAST_SHOW") {
+        if let Ok(view) = std::env::var("PROCAST_SHOW") {
             let mode = match view.as_str() {
                 "clipboard" => Mode::Clipboard,
                 "emoji" => Mode::Emoji,
@@ -766,7 +766,7 @@ impl Launcher {
                 _ => Mode::Root,
             };
             self.set_mode(mode, cx);
-            let q = std::env::var("AKSCAST_QUERY").unwrap_or_default();
+            let q = std::env::var("PROCAST_QUERY").unwrap_or_default();
             self.input.update(cx, |s, cx| s.emplace(&q, cx));
         }
         self.height = self.target_height(cx);
@@ -776,8 +776,8 @@ impl Launcher {
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
         self.scan_apps(false, false);
-        // AKSCAST_SHOW: the window was placed before its query existed.
-        if std::env::var_os("AKSCAST_SHOW").is_some() {
+        // PROCAST_SHOW: the window was placed before its query existed.
+        if std::env::var_os("PROCAST_SHOW").is_some() {
             self.height = 0.;
             self.request_resize(cx);
         }
@@ -951,7 +951,7 @@ impl Launcher {
             .filter(|p| p.exists())
             .or_else(|| ext.icon.clone());
         let icon = icon_path.and_then(|p| ext::load_rgba(&p)).and_then(|(rgba, w, h)| TrayImage::from_rgba(rgba, w, h).ok());
-        let tooltip = [bar.tooltip.as_str(), bar.title.as_str(), cmd_title.as_str()].into_iter().find(|t| !t.is_empty()).unwrap_or("akscast").to_string();
+        let tooltip = [bar.tooltip.as_str(), bar.title.as_str(), cmd_title.as_str()].into_iter().find(|t| !t.is_empty()).unwrap_or("procast").to_string();
 
         match self.trays.get_mut(&key) {
             Some((r, tray)) => {
@@ -1047,7 +1047,7 @@ impl Launcher {
                         let apps: Vec<Value> = self.apps.iter().map(|a| json!({"name": a.name, "path": format!("shell:AppsFolder\\{}", a.id), "bundleId": a.id})).collect();
                         self.reply(run, id, Ok(json!(apps)));
                     }
-                    m => self.reply(run, id, Err(format!("{m} is not supported in akscast yet"))),
+                    m => self.reply(run, id, Err(format!("{m} is not supported in procast yet"))),
                 }
             }
             "error" if ui => {
@@ -1501,7 +1501,7 @@ impl Launcher {
         let bounds = Bounds::centered(None, size(px(880.), px(620.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions { title: Some("akscast Settings".into()), ..Default::default() }),
+            titlebar: Some(gpui::TitlebarOptions { title: Some("procast Settings".into()), ..Default::default() }),
             windows_window_background: gpui::WindowsWindowBackground::MicaBackdrop,
             ..Default::default()
         };
@@ -1542,7 +1542,7 @@ impl Launcher {
             return;
         }
         let Some(host_dir) = ext::host_dir() else {
-            self.notice = Some("exthost folder not found next to akscast.exe".into());
+            self.notice = Some("exthost folder not found next to procast.exe".into());
             return cx.notify();
         };
         let (node, tx, dir) = (self.cfg.extensions.node.clone(), self.tx.clone(), ext::dir());
@@ -1841,7 +1841,7 @@ impl Launcher {
         }
         match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
             Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
-            _ => "akscast".into(),
+            _ => "procast".into(),
         }
     }
 
@@ -2025,16 +2025,16 @@ fn act_glyph(act: &Act) -> char {
     }
 }
 
-/// Test seam: with AKSCAST_E2E=1, each render writes what's on screen to
+/// Test seam: with PROCAST_E2E=1, each render writes what's on screen to
 /// %TEMP%\<file> so spikes/e2e.py can assert on it.
 fn dump_ui(file: &str, state: Value) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("AKSCAST_E2E").is_some()) {
+    if *ON.get_or_init(|| std::env::var_os("PROCAST_E2E").is_some()) {
         let _ = std::fs::write(std::env::temp_dir().join(file), state.to_string());
     }
 }
 
-/// %APPDATA%\akscast\extensions.log: extension errors and console output.
+/// %APPDATA%\procast\extensions.log: extension errors and console output.
 fn ext_log(who: &str, text: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(config::dir().join("extensions.log")) {
@@ -2075,7 +2075,7 @@ impl Render for Launcher {
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
         dump_ui(
-            "akscast-ui.json",
+            "procast-ui.json",
             json!({
                 "visible": self.visible,
                 "bg": format!("{:?}", t.bg),
@@ -2604,7 +2604,7 @@ fn tray_icon_image() -> TrayImage {
 }
 
 fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
-    let open = MenuItem::new("Open akscast", true, None);
+    let open = MenuItem::new("Open procast", true, None);
     let settings = MenuItem::new("Settings…", true, None);
     let edit = MenuItem::new("Edit config.toml", true, None);
     let quit = MenuItem::new("Quit", true, None);
@@ -2630,24 +2630,25 @@ fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
         let _ = menu_tx.unbounded_send(Msg::Tray(cmd));
     }));
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-        // Only akscast's own icon opens the launcher; extension icons just show their menu.
+        // Only procast's own icon opens the launcher; extension icons just show their menu.
         if let TrayIconEvent::Click { id, button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e
-            && id.0 == "akscast"
+            && id.0 == "procast"
         {
             let _ = tx.unbounded_send(Msg::Tray(TrayCmd::Open));
         }
     }));
-    TrayIconBuilder::new().with_id("akscast").with_menu(Box::new(menu)).with_tooltip("akscast").with_icon(tray_icon_image()).build().ok()
+    TrayIconBuilder::new().with_id("procast").with_menu(Box::new(menu)).with_tooltip("procast").with_icon(tray_icon_image()).build().ok()
 }
 
 fn main() {
+    config::migrate_old_data();
     // The whole-drive file index helper (see ntfs.rs).
     match std::env::args().nth(1).as_deref() {
         Some("--indexer") => return ntfs::serve(),
         Some(flag @ ("--install-indexer" | "--uninstall-indexer")) => {
             let done = if flag == "--install-indexer" { ntfs::install() } else { ntfs::uninstall() };
             if let Err(e) = done {
-                let _ = std::fs::write(std::env::temp_dir().join("akscast-indexer-error.txt"), e);
+                let _ = std::fs::write(std::env::temp_dir().join("procast-indexer-error.txt"), e);
                 std::process::exit(1);
             }
             return;
@@ -2690,6 +2691,9 @@ fn main() {
         ]);
 
         let (cfg, notice) = match config::load() {
+            Ok(cfg) if cfg.files.ntfs && ntfs::old_helper_installed() => {
+                (cfg, Some("Whole-drive file search is off since the rename to procast. Run \"Enable Fast File Search\" once to turn it back on.".into()))
+            }
             Ok(cfg) => (cfg, None),
             Err(e) => (Config::default(), Some(e)),
         };
@@ -2723,11 +2727,11 @@ fn main() {
             this.tray_icon = tray;
             this.scan_apps(true, false);
             // For screenshots and checks of the settings window without clicking through.
-            if std::env::var_os("AKSCAST_OPEN_SETTINGS").is_some() {
+            if std::env::var_os("PROCAST_OPEN_SETTINGS").is_some() {
                 let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Settings));
             }
-            // AKSCAST_SHOW=root|clipboard|emoji|files|running with AKSCAST_QUERY: opens there.
-            if std::env::var_os("AKSCAST_SHOW").is_some() {
+            // PROCAST_SHOW=root|clipboard|emoji|files|running with PROCAST_QUERY: opens there.
+            if std::env::var_os("PROCAST_SHOW").is_some() {
                 let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Open));
             }
         });

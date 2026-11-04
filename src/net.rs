@@ -1,4 +1,4 @@
-//! The two things akscast fetches: daily currency rates for the calculator (European
+//! The two things procast fetches: daily currency rates for the calculator (European
 //! Central Bank reference rates, per 1 EUR) and web images extensions show.
 
 use std::{

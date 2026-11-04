@@ -137,7 +137,7 @@ impl Hotkeys {
                     }
                     let status = parse_hotkey(spec).and_then(|key| {
                         if taken.contains(&key) {
-                            return Err(format!("hotkey {spec} is set twice in akscast; change one in Settings → Shortcuts"));
+                            return Err(format!("hotkey {spec} is set twice in procast; change one in Settings → Shortcuts"));
                         }
                         taken.push(key);
                         RegisterHotKey(None, i as i32 + 1, HOT_KEY_MODIFIERS(key.0) | MOD_NOREPEAT, key.1)
@@ -391,7 +391,7 @@ fn icon(item: &IShellItem, px: i32) -> Option<Arc<gpui::RenderImage>> {
     }
 }
 
-/// The app list with icons, cached so apps are searchable the moment akscast starts.
+/// The app list with icons, cached so apps are searchable the moment procast starts.
 /// Layout: per app, name and id as u32-length strings, then a flag and 48×48 RGBA.
 pub fn save_apps(path: &Path, apps: &[App]) -> std::io::Result<()> {
     let mut out = Vec::with_capacity(apps.len() * (ICON_PX * ICON_PX * 4 + 64) as usize);
@@ -574,7 +574,7 @@ pub fn run_as_admin(id: &str) {
     }
 }
 
-/// Runs akscast itself elevated with one argument (Windows shows the admin prompt).
+/// Runs procast itself elevated with one argument (Windows shows the admin prompt).
 pub fn run_self_as_admin(arg: &str) {
     let Ok(exe) = std::env::current_exe() else { return };
     unsafe {
@@ -601,10 +601,10 @@ pub fn open(target: &str) {
 
 // ---- process ------------------------------------------------------------------------
 
-/// False when another akscast is already running.
+/// False when another procast is already running.
 pub fn single_instance() -> bool {
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\akscast-single-instance"));
+        let _ = CreateMutexW(None, true, w!("Local\\procast-single-instance"));
         GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
@@ -615,9 +615,11 @@ pub fn set_start_at_login(on: bool) {
         if on {
             let Ok(exe) = std::env::current_exe() else { return };
             let value: Vec<u16> = format!("\"{}\"", exe.display()).encode_utf16().chain([0]).collect();
-            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, w!("akscast"), REG_SZ.0, Some(value.as_ptr() as _), (value.len() * 2) as u32);
+            let _ = RegSetKeyValueW(HKEY_CURRENT_USER, key, w!("procast"), REG_SZ.0, Some(value.as_ptr() as _), (value.len() * 2) as u32);
         } else {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, w!("akscast"));
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, w!("procast"));
         }
+        // The entry the app made under its old name.
+        let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, &HSTRING::from(crate::config::OLD_NAME));
     }
 }

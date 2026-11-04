@@ -1,5 +1,5 @@
 [package]
-name = "akscast"
+name = "procast"
 version = "0.1.0"
 edition = "2024"
 description = "Fast keyboard launcher for Windows"

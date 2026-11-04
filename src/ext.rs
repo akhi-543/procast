@@ -98,7 +98,7 @@ pub fn parse_manifest(dir: &Path, v: &Value) -> Option<Extension> {
     Some(Extension { title: v["title"].as_str().unwrap_or(&name).into(), name, dir: dir.into(), icon, prefs: prefs(&v["preferences"]), commands })
 }
 
-/// Installed extensions: every built folder under %APPDATA%\akscast\extensions.
+/// Installed extensions: every built folder under %APPDATA%\procast\extensions.
 pub fn scan() -> Vec<Extension> {
     let mut out: Vec<Extension> = std::fs::read_dir(dir())
         .into_iter()
@@ -195,7 +195,7 @@ impl Host {
     pub fn spawn(node: &str, tx: UnboundedSender<Msg>) -> Result<Self, String> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let dir = host_dir().ok_or("exthost folder not found next to akscast.exe")?;
+        let dir = host_dir().ok_or("exthost folder not found next to procast.exe")?;
         let mut child = Command::new(node)
             .arg(dir.join("host.mjs"))
             .current_dir(&dir)
@@ -506,7 +506,7 @@ pub fn parse_view(tree: &Value) -> View {
             }
         }
         "Form" => v.fields = kids(root).filter_map(field).collect(),
-        // A menu-bar command opened in akscast: its menu becomes a list.
+        // A menu-bar command opened in procast: its menu becomes a list.
         "MenuBarExtra" => {
             fn flat(nodes: &[MenuNode], section: Option<&str>, v: &mut View) {
                 for n in nodes {
@@ -731,7 +731,7 @@ mod tests {
         assert!(f[1].controlled && f[1].value == json!("hi"));
         assert_eq!((f[2].title.as_str(), &f[2].value), ("Pin it", &json!(false)));
 
-        let repo = std::env::temp_dir().join(format!("akscast-store-test-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("procast-store-test-{}", std::process::id()));
         for (name, manifest) in [
             ("b-ext", json!({"name": "b-ext", "title": "Beta", "author": "ann", "platforms": ["macOS", "Windows"], "commands": [{}, {}]})),
             ("a-ext", json!({"name": "a-ext", "title": "alpha", "description": "mac only"})),

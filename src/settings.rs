@@ -105,16 +105,16 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "Startup",
                 vec![
-                    row("Open at login", "start_at_login", Kind::Bool, "Start akscast in the background when you sign in to Windows."),
-                    row("Show in system tray", "tray", Kind::Bool, "Keep the akscast icon in the notification area, with Open, Settings and Quit."),
+                    row("Open at login", "start_at_login", Kind::Bool, "Start procast in the background when you sign in to Windows."),
+                    row("Show in system tray", "tray", Kind::Bool, "Keep the procast icon in the notification area, with Open, Settings and Quit."),
                 ],
             ),
             (
                 "Hotkeys",
                 vec![
-                    row("Open akscast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
+                    row("Open procast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
                     row("Emoji picker", "emoji.hotkey", Kind::Hotkey, "Opens emoji search straight away. Other commands get hotkeys under Shortcuts."),
-                    row("Double-tap to open", "keyboard.double_tap", Kind::Choice(crate::keys::TAP_KEYS), "Press this key twice quickly to open akscast, besides the hotkey above."),
+                    row("Double-tap to open", "keyboard.double_tap", Kind::Choice(crate::keys::TAP_KEYS), "Press this key twice quickly to open procast, besides the hotkey above."),
                     row("Hyper key", "keyboard.hyper", Kind::Choice(crate::keys::HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
                 ],
             ),
@@ -140,8 +140,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "Opening",
                 vec![
-                    row("Show akscast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Which monitor the window opens on: the one with the mouse, the one with the window you're using, or the main one."),
-                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long akscast remembers where you were after it closes. Now always starts fresh."),
+                    row("Show procast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Which monitor the window opens on: the one with the mouse, the one with the window you're using, or the main one."),
+                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long procast remembers where you were after it closes. Now always starts fresh."),
                 ],
             ),
             (
@@ -165,7 +165,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "Root search items",
                 vec![
-                    row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in akscast with Ctrl+K → Add to Favorites."),
+                    row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in procast with Ctrl+K → Add to Favorites."),
                     row("Hidden", "launcher.hidden", Kind::Keys, "Left out of results; aliases and hotkeys still work. Hide with Ctrl+K → Hide from Root Search."),
                 ],
             ),
@@ -255,7 +255,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             let mut r = groups(vec![(
                 "Extensions",
                 vec![
-                    row("Background commands", "extensions.background", Kind::Bool, "Let commands that refresh on a schedule (e.g. every 5 minutes) run while akscast is closed."),
+                    row("Background commands", "extensions.background", Kind::Bool, "Let commands that refresh on a schedule (e.g. every 5 minutes) run while procast is closed."),
                     row("Tray icons", "extensions.menu_bar", Kind::Bool, "Show menu-bar commands as icons in the notification area."),
                     row("Node.js", "extensions.node", Kind::Text, "The node program that runs extensions; \"node\" uses the one on your PATH. Needs version 22 or later."),
                     row("Memory per command (MB)", "extensions.memory_mb", Kind::Number, "A command using more than this is stopped, e.g. 256."),
@@ -345,8 +345,8 @@ impl Settings {
             items,
             category: 0,
             filter: String::new(),
-            // AKSCAST_OPEN_SETTINGS=<page> opens on that page (screenshots and checks).
-            section: std::env::var("AKSCAST_OPEN_SETTINGS").ok().and_then(|s| SECTIONS.iter().position(|x| *x == s)).unwrap_or(0),
+            // PROCAST_OPEN_SETTINGS=<page> opens on that page (screenshots and checks).
+            section: std::env::var("PROCAST_OPEN_SETTINGS").ok().and_then(|s| SECTIONS.iter().position(|x| *x == s)).unwrap_or(0),
             selected: 0,
             inputs: HashMap::new(),
             recording: false,
@@ -576,7 +576,7 @@ impl Settings {
     fn hotkey_owner(&self, spec: &str, except: &[String]) -> Option<String> {
         let want = config::parse_hotkey(spec).ok()?;
         let cfg = config::parse(&self.text).ok()?;
-        let builtin = [("hotkey", "Open akscast", &cfg.hotkey), ("clipboard.hotkey", "Clipboard History", &cfg.clipboard.hotkey), ("emoji.hotkey", "Emoji", &cfg.emoji.hotkey), ("files.hotkey", "Search Files", &cfg.files.hotkey)];
+        let builtin = [("hotkey", "Open procast", &cfg.hotkey), ("clipboard.hotkey", "Clipboard History", &cfg.clipboard.hotkey), ("emoji.hotkey", "Emoji", &cfg.emoji.hotkey), ("files.hotkey", "Search Files", &cfg.files.hotkey)];
         let builtin = builtin.into_iter().map(|(p, name, h)| (p.split('.').map(String::from).collect::<Vec<_>>(), name.to_string(), h.clone()));
         let commands = cfg.launcher.hotkeys.iter().map(|(k, h)| {
             let name = self.items.iter().find(|it| it.key.as_deref() == Some(k)).map_or(k.clone(), |it| it.title.clone());
@@ -939,7 +939,7 @@ impl Render for Settings {
         let rows = self.rows();
         let me = cx.weak_entity();
         crate::dump_ui(
-            "akscast-settings.json",
+            "procast-settings.json",
             serde_json::json!({
                 "section": SECTIONS[self.section],
                 "selected": self.selected,
@@ -984,7 +984,7 @@ impl Render for Settings {
                     .bg(t.surface)
                     .border_r_1()
                     .border_color(t.hairline)
-                    .child(div().px_2().pb_3().flex().items_center().gap(px(8.)).child(crate::design::fluent(crate::design::g::SETTING, 16., t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("akscast")))
+                    .child(div().px_2().pb_3().flex().items_center().gap(px(8.)).child(crate::design::fluent(crate::design::g::SETTING, 16., t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("procast")))
                     .children(SECTIONS.iter().enumerate().map(|(i, name)| {
                         let me = me.clone();
                         div()
@@ -1134,8 +1134,8 @@ fn preview(t: &crate::design::Tokens) -> impl IntoElement {
                 .child(div().text_color(t.text_muted).child("Search apps and commands…")),
         )
         .child(div().px(px(14.)).pt(px(8.)).pb(px(4.)).text_size(px(crate::design::ts::CAPTION)).text_color(t.text_faint).child("Results"))
-        .child(row(g::FOLDER, "Search Files", "akscast", "Command", true))
-        .child(row(g::PASTE, "Clipboard History", "akscast", "Command", false))
+        .child(row(g::FOLDER, "Search Files", "procast", "Command", true))
+        .child(row(g::PASTE, "Clipboard History", "procast", "Command", false))
         .child(row(g::CALCULATOR, "42", "6 × 7 =", "Calculator", false))
         .child(
             div()

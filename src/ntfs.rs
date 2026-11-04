@@ -1,10 +1,10 @@
 //! Whole-drive file search from the NTFS master file table, kept live by the USN change
 //! journal (the approach Everything uses). Reading a volume needs admin, so an elevated
-//! helper (`akscast-indexer.exe --indexer`, started at logon by a scheduled task) streams
-//! file records over a named pipe; akscast keeps the index and searches it.
+//! helper (`procast-indexer.exe --indexer`, started at logon by a scheduled task) streams
+//! file records over a named pipe; procast keeps the index and searches it.
 //!
 //! Security: the helper runs from Program Files (only admins can replace it), only does
-//! the privileged reads, and its pipe admits only the installing user. akscast checks the
+//! the privileged reads, and its pipe admits only the installing user. procast checks the
 //! pipe's server is that helper before trusting it.
 
 use std::{
@@ -53,16 +53,46 @@ use windows::{
 
 use crate::{files, search::Item, win::Msg};
 
-const PIPE: &str = r"\\.\pipe\akscast-ntfs";
-const TASK: &str = r"akscast\Indexer";
+const PIPE: &str = r"\\.\pipe\procast-ntfs";
+const TASK: &str = r"procast\Indexer";
 
 /// The helper's home: under Program Files, so only admins can change what runs elevated.
 pub fn helper_path() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join("akscast").join("akscast-indexer.exe")
+    PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join("procast").join("procast-indexer.exe")
 }
 
 pub fn installed() -> bool {
     helper_path().exists()
+}
+
+/// The helper as installed under the app's old name (task, folder, program).
+fn old_helper() -> (String, PathBuf) {
+    let old = crate::config::OLD_NAME;
+    let dir = PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into())).join(old);
+    (format!(r"{old}\Indexer"), dir.join(format!("{old}-indexer.exe")))
+}
+
+/// Installed under the old name and not yet replaced: whole-drive search is off until
+/// "Enable Fast File Search" runs once more (it needs admin).
+pub fn old_helper_installed() -> bool {
+    !installed() && old_helper().1.exists()
+}
+
+/// Ends and removes the helper installed under the old name (elevated).
+fn remove_old_helper() {
+    let (task, exe) = old_helper();
+    if !exe.exists() {
+        return;
+    }
+    let _ = schtasks(&["/End", "/TN", &task]);
+    let _ = schtasks(&["/Delete", "/TN", &task, "/F"]);
+    for _ in 0..20 {
+        if !exe.exists() || std::fs::remove_file(&exe).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = std::fs::remove_dir(exe.parent().unwrap());
 }
 
 // ---- wire format ----------------------------------------------------------------------
@@ -122,7 +152,7 @@ impl Pipe {
         Some(())
     }
 
-    /// Ends the connection; akscast reconnects and gets a fresh snapshot.
+    /// Ends the connection; procast reconnects and gets a fresh snapshot.
     fn kill(&self) {
         unsafe {
             let _ = DisconnectNamedPipe(self.h.0);
@@ -133,7 +163,7 @@ impl Pipe {
 /// `--indexer`: serve every client a snapshot of each NTFS drive, then live changes.
 pub fn serve() {
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\akscast-indexer"));
+        let _ = CreateMutexW(None, true, w!("Local\\procast-indexer"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -317,6 +347,7 @@ fn user_sid() -> Option<String> {
 /// `--install-indexer` (elevated): copy the helper to Program Files and register a logon
 /// task that runs it with highest privileges, then start it.
 pub fn install() -> Result<(), String> {
+    remove_old_helper();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dest = helper_path();
     std::fs::create_dir_all(dest.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -333,7 +364,7 @@ pub fn install() -> Result<(), String> {
     copied?;
     let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default());
     let xml = task_xml(&dest, &user);
-    let file = std::env::temp_dir().join("akscast-indexer-task.xml");
+    let file = std::env::temp_dir().join("procast-indexer-task.xml");
     // schtasks reads task XML as UTF-16.
     let bytes: Vec<u8> = [0xFF, 0xFE].into_iter().chain(xml.encode_utf16().flat_map(u16::to_le_bytes)).collect();
     std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
@@ -345,6 +376,7 @@ pub fn install() -> Result<(), String> {
 
 /// `--uninstall-indexer` (elevated).
 pub fn uninstall() -> Result<(), String> {
+    remove_old_helper();
     let _ = schtasks(&["/End", "/TN", TASK]);
     let _ = schtasks(&["/Delete", "/TN", TASK, "/F"]);
     let dest = helper_path();
@@ -369,7 +401,7 @@ fn task_xml(exe: &Path, user: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>akscast whole-drive file index (reads the NTFS file table)</Description></RegistrationInfo>
+  <RegistrationInfo><Description>procast whole-drive file index (reads the NTFS file table)</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
@@ -387,7 +419,7 @@ fn task_xml(exe: &Path, user: &str) -> String {
     )
 }
 
-// ---- akscast's side: the index ----------------------------------------------------------
+// ---- procast's side: the index ----------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -723,7 +755,7 @@ fn subsequence(needle: &[u8], hay: &[u8]) -> bool {
     it.peek().is_none()
 }
 
-// ---- akscast's side: the connection -----------------------------------------------------
+// ---- procast's side: the connection -----------------------------------------------------
 
 /// Shared with file search: the index, whether it's complete enough to search, and the
 /// footer's count / "indexing" flag.
@@ -732,7 +764,7 @@ pub struct Client {
     pub ready: Arc<AtomicBool>,
 }
 
-/// Keeps a connection to the helper for as long as akscast runs, reconnecting (and
+/// Keeps a connection to the helper for as long as procast runs, reconnecting (and
 /// restarting the helper's task) as needed.
 pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool>, tx: UnboundedSender<Msg>) -> Client {
     let index = Arc::new(RwLock::new(Index::new(&filter)));

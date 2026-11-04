@@ -1,4 +1,4 @@
-// Installs a Raycast extension into akscast: from the raycast/extensions repo by name, or
+// Installs a Raycast extension into procast: from the raycast/extensions repo by name, or
 // from a local folder (your own extensions). Builds with Raycast's `ray build` (MIT CLI).
 // usage: node install.mjs <name | local folder> <extensions dir>
 //        node install.mjs --sync <extensions dir>   (just refresh the store index)

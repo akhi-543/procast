@@ -1,4 +1,4 @@
-// akscast extension host: one long-lived Node process, one worker per command run.
+// procast extension host: one long-lived Node process, one worker per command run.
 // Speaks newline-delimited JSON on stdio with the Rust app:
 //   in:  {t:"run", run, entry, mode, arguments, preferences, environment, launchType, memoryMb}
 //        {t:"event", run, fn, args} | {t:"pop", run} | {t:"reply", run, id, value|error} | {t:"stop", run}

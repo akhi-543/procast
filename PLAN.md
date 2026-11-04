@@ -1,4 +1,4 @@
-# akscast: plan
+# procast: plan
 
 A keyboard launcher for Windows that runs Raycast store extensions. It is your own product, with its own name, look and settings. Raycast's code, icons, art and branding are not copied. Compatibility comes from implementing the **public** extension API (MIT type definitions) in our own runtime.
 
@@ -38,7 +38,7 @@ Hot path: keypress → WPF → WebView2/React → COM host object → JSON-RPC p
 
 ## 2. Design
 
-| | Raycast (Windows) | akscast | Phase 0 evidence |
+| | Raycast (Windows) | procast | Phase 0 evidence |
 |---|---|---|---|
 | UI | WPF + WebView2 + React | **Rust + GPUI** (`gpui-ce` 0.3.0, Win32 + DirectX) | spike builds and runs |
 | Core | Node + Rust napi + Swift | same Rust process as the UI, no IPC on the hot path | — |
@@ -62,7 +62,7 @@ Core patterns taken from [open-raycast](https://github.com/JingHao-Leon/open-ray
 
 ## 3. Settings (yours, plain text)
 
-`%APPDATA%\akscast\config.toml`:
+`%APPDATA%\procast\config.toml`:
 
 ```toml
 hotkey = "Alt+Space"          # or "DoubleTap+Ctrl"; conflicts are reported, not fatal
@@ -92,7 +92,7 @@ command = "theme-scheduler/apply-themes"
 
 [extensions]
 node = "auto"
-dir = "%APPDATA%\\akscast\\extensions"
+dir = "%APPDATA%\\procast\\extensions"
 memory_mb = 256
 idle_kill_secs = 300
 ```
@@ -163,9 +163,9 @@ Implementation order (extension count): ActionPanel 929 · Action 927 · Icon 85
 
 ## 5. Parity with Raycast for Windows
 
-Source: the settings pages and feature modules in the installed v2.10.1 frontend (568 modules). "Same" means the same capability and keyboard flow. The visual design is akscast's own; Raycast's look, icons and branding are not copied.
+Source: the settings pages and feature modules in the installed v2.10.1 frontend (568 modules). "Same" means the same capability and keyboard flow. The visual design is procast's own; Raycast's look, icons and branding are not copied.
 
-| Raycast feature | akscast | When |
+| Raycast feature | procast | When |
 |---|---|---|
 | Root search: apps, fuzzy match, frecency | ✅ | Phase 1 |
 | App icons in results | ✅ | Phase 2a |
@@ -227,7 +227,7 @@ These are covered by unit tests up to the Win32 call.
 Built:
 - **Ctrl+K action panel**: the selected item's actions replace the list; Esc closes it.
 - **File search mode**: a `jwalk` crawl of `[files] roots` (default: your user folder minus AppData, node_modules, .git, …) into memory. A worker thread searches it, only the newest query's results are shown, and the index re-crawls when you open file search and it's more than 2 minutes old.
-- **Script commands**: from `%APPDATA%\akscast\scripts`, with argument prompts and an output view.
+- **Script commands**: from `%APPDATA%\procast\scripts`, with argument prompts and an output view.
 
 Verified:
 - **12/12 e2e checks pass** (`spikes/e2e.py`). New since Phase 2a: file search → Ctrl+K → Copy Path, a fullOutput script, a script with an argument.
@@ -241,16 +241,16 @@ Measured:
 Not run live: Run as Administrator (it shows a UAC prompt).
 
 AI research for a later phase is in [docs/ai-research.md](docs/ai-research.md):
-- **Recommendation:** run the Agent SDK (TypeScript) in the Node sidecar, with akscast's own tools exposed as an in-process MCP server and the built-in tools removed.
+- **Recommendation:** run the Agent SDK (TypeScript) in the Node sidecar, with procast's own tools exposed as an in-process MCP server and the built-in tools removed.
 - **Licence:** personal use on your own Claude login is fine. Distributing the app needs per-user API keys.
 
 ### Phase 3 status (2026-11-03): Raycast extensions
 
-**Approach: run the real store extensions; don't rewrite them.** All the extensions you actually use declare Windows support and run unmodified on akscast's own `@raycast/api` runtime. Rewriting them would cost weeks and buy nothing. Native rebuilds are only worth it for an extension that's macOS-only or needs an API akscast can't provide.
+**Approach: run the real store extensions; don't rewrite them.** All the extensions you actually use declare Windows support and run unmodified on procast's own `@raycast/api` runtime. Rewriting them would cost weeks and buy nothing. Native rebuilds are only worth it for an extension that's macOS-only or needs an API procast can't provide.
 
 **Your extensions** (from 4 weeks of Raycast logs):
 
-| Extension | Opens | Status in akscast |
+| Extension | Opens | Status in procast |
 |---|---|---|
 | Theme Scheduler (your own, `D:\Pro\lightswtch`) | 29 opens + 126 background runs | ✅ installed from the folder; view works; `apply-themes` runs every 5 min |
 | Obsidian | 9 | ✅ 13 commands; forms work (Quick Capture). Menu bar hidden |
@@ -265,7 +265,7 @@ Not installed: toggl-track, remove-paywall, speedtest, skills and ~15 more. They
 **How it works**
 - `exthost/` (Node):
   - `host.mjs` runs one worker per command.
-  - `runtime.js` is akscast's own `@raycast/api`.
+  - `runtime.js` is procast's own `@raycast/api`.
   - `install.mjs` fetches an extension and runs `ray build`.
   - `smoke.mjs` is the regression gate.
 - **Wire format:** newline-delimited JSON over stdio. Every Raycast action kind becomes an `onAction` handler, and handler IDs come from tree position.
@@ -287,13 +287,13 @@ Not installed: toggl-track, remove-paywall, speedtest, skills and ~15 more. They
   - Port Manager listing real ports
   - your Theme Schedules list
   - Obsidian Quick Capture form, with Tab moving between fields (nothing submitted)
-- Background: `agent-usage/refresh-agent-usage` and `theme-scheduler/apply-themes` ran on schedule with no errors (`%APPDATA%\akscast\extensions.log`).
+- Background: `agent-usage/refresh-agent-usage` and `theme-scheduler/apply-themes` ran on schedule with no errors (`%APPDATA%\procast\extensions.log`).
 
 Bugs found and fixed while testing:
 - Text typed before an extension's first render was never sent to it.
 - A late echo of the extension's own controlled `searchText` overwrote newer keystrokes.
 
-**Memory:** akscast 65.7 MB; the Node extension host 90.4 MB while extensions run. It only starts when an extension runs, but background interval commands keep it alive.
+**Memory:** procast 65.7 MB; the Node extension host 90.4 MB while extensions run. It only starts when an extension runs, but background interval commands keep it alive.
 
 **Known gaps (later)**
 - Menu-bar commands (tray menus)
@@ -303,7 +303,7 @@ Bugs found and fixed while testing:
 - A view ends when the window hides (Raycast keeps it about 90 s)
 - No store browser (install by name)
 - OAuth, AI, `getSelectedText`, BrowserExtension throw "not supported"
-- Theme Scheduler now runs from both Raycast and akscast. It's idempotent, but turn it off in Raycast once you switch.
+- Theme Scheduler now runs from both Raycast and procast. It's idempotent, but turn it off in Raycast once you switch.
 
 ### Phase 4 status (2026-11-03): polish
 
@@ -311,7 +311,7 @@ Built:
 - **Tray menus for menu-bar commands.** Obsidian, Port Manager and Agent Usage each get a tray icon whose menu is their live `MenuBarExtra` tree.
   - Clicks call the extension's handler.
   - Commands with an interval re-run fresh and keep their icon.
-- **Settings window** ("akscast Settings", or tray → Settings…).
+- **Settings window** ("procast Settings", or tray → Settings…).
   - Sections: General, Search, Clipboard, Files, Theme, Extensions, Advanced.
   - Toggles, choices and text, number and list fields, plus a hotkey recorder.
   - Every installed extension's preferences are editable (required ones marked).

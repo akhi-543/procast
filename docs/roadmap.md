@@ -1,7 +1,7 @@
-# akscast roadmap: pick what to build
+# procast roadmap: pick what to build
 
 How this list was built: every row title and description in Raycast for Windows 2.10.1's
-settings (`frontend/*-settings-page-definition-*.js` and the settings views), compared with akscast.
+settings (`frontend/*-settings-page-definition-*.js` and the settings views), compared with procast.
 
 **How to choose:** tick `[x]` next to what you want, or just reply with the IDs (e.g. "A1 A2 C3 D1").
 
@@ -17,7 +17,7 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | [x] | A1 | **App list cached on disk** (`apps.bin`, names + icons). 208 apps load in 3.6 ms at start; icons are extracted only for new apps ("Reload Apps" re-extracts all) | ✅ | S | |
 | [x] | A2 | **New apps appear by themselves.** Start Menu folders and `%LOCALAPPDATA%\Packages` are watched; an install or uninstall triggers a rescan within ~10 s | ✅ | S | |
 | [x] | A3 | **Live file index.** `ReadDirectoryChangesW` on each folder applies creates, deletes, renames and moves as they happen. Safety re-crawl at most hourly | ✅ | M | |
-| [x] | A4 | **File index saved to disk** (`files.bin`). 138,617 entries load in 54 ms vs a 1.3 s crawl; one background crawl at start catches changes made while akscast was off | ✅ | S | |
+| [x] | A4 | **File index saved to disk** (`files.bin`). 138,617 entries load in 54 ms vs a 1.3 s crawl; one background crawl at start catches changes made while procast was off | ✅ | S | |
 | [ ] | A5 | **Use Everything if it's installed.** Ask voidtools Everything over IPC: whole drives, instant, no index of our own | ✗ | M | install Everything (free) |
 | [x] | A6 | **NTFS MFT scanner + USN journal** (what Raycast's "NTFS Scanner" service does). Indexes whole drives in seconds and stays live. Needs an elevated helper service | ✅ enabled: C:, D:, E:: 2.7 M entries in ~10 s at logon, 20–44 ms per search, changes show in ~60 ms | L | OK to install an admin service |
 | [ ] | A7 | **File content search** via the Windows Search index (Raycast does the same) | ✗ | M | turn on Windows Search indexing for your folders |
@@ -28,8 +28,8 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Open at login, launcher hotkey, follow system appearance | ✅ | | |
-| [x] | B1 | Toggle "Show in system tray" (today the akscast tray icon is always on) | ✅ | S | |
-| [x] | B2 | Named themes: pick a dark theme and a light theme from a list | ✅ akscast Dark, Midnight, Graphite, Forest · akscast Light, Paper, Mist | S | |
+| [x] | B1 | Toggle "Show in system tray" (today the procast tray icon is always on) | ✅ | S | |
+| [x] | B2 | Named themes: pick a dark theme and a light theme from a list | ✅ procast Dark, Midnight, Graphite, Forest · procast Light, Paper, Mist | S | |
 | [x] | B3 | Theme studio: visual colour editor with live preview | ✅ live preview + swatches in Settings → Theme | M | |
 | [x] | B4 | Interface size: small / default / large | ✅ | S | |
 | [x] | B5 | **Compact window mode:** only the search bar until you type, then it expands | ✅ Down opens the list | M | |
@@ -40,7 +40,7 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | [x] | C1 | Show on: screen with the mouse / **active window** / primary | ✅ | S | |
-| [x] | C2 | Pop to root after closing: immediately / after 5–180 s (today akscast always resets) | ✅ | S | |
+| [x] | C2 | Pop to root after closing: immediately / after 5–180 s (today procast always resets) | ✅ | S | |
 | [x] | C3 | Root search sensitivity: low / medium / high | ✅ | S | |
 | [x] | C4 | Include files in root search | ✅ | S | |
 | [x] | C5 | Search history: Up arrow restores recent queries | ✅ + Clear Search History | S | |
@@ -149,7 +149,7 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| | — | Run unmodified Raycast extensions, store browser, install, preferences, menu-bar commands in akscast | ✅ | | |
+| | — | Run unmodified Raycast extensions, store browser, install, preferences, menu-bar commands in procast | ✅ | | |
 | [ ] | N1 | Update installed extensions ("Updates available" in the store) | ✗ | S | |
 | [ ] | N2 | OAuth for extensions that need sign-in (GitHub, Linear, Spotify, …) | ✗ | M | |
 | [ ] | N3 | `AI.ask` for extensions | ✗ | M | choose the AI backend (see U1) |
@@ -180,7 +180,7 @@ Each of these could also be a store extension instead of built-in code.
 | [ ] | P3 | Use the system proxy and a custom CA certificate for network calls | ✗ | S | only behind a corporate proxy |
 | [ ] | P4 | Sync between your PCs (config.toml + data via OneDrive / Git) | ✗ | M | which sync folder |
 | [ ] | P5 | Hotkeys over elevated (admin) windows: UIAccess helper | ✗ | L | a code-signing certificate |
-| [ ] | P6 | akscast auto-update + installer (winget / MSIX) | ✗ | M | where releases live (GitHub?) + signing |
+| [ ] | P6 | procast auto-update + installer (winget / MSIX) | ✗ | M | where releases live (GitHub?) + signing |
 | — | — | Account, organizations, cloud sync, iPhone remote, Pro credits | not planned | | Raycast cloud services |
 
 ## U. AI (Phase 5, research in [ai-research.md](ai-research.md))

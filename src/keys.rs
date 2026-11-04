@@ -1,5 +1,5 @@
 //! A low-level keyboard hook for what RegisterHotKey can't do: the Hyper key (one key
-//! held = Ctrl+Alt+Shift+Win) and double-tapping a modifier to open akscast.
+//! held = Ctrl+Alt+Shift+Win) and double-tapping a modifier to open procast.
 //! The hook runs only while one of them is switched on; its callback must stay quick,
 //! since every keystroke on the machine passes through it.
 
@@ -37,7 +37,7 @@ const RALT: u16 = 0xA5;
 const LWIN: u16 = 0x5B;
 /// Unassigned virtual key: pressed between Win down and up so Windows doesn't open Start.
 const NOTHING: u16 = 0xE8;
-/// A tap is a press shorter than this; two taps closer than `GAP` open akscast.
+/// A tap is a press shorter than this; two taps closer than `GAP` open procast.
 const TAP: Duration = Duration::from_millis(250);
 const GAP: Duration = Duration::from_millis(400);
 

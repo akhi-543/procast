@@ -1,4 +1,4 @@
-// akscast's own implementation of the @raycast/api runtime, written against the MIT type
+// procast's own implementation of the @raycast/api runtime, written against the MIT type
 // definitions. Components are host elements; a react-reconciler turns the tree into JSON
 // and posts it to the host. Every Raycast action kind becomes an `onAction` handler, so the
 // UI side only ever needs "call handler X".
@@ -124,7 +124,7 @@ Action.Push = function Push({ target, title = "Open", onPush, onPop, ...props })
   return el("Action", { ...props, title, onAction: () => (nav.push(target, onPop), onPush?.()) });
 };
 for (const k of ["CreateQuicklink", "CreateSnippet", "ToggleQuickLook", "PickDate"])
-  Action[k] = builtin(k, () => toast({ style: "failure", title: `${k} is not supported in akscast` }));
+  Action[k] = builtin(k, () => toast({ style: "failure", title: `${k} is not supported in procast` }));
 Action.Style = { Regular: "regular", Destructive: "destructive" };
 
 function text(content) {
@@ -207,7 +207,14 @@ function jsonFile(file) {
   return { data, save };
 }
 
-const local = jsonFile(path.join(env.supportPath, ".akscast-localstorage.json"));
+// Data saved before the app was renamed (akscast → procast) moves to the new file names.
+for (const [from, to] of [[".akscast-localstorage.json", ".procast-localstorage.json"], [".akscast-cache", ".procast-cache"]]) {
+  try {
+    const [a, b] = [path.join(env.supportPath, from), path.join(env.supportPath, to)];
+    if (fs.existsSync(a) && !fs.existsSync(b)) fs.renameSync(a, b);
+  } catch {}
+}
+const local = jsonFile(path.join(env.supportPath, ".procast-localstorage.json"));
 const LocalStorage = {
   getItem: async (k) => local.data[k],
   setItem: async (k, v) => void ((local.data[k] = v), local.save()),
@@ -221,7 +228,7 @@ const caches = new Map();
 class Cache {
   constructor(options = {}) {
     const ns = options.namespace ?? "default";
-    if (!caches.has(ns)) caches.set(ns, { ...jsonFile(path.join(env.supportPath, ".akscast-cache", `${ns.replace(/[^\w.-]/g, "_")}.json`)), subs: new Set() });
+    if (!caches.has(ns)) caches.set(ns, { ...jsonFile(path.join(env.supportPath, ".procast-cache", `${ns.replace(/[^\w.-]/g, "_")}.json`)), subs: new Set() });
     const store = caches.get(ns);
     // Bound methods: @raycast/utils hands cache.subscribe straight to useSyncExternalStore.
     this.get = (k) => store.data[k];
@@ -261,7 +268,7 @@ const Keyboard = {
 const LaunchType = { UserInitiated: "userInitiated", Background: "background" };
 const PopToRootType = { Default: "default", Immediate: "immediate", Suspended: "suspended" };
 const notSupported = (what) => async () => {
-  throw new Error(`${what} is not supported in akscast yet`);
+  throw new Error(`${what} is not supported in procast yet`);
 };
 
 const api = {
@@ -295,7 +302,7 @@ const api = {
     read: async () => ({ text: await request("readClipboard") }),
   },
   AI: { ask: notSupported("AI"), Model: named("model"), Creativity: { None: 0, Low: 0.25, Medium: 0.5, High: 0.75, Maximum: 1 } },
-  OAuth: { PKCEClient: class { constructor() { throw new Error("OAuth is not supported in akscast yet"); } }, RedirectMethod: { Web: "web", App: "app", AppURI: "appURI" } },
+  OAuth: { PKCEClient: class { constructor() { throw new Error("OAuth is not supported in procast yet"); } }, RedirectMethod: { Web: "web", App: "app", AppURI: "appURI" } },
   BrowserExtension: { getTabs: notSupported("BrowserExtension"), getContent: notSupported("BrowserExtension") },
   Tool: {},
 };

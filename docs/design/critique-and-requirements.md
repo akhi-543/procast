@@ -1,4 +1,4 @@
-# akscast design critique and requirements
+# procast design critique and requirements
 
 Reviewed on 2026-11-04 from screenshots of the release build (dark theme, compact window mode,
 `width = 0.49` on a 1920 px screen, so the launcher is drawn at about 1.25×). Screens: empty root,
@@ -15,7 +15,7 @@ settings page.
 | **Consistency** | **5 / 10** | Two sets of size constants, an ad-hoc type scale, and the design doc no longer matches the code |
 | **Accessibility** | **5 / 10** | Placeholder and section-header text fail contrast; no visible focus ring in the launcher list |
 
-## Design critique: akscast launcher and settings
+## Design critique: procast launcher and settings
 
 ### Overall impression
 The launcher reads as a Windows 11 tool: acrylic, Segoe UI Variable, a violet selection pill, and
@@ -34,12 +34,12 @@ wrong item first, and the window height doesn't fit whole rows, so the last row 
 | Every status in the action bar is a green dot, including neutral messages ("Hidden from root search…"); the colour is guessed from the words | 🟡 Moderate | Explicit tone per message: info (neutral), success, error |
 | In Settings, every message that doesn't start with "Saved" is shown in red | 🟡 Moderate | Same explicit tones in Settings |
 | The empty root in compact mode is a bare bar with nothing to discover | 🟢 Minor | Show the favourites strip, or a faint hint of the hotkeys (`↓ recent · Ctrl K actions`) |
-| Long choice options wrap onto two lines in Settings ("Show akscast on", "Keep the last search") | 🟢 Minor | Short option labels; the description explains them |
+| Long choice options wrap onto two lines in Settings ("Show procast on", "Keep the last search") | 🟢 Minor | Short option labels; the description explains them |
 
 ### Visual hierarchy
 - **What draws the eye first:** the selected row (pill plus fill). Correct.
-- **Reading flow:** search text → selection → action bar. Good, but the left of the action bar repeats "akscast" with a search icon, which competes with the search bar and says nothing.
-- **Emphasis:** "akscast" as the subtitle of every built-in command, and "Command" or "Application" on every row, add noise without telling rows apart.
+- **Reading flow:** search text → selection → action bar. Good, but the left of the action bar repeats "procast" with a search icon, which competes with the search bar and says nothing.
+- **Emphasis:** "procast" as the subtitle of every built-in command, and "Command" or "Application" on every row, add noise without telling rows apart.
 
 ### Consistency
 
@@ -50,7 +50,7 @@ wrong item first, and the window height doesn't fit whole rows, so the last row 
 | Selection | Launcher: `surface` fill plus pill. Settings sidebar: `surface_strong` plus pill. Settings rows: `surface` plus pill. Shortcuts: icon tile turns `surface_strong` | One selected style: `surface_strong` fill plus the accent pill, everywhere |
 | Window material | Launcher uses Blurred (acrylic), Settings uses Mica | Keep both (launcher transient, settings long-lived), and record it in the doc |
 | Design doc | DESIGN.md says window 760 wide (code: 750), key cap 18 tall (code: 20), icon glyph 16 (code: 15), footer icon 16 (code: 14) | Update the doc to the code after this pass |
-| Subtitles | Built-ins say "akscast"; extension commands show the extension name; apps show nothing | Built-ins show their group ("Window", "System", "Clipboard"), extensions their extension, apps nothing |
+| Subtitles | Built-ins say "procast"; extension commands show the extension name; apps show nothing | Built-ins show their group ("Window", "System", "Clipboard"), extensions their extension, apps nothing |
 | Back affordance | Sub-views show a Back tile; Settings has no back, just sections | Fine; documented as is |
 
 ### Accessibility
@@ -72,9 +72,9 @@ wrong item first, and the window height doesn't fit whole rows, so the last row 
 
 | Process | Memory | What it is |
 |---|---|---|
-| akscast | 85 MB working set, 67 MB private | UI, catalog, app icons, file index client (whole-drive index after filters) |
-| akscast-indexer | 55 MB | Elevated NTFS helper |
-| akscast's node host | 73 MB | Runs Raycast extensions; only while extensions are in use |
+| procast | 85 MB working set, 67 MB private | UI, catalog, app icons, file index client (whole-drive index after filters) |
+| procast-indexer | 55 MB | Elevated NTFS helper |
+| procast's node host | 73 MB | Runs Raycast extensions; only while extensions are in use |
 | *Raycast for comparison* | *278 MB for its node backend alone* | |
 
 | UI choice | RAM cost | Decision |
@@ -101,7 +101,7 @@ Status after the 2026-11-04 pass: ✅ done · ◐ partly · ☐ not yet.
 **P1: inconsistent or noisy.**
 5. ◐ **R5 Type scale.** Six named sizes in `design::ts`; Settings and the main launcher text use them. A few small labels in extension views still use their own sizes.
 6. ✅ **R6 One selected style.** `surface_strong` plus pill for launcher rows, the action panel, settings rows and the sidebar; a separate, lighter `hover` token.
-7. ✅ **R7 Meaningful subtitles.** Built-ins show Window, System, Clipboard, Files, Emoji, Apps or akscast.
+7. ✅ **R7 Meaningful subtitles.** Built-ins show Window, System, Clipboard, Files, Emoji, Apps or procast.
 8. ✅ **R8 Calculator card.** Two rows tall; the answer at most four decimals in display type, the full value under it; Enter copies the full value.
 9. ✅ **R9 Running apps.** The program's own name as the title, the window title (without the app suffix) as the subtitle.
 10. ✅ **R10 Clipboard types.** Link, email, colour, path, code and text icons and subtitles.

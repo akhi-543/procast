@@ -1,4 +1,4 @@
-//! akscast's design tokens and small shared components (see docs/design/DESIGN.md).
+//! procast's design tokens and small shared components (see docs/design/DESIGN.md).
 //! Views take every colour, size and font from here.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -60,8 +60,8 @@ pub fn px(v: f32) -> Pixels {
     gpui::px(v * scale())
 }
 
-pub const DARK_THEMES: &[&str] = &["akscast Dark", "Midnight", "Graphite", "Forest"];
-pub const LIGHT_THEMES: &[&str] = &["akscast Light", "Paper", "Mist"];
+pub const DARK_THEMES: &[&str] = &["procast Dark", "Midnight", "Graphite", "Forest"];
+pub const LIGHT_THEMES: &[&str] = &["procast Light", "Paper", "Mist"];
 
 pub const BAR: f32 = 56.;
 pub const ROW: f32 = 40.;
@@ -90,7 +90,7 @@ pub mod ts {
 /// glance: window moves are teal, system actions amber, clipboard blue, and so on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tint {
-    /// akscast's own commands.
+    /// procast's own commands.
     Accent,
     /// Power, session, recycle bin, dark mode.
     System,
@@ -250,7 +250,7 @@ impl Tokens {
         }
     }
 
-    /// A named palette; unknown names fall back to akscast Dark / Light.
+    /// A named palette; unknown names fall back to procast Dark / Light.
     pub fn named(name: &str, dark: bool) -> Self {
         let base = if dark { Self::dark() } else { Self::light() };
         // (background, panels, text, muted, faint, accent)

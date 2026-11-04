@@ -1,16 +1,16 @@
-# akscast design system
+# procast design system
 
-akscast is a Windows-native launcher. It matches the *structure, density and polish* of the best launchers (Raycast was studied from screenshots of the installed v2.10.1 in `docs/design/reference/`, kept out of git), but has its own identity:
+procast is a Windows-native launcher. It matches the *structure, density and polish* of the best launchers (Raycast was studied from screenshots of the installed v2.10.1 in `docs/design/reference/`, kept out of git), but has its own identity:
 
 - **Windows 11 materials:** acrylic backdrop, OS-rounded corners, Segoe UI Variable, Segoe Fluent Icons.
 - **The Fluent selection pill:** an accent bar on the selected row.
-- **akscast's own accent colour.**
+- **procast's own accent colour.**
 
 No third-party artwork, icons, logo or palette is copied.
 
 ---
 
-## 1. Audit of akscast before this redesign (screenshots in `docs/design/before/`)
+## 1. Audit of procast before this redesign (screenshots in `docs/design/before/`)
 
 | Issue | Where | Fix |
 |---|---|---|
@@ -22,7 +22,7 @@ No third-party artwork, icons, logo or palette is copied.
 | Footer is tiny grey text; no key caps | footer | **Action bar**: context icon + title on the left; primary action + `↵` cap, divider, `Actions Ctrl K` on the right |
 | Ctrl+K replaces the list with a single row | action panel | **Floating popover** bottom-right over the list, with shortcut caps |
 | Square, opaque window with a grey border | window | DWM rounded corners, acrylic backdrop, hairline border |
-| Mode is a chip at the far right; no way back with the mouse | search bar | **Back button** tile on the left in sub-views; akscast mark at root |
+| Mode is a chip at the far right; no way back with the mouse | search bar | **Back button** tile on the left in sub-views; procast mark at root |
 | Form: labels in a left column, everything stretched | forms | Centred 520 px column, right-aligned labels, 34 px rounded inputs, chevron dropdowns |
 | No empty states | file search, empty lists | Centred icon, title and hint |
 | Text is too big and rows too tall (16 px / 44 px) | everywhere | 14 px text, 40 px rows; a denser and calmer layout |
@@ -45,7 +45,7 @@ No third-party artwork, icons, logo or palette is copied.
 | `text_faint` | `#8B8B97` | `#6B6B77` | section headers, placeholders, hints, accessories (at least 4.5:1 on the body in every theme) |
 | `hairline` | `#FFFFFF` @ 8% | `#000000` @ 8% | dividers |
 | `border` | `#FFFFFF` @ 12% | `#000000` @ 12% | window, inputs, popovers |
-| `accent` | `#7C6CFF` (akscast violet) | `#5B4BF0` | selection pill, focus ring, active toggle, root mark |
+| `accent` | `#7C6CFF` (procast violet) | `#5B4BF0` | selection pill, focus ring, active toggle, root mark |
 | `accent_text` | `#FFFFFF` | `#FFFFFF` | text on accent |
 | `success` / `warning` / `danger` | `#4CC38A` / `#F5B74F` / `#FF6B6B` | `#1F9D61` / `#C98100` / `#D93D3D` | toasts, tags, errors |
 
@@ -57,7 +57,7 @@ Everything else in the window stays neutral, and the accent is kept for selectio
 
 | Tint | Dark | Light | Rows |
 |---|---|---|---|
-| `Accent` | accent | accent | akscast's own commands (Settings, Store, Reload) |
+| `Accent` | accent | accent | procast's own commands (Settings, Store, Reload) |
 | `System` | `#F2B65A` | `#B27100` | lock, sleep, restart, shut down, dark mode |
 | `Window` | `#4FC4CF` | `#0F8A96` | window layouts |
 | `Paste` | `#6AA8FF` | `#2F6FD6` | clipboard, emoji, snippets |
@@ -119,7 +119,7 @@ Six text sizes, in `design::ts`. Views use nothing else.
 | **Window** | Acrylic body, hairline border, rounded corners, three bands: search bar / content / action bar | Light, dark or system; everything comes from tokens |
 | **Search bar** | `[mark or back tile] [input, display 17] [accessory: dropdown]` | Root shows the accent mark (Search icon). Sub-views show a Back tile (clickable = Esc). The placeholder is `text_faint` |
 | **Section header** | `Title  count`, `text_sm` in `text_faint`, sitting on the bottom of its slot | Not selectable; the cursor skips it |
-| **List row** | `[pill][icon tile] Title  subtitle ······ accessory` | **Default:** transparent. **Hover:** `hover`. **Selected:** `surface_strong` plus the 3×16 accent pill on the left edge. Subtitles name the group ("Window", "Clipboard"), never "akscast" on every row. Accessories are `text_faint` |
+| **List row** | `[pill][icon tile] Title  subtitle ······ accessory` | **Default:** transparent. **Hover:** `hover`. **Selected:** `surface_strong` plus the 3×16 accent pill on the left edge. Subtitles name the group ("Window", "Clipboard"), never "procast" on every row. Accessories are `text_faint` |
 | **Icon tile** | 26 px rounded `surface_strong` square holding a Fluent glyph; app/extension images draw at 20 px with no tile | Emoji draw at 18 px with no tile |
 | **Accessory** | Right-aligned `text_md` in `text_muted`; tags are tinted pills | |
 | **Key cap** | `CAPTION` on `surface`, `border`, `r_cap`, 20 px tall, min width 20 | `↵` uses the Fluent ReturnKey glyph |

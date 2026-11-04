@@ -103,14 +103,14 @@ pub const ALL: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Snap(Snap::Center), "Center Window", "window middle", g::TILES),
     (Cmd::Snap(Snap::Restore), "Restore Window", "window", g::RESTORE),
     (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", g::SWITCH_APPS),
-    (Cmd::Settings, "akscast Settings", "preferences options configure", g::SETTING),
+    (Cmd::Settings, "procast Settings", "preferences options configure", g::SETTING),
     (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", g::EDIT),
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", g::REFRESH),
     (Cmd::InstallExtension, "Install Extension", "raycast store add plugin", g::DOWNLOAD),
     (Cmd::BrowseStore, "Browse Extension Store", "raycast store extensions catalog install", g::SHOP),
     (Cmd::FastFileSearch(true), "Enable Fast File Search", "ntfs everything all drives admin index mft", g::SHIELD),
     (Cmd::FastFileSearch(false), "Disable Fast File Search", "ntfs everything all drives admin index mft", g::SHIELD),
-    (Cmd::Quit, "Quit akscast", "exit close", g::CANCEL),
+    (Cmd::Quit, "Quit procast", "exit close", g::CANCEL),
 ];
 
 impl Cmd {
@@ -132,7 +132,7 @@ impl Cmd {
             Cmd::Emoji => "Emoji",
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
-            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "akscast",
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
     }
@@ -150,7 +150,7 @@ impl Cmd {
     }
 }
 
-/// Runs a system or window command. `target` is the window that was active before akscast.
+/// Runs a system or window command. `target` is the window that was active before procast.
 pub fn run(cmd: Cmd, target: HWND) {
     unsafe {
         match cmd {
@@ -226,7 +226,7 @@ pub fn layout(s: Snap, wa: RECT, cur: RECT) -> RECT {
     }
 }
 
-/// The desktop and taskbar: opening akscast from them leaves no window to move.
+/// The desktop and taskbar: opening procast from them leaves no window to move.
 fn is_shell(hwnd: HWND) -> bool {
     let mut buf = [0u16; 32];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;

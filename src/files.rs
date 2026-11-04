@@ -242,7 +242,7 @@ fn cache_path() -> PathBuf {
 
 /// The cache is only used for the same roots and exclusions.
 fn cache_key(roots: &[String], exclude: &[String]) -> String {
-    format!("akscast-files-1\n{}\n{}", roots.join("|"), exclude.join("|"))
+    format!("procast-files-1\n{}\n{}", roots.join("|"), exclude.join("|"))
 }
 
 /// Layout: the key, then per entry a dir flag and the path, strings as u32 length + UTF-8.
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn crawl_skips_excluded_and_search_ranks_names() {
-        let root = std::env::temp_dir().join(format!("akscast-files-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("procast-files-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for p in ["docs/Quarterly Report.docx", "docs/report-draft.txt", "node_modules/pkg/report.js", "photos/beach.jpg"] {
             let p = root.join(p);
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn saved_index_round_trips_and_watcher_changes_apply() {
-        let root = std::env::temp_dir().join(format!("akscast-live-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("procast-live-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for p in ["a/one.txt", "a/sub/two.txt", "b.txt", "skip/x.txt"] {
             let p = root.join(p);
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn watcher_reports_new_files() {
-        let root = std::env::temp_dir().join(format!("akscast-watch-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("procast-watch-test-{}", std::process::id()));
         std::fs::create_dir_all(root.join("deep")).unwrap();
         let (tx, rx) = mpsc::channel();
         let dir = root.clone();

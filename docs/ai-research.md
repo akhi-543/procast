@@ -1,4 +1,4 @@
-# AI in akscast via Claude Code: research (2026-11-03)
+# AI in procast via Claude Code: research (2026-11-03)
 
 Research input for a later phase. Nothing here is implemented. A research subagent compiled it from Anthropic's docs.
 
@@ -6,11 +6,11 @@ Legend: **D** = documented on a cited Anthropic page. **I** = inference, to veri
 
 ## Summary
 
-Use the **Claude Agent SDK (TypeScript)** inside the existing Node sidecar as the AI engine. Expose akscast's own tools as an in-process SDK MCP server, and remove all built-in Claude Code tools so the model can only call akscast tools.
+Use the **Claude Agent SDK (TypeScript)** inside the existing Node sidecar as the AI engine. Expose procast's own tools as an in-process SDK MCP server, and remove all built-in Claude Code tools so the model can only call procast tools.
 
 The SDK provides sessions, streaming, interrupt, permission callbacks and MCP, so there is no harness to build. Use `claude -p` for scripts and tests. Use the raw Messages API only if you want to drop Claude Code's harness and pay per token.
 
-**Personal use with your own claude.ai login is workable. Distribution is the blocker.** Anthropic's terms do not let third-party apps offer claude.ai login or route Pro/Max credentials for their users. Sharing akscast needs per-user API keys (or each user signing into Claude Code themselves), or prior written approval.
+**Personal use with your own claude.ai login is workable. Distribution is the blocker.** Anthropic's terms do not let third-party apps offer claude.ai login or route Pro/Max credentials for their users. Sharing procast needs per-user API keys (or each user signing into Claude Code themselves), or prior written approval.
 
 No latency figures are published, so measure in a spike.
 
@@ -81,7 +81,7 @@ No latency figures are published, so measure in a spike.
 **Reading** (inferred):
 - Personal use on your own login is fine.
 - To distribute: use a per-user API key, or have each user install Claude Code and sign in themselves.
-- akscast must never hold anyone's claude.ai tokens.
+- procast must never hold anyone's claude.ai tokens.
 - Get written approval before anything beyond that.
 
 ## 3. Latency
@@ -100,14 +100,14 @@ No latency figures are published, so measure in a spike.
 |---|---|---|
 | Quick AI | One-shot `query()`: `tools: []`, `maxTurns: 1`, `model: "haiku"`, no persistence, `includePartialMessages`, custom `systemPrompt` | A custom string replaces the preset. Add a line explaining system reminders. **D** |
 | AI Chat with sessions | One session per chat: store `session_id` and `resume`, or hold a streaming session open. Sidebar from `listSessions` / `getSessionMessages` / `renameSession` | Transcripts live in `~/.claude`, so keep your own chat index. A `SessionStore` can mirror them. **D** |
-| AI Commands (`{selection}`, `{clipboard}`) | Substitute placeholders in akscast and send the result as the prompt. Each command can set its own append text and model | Skills or `.claude/commands` also work but add context and need setting sources. Plain templates are simpler. **I** |
+| AI Commands (`{selection}`, `{clipboard}`) | Substitute placeholders in procast and send the result as the prompt. Each command can set its own append text and model | Skills or `.claude/commands` also work but add context and need setting sources. Plain templates are simpler. **I** |
 | AI Extensions / Tools | In-process SDK MCP server: `tool()` + `createSdkMcpServer`, names `mcp__<server>__<tool>`, `readOnlyHint`, `permission_policy: "always_ask"` (TS), `canUseTool` for UI approval | **D** |
 | MCP management | Per-session `mcpServers` (stdio/http/sse), `.mcp.json`, `mcpServerStatus()`, `reconnectMcpServer()`. Isolate with `settingSources: []` / `strictMcpConfig` | claude.ai connectors load only with a claude.ai login, unless disabled. **D** |
 | Agents | `agents` option (`AgentDefinition`) plus `allowedTools: ["Agent"]` | Subagents cannot use `AskUserQuestion`. Agent teams are CLI-only. **D** |
 | Output styles | `settings: { outputStyle }`, with user/project setting sources loaded | Optional. **D** |
 | Hooks | `PreToolUse` for audit or deny; `PermissionRequest` for notifications | **D** |
 
-## 5. Giving Claude akscast's capabilities
+## 5. Giving Claude procast's capabilities
 
 Illustrative TypeScript:
 
@@ -115,11 +115,11 @@ Illustrative TypeScript:
 query({
   prompt,
   options: {
-    cwd: sandboxDir,              // empty directory owned by akscast
+    cwd: sandboxDir,              // empty directory owned by procast
     settingSources: [],           // no user/project CLAUDE.md, hooks, skills
     tools: [],                    // removes Bash, Read, Write, Edit, Agent, WebFetch
-    mcpServers: { akscast },      // in-process tools only
-    allowedTools: ["mcp__akscast__search_files", "mcp__akscast__clipboard_history"],
+    mcpServers: { procast },      // in-process tools only
+    allowedTools: ["mcp__procast__search_files", "mcp__procast__clipboard_history"],
     permissionMode: "default",    // unlisted mutating tools reach canUseTool
     canUseTool: approveInUi,
   },
@@ -137,7 +137,7 @@ query({
 
 **Routing `AI.ask` / `useAI`:**
 - The `@raycast/api` shim in the sidecar sends an IPC message to an AI broker.
-- The broker makes one `query()` with `tools: []`, no akscast MCP, `maxTurns: 1` and no persistence, and streams back to the worker. Extensions can't add tools to this call. **I**
+- The broker makes one `query()` with `tools: []`, no procast MCP, `maxTurns: 1` and no persistence, and streams back to the worker. Extensions can't add tools to this call. **I**
 - `useAI` wraps the same call; check its option surface against the shim. **I**
 - Extension AI tools: a per-extension MCP server, only in a chat the user opened, with side-effecting tools set to `always_ask`. **I**
 - Raycast AI options (model, creativity) haven't been mapped yet. Check them against real extensions. **I**
@@ -162,7 +162,7 @@ Node sidecar (worker_threads)
   |- AI service
   |    |- query() / streaming session per chat or Quick AI call (TS Agent SDK)
   |    |- canUseTool -> approval card in GPUI -> allow / deny
-  |    `- in-process SDK MCP server "akscast"  (tool handlers call Rust over IPC)
+  |    `- in-process SDK MCP server "procast"  (tool handlers call Rust over IPC)
   |- @raycast/api shim: AI.ask / useAI -> AI service with tools: []
   v
 claude CLI subprocess (bundled binary, one per session, stdio)
@@ -175,13 +175,13 @@ api.anthropic.com  (your claude.ai login for personal use; API key if distribute
 0. **Spike (1–2 days).**
    - Run `query()` from a `worker_thread`.
    - Measure cold start, time to first partial token and warm-turn latency.
-   - Confirm `tools: []` leaves only akscast tools.
+   - Confirm `tools: []` leaves only procast tools.
    - Test `interrupt()` and exit behaviour on Windows.
    - Pin the SDK version.
 1. **Quick AI:** one-shot, `tools: []`, `maxTurns: 1`, streamed, pre-spawned process, send on Enter, budget cap.
 2. **Chat:** one session per chat, your own chat index, sidebar from `listSessions` / `getSessionMessages`, interrupt, model picker.
 3. **AI Commands:** placeholder substitution, per-command append text and model, no tools.
-4. **Tools:** the in-process akscast server.
+4. **Tools:** the in-process procast server.
    - Read-only tools are auto-allowed; mutating tools go through the approval card.
    - `PreToolUse` writes an audit log.
    - SDK tools are deferred by tool search by default, so use `alwaysLoad` on the few core tools. **D**

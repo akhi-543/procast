@@ -158,29 +158,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "akscast"
-version = "0.1.0"
-dependencies = [
- "emojis",
- "fend-core",
- "futures",
- "gpui-ce",
- "gpui_ce_elements",
- "gpui_ce_platform",
- "image",
- "jwalk",
- "nucleo-matcher",
- "raw-window-handle",
- "serde",
- "serde_json",
- "toml 1.1.8+spec-1.1.0",
- "toml_edit 0.25.17+spec-1.1.0",
- "tray-icon",
- "ureq",
- "windows 0.62.2",
-]
-
-[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4998,6 +4975,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "procast"
+version = "0.1.0"
+dependencies = [
+ "emojis",
+ "fend-core",
+ "futures",
+ "gpui-ce",
+ "gpui_ce_elements",
+ "gpui_ce_platform",
+ "image",
+ "jwalk",
+ "nucleo-matcher",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "toml 1.1.8+spec-1.1.0",
+ "toml_edit 0.25.17+spec-1.1.0",
+ "tray-icon",
+ "ureq",
+ "windows 0.62.2",
 ]
 
 [[package]]

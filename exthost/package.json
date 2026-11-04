@@ -1,1 +1,1 @@
-{"name":"akscast-exthost","private":true,"type":"commonjs","dependencies":{"react":"19.2.0","react-reconciler":"0.33.0"}}
+{"name":"procast-exthost","private":true,"type":"commonjs","dependencies":{"react":"19.2.0","react-reconciler":"0.33.0"}}
