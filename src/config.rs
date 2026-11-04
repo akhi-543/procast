@@ -1,7 +1,7 @@
 //! `%APPDATA%\akscast\config.toml`: the only settings store. Unknown keys are ignored,
 //! so settings for later phases can already live in the file.
 
-use std::{fs, path::PathBuf, time::SystemTime};
+use std::{collections::BTreeMap, fs, path::PathBuf, time::SystemTime};
 
 use serde::Deserialize;
 
@@ -65,6 +65,18 @@ pub struct Launcher {
     pub favorites: Vec<String>,
     /// In compact mode, show favourites as icons under the search bar.
     pub compact_favorites: bool,
+    /// Item key -> alias typed in root search to bring it to the top (`cl`).
+    pub aliases: BTreeMap<String, String>,
+    /// Item key -> global hotkey that runs it.
+    pub hotkeys: BTreeMap<String, String>,
+    /// Items (by key, or `ext:<name>` for a whole extension) that are switched off everywhere.
+    pub disabled: Vec<String>,
+    /// Escape inside a command: `back` one level, or `close` the window and pop to root.
+    pub escape: String,
+    /// Extra list keys: `default`, `emacs` (Alt+N/P move, Alt+B back) or `vim` (Alt+J/K, Alt+H).
+    pub navigation: String,
+    /// Global hotkeys do nothing while a full-screen app or game has focus.
+    pub game_mode: bool,
 }
 
 impl Default for Launcher {
@@ -77,6 +89,12 @@ impl Default for Launcher {
             hidden: vec![],
             favorites: vec![],
             compact_favorites: true,
+            aliases: BTreeMap::new(),
+            hotkeys: BTreeMap::new(),
+            disabled: vec![],
+            escape: "back".into(),
+            navigation: "default".into(),
+            game_mode: false,
         }
     }
 }
@@ -88,6 +106,16 @@ impl Launcher {
             "never" => None,
             s => Some(std::time::Duration::from_secs(s.trim_end_matches('s').parse().unwrap_or(0))),
         }
+    }
+
+    /// Switched off, by itself or through its extension.
+    pub fn is_disabled(&self, key: &str) -> bool {
+        self.disabled.iter().any(|d| d == key || key.strip_prefix(d.as_str()).is_some_and(|rest| d.starts_with("ext:") && rest.starts_with('/')))
+    }
+
+    /// Command hotkeys with a key bound, in a stable order.
+    pub fn command_hotkeys(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.hotkeys.iter().filter(|(k, h)| !h.trim().is_empty() && !self.is_disabled(k))
     }
 }
 
@@ -320,6 +348,13 @@ history = true                # Up arrow in an empty search bar restores earlier
 hidden = []                   # items left out of root search (use Ctrl+K → Hide from Root Search)
 favorites = []                # items pinned to the top (Ctrl+K → Add to Favorites)
 compact_favorites = true      # compact mode: favourites as icons under the search bar
+disabled = []                 # items switched off everywhere; "ext:<name>" for a whole extension
+escape = "back"               # Escape in a command: back (one level) | close (hide and pop to root)
+navigation = "default"        # default | emacs (Alt+N/P move, Alt+B back) | vim (Alt+J/K move, Alt+H back)
+game_mode = false             # hotkeys do nothing while a full-screen app or game is focused
+# Aliases and hotkeys for any item, by key (Settings → Shortcuts edits these):
+# aliases = { "cmd:ClipboardHistory" = "cl" }
+# hotkeys = { "cmd:Snap(LeftHalf)" = "Ctrl+Alt+Left" }
 
 [search]
 calculator = true

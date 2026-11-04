@@ -130,12 +130,16 @@ pub struct Item {
     pub extra: Vec<(String, Act)>,
     /// Root-search item: whether it's a favourite (Ctrl+K offers pin/unpin and hide).
     pub fav: Option<bool>,
+    /// Typed alone in root search, puts this item first.
+    pub alias: String,
+    /// Left out of root search; its alias and hotkey still work.
+    pub hidden: bool,
 }
 
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None }
+        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None, alias: String::new(), hidden: false }
     }
 
     pub fn acc(mut self, accessory: impl Into<String>) -> Self {
@@ -227,17 +231,30 @@ impl Frecency {
     }
 }
 
-/// Everything root search can find. Rebuilt when apps or config change.
+/// Everything root search can find, minus what's switched off. Rebuilt when apps or config change.
 pub fn catalog(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
     let mut items = all_items(apps, scripts, exts, cfg);
-    items.retain(|it| it.key.as_ref().is_none_or(|k| !cfg.launcher.hidden.contains(k)));
+    items.retain(|it| it.key.as_ref().is_none_or(|k| !cfg.launcher.is_disabled(k)));
+    items
+}
+
+/// Every item, switched off or not, with its alias, hidden and favourite state
+/// (the Shortcuts table in Settings).
+pub fn all_items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
+    let mut items = items(apps, scripts, exts, cfg);
     for it in &mut items {
-        it.fav = it.key.as_ref().map(|k| cfg.launcher.favorites.contains(k));
+        let Some(k) = &it.key else { continue };
+        it.fav = Some(cfg.launcher.favorites.contains(k));
+        it.hidden = cfg.launcher.hidden.contains(k);
+        if let Some(a) = cfg.launcher.aliases.get(k).map(|a| a.trim()).filter(|a| !a.is_empty()) {
+            it.alias = a.to_string();
+            it.hay = format!("{} {a}", it.hay);
+        }
     }
     items
 }
 
-fn all_items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
+fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)], cfg: &Config) -> Vec<Item> {
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
@@ -314,7 +331,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         let favorites = favorites(catalog, cfg);
         let mut recent: Vec<_> = catalog
             .iter()
-            .filter(|it| it.fav != Some(true))
+            .filter(|it| it.fav != Some(true) && !it.hidden)
             .filter_map(|it| Some((frec.score(it.key.as_deref()?, now), it)))
             .filter(|(s, _)| *s > 0.01)
             .collect();
@@ -360,8 +377,11 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
             Some(Item::new(title, "", Icon::Fluent(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).sec(format!("Use \"{q}\" with")))
         })
         .collect();
+    // An alias typed exactly puts its item first, hidden or not.
+    let aliased: Vec<&Item> = catalog.iter().filter(|it| !it.alias.is_empty() && it.alias.eq_ignore_ascii_case(q)).collect();
+    top.splice(0..0, aliased.iter().map(|it| (*it).clone()));
     let room = max.saturating_sub(top.len() + fallbacks.len());
-    let hits = fuzzy(q, catalog.iter(), frec, matcher);
+    let hits = fuzzy(q, catalog.iter().filter(|it| !it.hidden && !aliased.iter().any(|a| std::ptr::eq(*a, *it))), frec, matcher);
     let best = hits.first().map_or(0., |h| h.0);
     let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
     let sensitive = |(score, it): &(f64, &Item)| match cfg.launcher.sensitivity.as_str() {
@@ -385,7 +405,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
 
 /// The pinned items, in the order they were pinned.
 pub fn favorites(catalog: &[Item], cfg: &Config) -> Vec<Item> {
-    cfg.launcher.favorites.iter().filter_map(|k| catalog.iter().find(|it| it.key.as_ref() == Some(k)).cloned()).collect()
+    cfg.launcher.favorites.iter().filter_map(|k| catalog.iter().find(|it| !it.hidden && it.key.as_ref() == Some(k)).cloned()).collect()
 }
 
 pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Matcher) -> Vec<Item> {
@@ -584,7 +604,8 @@ mod tests {
     fn launcher_favorites_hidden_sensitivity_and_fallbacks() {
         let apps: Vec<App> = ["Notepad", "Paint", "Photos"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
         let mut cfg = crate::config::parse(
-            "[launcher]\nfavorites = [\"app:Photos\"]\nhidden = [\"app:Paint\"]\n\
+            "[launcher]\nfavorites = [\"app:Photos\"]\nhidden = [\"app:Paint\"]\ndisabled = [\"cmd:Lock\", \"ext:todo\"]\n\
+             aliases = { \"app:Paint\" = \"pt\", \"cmd:Emoji\" = \"em\" }\n\
              [search]\nfallbacks = [\"GitHub\", \"web\"]\n\
              [[quicklink]]\nname = \"GitHub\"\nurl = \"https://github.com/search?q={query}\"",
         )
@@ -592,7 +613,11 @@ mod tests {
         let cat = catalog(&apps, &[], &[], &cfg);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let frec = Frecency::default();
-        assert!(cat.iter().all(|it| it.title != "Paint"), "hidden items leave the catalog");
+        assert!(root("paint", &cat, &cfg, &frec, &mut m).iter().all(|it| it.title != "Paint"), "hidden items leave root search");
+        assert_eq!(root("PT", &cat, &cfg, &frec, &mut m)[0].title, "Paint", "...but their alias still finds them");
+        assert_eq!(root("em", &cat, &cfg, &frec, &mut m)[0].act, Act::Cmd(Cmd::Emoji), "alias goes first");
+        assert!(cat.iter().all(|it| it.act != Act::Cmd(Cmd::Lock)), "disabled items leave the catalog");
+        assert!(cfg.launcher.is_disabled("ext:todo/list") && !cfg.launcher.is_disabled("ext:todos/list"), "a whole extension is switched off by name");
 
         let empty = root("", &cat, &cfg, &frec, &mut m);
         assert_eq!((empty[0].title.as_str(), empty[0].section.as_deref()), ("Photos", Some("Favorites")));

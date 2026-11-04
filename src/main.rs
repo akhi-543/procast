@@ -50,9 +50,11 @@ use design::{Tokens, g, px};
 use ext::FieldKind;
 use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
-use win::{Bind, Msg, TrayCmd};
+use win::{BINDS, Bind, Msg, TrayCmd};
 
 actions!(akscast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
+// Navigation-key styles; each does something only when `[launcher] navigation` picks it.
+actions!(akscast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
 const BAR: f32 = 56.;
 const ROW: f32 = 44.;
@@ -102,8 +104,10 @@ impl Mode {
     }
 }
 
-fn hotkey_specs(cfg: &Config) -> [String; 4] {
-    [cfg.hotkey.clone(), cfg.clipboard.hotkey.clone(), cfg.emoji.hotkey.clone(), cfg.files.hotkey.clone()]
+/// The global hotkeys: the four in `BINDS`, then one per command with a hotkey.
+fn hotkey_specs(cfg: &Config) -> Vec<String> {
+    let builtin = [&cfg.hotkey, &cfg.clipboard.hotkey, &cfg.emoji.hotkey, &cfg.files.hotkey];
+    builtin.into_iter().chain(cfg.launcher.command_hotkeys().map(|(_, h)| h)).cloned().collect()
 }
 
 fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> {
@@ -207,7 +211,7 @@ struct Launcher {
     status: Option<String>,
     /// Config or extension problem, shown above the results.
     notice: Option<String>,
-    hotkey_errors: [Option<String>; 4],
+    hotkey_errors: Vec<Option<String>>,
     hwnd: HWND,
     prev: HWND,
     visible: bool,
@@ -278,7 +282,7 @@ impl Launcher {
             output: None,
             status: None,
             notice,
-            hotkey_errors: Default::default(),
+            hotkey_errors: vec![],
             hwnd: HWND::default(),
             prev: HWND::default(),
             visible: false,
@@ -1191,7 +1195,7 @@ impl Launcher {
         if let Some(key) = key.as_ref().filter(|_| !housekeeping) {
             self.frec.record(key, search::now());
         }
-        if self.mode == Mode::Root && self.cfg.launcher.history && !housekeeping {
+        if self.visible && self.mode == Mode::Root && self.cfg.launcher.history && !housekeeping {
             let q = self.query(cx).trim().to_string();
             if !q.is_empty() {
                 self.remember_search(q);
@@ -1312,10 +1316,49 @@ impl Launcher {
         self.hide(true, cx);
     }
 
+    /// The command a hotkey past `BINDS` runs (None if it's switched off or gone).
+    fn hotkey_item(&self, i: usize) -> Option<&Item> {
+        let key = self.cfg.launcher.command_hotkeys().nth(i.checked_sub(BINDS.len())?)?.0;
+        self.catalog.iter().find(|it| it.key.as_ref() == Some(key))
+    }
+
+    /// Whether running this needs the launcher on screen (it opens a view or asks for input).
+    fn needs_window(&self, act: &Act) -> bool {
+        match act {
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore) | Act::Fill(_) => true,
+            Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
+            Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
+            _ => false,
+        }
+    }
+
+    fn hotkey_opens(&self, i: usize) -> bool {
+        i < BINDS.len() || self.hotkey_item(i).is_some_and(|it| self.needs_window(&it.act))
+    }
+
+    /// A command's own hotkey: runs it straight away, opening the launcher only when it must.
+    fn run_hotkey(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(it) = self.hotkey_item(i).cloned() else { return };
+        if self.needs_window(&it.act) {
+            self.show(Mode::Root, window, cx);
+        } else if !self.visible {
+            let fg = win::foreground();
+            if fg != self.hwnd {
+                self.prev = fg;
+            }
+        }
+        self.run(it.act, it.key, window, cx);
+    }
+
     /// Brings up the settings window, reusing it if it's already open.
     fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let items = search::all_items(&self.apps, &self.scripts, &self.exts, &self.cfg);
         if let Some(h) = self.settings_window
-            && h.update(cx, |_, window, _| window.activate()).is_ok()
+            && h.update(cx, |s, window, _| {
+                s.set_items(items.clone());
+                window.activate()
+            })
+            .is_ok()
         {
             return;
         }
@@ -1326,7 +1369,7 @@ impl Launcher {
             windows_window_background: gpui::WindowsWindowBackground::MicaBackdrop,
             ..Default::default()
         };
-        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(window, cx))).ok();
+        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, window, cx))).ok();
     }
 
     /// Reads the store index in the background, syncing the sparse clone first when it's
@@ -1436,6 +1479,7 @@ impl Launcher {
         match config::load() {
             Ok(cfg) => {
                 if hotkey_specs(&cfg) != hotkey_specs(&self.cfg) {
+                    self.hotkey_errors.clear();
                     self.hotkeys.set(hotkey_specs(&cfg));
                 }
                 if cfg.start_at_login != self.cfg.start_at_login {
@@ -1461,8 +1505,10 @@ impl Launcher {
 
     fn on_msg(&mut self, msg: Msg, window: &mut Window, cx: &mut Context<Self>) {
         match msg {
-            Msg::Hotkey(bind) if self.visible && self.mode == Mode::of(bind) => self.hide(true, cx),
-            Msg::Hotkey(bind) => self.show(Mode::of(bind), window, cx),
+            Msg::Hotkey(_) if self.cfg.launcher.game_mode && !self.visible && win::full_screen_app() => {}
+            Msg::Hotkey(i) if i >= BINDS.len() => self.run_hotkey(i, window, cx),
+            Msg::Hotkey(i) if self.visible && self.mode == Mode::of(BINDS[i]) => self.hide(true, cx),
+            Msg::Hotkey(i) => self.show(Mode::of(BINDS[i]), window, cx),
             Msg::Tray(TrayCmd::Open) => self.show(Mode::Root, window, cx),
             Msg::Tray(TrayCmd::Settings) => self.open_settings(cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
@@ -1564,10 +1610,14 @@ impl Launcher {
                     self.send(json!({"t": "event", "run": run, "fn": f, "args": [{"type": "left-click"}]}));
                 }
             }
-            Msg::HotkeyStatus(bind, status) => {
-                self.hotkey_errors[bind as usize - 1] = status.err();
+            Msg::HotkeyStatus(i, status) => {
+                if self.hotkey_errors.len() <= i {
+                    self.hotkey_errors.resize(i + 1, None);
+                }
+                let title = self.hotkey_item(i).map(|it| it.title.clone());
+                self.hotkey_errors[i] = status.err().map(|e| title.map_or(e.clone(), |t| format!("{t}: {e}")));
                 // Without a working main hotkey the user can't reach us, so open and say why.
-                if bind == Bind::Launcher && self.hotkey_errors[0].is_some() {
+                if i == 0 && self.hotkey_errors[0].is_some() {
                     self.show(Mode::Root, window, cx);
                 }
                 cx.notify();
@@ -1649,6 +1699,13 @@ impl Launcher {
     }
 
     /// Esc: close a popover/dialog, pop a pushed view, leave a mode, or hide.
+    /// An Emacs or Vim navigation key: acts as `action` when that style is chosen.
+    fn nav(&mut self, style: &str, action: Box<dyn gpui::Action>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cfg.launcher.navigation == style {
+            window.dispatch_action(action, cx);
+        }
+    }
+
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.panel.take().is_some() {
             cx.notify();
@@ -1663,6 +1720,12 @@ impl Launcher {
             self.send(json!({"t": "pop", "run": run}));
         } else if self.mode == Mode::Root {
             self.hide(true, cx)
+        } else if self.cfg.launcher.escape == "close" {
+            self.pending = None;
+            self.set_mode(Mode::Root, cx);
+            self.hide(true, cx);
+            // Popped to root: the next open starts fresh whatever pop_to_root says.
+            self.hidden_at = None;
         } else {
             self.pending = None;
             self.set_mode(Mode::Root, cx);
@@ -2275,6 +2338,12 @@ impl Render for Launcher {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .on_action(cx.listener(|this, _: &EmacsNext, window, cx| this.nav("emacs", Box::new(SelectNext), window, cx)))
+            .on_action(cx.listener(|this, _: &EmacsPrev, window, cx| this.nav("emacs", Box::new(SelectPrev), window, cx)))
+            .on_action(cx.listener(|this, _: &EmacsBack, window, cx| this.nav("emacs", Box::new(Dismiss), window, cx)))
+            .on_action(cx.listener(|this, _: &VimNext, window, cx| this.nav("vim", Box::new(SelectNext), window, cx)))
+            .on_action(cx.listener(|this, _: &VimPrev, window, cx| this.nav("vim", Box::new(SelectPrev), window, cx)))
+            .on_action(cx.listener(|this, _: &VimBack, window, cx| this.nav("vim", Box::new(Dismiss), window, cx)))
             .on_action(cx.listener(|this, _: &Launch, window, cx| this.launch(window, cx)))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
                 if this.is_form() && this.panel.is_none() {
@@ -2397,6 +2466,12 @@ fn main() {
             KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-p", EmacsPrev, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-b", EmacsBack, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),
@@ -2453,8 +2528,11 @@ fn main() {
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
                 // proc re-borrows the app, so the window is moved here, between updates.
-                let opens = matches!(msg, Msg::Hotkey(_) | Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(Bind::Launcher, Err(_)) | Msg::ScriptDone(..));
-                let opens_root = matches!(msg, Msg::Hotkey(Bind::Launcher) | Msg::Tray(TrayCmd::Open));
+                let opens = match msg {
+                    Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
+                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..)),
+                };
+                let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
                 let geometry = handle.update(cx, |this, _, cx| {
                     // Opening compact root search: just the bar, unless the last search is kept.
                     let compact = opens_root && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));

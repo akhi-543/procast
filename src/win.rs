@@ -49,8 +49,9 @@ use crate::config::parse_hotkey;
 
 /// Messages from Win32 threads (hotkeys, tray, app scan, clipboard) to the UI thread.
 pub enum Msg {
-    Hotkey(Bind),
-    HotkeyStatus(Bind, Result<(), String>),
+    /// A global hotkey, by its index in the list given to `Hotkeys` (the first four are `BINDS`).
+    Hotkey(usize),
+    HotkeyStatus(usize, Result<(), String>),
     Apps(Vec<App>),
     Tray(TrayCmd),
     Clip(String),
@@ -94,7 +95,7 @@ pub struct App {
 
 // ---- hotkeys ------------------------------------------------------------------------
 
-/// What a global hotkey opens. The discriminant is the RegisterHotKey id.
+/// What the first four global hotkeys open; the rest run commands.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Bind {
     Launcher = 1,
@@ -107,41 +108,48 @@ pub const BINDS: [Bind; 4] = [Bind::Launcher, Bind::Clipboard, Bind::Emoji, Bind
 
 /// Owns RegisterHotKey on a dedicated thread with its own message loop.
 /// `set` re-registers everything; failures are reported, never fatal. Empty spec = unbound.
+/// RegisterHotKey ids are list index + 1.
 pub struct Hotkeys {
     thread: u32,
-    wanted: Arc<Mutex<[String; 4]>>,
+    wanted: Arc<Mutex<Vec<String>>>,
 }
 
 impl Hotkeys {
-    pub fn spawn(specs: [String; 4], tx: UnboundedSender<Msg>) -> Self {
+    pub fn spawn(specs: Vec<String>, tx: UnboundedSender<Msg>) -> Self {
         let wanted = Arc::new(Mutex::new(specs));
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let shared = wanted.clone();
         std::thread::spawn(move || unsafe {
             let _ = tid_tx.send(GetCurrentThreadId());
-            let register = || {
+            let mut registered = 0;
+            let mut register = || {
                 let specs = shared.lock().unwrap().clone();
-                for (bind, spec) in BINDS.into_iter().zip(specs) {
-                    let id = bind as i32;
+                for id in 1..=registered.max(specs.len()) as i32 {
                     let _ = UnregisterHotKey(None, id);
+                }
+                registered = specs.len();
+                let mut taken: Vec<(u32, u32)> = vec![];
+                for (i, spec) in specs.iter().enumerate() {
                     if spec.trim().is_empty() {
                         continue;
                     }
-                    let status = parse_hotkey(&spec).and_then(|(mods, vk)| {
-                        RegisterHotKey(None, id, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk)
-                            .map_err(|_| format!("hotkey {spec} is already used by another app; change it in config.toml"))
+                    let status = parse_hotkey(spec).and_then(|key| {
+                        if taken.contains(&key) {
+                            return Err(format!("hotkey {spec} is set twice in akscast; change one in Settings → Shortcuts"));
+                        }
+                        taken.push(key);
+                        RegisterHotKey(None, i as i32 + 1, HOT_KEY_MODIFIERS(key.0) | MOD_NOREPEAT, key.1)
+                            .map_err(|_| format!("hotkey {spec} is already used by another app; change it in Settings"))
                     });
-                    let _ = tx.unbounded_send(Msg::HotkeyStatus(bind, status));
+                    let _ = tx.unbounded_send(Msg::HotkeyStatus(i, status));
                 }
             };
             register();
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 match msg.message {
-                    WM_HOTKEY => {
-                        if let Some(&bind) = BINDS.iter().find(|b| **b as usize == msg.wParam.0) {
-                            let _ = tx.unbounded_send(Msg::Hotkey(bind));
-                        }
+                    WM_HOTKEY if msg.wParam.0 >= 1 => {
+                        let _ = tx.unbounded_send(Msg::Hotkey(msg.wParam.0 - 1));
                     }
                     WM_APP => register(),
                     _ => {}
@@ -151,7 +159,7 @@ impl Hotkeys {
         Self { thread: tid_rx.recv().unwrap_or(0), wanted }
     }
 
-    pub fn set(&self, specs: [String; 4]) {
+    pub fn set(&self, specs: Vec<String>) {
         *self.wanted.lock().unwrap() = specs;
         unsafe { _ = PostThreadMessageW(self.thread, WM_APP, Default::default(), Default::default()) };
     }
@@ -190,6 +198,14 @@ pub fn cloak(hwnd: HWND, on: bool) {
 
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
+}
+
+/// A full-screen app or game has focus (game mode turns hotkeys off then).
+/// ponytail: the hotkey is still registered, so the key never reaches the game; unregister
+/// on a foreground-change hook if that matters.
+pub fn full_screen_app() -> bool {
+    use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
+    unsafe { SHQueryUserNotificationState() }.is_ok_and(|s| [QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE].contains(&s))
 }
 
 pub fn focus(hwnd: HWND) {

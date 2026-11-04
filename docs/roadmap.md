@@ -51,21 +51,21 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | D1 | **One table of every command** (apps, built-ins, extensions, quicklinks, scripts), filterable by category | ✗ | M | |
-| [ ] | D2 | **Hotkey for any command or app**, with conflict warning | ◐ launcher, clipboard, emoji and files only | M | |
-| [ ] | D3 | **Alias for any command** (type `cl` to run Clipboard History) | ◐ quicklink keywords only | S | |
+| [x] | D1 | **One table of every command** (apps, built-ins, extensions, quicklinks, scripts), filterable by category | ✅ Settings → Shortcuts: category + name filter | M | |
+| [x] | D2 | **Hotkey for any command or app**, with conflict warning | ✅ `[launcher.hotkeys]`; clashes refused in Settings, other apps' clashes reported | M | |
+| [x] | D3 | **Alias for any command** (type `cl` to run Clipboard History) | ✅ exact alias goes first, even for hidden items | S | |
 | [x] | D4 | Favourites (pinned to the top of root search) | ✅ Ctrl+K → Add to Favorites | S | |
-| [ ] | D5 | Enable / disable any command or extension | ✗ | S | |
+| [x] | D5 | Enable / disable any command or extension | ✅ Ctrl+D in Shortcuts; `ext:<name>` for a whole extension | S | |
 
 ## E. Keyboard
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | E1 | Escape: go back vs close window and pop to root | ◐ goes back | S | |
-| [ ] | E2 | Navigation bindings: Emacs (Alt+B/F/P/N) or Vim (Alt+H/J/K/L) | ✗ | S | |
+| [x] | E1 | Escape: go back vs close window and pop to root | ✅ | S | |
+| [x] | E2 | Navigation bindings: Emacs (Alt+B/F/P/N) or Vim (Alt+H/J/K/L) | ✅ move + back (F/L, open, left out on purpose) | S | |
 | [ ] | E3 | **Hyper key:** Caps Lock (or another key) becomes Ctrl+Alt+Shift+Win | ✗ | M | |
 | [ ] | E4 | Double-tap a modifier to open (Raycast's default is double-tap Win) | ✗ | M | |
-| [ ] | E5 | Game mode: hotkeys off while a full-screen game is focused | ✗ | S | |
+| [x] | E5 | Game mode: hotkeys off while a full-screen game is focused | ✅ | S | |
 
 ## F. Applications
 

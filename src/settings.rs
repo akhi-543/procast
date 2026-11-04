@@ -7,9 +7,9 @@ use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
     prelude::*,
 };
-use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, text_input};
+use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 
-use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, design::px, ext};
+use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, design::px, ext, search::Item};
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -22,6 +22,30 @@ enum Kind {
     List,
     /// Opens a file.
     Open(&'static str),
+    /// Shortcuts: which kind of item the table lists (not saved).
+    Category,
+    /// Shortcuts: narrows the table by title (not saved).
+    Filter,
+    /// Shortcuts: one item (index into `Settings::items`); its input edits the alias.
+    Command(usize),
+}
+
+const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts"];
+
+/// The Shortcuts category an item belongs to, from its key prefix.
+fn category(it: &Item) -> &'static str {
+    match it.key.as_deref().and_then(|k| k.split_once(':')).map(|(p, _)| p) {
+        Some("cmd") => "Commands",
+        Some("ext") => "Extensions",
+        Some("ql") => "Quicklinks",
+        Some("sn") => "Snippets",
+        Some("sc") => "Scripts",
+        _ => "Applications",
+    }
+}
+
+fn key_of(it: &Item) -> String {
+    it.key.clone().unwrap_or_default()
 }
 
 struct Row {
@@ -31,7 +55,7 @@ struct Row {
     kind: Kind,
 }
 
-const SECTIONS: [&str; 7] = ["General", "Launcher", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 8] = ["General", "Launcher", "Shortcuts", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
     Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind }
@@ -59,6 +83,9 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             row("Rows", "max_results", Kind::Number, "Results shown in root search"),
             row("Include files", "launcher.files", Kind::Bool, "Matching files under root results"),
             row("Search history", "launcher.history", Kind::Bool, "Up arrow brings back earlier searches"),
+            row("Escape key", "launcher.escape", Kind::Choice(&["back", "close"]), "In a command: go back one level, or close and pop to root"),
+            row("Navigation keys", "launcher.navigation", Kind::Choice(&["default", "emacs", "vim"]), "Emacs: Alt+N/P move, Alt+B back · Vim: Alt+J/K move, Alt+H back"),
+            row("Game mode", "launcher.game_mode", Kind::Bool, "Hotkeys do nothing while a full-screen app or game is focused"),
             row("Favourites", "launcher.favorites", Kind::List, "Pinned to the top · Ctrl+K → Add to Favorites"),
             row("Hidden from root search", "launcher.hidden", Kind::List, "Ctrl+K → Hide from Root Search; remove one to show it again"),
             row("Calculator", "search.calculator", Kind::Bool, "Math, units and currencies"),
@@ -126,6 +153,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             }
             r
         }
+        "Shortcuts" => vec![],
         _ => vec![
             Row { label: "Open config.toml".into(), help: "Every setting, with comments".into(), path: vec![], kind: Kind::Open("config.toml") },
             Row { label: "Open extensions log".into(), help: "Extension errors and console output".into(), path: vec![], kind: Kind::Open("extensions.log") },
@@ -156,6 +184,13 @@ fn hotkey_from(ev: &KeyDownEvent) -> Option<String> {
 pub struct Settings {
     text: String,
     exts: Vec<ext::Extension>,
+    /// Every launcher item, for the Shortcuts table.
+    items: Vec<Item>,
+    category: usize,
+    filter: String,
+    /// `[launcher]` as last saved: the Shortcuts table reads hotkeys and on/off from here
+    /// instead of re-parsing the file for every row.
+    launcher: config::Launcher,
     section: usize,
     selected: usize,
     inputs: HashMap<String, Entity<EditableTextState>>,
@@ -166,10 +201,14 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             text: std::fs::read_to_string(config::path()).unwrap_or_default(),
+            launcher: config::load().map(|c| c.launcher).unwrap_or_default(),
             exts: ext::scan(),
+            items,
+            category: 0,
+            filter: String::new(),
             section: 0,
             selected: 0,
             inputs: HashMap::new(),
@@ -183,17 +222,59 @@ impl Settings {
         this
     }
 
+    /// Fresh launcher items when the window is brought back; rows keep their indices
+    /// until the section is next entered.
+    pub fn set_items(&mut self, items: Vec<Item>) {
+        if SECTIONS[self.section] != "Shortcuts" {
+            self.items = items;
+        }
+    }
+
     fn rows(&self) -> Vec<Row> {
+        if SECTIONS[self.section] == "Shortcuts" {
+            return self.shortcut_rows();
+        }
         rows(self.section, &self.exts)
+    }
+
+    /// The Shortcuts table: category and filter, then every matching item.
+    fn shortcut_rows(&self) -> Vec<Row> {
+        let mut out = vec![
+            Row { label: "Show".into(), help: "↵ next category".into(), path: vec![], kind: Kind::Category },
+            Row { label: "Filter".into(), help: "By name or alias".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter },
+        ];
+        let want = CATEGORIES[self.category];
+        let words: Vec<String> = self.filter.split_whitespace().map(str::to_lowercase).collect();
+        for (i, it) in self.items.iter().enumerate() {
+            let hay = format!("{} {} {}", it.title, it.subtitle, it.alias).to_lowercase();
+            if (want == "All" || category(it) == want) && words.iter().all(|w| hay.contains(w.as_str())) {
+                let help = [category(it).trim_end_matches('s'), &it.subtitle].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i) });
+            }
+        }
+        out
     }
 
     fn build_inputs(&mut self, cx: &mut Context<Self>) {
         self.inputs.clear();
+        self._subs.clear();
         for r in self.rows() {
-            if matches!(r.kind, Kind::Text | Kind::Number | Kind::List) {
-                let value = config::read_value(&self.text, &r.path);
+            if matches!(r.kind, Kind::Text | Kind::Number | Kind::List | Kind::Command(_)) {
+                let value = match r.kind {
+                    Kind::Command(i) => self.launcher.aliases.get(&key_of(&self.items[i])).cloned().unwrap_or_default(),
+                    _ => config::read_value(&self.text, &r.path),
+                };
                 let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
                 input.update(cx, |s, cx| s.emplace(&value, cx));
+                self.inputs.insert(r.path.join("."), input);
+            }
+            if r.kind == Kind::Filter {
+                let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+                input.update(cx, |s, cx| s.emplace(&self.filter, cx));
+                self._subs.push(cx.subscribe(&input, |this, input, _: &TextChanged, cx| {
+                    this.filter = input.read(cx).as_str().to_string();
+                    cx.notify();
+                }));
                 self.inputs.insert(r.path.join("."), input);
             }
         }
@@ -211,6 +292,7 @@ impl Settings {
         match config::write_value(&current, path, value).and_then(|t| config::parse(&t).map(|_| t)) {
             Ok(text) => match std::fs::write(config::path(), &text) {
                 Ok(()) => {
+                    self.launcher = config::parse(&text).map(|c| c.launcher).unwrap_or_default();
                     self.text = text;
                     self.status = Some(format!("Saved {}", path.join(".")));
                 }
@@ -224,7 +306,7 @@ impl Settings {
     /// Saves the selected text-like row if its input differs from the file.
     fn commit(&mut self, cx: &mut Context<Self>) {
         let rows = self.rows();
-        let Some(r) = rows.get(self.selected) else { return };
+        let Some(r) = rows.get(self.selected).filter(|r| r.kind != Kind::Filter) else { return };
         let Some(input) = self.inputs.get(&r.path.join(".")) else { return };
         let typed = input.read(cx).as_str().trim().to_string();
         if typed == config::read_value(&self.text, &r.path) {
@@ -265,6 +347,9 @@ impl Settings {
         self.recording = false;
         self.section = s % SECTIONS.len();
         self.selected = 0;
+        // Inputs are built for every row the table can show.
+        self.filter.clear();
+        self.category = 0;
         self.build_inputs(cx);
         self.focus_row(window, cx);
     }
@@ -283,30 +368,92 @@ impl Settings {
                 let i = opts.iter().position(|o| *o == current).map_or(0, |i| (i + 1) % opts.len());
                 self.save(&r.path, opts[i].into(), cx);
             }
-            Kind::Hotkey => {
+            Kind::Hotkey | Kind::Command(_) => {
+                self.commit(cx);
                 self.recording = true;
-                self.status = Some("Press the new shortcut (Esc cancels)".into());
+                self.status = Some("Press the new shortcut (Backspace removes it, Esc cancels)".into());
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
             Kind::Open(file) => crate::win::open(&config::dir().join(file).to_string_lossy()),
             Kind::Text | Kind::Number | Kind::List => self.commit(cx),
+            Kind::Category => {
+                self.category = (self.category + 1) % CATEGORIES.len();
+                cx.notify();
+            }
+            Kind::Filter => {}
         }
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        if !self.recording {
-            return;
+    /// Where a row's hotkey lives: its own key, or the item's entry under `[launcher.hotkeys]`.
+    fn hotkey_path(&self, r: &Row) -> Vec<String> {
+        match r.kind {
+            Kind::Command(i) => vec!["launcher".into(), "hotkeys".into(), key_of(&self.items[i])],
+            _ => r.path.clone(),
         }
-        let Some(spec) = hotkey_from(ev) else { return };
+    }
+
+    /// The other setting already using this hotkey, by name.
+    fn hotkey_owner(&self, spec: &str, except: &[String]) -> Option<String> {
+        let want = config::parse_hotkey(spec).ok()?;
+        let cfg = config::parse(&self.text).ok()?;
+        let builtin = [("hotkey", "Open akscast", &cfg.hotkey), ("clipboard.hotkey", "Clipboard History", &cfg.clipboard.hotkey), ("emoji.hotkey", "Emoji", &cfg.emoji.hotkey), ("files.hotkey", "Search Files", &cfg.files.hotkey)];
+        let builtin = builtin.into_iter().map(|(p, name, h)| (p.split('.').map(String::from).collect::<Vec<_>>(), name.to_string(), h.clone()));
+        let commands = cfg.launcher.hotkeys.iter().map(|(k, h)| {
+            let name = self.items.iter().find(|it| it.key.as_deref() == Some(k)).map_or(k.clone(), |it| it.title.clone());
+            (vec!["launcher".into(), "hotkeys".into(), k.clone()], name, h.clone())
+        });
+        builtin.chain(commands).find(|(p, _, h)| p != except && config::parse_hotkey(h).ok() == Some(want)).map(|(_, name, _)| name)
+    }
+
+    /// Ctrl+D on a Shortcuts row: switch the item off everywhere, or back on.
+    fn toggle_enabled(&mut self, i: usize, cx: &mut Context<Self>) {
+        let key = key_of(&self.items[i]);
+        let mut list = self.launcher.disabled.clone();
+        let off = !list.contains(&key);
+        list.retain(|k| *k != key);
+        if off {
+            list.push(key);
+        }
+        self.save(&["launcher".into(), "disabled".into()], list.iter().map(String::as_str).collect::<toml_edit::Array>().into(), cx);
+        if self.status.as_deref().is_some_and(|s| s.starts_with("Saved")) {
+            self.status = Some(format!("Saved: {} {}", self.items[i].title, if off { "switched off" } else { "switched on" }));
+        }
+    }
+
+    fn is_off(&self, i: usize) -> bool {
+        self.launcher.is_disabled(&key_of(&self.items[i]))
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let rows = self.rows();
         let Some(r) = rows.get(self.selected) else { return };
+        let k = &ev.keystroke;
+        if !self.recording {
+            if let Kind::Command(i) = r.kind
+                && k.modifiers.control
+                && k.key == "d"
+            {
+                self.toggle_enabled(i, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let path = self.hotkey_path(r);
+        if matches!(k.key.as_str(), "backspace" | "delete") && !k.modifiers.modified() {
+            self.recording = false;
+            return self.save(&path, "".into(), cx);
+        }
+        let Some(spec) = hotkey_from(ev) else { return };
         self.recording = false;
         match config::parse_hotkey(&spec) {
-            Ok(_) => {
-                let path = r.path.clone();
-                self.save(&path, spec.into(), cx);
-            }
+            Ok(_) => match self.hotkey_owner(&spec, &path) {
+                Some(owner) => {
+                    self.status = Some(format!("{spec} is already used by {owner}"));
+                    cx.notify();
+                }
+                None => self.save(&path, spec.into(), cx),
+            },
             Err(e) => {
                 self.status = Some(e);
                 cx.notify();
@@ -341,10 +488,15 @@ impl Settings {
                 .into_any_element()
         };
         match &r.kind {
-            Kind::Text | Kind::Number | Kind::List => match self.inputs.get(&r.path.join(".")) {
+            Kind::Text | Kind::Number | Kind::List | Kind::Filter | Kind::Command(_) => match self.inputs.get(&r.path.join(".")) {
                 Some(input) => text_input(SharedString::from(format!("set-{}", r.path.join("."))))
                     .state(input.downgrade())
-                    .placeholder(if r.kind == Kind::List { "a; b; c" } else { "" })
+                    .placeholder(match r.kind {
+                        Kind::List => "a; b; c",
+                        Kind::Filter => "Type to filter",
+                        Kind::Command(_) => "Alias",
+                        _ => "",
+                    })
                     .placeholder_color(t.text_muted)
                     .caret_color(t.accent)
                     .w_full()
@@ -359,23 +511,59 @@ impl Settings {
                 None => div().into_any_element(),
             },
             Kind::Bool => crate::design::toggle(value == "true", t).into_any_element(),
-            Kind::Choice(opts) => div()
-                .flex()
-                .flex_wrap()
-                .p(px(2.))
-                .gap(px(2.))
-                .rounded(px(6.))
-                .bg(t.surface)
-                .children(opts.iter().map(|o| {
-                    let cur = *o == value;
-                    div().px(px(10.)).py(px(3.)).rounded(px(4.)).text_size(px(13.)).when(cur, |d| d.bg(t.accent).text_color(t.accent_text)).when(!cur, |d| d.text_color(t.text_muted)).child(o.to_string())
-                }))
-                .into_any_element(),
+            Kind::Choice(opts) => choices(opts, &value, t),
             Kind::Hotkey if self.recording && on => pill("Press keys…".into(), true),
             Kind::Hotkey if value.is_empty() => pill("Record".into(), false),
             Kind::Hotkey => div().flex().gap(px(4.)).children(value.split('+').map(|k| crate::design::key_cap(k, t))).into_any_element(),
             Kind::Open(_) => pill("Open".into(), false),
+            Kind::Category => choices(CATEGORIES, CATEGORIES[self.category], t),
         }
+    }
+
+    /// A Shortcuts row: alias input, hotkey, on/off switch.
+    fn command_control(&self, i: usize, r: &Row, on: bool, t: &crate::design::Tokens, me: gpui::WeakEntity<Self>) -> AnyElement {
+        let hotkey = self.launcher.hotkeys.get(&key_of(&self.items[i])).cloned().unwrap_or_default();
+        let keys = if self.recording && on {
+            div().px_2().py_1().rounded_md().bg(t.accent).text_color(t.accent_text).text_size(px(12.)).child("Press keys…").into_any_element()
+        } else if hotkey.is_empty() {
+            div().px_2().py_1().rounded_md().border_1().border_color(t.border).text_size(px(12.)).text_color(t.text_muted).child("Record Hotkey").into_any_element()
+        } else {
+            div().flex().gap(px(4.)).children(hotkey.split('+').map(|k| crate::design::key_cap(k, t))).into_any_element()
+        };
+        let (me2, me3) = (me.clone(), me);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().w(px(110.)).flex_none().child(self.input_control(r, on, t)))
+            .child(
+                div()
+                    .id(("hotkey", i))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        drop(me2.update(cx, |this, cx| {
+                            if let Some(row) = this.rows().iter().position(|r| r.kind == Kind::Command(i)) {
+                                this.select(row, window, cx);
+                                this.activate(window, cx);
+                            }
+                        }))
+                    })
+                    .child(keys),
+            )
+            .child(
+                div()
+                    .id(("enabled", i))
+                    .flex_none()
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        drop(me3.update(cx, |this, cx| this.toggle_enabled(i, cx)))
+                    })
+                    .child(crate::design::toggle(!self.is_off(i), t)),
+            )
+            .into_any_element()
     }
 }
 
@@ -454,7 +642,7 @@ impl Render for Settings {
                             .child(*name)
                     }))
                     .child(div().flex_1())
-                    .child(div().px_2().text_xs().text_color(t.text_muted).child("↑↓ rows · Ctrl+↑↓ sections · ↵ change · Esc close")),
+                    .child(div().px_2().text_xs().text_color(t.text_muted).child(if SECTIONS[self.section] == "Shortcuts" { "Alias: type · ↵ hotkey · Ctrl+D on/off" } else { "↑↓ rows · Ctrl+↑↓ sections · ↵ change · Esc close" })),
             )
             .child(
                 div()
@@ -486,14 +674,22 @@ impl Render for Settings {
                                     .py_2()
                                     .rounded_md()
                                     .when(on, |d| d.bg(t.surface))
-                                    .on_click(move |_, window, cx| {
-                                        drop(me.update(cx, |this, cx| {
-                                            let again = this.selected == i;
-                                            this.select(i, window, cx);
-                                            if again || !matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List) {
-                                                this.activate(window, cx);
-                                            }
-                                        }))
+                                    .on_click({
+                                        let me = me.clone();
+                                        move |_, window, cx| {
+                                            drop(me.update(cx, |this, cx| {
+                                                let again = this.selected == i;
+                                                this.select(i, window, cx);
+                                                if again || !matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List | Kind::Filter | Kind::Command(_)) {
+                                                    this.activate(window, cx);
+                                                }
+                                            }))
+                                        }
+                                    })
+                                    .when(matches!(r.kind, Kind::Command(c) if self.is_off(c)), |d| d.text_color(t.text_muted))
+                                    .children(match r.kind {
+                                        Kind::Command(c) => Some(crate::design::icon_view(&self.items[c].icon, &t, on)),
+                                        _ => None,
                                     })
                                     .child(
                                         div()
@@ -504,7 +700,10 @@ impl Render for Settings {
                                             .child(div().truncate().child(r.label.clone()))
                                             .children((!r.help.is_empty()).then(|| div().text_xs().text_color(t.text_muted).truncate().child(r.help.clone()))),
                                     )
-                                    .child(div().flex_1().min_w_0().child(self.control(r, on, &t)))
+                                    .child(div().flex_1().min_w_0().child(match r.kind {
+                                        Kind::Command(c) => self.command_control(c, r, on, &t, me.clone()),
+                                        _ => self.control(r, on, &t),
+                                    }))
                             }))
                             .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
                     )
@@ -526,6 +725,22 @@ impl Render for Settings {
                     ),
             )
     }
+}
+
+/// A segmented control with the current option highlighted.
+fn choices(opts: &[&str], current: &str, t: &crate::design::Tokens) -> AnyElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(6.))
+        .bg(t.surface)
+        .children(opts.iter().map(|o| {
+            let cur = *o == current;
+            div().px(px(10.)).py(px(3.)).rounded(px(4.)).text_size(px(13.)).when(cur, |d| d.bg(t.accent).text_color(t.accent_text)).when(!cur, |d| d.text_color(t.text_muted)).child(o.to_string())
+        }))
+        .into_any_element()
 }
 
 /// Theme rows show the colour in use: the override, or the palette's own.
