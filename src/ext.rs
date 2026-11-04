@@ -20,6 +20,7 @@ pub struct Pref {
     pub kind: String,
     pub required: bool,
     pub default: Value,
+    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +60,7 @@ fn prefs(v: &Value) -> Vec<Pref> {
             kind: p["type"].as_str().unwrap_or("textfield").into(),
             required: p["required"].as_bool().unwrap_or(false),
             default: p["default"].clone(),
+            description: p["description"].as_str().unwrap_or_default().into(),
         })
         .collect()
 }

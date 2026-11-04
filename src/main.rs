@@ -2516,6 +2516,10 @@ fn main() {
             window.set_visible(true);
             this.tray_icon = tray;
             this.scan_apps(true, false);
+            // For screenshots and checks of the settings window without clicking through.
+            if std::env::var_os("AKSCAST_OPEN_SETTINGS").is_some() {
+                let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Settings));
+            }
         });
 
         cx.spawn(async move |cx| {

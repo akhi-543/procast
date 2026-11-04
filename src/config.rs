@@ -455,22 +455,28 @@ pub fn parse(text: &str) -> Result<Config, String> {
     toml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("config.toml: {}", e.message()))
 }
 
-/// One setting's value as the settings window shows it ("" when unset).
-pub fn read_value(text: &str, path: &[String]) -> String {
-    let Ok(doc) = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>() else { return String::new() };
+/// The value in effect: the file's, or the default when the key isn't there (older
+/// config files lack settings added since).
+pub fn shown_value(text: &str, path: &[String]) -> String {
+    read_opt(text, path).or_else(|| read_opt(TEMPLATE, path)).unwrap_or_default()
+}
+
+fn read_opt(text: &str, path: &[String]) -> Option<String> {
+    let doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().ok()?;
     let mut item = doc.as_item();
     for key in path {
-        match item.get(key) {
-            Some(i) => item = i,
-            None => return String::new(),
+        item = item.get(key)?;
+    }
+    Some(match item.as_value()? {
+        toml_edit::Value::String(s) => s.value().clone(),
+        toml_edit::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; "),
+        // Without its decor: a trailing comment is not part of the value.
+        v => {
+            let mut v = v.clone();
+            v.decor_mut().clear();
+            v.to_string()
         }
-    }
-    match item.as_value() {
-        Some(toml_edit::Value::String(s)) => s.value().clone(),
-        Some(toml_edit::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("; "),
-        Some(v) => v.to_string().trim().to_string(),
-        None => String::new(),
-    }
+    })
 }
 
 /// Sets one setting in the config text, keeping every comment and the layout; missing
@@ -578,6 +584,9 @@ mod tests {
         let old = parse("[[alias]]\nkeyword = \"gh\"\nurl = \"u\"\n[extensions]\nnode = \"auto\"").unwrap();
         assert_eq!(old.quicklink[0].title(), "gh");
         assert_eq!(parse_hotkey("Alt+Space"), Ok((0x1, 0x20)));
+        let key = |s: &str| s.split('.').map(String::from).collect::<Vec<_>>();
+        assert_eq!(shown_value("width = 0.49   # share of the screen", &key("width")), "0.49", "no trailing comment");
+        assert_eq!(shown_value("[launcher]\nfiles = true", &key("launcher.history")), "true", "missing keys show their default");
         assert_eq!(parse_hotkey("ctrl+shift+k"), Ok((0x2 | 0x4, b'K' as u32)));
         assert_eq!(parse_hotkey("F9"), Ok((0, 0x78)));
         assert!(parse_hotkey("Space").is_err());
@@ -596,9 +605,9 @@ mod tests {
         let c = parse(&edited).unwrap();
         assert_eq!((c.hotkey.as_str(), c.clipboard.history), ("Ctrl+Alt+K", 100));
         assert_eq!(c.extension["youtube"]["apikey"].as_str(), Some("abc"));
-        assert_eq!(read_value(&edited, &p("extension.youtube.apikey")), "abc");
-        assert_eq!(read_value(&edited, &p("files.exclude")).split("; ").next(), Some("AppData"));
-        assert_eq!(read_value(&edited, &p("nope.missing")), "");
+        assert_eq!(shown_value(&edited, &p("extension.youtube.apikey")), "abc");
+        assert_eq!(shown_value(&edited, &p("files.exclude")).split("; ").next(), Some("AppData"));
+        assert_eq!(read_opt(&edited, &p("nope.missing")), None);
 
         let t = parse("[theme]\nmode = 'dark'\nselected = '#ff0000'").unwrap().theme;
         assert_eq!((t.mode.as_str(), t.selected.as_deref()), ("dark", Some("#ff0000")));
