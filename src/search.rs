@@ -20,7 +20,7 @@ use crate::{
     clipboard::Entry,
     commands::{self, Cmd},
     config::Config,
-    design::g,
+    design::{Tint, g},
     scripts::Script,
     win::App,
 };
@@ -140,16 +140,23 @@ pub struct Item {
     pub alias: String,
     /// Left out of root search; its alias and hotkey still work.
     pub hidden: bool,
+    /// The hue of its icon tile (what kind of thing it is).
+    pub tint: Option<Tint>,
 }
 
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None, alias: String::new(), hidden: false }
+        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None, alias: String::new(), hidden: false, tint: None }
     }
 
     pub fn acc(mut self, accessory: impl Into<String>) -> Self {
         self.accessory = accessory.into();
+        self
+    }
+
+    pub fn tinted(mut self, tint: Tint) -> Self {
+        self.tint = Some(tint);
         self
     }
 
@@ -275,7 +282,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         {
             continue;
         }
-        items.push(Item::new(title, cmd.subtitle(), Icon::Fluent(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words));
+        items.push(Item::new(title, cmd.subtitle(), Icon::Fluent(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
     }
     for q in &cfg.quicklink {
         let act = if q.url.contains("{query}") {
@@ -283,10 +290,10 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         } else {
             Act::Open(q.url.clone())
         };
-        items.push(Item::new(q.title(), &q.keyword, Icon::Fluent(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword));
+        items.push(Item::new(q.title(), &q.keyword, Icon::Fluent(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web));
     }
     for s in &cfg.snippet {
-        items.push(Item::new(&s.name, &s.keyword, Icon::Fluent(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword));
+        items.push(Item::new(&s.name, &s.keyword, Icon::Fluent(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
     }
     for (i, s) in scripts.iter().enumerate() {
         let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Fluent(g::COMMAND));
@@ -319,7 +326,7 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
         .filter_map(|it| {
             let s = pattern.score(Utf32Str::new(&it.hay, &mut buf), matcher)?;
             // Extra search words only help find an item; a match on the visible title ranks higher.
-            let in_title = pattern.score(Utf32Str::new(&it.title, &mut buf), matcher).map_or(0., |t| t as f64 / 2.);
+            let in_title = pattern.score(Utf32Str::new(&it.title, &mut buf), matcher).map_or(0., |t| t as f64 / 2.) + tier(&it.title, q);
             let boost = it.key.as_deref().map_or(0., |k| frec.score(k, now).min(10.));
             // ponytail: fixed weight; tune once there is real launch history.
             Some((s as f64 + in_title + 25. * boost, it))
@@ -327,6 +334,39 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
         .collect();
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.title.len().cmp(&b.1.title.len())));
     hits
+}
+
+/// How a query meets a title, strongest first: the whole title, its start, the start of a
+/// word, the initials. Scattered letters ("sear*c*h fi*l*es" for "cl") get nothing extra.
+fn tier(title: &str, q: &str) -> f64 {
+    let (t, q) = (title.to_lowercase(), q.to_lowercase());
+    let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
+    if t == q {
+        1000.
+    } else if t.starts_with(&q) {
+        600.
+    } else if words.iter().any(|w| w.starts_with(&q)) {
+        400.
+    } else if initials.starts_with(&q.replace(' ', "")) && q.len() > 1 {
+        300.
+    } else {
+        0.
+    }
+}
+
+/// The calculator's answer as shown: no "approx.", at most four decimals.
+pub fn tidy_number(answer: &str) -> String {
+    let a = answer.trim_start_matches("approx. ").trim();
+    let (num, rest) = a.split_once(' ').unwrap_or((a, ""));
+    let shown = match num.parse::<f64>() {
+        Ok(n) if num.split_once('.').is_some_and(|(_, d)| d.len() > 4) => {
+            let s = format!("{n:.4}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        }
+        _ => num.to_string(),
+    };
+    if rest.is_empty() { shown } else { format!("{shown} {rest}") }
 }
 
 pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matcher: &mut Matcher) -> Vec<Item> {
@@ -366,7 +406,8 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
-        top.push(Item::new(&result, format!("{q} ="), Icon::Fluent(g::CALCULATOR), Act::Copy(result.clone())).acc("Calculator"));
+        let full = result.trim_start_matches("approx. ").to_string();
+        top.push(Item::new(tidy_number(&result), q, Icon::Fluent(g::CALCULATOR), Act::Copy(full)).acc("Calculator").tinted(Tint::Calc));
     }
 
     // Fallback commands: the web search and quicklinks that take a query, in the configured order.
@@ -381,7 +422,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
                 let l = cfg.quicklink.iter().find(|l| l.title().eq_ignore_ascii_case(name) && l.url.contains("{query}"))?;
                 (l.title().to_string(), l.url.clone(), g::LINK, "Quicklink")
             };
-            Some(Item::new(title, "", Icon::Fluent(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).sec(format!("Use \"{q}\" with")))
+            Some(Item::new(title, "", Icon::Fluent(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).tinted(Tint::Web).sec(format!("Use \"{q}\" with")))
         })
         .collect();
     // An alias typed exactly puts its item first, hidden or not.
@@ -415,6 +456,27 @@ pub fn favorites(catalog: &[Item], cfg: &Config) -> Vec<Item> {
     cfg.launcher.favorites.iter().filter_map(|k| catalog.iter().find(|it| !it.hidden && it.key.as_ref() == Some(k)).cloned()).collect()
 }
 
+/// What a clipboard entry looks like it is, for its icon and subtitle.
+fn clip_kind(text: &str) -> (char, &'static str) {
+    let t = text.trim();
+    let one_line = !t.contains('\n');
+    if one_line && (t.starts_with("http://") || t.starts_with("https://")) {
+        (g::LINK, "Link")
+    } else if one_line && t.contains('@') && !t.contains(' ') && t.contains('.') {
+        (g::MAIL, "Email")
+    } else if one_line && t.starts_with('#') && matches!(t.len(), 4 | 7 | 9) && t[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        (g::PERSONALIZE, "Colour")
+    } else if one_line && t.len() > 3 && t.as_bytes()[1] == b':' && t.as_bytes()[2] == b'\\' {
+        (g::FOLDER, "Path")
+    } else if t.lines().count() > 1 && t.contains(['{', ';', '(']) {
+        (g::CODE, "Code")
+    } else if t.lines().count() > 1 {
+        (g::DOCUMENT, "Text")
+    } else {
+        (g::DOCUMENT, "")
+    }
+}
+
 pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Matcher) -> Vec<Item> {
     let now = now();
     let row = |e: &Entry| {
@@ -427,7 +489,8 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
             3600..86400 => format!("{} h ago", age / 3600),
             _ => format!("{} d ago", age / 86400),
         };
-        let mut it = Item::new(title, "", Icon::Fluent(g::DOCUMENT), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" });
+        let (glyph, kind) = clip_kind(&e.text);
+        let mut it = Item::new(title, kind, Icon::Fluent(glyph), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" }).tinted(Tint::Paste);
         it.hay = e.text.chars().take(500).collect();
         it
     };
@@ -639,6 +702,24 @@ mod tests {
         cfg.launcher.sensitivity = "low".into();
         assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");
         assert_eq!(root("note", &cat, &cfg, &frec, &mut m)[0].title, "Notepad");
+    }
+
+    #[test]
+    fn word_starts_beat_scattered_letters() {
+        let apps: Vec<App> = ["Clock", "Claude"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
+        let cfg = crate::config::parse("").unwrap();
+        let cat = catalog(&apps, &[], &[], &cfg);
+        let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let titles: Vec<String> = root("cl", &cat, &cfg, &Frecency::default(), &mut m).into_iter().map(|h| h.title).collect();
+        let at = |t: &str| titles.iter().position(|x| x == t).unwrap_or(usize::MAX);
+        assert!(at("Clipboard History") < at("Search Files") && at("Clock") < at("Search Files"), "{titles:?}");
+        assert_eq!(tier("Quit Applications", "qa"), 300., "initials");
+        assert_eq!(tidy_number("approx. 3.1068559612 miles"), "3.1069 miles");
+        assert_eq!(tidy_number("42"), "42");
+        assert_eq!(clip_kind("https://example.com").1, "Link");
+        assert_eq!(clip_kind("#7c6cff").1, "Colour");
+        assert_eq!(clip_kind(r"C:\Users\me").1, "Path");
+        assert_eq!(clip_kind("me@example.com").1, "Email");
     }
 
     #[test]

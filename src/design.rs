@@ -67,6 +67,63 @@ pub const BAR: f32 = 56.;
 pub const ROW: f32 = 40.;
 pub const FOOTER: f32 = 40.;
 pub const TILE: f32 = 26.;
+/// Space above and below the list, so the window holds whole rows.
+pub const LIST_PAD: f32 = 4.;
+
+/// The type scale. Views use only these sizes for text.
+pub mod ts {
+    /// Key caps, tiny labels.
+    pub const CAPTION: f32 = 11.;
+    /// Section headers, descriptions, the settings footer.
+    pub const SMALL: f32 = 12.;
+    /// Subtitles, accessories, the action bar.
+    pub const BODY_SM: f32 = 13.;
+    /// Rows and body text.
+    pub const BODY: f32 = 14.;
+    /// The search field.
+    pub const TITLE: f32 = 17.;
+    /// Page headings and the calculator answer.
+    pub const DISPLAY: f32 = 22.;
+}
+
+/// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
+/// glance: window moves are teal, system actions amber, clipboard blue, and so on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tint {
+    /// akscast's own commands.
+    Accent,
+    /// Power, session, recycle bin, dark mode.
+    System,
+    /// Window layout.
+    Window,
+    /// Clipboard, emoji, snippets: things you paste.
+    Paste,
+    /// Quicklinks and web search.
+    Web,
+    /// Files and folders.
+    File,
+    /// The calculator.
+    Calc,
+    /// Ending or removing something.
+    Danger,
+}
+
+impl Tint {
+    pub fn hue(self, t: &Tokens) -> Hsla {
+        // (dark theme, light theme): lighter on dark backgrounds, deeper on light ones.
+        let (d, l) = match self {
+            Tint::Accent => return t.accent,
+            Tint::Danger => return t.danger,
+            Tint::System => (0xf2b65aff, 0xb27100ff),
+            Tint::Window => (0x4fc4cfff, 0x0f8a96ff),
+            Tint::Paste => (0x6aa8ffff, 0x2f6fd6ff),
+            Tint::Web => (0x6fd19cff, 0x1f9d61ff),
+            Tint::File => (0xd9b77eff, 0x9a6b1fff),
+            Tint::Calc => (0xf08cc0ff, 0xc23d84ff),
+        };
+        c(if t.dark { d } else { l })
+    }
+}
 
 /// Segoe Fluent Icons codepoints (each verified to exist in the font).
 pub mod g {
@@ -119,6 +176,7 @@ pub mod g {
     pub const KEYBOARD: char = '\u{E765}';
     pub const BULLETS: char = '\u{E8FD}';
     pub const UP: char = '\u{E74A}';
+    pub const FORWARD: char = '\u{E72A}';
     pub const PIN: char = '\u{E718}';
     pub const SHIELD: char = '\u{EA18}';
     pub const MAIL: char = '\u{E715}';
@@ -126,10 +184,13 @@ pub mod g {
 
 #[derive(Clone, Copy)]
 pub struct Tokens {
+    pub dark: bool,
     pub bg: Hsla,
     pub bg_elevated: Hsla,
     pub surface: Hsla,
     pub surface_strong: Hsla,
+    /// Under the mouse: lighter than selection, so the two never look alike.
+    pub hover: Hsla,
     pub text: Hsla,
     pub text_muted: Hsla,
     pub text_faint: Hsla,
@@ -149,13 +210,15 @@ fn c(hex: u32) -> Hsla {
 impl Tokens {
     fn dark() -> Self {
         Self {
+            dark: true,
             bg: c(0x1b1b1fdb),
             bg_elevated: c(0x26262cff),
             surface: c(0xffffff10),
-            surface_strong: c(0xffffff1a),
+            surface_strong: c(0xffffff1f),
+            hover: c(0xffffff0a),
             text: c(0xf2f2f5ff),
             text_muted: c(0xa0a0abff),
-            text_faint: c(0x6e6e7aff),
+            text_faint: c(0x8b8b97ff),
             hairline: c(0xffffff14),
             border: c(0xffffff1f),
             accent: c(0x7c6cffff),
@@ -168,13 +231,15 @@ impl Tokens {
 
     fn light() -> Self {
         Self {
+            dark: false,
             bg: c(0xf7f7f9e0),
             bg_elevated: c(0xffffffff),
             surface: c(0x0000000d),
-            surface_strong: c(0x00000014),
+            surface_strong: c(0x00000017),
+            hover: c(0x00000008),
             text: c(0x1b1b1fff),
             text_muted: c(0x5f5f6bff),
-            text_faint: c(0x8e8e9aff),
+            text_faint: c(0x6b6b77ff),
             hairline: c(0x00000014),
             border: c(0x0000001f),
             accent: c(0x5b4bf0ff),
@@ -190,11 +255,11 @@ impl Tokens {
         let base = if dark { Self::dark() } else { Self::light() };
         // (background, panels, text, muted, faint, accent)
         let (bg, elevated, text, muted, faint, accent) = match (dark, name) {
-            (true, "Midnight") => (0x0f1424db, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x67728fff, 0x4fb3ffff),
-            (true, "Graphite") => (0x1f1f1fdb, 0x2a2a2aff, 0xf0f0f0ff, 0xa8a8a8ff, 0x707070ff, 0xff8a3dff),
-            (true, "Forest") => (0x141c18db, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x6a8174ff, 0x4cc38aff),
-            (false, "Paper") => (0xfbf8f1e6, 0xffffffff, 0x2b2620ff, 0x6e655aff, 0x9a9083ff, 0xc2410cff),
-            (false, "Mist") => (0xf1f5f9e6, 0xffffffff, 0x14212bff, 0x55667aff, 0x8796a8ff, 0x0f9b8eff),
+            (true, "Midnight") => (0x0f1424db, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x8591b0ff, 0x4fb3ffff),
+            (true, "Graphite") => (0x1f1f1fdb, 0x2a2a2aff, 0xf0f0f0ff, 0xa8a8a8ff, 0x8c8c8cff, 0xff8a3dff),
+            (true, "Forest") => (0x141c18db, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x86a092ff, 0x4cc38aff),
+            (false, "Paper") => (0xfbf8f1e6, 0xffffffff, 0x2b2620ff, 0x6e655aff, 0x776d61ff, 0xc2410cff),
+            (false, "Mist") => (0xf1f5f9e6, 0xffffffff, 0x14212bff, 0x55667aff, 0x627385ff, 0x0f9b8eff),
             _ => return base,
         };
         Self { bg: c(bg), bg_elevated: c(elevated), text: c(text), text_muted: c(muted), text_faint: c(faint), accent: c(accent), ..base }
@@ -233,14 +298,21 @@ pub fn fluent(glyph: char, size: f32, color: Hsla) -> Div {
 
 /// A list icon: Fluent glyphs sit in a rounded tile; images and emoji draw bare.
 pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
+    icon_tile(icon, t, selected, None)
+}
+
+/// A list icon whose tile takes the row's kind hue (a tinted wash with the glyph in the hue).
+pub fn icon_tile(icon: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
     let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
     match icon {
         Icon::Image(image) => frame().child(img(image.clone()).size(px(20.))).into_any_element(),
-        Icon::Fluent(ch) => frame()
-            .rounded(px(6.))
-            .bg(if selected { t.surface_strong } else { t.surface })
-            .child(fluent(*ch, 15., if selected { t.text } else { t.text_muted }))
-            .into_any_element(),
+        Icon::Fluent(ch) => {
+            let (wash, glyph) = match tint.map(|k| k.hue(t)) {
+                Some(h) => (Hsla { alpha: if selected { 0.30 } else { 0.18 }, ..h }, h),
+                None => (if selected { t.surface_strong } else { t.surface }, if selected { t.text } else { t.text_muted }),
+            };
+            frame().rounded(px(6.)).bg(wash).child(fluent(*ch, 15., glyph)).into_any_element()
+        }
         Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(17.)).child(s.clone()).into_any_element(),
     }
 }
@@ -258,7 +330,7 @@ pub fn key_cap(label: &str, t: &Tokens) -> Div {
         .bg(t.surface)
         .border_1()
         .border_color(t.border)
-        .text_size(px(11.))
+        .text_size(px(ts::CAPTION))
         .text_color(t.text_muted);
     if label == "↵" { cap.child(fluent(g::RETURN, 11., t.text_muted)) } else { cap.child(label.to_string()) }
 }
@@ -287,7 +359,7 @@ pub fn section_header(title: &str, count: Option<usize>, t: &Tokens) -> Div {
         .flex()
         .items_end()
         .gap(px(8.))
-        .text_size(px(12.5))
+        .text_size(px(ts::SMALL))
         .text_color(t.text_faint)
         .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
         .children(count.map(|n| div().child(n.to_string())))
@@ -305,7 +377,7 @@ pub fn empty_state(glyph: char, title: &str, hint: &str, t: &Tokens) -> Div {
         .gap(px(10.))
         .child(fluent(glyph, 44., t.text_faint))
         .child(div().pt(px(6.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(title.to_string()))
-        .children((!hint.is_empty()).then(|| div().text_size(px(13.)).text_color(t.text_muted).child(hint.to_string())))
+        .children((!hint.is_empty()).then(|| div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(hint.to_string())))
 }
 
 /// On/off switch for settings.

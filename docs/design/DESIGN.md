@@ -37,16 +37,34 @@ No third-party artwork, icons, logo or palette is copied.
 |---|---|---|---|
 | `bg` | `#1B1B1F` @ 86% over acrylic | `#F7F7F9` @ 88% | window body |
 | `bg_elevated` | `#26262C` | `#FFFFFF` | popovers, dialogs |
-| `surface` | `#FFFFFF` @ 6% | `#000000` @ 5% | selected/hovered row, inputs, key caps |
-| `surface_strong` | `#FFFFFF` @ 10% | `#000000` @ 8% | pressed, icon tiles |
+| `surface` | `#FFFFFF` @ 6% | `#000000` @ 5% | inputs, key caps, unselected icon tiles, cards |
+| `surface_strong` | `#FFFFFF` @ 12% | `#000000` @ 9% | **the selected state everywhere** (rows, settings rows, sidebar, action panel) |
+| `hover` | `#FFFFFF` @ 4% | `#000000` @ 3% | under the mouse; always lighter than selection |
 | `text` | `#F2F2F5` | `#1B1B1F` | primary text |
 | `text_muted` | `#A0A0AB` | `#5F5F6B` | subtitles, labels, accessories |
-| `text_faint` | `#6E6E7A` | `#8E8E9A` | section headers, placeholders, hints |
+| `text_faint` | `#8B8B97` | `#6B6B77` | section headers, placeholders, hints, accessories (at least 4.5:1 on the body in every theme) |
 | `hairline` | `#FFFFFF` @ 8% | `#000000` @ 8% | dividers |
 | `border` | `#FFFFFF` @ 12% | `#000000` @ 12% | window, inputs, popovers |
 | `accent` | `#7C6CFF` (akscast violet) | `#5B4BF0` | selection pill, focus ring, active toggle, root mark |
 | `accent_text` | `#FFFFFF` | `#FFFFFF` | text on accent |
 | `success` / `warning` / `danger` | `#4CC38A` / `#F5B74F` / `#FF6B6B` | `#1F9D61` / `#C98100` / `#D93D3D` | toasts, tags, errors |
+
+### Kind tints
+
+The one distinctive element: a row's icon tile takes the hue of what the row *is*, as a wash
+(18% alpha, 30% when selected) with the glyph in the full hue. Images and emoji draw untinted.
+Everything else in the window stays neutral, and the accent is kept for selection and focus.
+
+| Tint | Dark | Light | Rows |
+|---|---|---|---|
+| `Accent` | accent | accent | akscast's own commands (Settings, Store, Reload) |
+| `System` | `#F2B65A` | `#B27100` | lock, sleep, restart, shut down, dark mode |
+| `Window` | `#4FC4CF` | `#0F8A96` | window layouts |
+| `Paste` | `#6AA8FF` | `#2F6FD6` | clipboard, emoji, snippets |
+| `Web` | `#6FD19C` | `#1F9D61` | quicklinks, web search fallbacks |
+| `File` | `#D9B77E` | `#9A6B1F` | file search |
+| `Calc` | `#F08CC0` | `#C23D84` | the calculator |
+| `Danger` | danger | danger | clearing history, quitting apps |
 
 `[theme]` overrides map like this:
 - `background` → `bg`
@@ -60,15 +78,20 @@ No third-party artwork, icons, logo or palette is copied.
 
 ### Typography
 
-| Token | Font | Size / weight | Use |
-|---|---|---|---|
-| `font_ui` | Segoe UI Variable Text | 14 / regular | rows, body |
-| `font_display` | Segoe UI Variable Display | 17 regular (search), 20 semibold (H1) | search field, headings |
-| `font_mono` | Cascadia Mono | 13 | code, detail code blocks |
-| `font_icon` | Segoe Fluent Icons | 16 (row), 14 (footer), 48 (empty state) | all UI icons |
-| `text_xs` | | 11 / semibold | key caps |
-| `text_sm` | | 12.5 / semibold | section headers |
-| `text_md` | | 13 | subtitles, accessories, footer |
+Fonts: Segoe UI Variable Text (UI), Segoe UI Variable Display (search field, headings, the
+calculator answer), Cascadia Mono (code), Segoe Fluent Icons (every UI icon: 15 in tiles, 14 in
+the action bar, 44 in empty states).
+
+Six text sizes, in `design::ts`. Views use nothing else.
+
+| Step | Size | Use |
+|---|---|---|
+| `CAPTION` | 11 | key caps |
+| `SMALL` | 12 | section headers (semibold), settings descriptions, footers |
+| `BODY_SM` | 13 | subtitles, accessories, the action bar |
+| `BODY` | 14 | rows, body text |
+| `TITLE` | 17 | the search field |
+| `DISPLAY` | 22 | page headings, the calculator answer (semibold) |
 
 ### Spacing, size, radius
 
@@ -76,10 +99,14 @@ No third-party artwork, icons, logo or palette is copied.
 - **Sizes:**
   - search bar 56
   - row 40 (section-header rows share the 40 px slot for virtualisation and sit on the bottom edge)
+  - list padding 4 above and below
   - action bar 40
-  - icon tile 26 with a 16 px glyph
+  - window height = 2 (border) + 56 + 40 × (rows shown + 1 header) + 8 + 40, so the list always holds whole rows
+  - icon tile 26 with a 15 px glyph
   - selection pill 3×16
-  - window 760 wide
+  - calculator card two rows tall
+  - window 750 wide before scaling (`width` ≤ 1 is a share of the screen)
+- All of these live in `design.rs` only; views import them.
 - **Radius:** window 8 (set by the OS); `r_row` 8, `r_tile` 6, `r_input` 6, `r_popover` 10, `r_cap` 4.
 - **Elevation:** popovers use `bg_elevated`, a `border` and a large soft shadow; nothing else is shadowed.
 
@@ -92,11 +119,13 @@ No third-party artwork, icons, logo or palette is copied.
 | **Window** | Acrylic body, hairline border, rounded corners, three bands: search bar / content / action bar | Light, dark or system; everything comes from tokens |
 | **Search bar** | `[mark or back tile] [input, display 17] [accessory: dropdown]` | Root shows the accent mark (Search icon). Sub-views show a Back tile (clickable = Esc). The placeholder is `text_faint` |
 | **Section header** | `Title  count`, `text_sm` in `text_faint`, sitting on the bottom of its slot | Not selectable; the cursor skips it |
-| **List row** | `[pill][icon tile] Title  subtitle ······ accessory` | **Default:** transparent. **Hover:** `surface`. **Selected:** `surface` plus the 3×16 accent pill on the left edge. The title truncates first, the subtitle before the accessory |
+| **List row** | `[pill][icon tile] Title  subtitle ······ accessory` | **Default:** transparent. **Hover:** `hover`. **Selected:** `surface_strong` plus the 3×16 accent pill on the left edge. Subtitles name the group ("Window", "Clipboard"), never "akscast" on every row. Accessories are `text_faint` |
 | **Icon tile** | 26 px rounded `surface_strong` square holding a Fluent glyph; app/extension images draw at 20 px with no tile | Emoji draw at 18 px with no tile |
 | **Accessory** | Right-aligned `text_md` in `text_muted`; tags are tinted pills | |
-| **Key cap** | `text_xs` on `surface`, `border`, `r_cap`, 18 px tall, min width 18 | `↵` uses the Fluent ReturnKey glyph |
-| **Action bar** | Left: context icon (16) + title, or a toast (coloured dot + text). Right: `Primary ↵ │ Actions Ctrl K` | The second action shows as `Ctrl ↵` in the panel and runs on Ctrl+Enter |
+| **Key cap** | `CAPTION` on `surface`, `border`, `r_cap`, 20 px tall, min width 20 | `↵` uses the Fluent ReturnKey glyph |
+| **Action bar** | Left: context icon (14) + where you are (in root search: the selected row's kind), or a message with a dot: accent = info, success = done, danger = error. Right: `Primary ↵ │ Actions Ctrl K` | Messages carry their tone explicitly; colour is never guessed from the words |
+| **Calculator card** | Two rows tall above the list: tinted calculator glyph, the question (TITLE, muted), a forward arrow, the answer (DISPLAY semibold, at most four decimals) and the full value below it | Selected like a row (fill plus pill); Enter copies the full value |
+| **Settings** | Sidebar of pages; each page is cards under headings; a row is label + wrapping description (300 px) and its control | Choices are segmented controls with short labels, clicked directly; lists are chips (× and ← are 22 px targets) with an Add field; the footer shows Saved/neutral messages muted and errors in danger |
 | **Action panel** | A 320 px popover anchored above the action bar on the right. Header: item title. Rows: icon + label + caps (32 px) | Esc closes it; ↑↓ moves; Enter runs the action |
 | **Detail pane** | 40/60 split with a hairline divider. Markdown: H1 20 semibold, body 14 at 1.5, code in mono on `surface`. Metadata: an `Information` header, then label/value rows with hairlines | |
 | **Form** | Centred 520 px column; label (120, right-aligned, muted) then control | Inputs are 34 px with `surface` fill and a `border`; the focused field gets an `accent` ring. Dropdowns show value + chevron, checkboxes the Fluent Checkbox glyph |

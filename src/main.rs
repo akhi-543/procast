@@ -58,12 +58,12 @@ actions!(akscast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submi
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(akscast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
-const BAR: f32 = 56.;
-const ROW: f32 = 44.;
-const FOOTER: f32 = 34.;
+use design::{BAR, FOOTER, LIST_PAD, ROW};
 
 fn window_height(cfg: &Config) -> f32 {
-    BAR + ROW * cfg.max_results.max(1) as f32 + 12. + FOOTER
+    // The window's 1 px border top and bottom, the bar, whole rows (results plus a section
+    // header), the list padding and the action bar.
+    2. + BAR + ROW * (cfg.max_results.max(1) + 1) as f32 + 2. * LIST_PAD + FOOTER
 }
 
 /// Compact mode's favourites strip under the search bar.
@@ -75,6 +75,14 @@ const BASE_WIDTH: f32 = 750.;
 
 fn base_width(cfg: &Config) -> f32 {
     if cfg.width <= 1. { BASE_WIDTH } else { cfg.width }
+}
+
+/// What kind of message the action bar is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum Tone {
+    Info,
+    Ok,
+    Error,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -127,6 +135,9 @@ fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
     for (i, it) in items.iter().enumerate() {
+        if is_answer(items, i) {
+            continue;
+        }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
         if sec.is_some() && sec != last {
             out.push(None);
@@ -135,6 +146,11 @@ fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
         out.push(Some(i));
     }
     out
+}
+
+/// The calculator's answer leads root results and is drawn as a card above the list.
+fn is_answer(items: &[Item], i: usize) -> bool {
+    i == 0 && items.first().is_some_and(|it| it.accessory == "Calculator")
 }
 
 fn empty_row(glyph: char, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
@@ -217,7 +233,8 @@ struct Launcher {
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     /// Short-lived message in the footer.
-    status: Option<String>,
+    /// The action bar message, with how it should look.
+    status: Option<(Tone, String)>,
     /// Config or extension problem, shown above the results.
     notice: Option<String>,
     hotkey_errors: Vec<Option<String>>,
@@ -388,7 +405,7 @@ impl Launcher {
                 }
                 self.rebuild_catalog(cx);
             }
-            Err(e) => self.status = Some(e),
+            Err(e) => self.status = Some((Tone::Error, e)),
         }
         cx.notify();
     }
@@ -422,6 +439,10 @@ impl Launcher {
     }
 
     fn image(&mut self, path: PathBuf) -> Option<Arc<RenderImage>> {
+        // ponytail: dropped wholesale past 200 images; per-entry LRU if lists get that big.
+        if self.images.len() > 200 && !self.images.contains_key(&path) {
+            self.images.clear();
+        }
         self.images.entry(path.clone()).or_insert_with(|| ext::load_image(&path)).clone()
     }
 
@@ -610,9 +631,20 @@ impl Launcher {
                         .map(|(r, icon)| {
                             let file = std::path::Path::new(&r.exe).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                             let windows = if r.windows.len() > 1 { format!("{} windows", r.windows.len()) } else { String::new() };
-                            Item::new(&r.title, &file, icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP)), Act::QuitApp(r.pid))
+                            let name = if r.name.is_empty() { file.clone() } else { r.name.clone() };
+                            // "Reddit - Google Chrome" -> "Reddit"; nothing when it just repeats the name.
+                            let mut title = r.title.as_str();
+                            for sep in [" - ", " – ", " — "] {
+                                if let Some((head, tail)) = title.rsplit_once(sep)
+                                    && name.split_whitespace().any(|w| tail.contains(w))
+                                {
+                                    title = head;
+                                }
+                            }
+                            let title = if title == name { "" } else { title };
+                            Item::new(&name, title, icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP)), Act::QuitApp(r.pid))
                                 .acc(windows)
-                                .with_hay(format!("{} {file}", r.title))
+                                .with_hay(format!("{name} {} {file}", r.title))
                         })
                         .collect();
                     search::filter(&query, rows, &mut self.matcher)
@@ -725,6 +757,18 @@ impl Launcher {
             self.search_pos = None;
             self.set_mode(mode, cx);
         }
+        if let Ok(view) = std::env::var("AKSCAST_SHOW") {
+            let mode = match view.as_str() {
+                "clipboard" => Mode::Clipboard,
+                "emoji" => Mode::Emoji,
+                "files" => Mode::Files,
+                "running" => Mode::Running,
+                _ => Mode::Root,
+            };
+            self.set_mode(mode, cx);
+            let q = std::env::var("AKSCAST_QUERY").unwrap_or_default();
+            self.input.update(cx, |s, cx| s.emplace(&q, cx));
+        }
         self.height = self.target_height(cx);
         win::cloak(self.hwnd, false);
         win::focus(self.hwnd);
@@ -732,6 +776,11 @@ impl Launcher {
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
         self.scan_apps(false, false);
+        // AKSCAST_SHOW: the window was placed before its query existed.
+        if std::env::var_os("AKSCAST_SHOW").is_some() {
+            self.height = 0.;
+            self.request_resize(cx);
+        }
     }
 
     /// `restore` hands focus back to the window that was active before we opened;
@@ -1058,7 +1107,12 @@ impl Launcher {
             "toast" if ui => {
                 self.status = (!p["hide"].as_bool().unwrap_or(false)).then(|| {
                     let (t, m) = (text("title"), text("message"));
-                    if m.is_empty() { t } else { format!("{t} — {m}") }
+                    let tone = match p["style"].as_str().unwrap_or_default().to_lowercase().as_str() {
+                        "failure" => Tone::Error,
+                        "success" => Tone::Ok,
+                        _ => Tone::Info,
+                    };
+                    (tone, if m.is_empty() { t } else { format!("{t}: {m}") })
                 });
                 cx.notify();
             }
@@ -1079,7 +1133,7 @@ impl Launcher {
                 }
             }
             "trash" if ui => {
-                self.status = Some("Move to Recycle Bin isn't supported yet".into());
+                self.status = Some((Tone::Error, "Move to Recycle Bin isn't supported yet".into()));
                 cx.notify();
             }
             _ => {}
@@ -1244,7 +1298,7 @@ impl Launcher {
                 if add {
                     list.push(key);
                 }
-                self.status = Some(if add { "Added to Favorites" } else { "Removed from Favorites" }.into());
+                self.status = Some((Tone::Ok, if add { "Added to Favorites" } else { "Removed from Favorites" }.into()));
                 return self.save_launcher_list("favorites", list, cx);
             }
             Act::Hide(key) => {
@@ -1252,7 +1306,7 @@ impl Launcher {
                 if !list.contains(&key) {
                     list.push(key);
                 }
-                self.status = Some("Hidden from root search. Undo in Settings → Launcher".into());
+                self.status = Some((Tone::Info, "Hidden from root search. Undo in Settings → Launcher".into()));
                 return self.save_launcher_list("hidden", list, cx);
             }
             Act::Cmd(Cmd::ClearSearchHistory) => {
@@ -1268,7 +1322,7 @@ impl Launcher {
             Act::Paste(text) | Act::Clip(text) => return self.paste(text, cx),
             Act::DeleteClip(text) => {
                 self.history.remove(&text);
-                self.status = Some("Deleted from clipboard history".into());
+                self.status = Some((Tone::Ok, "Deleted from clipboard history".into()));
                 return self.refresh(cx);
             }
             Act::Snippet(template) => {
@@ -1321,7 +1375,7 @@ impl Launcher {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
                 self.load_extensions();
-                self.status = Some(format!("Uninstalled {name}"));
+                self.status = Some((Tone::Ok, format!("Uninstalled {name}")));
                 return self.refresh(cx);
             }
             Act::None => return,
@@ -1333,11 +1387,11 @@ impl Launcher {
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
             Act::QuitApp(pid) => {
                 apps::quit(pid);
-                self.status = Some("Asked to quit; it may ask to save first".into());
+                self.status = Some((Tone::Info, "Asked to quit; it may ask to save first".into()));
                 return self.load_running_after(Duration::from_millis(700));
             }
             Act::ForceQuit(pid) => {
-                self.status = Some(if apps::force_quit(pid) { "Force quit".into() } else { "Could not end it (it may run as administrator)".to_string() });
+                self.status = Some(if apps::force_quit(pid) { (Tone::Ok, "Force quit".into()) } else { (Tone::Error, "Could not end it (it may run as administrator)".into()) });
                 return self.load_running_after(Duration::from_millis(300));
             }
             Act::Install(name) => return self.install(name, cx),
@@ -1492,7 +1546,7 @@ impl Launcher {
             return cx.notify();
         };
         let (node, tx, dir) = (self.cfg.extensions.node.clone(), self.tx.clone(), ext::dir());
-        self.status = Some(format!("Installing {what}…"));
+        self.status = Some((Tone::Info, format!("Installing {what}…")));
         cx.notify();
         std::thread::spawn(move || {
             use std::os::windows::process::CommandExt;
@@ -1524,7 +1578,7 @@ impl Launcher {
         let spec = &self.scripts[i].args[got.len()];
         if value.is_empty() && !spec.optional {
             self.pending = Some((i, got));
-            self.status = Some(format!("{} is required", spec.placeholder));
+            self.status = Some((Tone::Error, format!("{} is required", spec.placeholder)));
             return cx.notify();
         }
         got.push(value);
@@ -1545,7 +1599,7 @@ impl Launcher {
                 self.set_mode(Mode::Output, cx);
             }
             Output::Compact => {
-                self.status = Some(format!("Running {}…", script.title));
+                self.status = Some((Tone::Info, format!("Running {}…", script.title)));
                 self.set_mode(Mode::Root, cx);
             }
             Output::Silent => self.hide(true, cx),
@@ -1644,12 +1698,12 @@ impl Launcher {
                     Output::Full => {
                         if self.mode == Mode::Output && self.output.as_ref().is_some_and(|o| o.0 == i) {
                             self.output = Some((i, out, false));
-                            self.status = (!ok).then(|| format!("{} failed", script.title));
+                            self.status = (!ok).then(|| (Tone::Error, format!("{} failed", script.title)));
                             self.refresh(cx);
                         }
                     }
                     Output::Compact => {
-                        self.status = Some(if ok { if last.is_empty() { format!("{} done", script.title) } else { last } } else { format!("{} failed: {last}", script.title) });
+                        self.status = Some(if ok { (Tone::Ok, if last.is_empty() { format!("{} done", script.title) } else { last }) } else { (Tone::Error, format!("{} failed: {last}", script.title)) });
                         cx.notify();
                     }
                     Output::Silent if !ok => {
@@ -1661,7 +1715,7 @@ impl Launcher {
             }
             Msg::Ext(v) => self.on_ext(v, window, cx),
             Msg::Install(message, done) => {
-                self.status = Some(message);
+                self.status = Some((match done { Some(true) => Tone::Ok, Some(false) => Tone::Error, None => Tone::Info }, message));
                 if let Some(ok) = done {
                     self.load_extensions();
                     if ok && self.mode == Mode::Install {
@@ -1698,7 +1752,7 @@ impl Launcher {
             }
             Msg::Store(entries) => {
                 self.store_loading = false;
-                self.status = Some(format!("{} Windows-capable extensions", entries.iter().filter(|s| s.windows).count()));
+                self.status = Some((Tone::Info, format!("{} Windows-capable extensions", entries.iter().filter(|s| s.windows).count())));
                 self.store = Some(entries);
                 if self.mode == Mode::Store {
                     self.refresh(cx);
@@ -1769,7 +1823,7 @@ impl Launcher {
 
     /// Text on the left of the action bar: a toast, index status, or where you are.
     fn footer_left(&self) -> String {
-        if let Some(s) = &self.status {
+        if let Some((_, s)) = &self.status {
             return s.clone();
         }
         if self.mode == Mode::Files
@@ -1782,7 +1836,13 @@ impl Launcher {
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
         }
-        self.label().unwrap_or_else(|| "akscast".into())
+        if let Some(label) = self.label() {
+            return label;
+        }
+        match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
+            Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
+            _ => "akscast".into(),
+        }
     }
 
     /// The icon on the left of the action bar.
@@ -1986,7 +2046,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, icon: Icon },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, icon: Icon, tint: Option<design::Tint> },
 }
 
 impl Render for Launcher {
@@ -2050,7 +2110,7 @@ impl Render for Launcher {
                     }
                     Some(i) => {
                         let it = &self.items[*i];
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory: it.accessory.clone(), icon: it.icon.clone() });
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory: it.accessory.clone(), icon: it.icon.clone(), tint: it.tint });
                     }
                 }
             }
@@ -2067,7 +2127,7 @@ impl Render for Launcher {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, icon } => {
+                        Slot::Row { idx, title, subtitle, accessory, icon, tint } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
                             div()
@@ -2087,8 +2147,8 @@ impl Render for Launcher {
                                         .items_center()
                                         .gap(px(12.))
                                         .rounded(px(8.))
-                                        .when(on, |d| d.bg(t.surface))
-                                        .when(!on, |d| d.hover(|s| s.bg(t.surface)))
+                                        .when(on, |d| d.bg(t.surface_strong))
+                                        .when(!on, |d| d.hover(|s| s.bg(t.hover)))
                                         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                             me.update(cx, |this, cx| {
                                                 this.selected = i;
@@ -2098,7 +2158,7 @@ impl Render for Launcher {
                                         })
                                         // Fluent selection pill.
                                         .child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(16.)).rounded_full().when(on, |d| d.bg(t.accent)))
-                                        .child(design::icon_view(icon, &t, on))
+                                        .child(design::icon_tile(icon, &t, on, *tint))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -2108,9 +2168,9 @@ impl Render for Launcher {
                                                 .gap(px(10.))
                                                 // Title keeps priority; the subtitle gives way first.
                                                 .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.clone()))
-                                                .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(13.)).text_color(t.text_muted).child(subtitle.clone()))),
+                                                .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(subtitle.clone()))),
                                         )
-                                        .when(!accessory.is_empty(), |d| d.child(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(13.)).text_color(t.text_muted).child(accessory.clone()))),
+                                        .when(!accessory.is_empty(), |d| d.child(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_faint).child(accessory.clone()))),
                                 )
                                 .into_any_element()
                         }
@@ -2121,8 +2181,52 @@ impl Render for Launcher {
             .w_full()
             .flex_1()
             .min_h_0()
-            .py(px(4.))
+            .py(px(LIST_PAD))
         };
+
+        // ---- calculator answer card (two rows tall, so the list below keeps whole rows) ----
+        let answer = (self.mode == Mode::Root && is_answer(&self.items, 0)).then(|| {
+            let it = &self.items[0];
+            let on = self.selected == 0;
+            let hue = design::Tint::Calc.hue(&t);
+            let full = match &it.act {
+                Act::Copy(v) => v.clone(),
+                _ => String::new(),
+            };
+            let me = cx.weak_entity();
+            div().h(px(2. * ROW)).flex_none().px(px(6.)).pt(px(LIST_PAD)).child(
+                div()
+                    .id("answer")
+                    .relative()
+                    .size_full()
+                    .px(px(16.))
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .rounded(px(10.))
+                    .bg(if on { t.surface_strong } else { t.surface })
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                        me.update(cx, |this, cx| {
+                            this.selected = 0;
+                            this.launch(window, cx);
+                        })
+                        .ok();
+                    })
+                    .child(div().absolute().left(px(0.)).top(px(24.)).w(px(3.)).h(px(24.)).rounded_full().when(on, |d| d.bg(t.accent)))
+                    .child(design::fluent(g::CALCULATOR, 18., hue))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::TITLE)).text_color(t.text_muted).child(it.subtitle.clone()))
+                    .child(design::fluent(g::FORWARD, 14., t.text_faint))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(it.title.clone()))
+                            .when(full != it.title, |d| d.child(div().text_size(px(design::ts::SMALL)).text_color(t.text_faint).child(full))),
+                    ),
+            )
+        });
 
         // ---- body ----
         let body = match (&empty, &view) {
@@ -2145,7 +2249,7 @@ impl Render for Launcher {
                     .into_any_element()
             }
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
-            _ => list.into_any_element(),
+            _ => div().flex_1().min_h_0().flex().flex_col().children(answer).child(list).into_any_element(),
         };
 
         // ---- compact mode: favourites as icons ----
@@ -2228,17 +2332,17 @@ impl Render for Launcher {
                     .caret_blink_interval_500ms()
                     .flex_1()
                     .font_family(design::FONT_DISPLAY)
-                    .text_size(px(17.))
+                    .text_size(px(design::ts::TITLE))
                     .whitespace_nowrap(),
             )
             .children(dropdown);
 
         // ---- action bar ----
-        let tone = match self.status.as_deref() {
-            Some(s) if s.contains("failed") || s.contains("error") || s.contains("not supported") => Some(t.danger),
-            Some(_) => Some(t.success),
-            None => None,
-        };
+        let tone = self.status.as_ref().map(|(tone, _)| match tone {
+            Tone::Error => t.danger,
+            Tone::Ok => t.success,
+            Tone::Info => t.accent,
+        });
         let footer = div()
             .h(px(design::FOOTER))
             .flex_none()
@@ -2249,7 +2353,7 @@ impl Render for Launcher {
             .gap(px(16.))
             .border_t_1()
             .border_color(t.hairline)
-            .text_size(px(13.))
+            .text_size(px(design::ts::BODY_SM))
             .child(
                 div()
                     .flex_1()
@@ -2324,8 +2428,8 @@ impl Render for Launcher {
                         .items_center()
                         .gap(px(10.))
                         .rounded(px(6.))
-                        .when(on, |d| d.bg(t.surface))
-                        .hover(|s| s.bg(t.surface))
+                        .when(on, |d| d.bg(t.surface_strong))
+                        .hover(|s| s.bg(t.hover))
                         .on_click(move |_, window, cx| {
                             me.update(cx, |this, cx| {
                                 if let Some((_, p)) = &mut this.panel {
@@ -2621,6 +2725,10 @@ fn main() {
             // For screenshots and checks of the settings window without clicking through.
             if std::env::var_os("AKSCAST_OPEN_SETTINGS").is_some() {
                 let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Settings));
+            }
+            // AKSCAST_SHOW=root|clipboard|emoji|files|running with AKSCAST_QUERY: opens there.
+            if std::env::var_os("AKSCAST_SHOW").is_some() {
+                let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Open));
             }
         });
 

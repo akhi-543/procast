@@ -31,6 +31,8 @@ pub struct Running {
     pub pid: u32,
     /// Full path of the program.
     pub exe: String,
+    /// The program's own name ("Google Chrome"), from its version information.
+    pub name: String,
     /// The first window's title.
     pub title: String,
     pub windows: Vec<isize>,
@@ -132,10 +134,41 @@ pub fn running() -> Vec<Running> {
         }
         match out.iter_mut().find(|r| r.pid == pid) {
             Some(r) => r.windows.push(h.0 as isize),
-            None => out.push(Running { pid, exe, title: title(h), windows: vec![h.0 as isize] }),
+            None => out.push(Running { pid, name: app_name(&exe), exe, title: title(h), windows: vec![h.0 as isize] }),
         }
     }
     out
+}
+
+/// A program's display name (FileDescription), or "" when it has none.
+pub fn app_name(exe: &str) -> String {
+    use windows::{
+        Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
+        core::{HSTRING, w},
+    };
+    unsafe {
+        let path = HSTRING::from(exe);
+        let size = GetFileVersionInfoSizeW(&path, None);
+        if size == 0 {
+            return String::new();
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(&path, None, size, data.as_mut_ptr() as _).is_err() {
+            return String::new();
+        }
+        // The first language/code page pair names the string table to read.
+        let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
+        if !VerQueryValueW(data.as_ptr() as _, w!("\\VarFileInfo\\Translation"), &mut ptr, &mut len).as_bool() || len < 4 {
+            return String::new();
+        }
+        let pair = std::slice::from_raw_parts(ptr as *const u16, 2);
+        let key = HSTRING::from(format!("\\StringFileInfo\\{:04x}{:04x}\\FileDescription", pair[0], pair[1]));
+        if !VerQueryValueW(data.as_ptr() as _, &key, &mut ptr, &mut len).as_bool() || len == 0 {
+            return String::new();
+        }
+        let s = std::slice::from_raw_parts(ptr as *const u16, len as usize);
+        String::from_utf16_lossy(s).trim_end_matches('\0').trim().to_string()
+    }
 }
 
 /// Asks the app to close its windows (it may ask to save first).

@@ -2,6 +2,7 @@
 //! `run` is called off the UI thread: several of these broadcast or send window messages
 //! that would re-enter GPUI if issued from inside an update.
 
+use crate::design::Tint;
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
@@ -122,12 +123,29 @@ impl Cmd {
         format!("cmd:{self:?}")
     }
 
+    /// The group a command belongs to, shown after its title.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Cmd::Snap(_) => "Window Management",
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji => "akscast",
-            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit | Cmd::QuitApps => "akscast",
+            Cmd::Snap(_) => "Window",
+            Cmd::SearchFiles => "Files",
+            Cmd::ClipboardHistory | Cmd::ClearClipboardHistory => "Clipboard",
+            Cmd::Emoji => "Emoji",
+            Cmd::ClearSearchHistory => "Search",
+            Cmd::QuitApps => "Apps",
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "akscast",
             _ => "System",
+        }
+    }
+
+    /// The hue of the command's icon tile.
+    pub fn tint(self) -> Tint {
+        match self {
+            Cmd::Snap(_) => Tint::Window,
+            Cmd::SearchFiles => Tint::File,
+            Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
+            Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::QuitApps => Tint::Danger,
+            Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => Tint::Accent,
+            _ => Tint::System,
         }
     }
 }

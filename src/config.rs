@@ -121,7 +121,7 @@ impl Launcher {
     }
 }
 
-pub const POP_TO_ROOT: &[&str] = &["immediately", "5s", "15s", "30s", "60s", "90s", "120s", "180s", "never"];
+pub const POP_TO_ROOT: &[&str] = &["immediately", "15s", "30s", "60s", "120s", "180s", "never"];
 
 /// Keys handled by akscast's keyboard hook.
 #[derive(Debug, Clone, Deserialize, PartialEq)]

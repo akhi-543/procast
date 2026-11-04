@@ -73,14 +73,13 @@ fn groups(list: Vec<(&'static str, Vec<Row>)>) -> Vec<Row> {
 /// How a choice value reads on screen.
 fn choice_label(v: &str) -> String {
     match v {
-        "cursor" => "Screen with the mouse".into(),
-        "active" => "Screen with the focused window".into(),
+        "cursor" => "Mouse".into(),
+        "active" => "Focused window".into(),
         "primary" => "Main screen".into(),
-        "back" => "Go back one level".into(),
-        "close" => "Close and return to root".into(),
-        "default" => "Arrows only".into(),
-        "emacs" => "Emacs  (Alt+N / P / B)".into(),
-        "vim" => "Vim  (Alt+J / K / H)".into(),
+        "back" => "Go back".into(),
+        "close" => "Close".into(),
+        "default" => "Arrows".into(),
+        "immediately" => "Now".into(),
         "system" => "Follow Windows".into(),
         "expanded" => "Full list".into(),
         "compact" => "Search bar only".into(),
@@ -89,9 +88,9 @@ fn choice_label(v: &str) -> String {
         "rightalt" => "Right Alt".into(),
         "rightctrl" => "Right Ctrl".into(),
         "scrolllock" => "Scroll Lock".into(),
-        "launch" => "Start a new one".into(),
-        "focus" => "Switch to its window".into(),
-        "toggle" => "Switch, or hide if in front".into(),
+        "launch" => "New window".into(),
+        "focus" => "Switch to it".into(),
+        "toggle" => "Switch or hide".into(),
         s if s.ends_with('s') && s[..s.len() - 1].parse::<u32>().is_ok() => format!("{} s", &s[..s.len() - 1]),
         s => {
             let mut c = s.chars();
@@ -141,8 +140,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "Opening",
                 vec![
-                    row("Show akscast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Which monitor the window opens on when you have more than one."),
-                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long akscast remembers where you were after it closes. Immediately always starts fresh."),
+                    row("Show akscast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Which monitor the window opens on: the one with the mouse, the one with the window you're using, or the main one."),
+                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long akscast remembers where you were after it closes. Now always starts fresh."),
                 ],
             ),
             (
@@ -158,8 +157,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 "Keyboard",
                 vec![
                     row("Search history", "launcher.history", Kind::Bool, "Up arrow in an empty search bar brings back earlier searches."),
-                    row("Escape key", "launcher.escape", Kind::Choice(&["back", "close"]), "What Escape does inside a command such as Clipboard History."),
-                    row("Extra navigation keys", "launcher.navigation", Kind::Choice(&["default", "emacs", "vim"]), "Move through the list without the arrow keys."),
+                    row("Escape key", "launcher.escape", Kind::Choice(&["back", "close"]), "Inside a command such as Clipboard History: go back one level, or close the window and start fresh next time."),
+                    row("Extra navigation keys", "launcher.navigation", Kind::Choice(&["default", "emacs", "vim"]), "Move without the arrow keys. Emacs: Alt+N/P move, Alt+B back. Vim: Alt+J/K move, Alt+H back."),
                     row("Game mode", "launcher.game_mode", Kind::Bool, "Hotkeys do nothing while a full-screen app or game has focus."),
                 ],
             ),
@@ -185,7 +184,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                     "An app's hotkey",
                     "apps.hotkey_action",
                     Kind::Choice(&["launch", "focus", "toggle"]),
-                    "What a hotkey set under Shortcuts does when the app is already open.",
+                    "When the app is already open, its hotkey (set under Shortcuts) can open a new window, switch to the open one, or switch to it and hide it again if it's already in front.",
                 )],
             ),
             (
@@ -331,7 +330,8 @@ pub struct Settings {
     selected: usize,
     inputs: HashMap<String, Entity<EditableTextState>>,
     recording: bool,
-    status: Option<String>,
+    /// The footer message and whether it is an error.
+    status: Option<(bool, String)>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -433,11 +433,11 @@ impl Settings {
                 Ok(()) => {
                     self.launcher = config::parse(&text).map(|c| c.launcher).unwrap_or_default();
                     self.text = text;
-                    self.status = Some(format!("Saved {}", path.join(".")));
+                    self.status = Some((false, format!("Saved {}", path.join("."))));
                 }
-                Err(e) => self.status = Some(format!("Could not write config.toml: {e}")),
+                Err(e) => self.status = Some((true, format!("Could not write config.toml: {e}"))),
             },
-            Err(e) => self.status = Some(e),
+            Err(e) => self.status = Some((true, e)),
         }
         cx.notify();
     }
@@ -471,7 +471,7 @@ impl Settings {
                 Ok(n) if n > 0. && n.fract() == 0. => (n as i64).into(),
                 Ok(n) if n > 0. => n.into(),
                 _ => {
-                    self.status = Some(format!("{} must be a positive number", r.label));
+                    self.status = Some((true, format!("{} must be a positive number", r.label)));
                     return cx.notify();
                 }
             },
@@ -550,7 +550,7 @@ impl Settings {
             Kind::Hotkey | Kind::Command(_) => {
                 self.commit(cx);
                 self.recording = true;
-                self.status = Some("Press the new shortcut (Backspace removes it, Esc cancels)".into());
+                self.status = Some((false, "Press the new shortcut (Backspace removes it, Esc cancels)".into()));
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
@@ -595,8 +595,8 @@ impl Settings {
             list.push(key);
         }
         self.save(&["launcher".into(), "disabled".into()], list.iter().map(String::as_str).collect::<toml_edit::Array>().into(), cx);
-        if self.status.as_deref().is_some_and(|s| s.starts_with("Saved")) {
-            self.status = Some(format!("Saved: {} {}", self.items[i].title, if off { "switched off" } else { "switched on" }));
+        if self.status.as_ref().is_some_and(|(error, _)| !error) {
+            self.status = Some((false, format!("{} switched {}", self.items[i].title, if off { "off" } else { "on" })));
         }
     }
 
@@ -628,13 +628,13 @@ impl Settings {
         match config::parse_hotkey(&spec) {
             Ok(_) => match self.hotkey_owner(&spec, &path) {
                 Some(owner) => {
-                    self.status = Some(format!("{spec} is already used by {owner}"));
+                    self.status = Some((true, format!("{spec} is already used by {owner}")));
                     cx.notify();
                 }
                 None => self.save(&path, spec.into(), cx),
             },
             Err(e) => {
-                self.status = Some(e);
+                self.status = Some((true, e));
                 cx.notify();
             }
         }
@@ -725,14 +725,17 @@ impl Settings {
                             .py(px(2.))
                             .rounded(px(5.))
                             .bg(t.surface_strong)
-                            .text_size(px(13.))
+                            .text_size(px(crate::design::ts::BODY_SM))
                             .child(self.entry_label(&kind, e))
                             .when(ordered && n > 0, |d| {
                                 d.child(
                                     div()
                                         .id(SharedString::from(format!("up-{}-{e}", r.path.join("."))))
-                                        .px(px(3.))
-                                        .rounded(px(3.))
+                                        .size(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(4.))
                                         .text_color(t.text_muted)
                                         .hover(|s| s.bg(t.surface).text_color(t.text))
                                         .on_click(move |_, _, cx| {
@@ -745,8 +748,11 @@ impl Settings {
                             .child(
                                 div()
                                     .id(SharedString::from(format!("rm-{}-{e}", r.path.join("."))))
-                                    .px(px(4.))
-                                    .rounded(px(3.))
+                                    .size(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
                                     .text_color(t.text_muted)
                                     .hover(|s| s.bg(t.surface).text_color(t.danger))
                                     .on_click(move |_, _, cx| {
@@ -756,7 +762,7 @@ impl Settings {
                                     .child("×"),
                             )
                     }))
-                    .when(entries.is_empty() && r.kind == Kind::Keys, |d| d.child(div().text_size(px(13.)).text_color(t.text_muted).child("None yet")))
+                    .when(entries.is_empty() && r.kind == Kind::Keys, |d| d.child(div().text_size(px(crate::design::ts::BODY_SM)).text_color(t.text_muted).child("None yet")))
                     .when(r.kind == Kind::List, |d| d.child(self.text_box(r, on, t)))
                     .into_any_element()
             }
@@ -770,13 +776,13 @@ impl Settings {
                 })
             }
             Kind::Hotkey if self.recording && on => pill("Press keys… (Backspace removes, Esc cancels)".into(), true),
-            Kind::Hotkey if value.is_empty() => div().text_size(px(13.)).child(pill("Record Hotkey".into(), false)).into_any_element(),
+            Kind::Hotkey if value.is_empty() => div().text_size(px(crate::design::ts::BODY_SM)).child(pill("Record Hotkey".into(), false)).into_any_element(),
             Kind::Hotkey => div()
                 .flex()
                 .items_center()
                 .gap(px(4.))
                 .children(value.split('+').map(|k| crate::design::key_cap(k, t)))
-                .child(div().pl(px(8.)).text_size(px(12.)).text_color(t.text_muted).child("Click to change"))
+                .child(div().pl(px(8.)).text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child("Click to change"))
                 .into_any_element(),
             Kind::Open(_) => pill("Open".into(), false),
             Kind::Category => {
@@ -795,9 +801,9 @@ impl Settings {
     fn command_control(&self, i: usize, r: &Row, on: bool, t: &crate::design::Tokens, me: gpui::WeakEntity<Self>) -> AnyElement {
         let hotkey = self.launcher.hotkeys.get(&key_of(&self.items[i])).cloned().unwrap_or_default();
         let keys = if self.recording && on {
-            div().px_2().py_1().rounded_md().bg(t.accent).text_color(t.accent_text).text_size(px(12.)).child("Press keys…").into_any_element()
+            div().px_2().py_1().rounded_md().bg(t.accent).text_color(t.accent_text).text_size(px(crate::design::ts::SMALL)).child("Press keys…").into_any_element()
         } else if hotkey.is_empty() {
-            div().px_2().py_1().rounded_md().border_1().border_color(t.border).text_size(px(12.)).text_color(t.text_muted).child("Record Hotkey").into_any_element()
+            div().px_2().py_1().rounded_md().border_1().border_color(t.border).text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child("Record Hotkey").into_any_element()
         } else {
             div().flex().gap(px(4.)).children(hotkey.split('+').map(|k| crate::design::key_cap(k, t))).into_any_element()
         };
@@ -854,7 +860,7 @@ impl Settings {
                     .flex_col()
                     .gap(px(6.))
                     .pb(px(14.))
-                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_muted).child(group)))
+                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).text_size(px(crate::design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_muted).child(group)))
                     .child(
                         div()
                             .flex()
@@ -884,7 +890,7 @@ impl Settings {
             .py(px(10.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| d.bg(t.surface).child(div().absolute().left(px(0.)).top(px(10.)).bottom(px(10.)).w(px(3.)).rounded_full().bg(t.accent)))
+            .when(on, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(10.)).bottom(px(10.)).w(px(3.)).rounded_full().bg(t.accent)))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -908,7 +914,7 @@ impl Settings {
                     .flex_col()
                     .gap(px(2.))
                     .child(div().child(r.label.clone()))
-                    .children((!r.help.is_empty()).then(|| div().text_size(px(12.)).line_height(px(17.)).text_color(t.text_muted).child(r.help.clone()))),
+                    .children((!r.help.is_empty()).then(|| div().text_size(px(crate::design::ts::SMALL)).line_height(px(17.)).text_color(t.text_muted).child(r.help.clone()))),
             )
             .child(div().flex_1().min_w_0().flex().items_center().child(match r.kind {
                 Kind::Command(c) => self.command_control(c, r, on, t, me.clone()),
@@ -946,7 +952,7 @@ impl Render for Settings {
             .size_full()
             .flex()
             .font_family(crate::design::FONT_UI)
-            .text_size(px(14.))
+            .text_size(px(crate::design::ts::BODY))
             .bg(t.bg)
             .text_color(t.text)
             .key_context("Settings")
@@ -960,7 +966,7 @@ impl Render for Settings {
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
                 if this.recording {
                     this.recording = false;
-                    this.status = Some("Cancelled".into());
+                    this.status = Some((false, "Cancelled".into()));
                     cx.notify();
                 } else {
                     this.commit(cx);
@@ -988,12 +994,12 @@ impl Render for Settings {
                             .rounded_md()
                             .relative()
                             .when(i == self.section, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(8.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)))
-                            .when(i != self.section, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.surface)))
+                            .when(i != self.section, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.hover)))
                             .on_click(move |_, window, cx| drop(me.update(cx, |this, cx| this.set_section(i, window, cx))))
                             .child(*name)
                     }))
                     .child(div().flex_1())
-                    .child(div().px_2().text_xs().text_color(t.text_muted).child(if SECTIONS[self.section] == "Shortcuts" { "Type an alias · Enter record hotkey · Ctrl+D switch on/off" } else { "Up/Down rows · Ctrl+Up/Down pages · Enter change · Esc close" })),
+                    .child(div().px_2().text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child(if SECTIONS[self.section] == "Shortcuts" { "Type an alias · Enter record hotkey · Ctrl+D switch on/off" } else { "Up/Down rows · Ctrl+Up/Down pages · Enter change · Esc close" })),
             )
             .child(
                 div()
@@ -1011,7 +1017,7 @@ impl Render for Settings {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().font_family(crate::design::FONT_DISPLAY).text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
+                            .child(div().font_family(crate::design::FONT_DISPLAY).text_size(px(crate::design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
                             .children((SECTIONS[self.section] == "Theme").then(|| preview(&t)))
                             .children(self.cards(&rows, &t, &me))
                             .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
@@ -1025,12 +1031,12 @@ impl Render for Settings {
                             .items_center()
                             .border_t_1()
                             .border_color(t.hairline)
-                            .text_xs()
-                            .text_color(match self.status.as_deref() {
-                                Some(s) if !(s.starts_with("Saved") || s.starts_with("Press") || s == "Cancelled") => t.danger,
+                            .text_size(px(crate::design::ts::SMALL))
+                            .text_color(match self.status.as_ref().map(|(error, _)| *error) {
+                                Some(true) => t.danger,
                                 _ => t.text_muted,
                             })
-                            .child(self.status.clone().unwrap_or_else(|| format!("Changes save to {} and apply within 2 s", config::path().display()))),
+                            .child(self.status.as_ref().map(|(_, m)| m.clone()).unwrap_or_else(|| format!("Changes save to {} and apply within 2 s", config::path().display()))),
                     ),
             )
     }
@@ -1054,7 +1060,7 @@ fn choices(opts: &[&'static str], current: &str, t: &crate::design::Tokens, id: 
                 .px(px(10.))
                 .py(px(3.))
                 .rounded(px(4.))
-                .text_size(px(13.))
+                .text_size(px(crate::design::ts::BODY_SM))
                 .when(cur, |d| d.bg(t.accent).text_color(t.accent_text))
                 .when(!cur, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.surface_strong).text_color(t.text)))
                 .on_click(move |_, _, cx| {
@@ -1103,7 +1109,7 @@ fn preview(t: &crate::design::Tokens) -> impl IntoElement {
             .child(div().child(title.to_string()))
             .child(div().text_color(t.text_muted).child(sub.to_string()))
             .child(div().flex_1())
-            .child(div().text_size(px(12.)).text_color(t.text_faint).child(acc.to_string()))
+            .child(div().text_size(px(crate::design::ts::SMALL)).text_color(t.text_faint).child(acc.to_string()))
     };
     div()
         .mb(px(14.))
@@ -1112,7 +1118,7 @@ fn preview(t: &crate::design::Tokens) -> impl IntoElement {
         .border_color(t.border)
         .bg(t.bg)
         .font_family(FONT_UI)
-        .text_size(px(13.))
+        .text_size(px(crate::design::ts::BODY_SM))
         .text_color(t.text)
         .overflow_hidden()
         .child(
@@ -1127,7 +1133,7 @@ fn preview(t: &crate::design::Tokens) -> impl IntoElement {
                 .child(fluent(g::SEARCH, 15., t.accent))
                 .child(div().text_color(t.text_muted).child("Search apps and commands…")),
         )
-        .child(div().px(px(14.)).pt(px(8.)).pb(px(4.)).text_size(px(11.5)).text_color(t.text_faint).child("Results"))
+        .child(div().px(px(14.)).pt(px(8.)).pb(px(4.)).text_size(px(crate::design::ts::CAPTION)).text_color(t.text_faint).child("Results"))
         .child(row(g::FOLDER, "Search Files", "akscast", "Command", true))
         .child(row(g::PASTE, "Clipboard History", "akscast", "Command", false))
         .child(row(g::CALCULATOR, "42", "6 × 7 =", "Calculator", false))
