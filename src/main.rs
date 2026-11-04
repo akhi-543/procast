@@ -769,18 +769,18 @@ impl Launcher {
             let q = std::env::var("PROCAST_QUERY").unwrap_or_default();
             self.input.update(cx, |s, cx| s.emplace(&q, cx));
         }
-        self.height = self.target_height(cx);
         win::cloak(self.hwnd, false);
         win::focus(self.hwnd);
         window.activate();
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
         self.scan_apps(false, false);
-        // PROCAST_SHOW: the window was placed before its query existed.
-        if std::env::var_os("PROCAST_SHOW").is_some() {
-            self.height = 0.;
-            self.request_resize(cx);
-        }
+        // The window was placed before this view existed (a notice, a kept search or a
+        // query can each change its height), so size it to what it shows now. Without this,
+        // `height` could claim a size the window doesn't have, and typing in compact mode
+        // would never grow it. win::resize does nothing when the size is already right.
+        self.height = 0.;
+        self.request_resize(cx);
     }
 
     /// `restore` hands focus back to the window that was active before we opened;
@@ -2735,6 +2735,16 @@ fn main() {
                 let _ = this.tx.unbounded_send(Msg::Tray(TrayCmd::Open));
             }
         });
+
+        // PROCAST_TYPE: text put in the search bar a second after opening, through the same
+        // change event as typing (checks of compact mode without sending keys).
+        if let Ok(text) = std::env::var("PROCAST_TYPE") {
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                let _ = handle.update(cx, |this, _, cx| this.input.update(cx, |s, cx| s.emplace(&text, cx)));
+            })
+            .detach();
+        }
 
         cx.spawn(async move |cx| {
             while let Some(msg) = rx.next().await {
