@@ -86,7 +86,7 @@ impl Act {
             Act::Copy(_) => "Copy",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) => "Open",
             Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) => "Run Command",
             Act::ExtFn(_) => "Run Action",
@@ -709,6 +709,7 @@ mod tests {
         let gpt = root("a b", &cat, &cfg, &frec, &mut m).into_iter().find(|h| h.title == "Search with ChatGPT").unwrap();
         assert_eq!(gpt.act, Act::Open("https://chatgpt.com/?q=a%20b".into()), "the query is encoded into the URL");
         assert!(root("a b", &cat, &cfg, &frec, &mut m).iter().any(|h| h.act == Act::Ask("a b".into())), "Ask AI takes the query as typed");
+        assert_eq!(root("ai", &cat, &cfg, &frec, &mut m)[0].act, Act::Cmd(Cmd::AskAi), "typing ai finds the command first");
 
         cfg.launcher.sensitivity = "low".into();
         assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");

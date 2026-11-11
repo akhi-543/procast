@@ -205,6 +205,17 @@ api.anthropic.com  (your claude.ai login for personal use; API key if distribute
 - `AbortController.abort()` works on Windows: the `claude.exe` is gone within 4.5 s.
 - `apiKeySource=none`: the subscription is used. The bundled binary is 327 MB of the 381 MB install.
 
+### Chat session (2026-11-12)
+
+`exthost/ai.mjs` now keeps one streaming-input `query()` per open chat instead of one process per question (`spikes/ai/session.mjs`, `spikes/ai/idle.mjs`).
+
+- Follow-ups keep their context: a number given in turn 1 was recalled in turns 2, 4 and 5.
+- The process starts when the Ask AI view opens, so it is ready while the question is typed. First text in the app: 2.6–3.0 s for the first question, 1.4–2.4 s for follow-ups (debug build). Driving the module directly: 1.2–1.9 s.
+- A question sent within about 4 s of the previous answer waits for that turn's `post_turn_summary` (5.0 s to first text). No switch for it was found.
+- `interrupt()` cuts an answer short and the session carries on with the next question.
+- `abortController.abort()` ends the process within 3 s. An unused chat is closed after 10 minutes (`PROCAST_AI_IDLE_MS`); the next question starts a new session without the earlier context.
+- Still nothing persisted (`persistSession: false`): the context lives in the process.
+
 ## Risks and unknowns
 
 - **Distribution terms** (§2). This is the biggest risk.

@@ -2,13 +2,13 @@
 // Speaks newline-delimited JSON on stdio with the Rust app:
 //   in:  {t:"run", run, entry, mode, arguments, preferences, environment, launchType, memoryMb}
 //        {t:"event", run, fn, args} | {t:"pop", run} | {t:"reply", run, id, value|error} | {t:"stop", run}
-//        {t:"ai", id, prompt, model} | {t:"aiStop"}
+//        {t:"aiOpen", model} | {t:"ai", id, prompt, model} | {t:"aiStop"}
 //   out: whatever a worker posts ({t:"render"|"call"|"request"|"error"|"log"|"exit"}), tagged with run
-//        {t:"aiDelta", id, text} | {t:"aiDone", id, error?}
+//        {t:"aiDelta", id, text} | {t:"aiDone", id, error?} | {t:"aiClosed"}
 import { Worker } from "node:worker_threads";
 import { createInterface } from "node:readline";
 import fs from "node:fs";
-import { ask, stop } from "./ai.mjs";
+import { ask, open, stop } from "./ai.mjs";
 
 const workers = new Map();
 const out = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
@@ -41,7 +41,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     return;
   }
   if (msg.t === "run") return start(msg);
-  if (msg.t === "ai") return void ask(msg.id, msg.prompt, msg.model, out);
+  if (msg.t === "aiOpen") return void open(msg.model, out);
+  if (msg.t === "ai") return ask(msg.id, msg.prompt, msg.model, out);
   if (msg.t === "aiStop") return stop();
   const worker = workers.get(msg.run);
   if (!worker) return;

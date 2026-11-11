@@ -186,7 +186,7 @@ Source: the settings pages and feature modules in the installed v2.10.1 frontend
 | Action panel (Ctrl+K secondary actions) | ✅ (run as admin, reveal, copy path/name, delete clipboard entry) | Phase 2b |
 | File search | ✅ own index of `[files] roots`, saved to disk, kept live by `ReadDirectoryChangesW`; worker thread + generation counter | Phase 2b. Live index + disk cache: done (roadmap A3/A4). Whole-drive MFT/USN: roadmap A6 |
 | Script commands | ✅ Raycast headers, silent/compact/fullOutput, arguments, needsConfirmation | Phase 2b. Inline/refresh-interval: later |
-| AI (Claude Code / Agent SDK) | Quick AI (`exthost/ai.mjs`, "Ask AI" row); the rest is research: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
+| AI (Claude Code / Agent SDK) | Quick AI with follow-ups (`exthost/ai.mjs`, "Ask AI" command and row, one Claude session per open chat); the rest is research: [docs/ai-research.md](docs/ai-research.md) | Phase 5 |
 | Extensions (Raycast API, unmodified store extensions) | ✅ own runtime (`exthost/`), List / Grid / Detail / Form / ActionPanel / navigation / toasts / confirm / storage / prefs, interval background commands | Phase 3 |
 | Extension install + store | ✅ "Install Extension" (name or folder) and "Browse Extension Store" (996 Windows-capable) | Phase 3 / Phase 4 |
 | Menu-bar extras → tray | ✅ one tray icon per menu-bar command, live menu, interval refresh | Phase 4 |

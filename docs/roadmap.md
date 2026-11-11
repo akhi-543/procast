@@ -187,7 +187,7 @@ Each of these could also be a store extension instead of built-in code.
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [x] | U1 | Quick AI: ask from the search bar, answer streams into a detail view | ✅ "Ask AI" fallback row, Agent SDK on your Claude Code login, no tools; first token about 5–13 s (cold) | M | |
+| [x] | U1 | Quick AI: ask from the search bar, answer streams into a detail view | ✅ "Ask AI" command and fallback row, Agent SDK on your Claude Code login, no tools; first text about 2–3 s from the Ask AI view, 3.5–13 s from the fallback row | M | |
 | [ ] | U2 | AI commands: saved prompts over selected text / clipboard | ✗ | M | your prompts |
-| [ ] | U3 | AI chat window with history | ✗ | L | |
+| [ ] | U3 | AI chat window with history | ◐ follow-ups in the Ask AI view keep their context while it is open; nothing is saved | L | |
 | [ ] | U4 | Dictation (speech to text) | ✗ | L | local (Whisper) or cloud |

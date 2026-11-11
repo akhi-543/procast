@@ -51,6 +51,8 @@ pub enum Cmd {
     FastFileSearch(bool),
     /// List running apps to quit or force-quit.
     QuitApps,
+    /// Open the Quick AI view to type a question.
+    AskAi,
     Quit,
 }
 
@@ -82,6 +84,7 @@ pub const ALL: &[(Cmd, &str, &str, char)] = &[
     (Cmd::ClearSearchHistory, "Clear Search History", "recent queries up arrow forget", g::DELETE),
     (Cmd::Emoji, "Search Emoji", "emoji symbols", g::EMOJI),
     (Cmd::QuitApps, "Quit Applications", "close kill force end task running processes", g::CANCEL),
+    (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::LIGHTBULB),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::REFRESH),
@@ -165,7 +168,7 @@ pub fn run(cmd: Cmd, target: HWND) {
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi => {}
         }
     }
 }

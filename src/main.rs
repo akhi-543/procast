@@ -107,12 +107,38 @@ enum Mode {
     Ai,
 }
 
-/// One Quick AI answer, streaming until `busy` clears.
-struct AiAnswer {
+/// A Quick AI chat: one Claude session, kept while the view is open.
+#[derive(Default)]
+struct AiChat {
+    turns: Vec<AiTurn>,
+    /// The last turn is still streaming.
+    busy: bool,
+    /// Keep the newest question at the top of the view (until Up or Down).
+    follow: bool,
+}
+
+struct AiTurn {
     id: u64,
     prompt: String,
     text: String,
-    busy: bool,
+}
+
+impl AiChat {
+    /// The chat as markdown, and how many lines come before the newest question.
+    fn markdown(&self) -> (String, usize) {
+        let parts: Vec<String> = self
+            .turns
+            .iter()
+            .map(|t| {
+                let text = if t.text.is_empty() { "Thinking…" } else { t.text.trim_end() };
+                // An answer cut off inside a code block must not swallow the next question.
+                let open = text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+                format!("### {}\n\n{text}{}\n\n", t.prompt, if open { "\n```" } else { "" })
+            })
+            .collect();
+        let before = parts.len().saturating_sub(1);
+        (parts.concat(), ext::markdown_lines(&parts[..before].concat()).len())
+    }
 }
 
 impl Mode {
@@ -242,7 +268,7 @@ struct Launcher {
     pending: Option<(usize, Vec<String>)>,
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
-    ai: Option<AiAnswer>,
+    ai: Option<AiChat>,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -603,7 +629,9 @@ impl Launcher {
                 }
                 None => vec![],
             },
-            Mode::Ai => self.ai.iter().filter(|a| !a.text.is_empty()).map(|a| Item::new("Copy answer", "", Icon::Fluent(g::COPY), Act::Copy(a.text.clone()))).collect(),
+            // Typed text is the next question; with an empty bar, Enter copies the answer.
+            Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Fluent(g::LIGHTBULB), Act::Ask(query.trim().to_string()))],
+            Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Fluent(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
@@ -827,25 +855,52 @@ impl Launcher {
 
     // ---- Quick AI -------------------------------------------------------------------
 
+    /// Opens an empty chat and starts Claude, so it is ready by the time a question is typed.
+    fn open_ai(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_host() {
+            return self.refresh(cx);
+        }
+        self.status = None;
+        self.send(json!({"t": "aiOpen", "model": self.cfg.ai.model}));
+        self.ai = Some(AiChat::default());
+        self.set_mode(Mode::Ai, cx);
+    }
+
+    /// Asks in the open chat (or starts one); earlier questions stay as context.
     fn ask(&mut self, prompt: String, cx: &mut Context<Self>) {
         if !self.ensure_host() {
             return self.refresh(cx);
         }
         self.next_run += 1;
         let id = self.next_run;
+        self.status = None;
         self.send(json!({"t": "ai", "id": id, "prompt": prompt, "model": self.cfg.ai.model}));
-        self.ai = Some(AiAnswer { id, prompt, text: String::new(), busy: true });
-        self.ai_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        let chat = self.ai.get_or_insert_default();
+        chat.turns.push(AiTurn { id, prompt, text: String::new() });
+        chat.busy = true;
+        chat.follow = true;
         self.set_mode(Mode::Ai, cx);
     }
 
     fn on_ai(&mut self, v: &Value, cx: &mut Context<Self>) {
-        let Some(answer) = self.ai.as_mut().filter(|a| Some(a.id) == v["id"].as_u64()) else { return };
-        if let Some(text) = v["text"].as_str() {
-            answer.text.push_str(text);
+        if v["t"] == "aiClosed" {
+            // The sidecar closed an idle chat. Out of sight it just ends; in view the
+            // answers stay, but the next question starts without their context.
+            if self.mode == Mode::Ai && !self.visible {
+                self.set_mode(Mode::Root, cx);
+            } else if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) {
+                self.status = Some((Tone::Info, "Idle chat closed: the next question starts a new one".into()));
+                self.refresh(cx);
+            }
+            return;
+        }
+        // Only the newest question's answer is still wanted.
+        let Some(chat) = self.ai.as_mut().filter(|a| a.turns.last().map(|t| t.id) == v["id"].as_u64()) else { return };
+        if let (Some(text), Some(turn)) = (v["text"].as_str(), chat.turns.last_mut()) {
+            turn.text.push_str(text);
         }
         if v["t"] == "aiDone" {
-            answer.busy = false;
+            chat.busy = false;
             if let Some(e) = v["error"].as_str() {
                 self.status = Some((Tone::Error, e.to_string()));
             }
@@ -853,8 +908,11 @@ impl Launcher {
         self.refresh(cx);
     }
 
-    /// Up and Down read a long answer.
+    /// Up and Down read the chat.
     fn scroll_ai(&mut self, dy: f32, cx: &mut Context<Self>) {
+        if let Some(chat) = &mut self.ai {
+            chat.follow = false;
+        }
         let (offset, max) = (self.ai_scroll.offset(), self.ai_scroll.max_offset());
         let y = (offset.y - px(dy)).min(px(0.)).max(-max.y);
         self.ai_scroll.set_offset(gpui::point(offset.x, y));
@@ -1126,12 +1184,12 @@ impl Launcher {
                     }
                 }
             }
-            "aiDelta" | "aiDone" => self.on_ai(&v, cx),
+            "aiDelta" | "aiDone" | "aiClosed" => self.on_ai(&v, cx),
             "hostExit" => {
                 self.host = None;
                 self.bg_runs.clear();
-                if let Some(answer) = self.ai.as_mut().filter(|a| a.busy) {
-                    answer.busy = false;
+                if let Some(chat) = self.ai.as_mut().filter(|a| a.busy) {
+                    chat.busy = false;
                     self.status = Some((Tone::Error, "The extension host stopped".into()));
                     self.refresh(cx);
                 }
@@ -1445,6 +1503,7 @@ impl Launcher {
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
+            Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
             Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
                 apps::quit(pid);
@@ -1506,7 +1565,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -1852,7 +1911,7 @@ impl Launcher {
             Mode::Running => Some("Quit Applications".into()),
             Mode::Args => self.pending.as_ref().map(|(i, _)| self.scripts[*i].title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
-            Mode::Ai => self.ai.as_ref().map(|a| a.prompt.clone()),
+            Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
                 e.view.title.clone().unwrap_or_else(|| x.title.clone())
@@ -1880,7 +1939,8 @@ impl Launcher {
                 .unwrap_or_default()
                 .into(),
             Mode::Output => "Enter copies the output".into(),
-            Mode::Ai => "Enter copies the answer, Esc goes back".into(),
+            Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
+            Mode::Ai => "Ask a question…".into(),
         }
     }
 
@@ -2153,7 +2213,7 @@ impl Render for Launcher {
                 "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
                 "panel": self.panel.is_some(),
                 "footer": [self.footer_left(), footer_action.clone()],
-                "ai": self.ai.as_ref().map(|a| json!({"text": a.text, "busy": a.busy})),
+                "ai": self.ai.as_ref().map(|a| json!({"text": a.turns.last().map_or("", |t| t.text.as_str()), "busy": a.busy, "turns": a.turns.len()})),
                 "notice": self.notice,
                 "view": view.as_ref().map(|v| &v.kind),
                 "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
@@ -2297,9 +2357,16 @@ impl Render for Launcher {
         // ---- body ----
         let body = match (&empty, &view) {
             _ if self.mode == Mode::Ai => {
-                let answer = self.ai.as_ref();
-                let md = answer.filter(|a| !a.text.is_empty() || !a.busy).map_or("Thinking…", |a| &a.text);
-                Self::render_markdown(md, &[], &t, "ai", Some(&self.ai_scroll))
+                match self.ai.as_ref().filter(|a| !a.turns.is_empty()) {
+                    None => Self::render_markdown("Type a question, then press Enter.", &[], &t, "ai", Some(&self.ai_scroll)),
+                    Some(chat) => {
+                        let (md, newest) = chat.markdown();
+                        if chat.follow {
+                            self.ai_scroll.scroll_to_top_of_item(newest);
+                        }
+                        Self::render_markdown(&md, &[], &t, "ai", Some(&self.ai_scroll))
+                    }
+                }
             }
             (Some(e), _) => {
                 let glyph = if let Icon::Fluent(c) = e.icon { c } else { g::SEARCH };
@@ -2875,4 +2942,24 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_chat_markdown_pins_the_newest_question() {
+        let turn = |prompt: &str, text: &str| AiTurn { id: 0, prompt: prompt.into(), text: text.into() };
+        let mut chat = AiChat::default();
+        chat.turns.push(turn("first", "one\n```rust\nfn main() {"));
+        chat.turns.push(turn("second", ""));
+        let (md, newest) = chat.markdown();
+        let lines = ext::markdown_lines(&md);
+        assert_eq!(lines[newest], (3, "second".to_string()), "the pinned line is the newest question");
+        assert_eq!(lines.last().unwrap(), &(0, String::new()));
+        assert!(lines.contains(&(0, "Thinking…".to_string())), "an unanswered question shows a placeholder");
+        assert!(lines.iter().any(|l| l == &(9, "fn main() {".to_string())), "code stays code");
+        assert!(lines[newest..].iter().all(|l| l.0 != 9), "a cut-off code block does not swallow the next question");
+    }
 }
