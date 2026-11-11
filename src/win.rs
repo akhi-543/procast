@@ -522,10 +522,7 @@ pub fn local_date_time() -> (String, String) {
 /// Windows Run: first token is the program, the rest its arguments.
 pub fn run(cmdline: &str) {
     let (file, args) = cmdline.split_once(' ').unwrap_or((cmdline, ""));
-    unsafe {
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        ShellExecuteW(None, w!("open"), &HSTRING::from(file), &HSTRING::from(args), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    shell("open", file.into(), args.into());
 }
 
 #[cfg(test)]
@@ -568,35 +565,36 @@ pub fn app_target(id: &str) -> Option<String> {
 
 /// Elevated launch (UAC prompt). Works for desktop apps; Store apps can't be elevated.
 pub fn run_as_admin(id: &str) {
-    unsafe {
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        ShellExecuteW(None, w!("runas"), &HSTRING::from(format!("shell:AppsFolder\\{id}")), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    shell("runas", format!("shell:AppsFolder\\{id}").into(), HSTRING::new());
 }
 
 /// Runs procast itself elevated with one argument (Windows shows the admin prompt).
 pub fn run_self_as_admin(arg: &str) {
     let Ok(exe) = std::env::current_exe() else { return };
-    unsafe {
-        ShellExecuteW(None, w!("runas"), &HSTRING::from(exe.as_os_str()), &HSTRING::from(arg), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    shell("runas", exe.as_os_str().into(), arg.into());
 }
 
 /// Opens Explorer with the item selected.
 pub fn reveal(path: &str) {
-    unsafe {
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        let args = HSTRING::from(format!("/select,\"{path}\""));
-        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    shell("open", "explorer.exe".into(), format!("/select,\"{path}\"").into());
 }
 
-/// ShellExecute for paths, URLs and shell: targets. Lets the started app take focus.
+/// ShellExecute for paths, URLs and shell: targets.
 pub fn open(target: &str) {
+    shell("open", target.into(), HSTRING::new());
+}
+
+/// ShellExecute on its own thread, letting the started app take focus. It pumps Windows
+/// messages while it works; on the UI thread, a gpui timer run from that pump panics on the
+/// App borrow held by the calling action, which aborts procast.
+fn shell(verb: &'static str, file: HSTRING, args: HSTRING) {
     unsafe {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
-        ShellExecuteW(None, w!("open"), &HSTRING::from(target), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        ShellExecuteW(None, &HSTRING::from(verb), &file, &args, PCWSTR::null(), SW_SHOWNORMAL);
+    });
 }
 
 // ---- process ------------------------------------------------------------------------
