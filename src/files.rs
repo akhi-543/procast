@@ -319,7 +319,7 @@ pub fn item(path: &str, dir: bool, home: &str) -> Item {
         "exe" | "msi" | "lnk" => (g::APP, "Program"),
         _ => (g::DOCUMENT, "File"),
     };
-    Item::new(name, parent, Icon::Fluent(glyph), Act::File(path.to_string())).acc(kind)
+    Item::new(name, parent, Icon::Vector(glyph), Act::File(path.to_string())).acc(kind)
 }
 
 #[cfg(test)]

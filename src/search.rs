@@ -108,8 +108,8 @@ impl Act {
 #[derive(Clone)]
 pub enum Icon {
     Image(Arc<RenderImage>),
-    /// A Segoe Fluent Icons glyph, drawn in a tile.
-    Fluent(char),
+    /// A vector icon (a `design::g` name), drawn in a tile.
+    Vector(&'static str),
     /// Emoji or other content text.
     Glyph(SharedString),
 }
@@ -275,7 +275,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
     let mut items: Vec<Item> = apps
         .iter()
         .map(|a| {
-            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP));
+            let icon = a.icon.clone().map(Icon::Image).unwrap_or(Icon::Vector(g::APP));
             Item::new(&a.name, "", icon, Act::App(a.id.clone())).acc("Application").keyed(a.id.clone())
         })
         .collect();
@@ -285,7 +285,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         {
             continue;
         }
-        items.push(Item::new(title, cmd.subtitle(), Icon::Fluent(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
+        items.push(Item::new(title, cmd.subtitle(), Icon::Vector(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
     }
     for q in &cfg.quicklink {
         let act = if q.url.contains("{query}") {
@@ -293,13 +293,13 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         } else {
             Act::Open(q.url.clone())
         };
-        items.push(Item::new(q.title(), &q.keyword, Icon::Fluent(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web));
+        items.push(Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web));
     }
     for s in &cfg.snippet {
-        items.push(Item::new(&s.name, &s.keyword, Icon::Fluent(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
+        items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
     }
     for (i, s) in scripts.iter().enumerate() {
-        let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Fluent(g::COMMAND));
+        let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Vector(g::COMMAND));
         items.push(Item::new(&s.title, &s.package, icon, Act::Script(i)).acc("Script Command").keyed(format!("sc:{}", s.path)));
     }
     for (e, (ext, icon)) in exts.iter().enumerate() {
@@ -397,20 +397,20 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
 
     let mut top = Vec::new();
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
-        top.push(Item::new(cmdline, "", Icon::Fluent(g::COMMAND), Act::Run(cmdline.to_string())).acc("Windows Run"));
+        top.push(Item::new(cmdline, "", Icon::Vector(g::COMMAND), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
     if let Some((kw, rest)) = q.split_once(' ')
         && let Some(link) = cfg.quicklink.iter().find(|l| !l.keyword.is_empty() && l.keyword.eq_ignore_ascii_case(kw))
         && !rest.trim().is_empty()
     {
         let url = link.url.replace("{query}", &url_encode(rest.trim()));
-        top.push(Item::new(rest.trim(), link.title(), Icon::Fluent(g::LINK), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
+        top.push(Item::new(rest.trim(), link.title(), Icon::Vector(g::LINK), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
         let full = result.trim_start_matches("approx. ").to_string();
-        top.push(Item::new(tidy_number(&result), q, Icon::Fluent(g::CALCULATOR), Act::Copy(full)).acc("Calculator").tinted(Tint::Calc));
+        top.push(Item::new(tidy_number(&result), q, Icon::Vector(g::CALCULATOR), Act::Copy(full)).acc("Calculator").tinted(Tint::Calc));
     }
 
     // Fallback commands: the web search and quicklinks that take a query, in the configured order.
@@ -420,7 +420,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         .iter()
         .filter_map(|name| {
             if name.eq_ignore_ascii_case("ai") {
-                return Some(Item::new("Ask AI", "", Icon::Fluent(g::LIGHTBULB), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
+                return Some(Item::new("Ask AI", "", Icon::Vector(g::LIGHTBULB), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
             }
             let (title, url, glyph, kind) = if name.eq_ignore_ascii_case("web") {
                 (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), g::GLOBE, "Web"))?
@@ -430,7 +430,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
                 let l = cfg.quicklink.iter().find(|l| l.title().eq_ignore_ascii_case(name) && l.url.contains("{query}"))?;
                 (l.title().to_string(), l.url.clone(), g::LINK, "Quicklink")
             };
-            Some(Item::new(title, "", Icon::Fluent(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).tinted(Tint::Web).sec(format!("Use \"{q}\" with")))
+            Some(Item::new(title, "", Icon::Vector(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).tinted(Tint::Web).sec(format!("Use \"{q}\" with")))
         })
         .collect();
     // An alias typed exactly puts its item first, hidden or not.
@@ -465,7 +465,7 @@ pub fn favorites(catalog: &[Item], cfg: &Config) -> Vec<Item> {
 }
 
 /// What a clipboard entry looks like it is, for its icon and subtitle.
-fn clip_kind(text: &str) -> (char, &'static str) {
+fn clip_kind(text: &str) -> (&'static str, &'static str) {
     let t = text.trim();
     let one_line = !t.contains('\n');
     if one_line && (t.starts_with("http://") || t.starts_with("https://")) {
@@ -498,7 +498,7 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
             _ => format!("{} d ago", age / 86400),
         };
         let (glyph, kind) = clip_kind(&e.text);
-        let mut it = Item::new(title, kind, Icon::Fluent(glyph), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" }).tinted(Tint::Paste);
+        let mut it = Item::new(title, kind, Icon::Vector(glyph), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" }).tinted(Tint::Paste);
         it.hay = e.text.chars().take(500).collect();
         it
     };

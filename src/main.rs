@@ -192,8 +192,8 @@ fn is_answer(items: &[Item], i: usize) -> bool {
     i == 0 && items.first().is_some_and(|it| it.accessory == "Calculator")
 }
 
-fn empty_row(glyph: char, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
-    let mut it = Item::new(title, hint, Icon::Fluent(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
+fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
+    let mut it = Item::new(title, hint, Icon::Vector(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
     it.extra = actions;
     it
 }
@@ -493,21 +493,21 @@ impl Launcher {
 
     /// An extension icon value: "icon:Name", an emoji, an asset file or a URL.
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
-        let Some(icon) = icon else { return Icon::Fluent(g::BULLETS) };
+        let Some(icon) = icon else { return Icon::Vector(g::BULLETS) };
         if let Some(name) = icon.strip_prefix("icon:") {
-            return Icon::Fluent(ext::icon_glyph(name));
+            return Icon::Vector(ext::icon_glyph(name));
         }
         if icon.starts_with("http") {
             // Web images: drawn from the cache once downloaded; a globe until then.
             let cached = net::image_path(icon);
             if cached.exists() {
-                return self.image(cached).map(Icon::Image).unwrap_or(Icon::Fluent(g::GLOBE));
+                return self.image(cached).map(Icon::Image).unwrap_or(Icon::Vector(g::GLOBE));
             }
             net::fetch_image(icon, &self.tx);
-            return Icon::Fluent(g::GLOBE);
+            return Icon::Vector(g::GLOBE);
         }
         if icon.starts_with("data:") {
-            return Icon::Fluent(g::DOCUMENT);
+            return Icon::Vector(g::DOCUMENT);
         }
         if icon.chars().count() <= 4 && !icon.contains('.') {
             return Icon::glyph(icon.to_string());
@@ -516,7 +516,7 @@ impl Launcher {
         let path = if std::path::Path::new(icon).is_absolute() { PathBuf::from(icon) } else { dir.join(icon) };
         match self.image(path) {
             Some(i) => Icon::Image(i),
-            None => Icon::Fluent(g::BULLETS),
+            None => Icon::Vector(g::BULLETS),
         }
     }
 
@@ -524,7 +524,7 @@ impl Launcher {
         let exts = ext::scan();
         let mut out = Vec::with_capacity(exts.len());
         for e in exts {
-            let icon = e.icon.clone().and_then(|p| self.image(p)).map(Icon::Image).unwrap_or(Icon::Fluent(g::PUZZLE));
+            let icon = e.icon.clone().and_then(|p| self.image(p)).map(Icon::Image).unwrap_or(Icon::Vector(g::PUZZLE));
             out.push((e, icon));
         }
         self.exts = out;
@@ -542,9 +542,9 @@ impl Launcher {
     fn ext_rows(&mut self, query: &str) -> Vec<Item> {
         if let Some(c) = &self.confirm {
             // Drawn as a dialog; these two rows only drive selection and Enter.
-            let mut ok = Item::new(c.primary.clone(), "", Icon::Fluent(g::CHECK), Act::Confirm(true));
+            let mut ok = Item::new(c.primary.clone(), "", Icon::Vector(g::CHECK), Act::Confirm(true));
             ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
-            return vec![ok, Item::new("Cancel", "", Icon::Fluent(g::CANCEL), Act::Confirm(false))];
+            return vec![ok, Item::new("Cancel", "", Icon::Vector(g::CANCEL), Act::Confirm(false))];
         }
         let Some(ev) = &self.extv else { return vec![] };
         let (ext, view) = (ev.ext, ev.view.clone());
@@ -588,7 +588,7 @@ impl Launcher {
             "" => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
             // Detail and Form draw their own body; Enter and Ctrl+K use the view's actions.
             _ => {
-                let mut row = Item::new(view.title.clone().unwrap_or_default(), "", Icon::Fluent(g::BULLETS), view_actions.first().map(|a| a.1.clone()).unwrap_or(Act::None));
+                let mut row = Item::new(view.title.clone().unwrap_or_default(), "", Icon::Vector(g::BULLETS), view_actions.first().map(|a| a.1.clone()).unwrap_or(Act::None));
                 row.extra = view_actions;
                 vec![row]
             }
@@ -630,19 +630,19 @@ impl Launcher {
                 Some((i, got)) => {
                     let s = &self.scripts[*i];
                     let n = s.args.len();
-                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Fluent(g::COMMAND), Act::Script(*i))]
+                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::COMMAND), Act::Script(*i))]
                 }
                 None => vec![],
             },
             // Typed text is the next question; with an empty bar, Enter copies the answer.
-            Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Fluent(g::LIGHTBULB), Act::Ask(query.trim().to_string()))],
-            Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Fluent(g::COPY), Act::Copy(t.text.clone()))).collect(),
+            Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::LIGHTBULB), Act::Ask(query.trim().to_string()))],
+            Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
                     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                     let shown = if lines.is_empty() { vec!["(no output)"] } else { lines };
-                    shown.iter().map(|l| Item::new(*l, "", Icon::Fluent(g::COMMAND), Act::Copy(text.clone())).sec("Output")).collect()
+                    shown.iter().map(|l| Item::new(*l, "", Icon::Vector(g::COMMAND), Act::Copy(text.clone())).sec("Output")).collect()
                 }
                 None => vec![],
             },
@@ -656,7 +656,7 @@ impl Launcher {
                         .filter(|s| s.windows)
                         .map(|s| {
                             let done = installed.contains(&s.name.as_str());
-                            let mut it = Item::new(&s.title, &s.description, Icon::Fluent(if done { g::CHECK } else { g::PUZZLE }), Act::Install(s.name.clone()))
+                            let mut it = Item::new(&s.title, &s.description, Icon::Vector(if done { g::CHECK } else { g::PUZZLE }), Act::Install(s.name.clone()))
                                 .acc(if done { "Installed".to_string() } else { s.author.clone() })
                                 .with_hay(format!("{} {} {} {}", s.title, s.name, s.author, s.description));
                             it.extra = vec![
@@ -690,7 +690,7 @@ impl Launcher {
                                 }
                             }
                             let title = if title == name { "" } else { title };
-                            Item::new(&name, title, icon.clone().map(Icon::Image).unwrap_or(Icon::Fluent(g::APP)), Act::QuitApp(r.pid))
+                            Item::new(&name, title, icon.clone().map(Icon::Image).unwrap_or(Icon::Vector(g::APP)), Act::QuitApp(r.pid))
                                 .acc(windows)
                                 .with_hay(format!("{name} {} {file}", r.title))
                         })
@@ -1977,16 +1977,16 @@ impl Launcher {
     /// The icon on the left of the action bar.
     fn context_icon(&self) -> Icon {
         match self.mode {
-            Mode::Ext => self.extv.as_ref().map(|e| self.exts[e.ext].1.clone()).unwrap_or(Icon::Fluent(g::PUZZLE)),
-            Mode::Root => Icon::Fluent(g::SEARCH),
-            Mode::Clipboard => Icon::Fluent(g::PASTE),
-            Mode::Emoji => Icon::Fluent(g::EMOJI),
-            Mode::Files => Icon::Fluent(g::FOLDER),
-            Mode::Store => Icon::Fluent(g::SHOP),
-            Mode::Install => Icon::Fluent(g::DOWNLOAD),
-            Mode::Running => Icon::Fluent(g::CANCEL),
-            Mode::Args | Mode::Output => Icon::Fluent(g::COMMAND),
-            Mode::Ai => Icon::Fluent(g::LIGHTBULB),
+            Mode::Ext => self.extv.as_ref().map(|e| self.exts[e.ext].1.clone()).unwrap_or(Icon::Vector(g::PUZZLE)),
+            Mode::Root => Icon::Vector(g::SEARCH),
+            Mode::Clipboard => Icon::Vector(g::PASTE),
+            Mode::Emoji => Icon::Vector(g::EMOJI),
+            Mode::Files => Icon::Vector(g::FOLDER),
+            Mode::Store => Icon::Vector(g::SHOP),
+            Mode::Install => Icon::Vector(g::DOWNLOAD),
+            Mode::Running => Icon::Vector(g::CANCEL),
+            Mode::Args | Mode::Output => Icon::Vector(g::COMMAND),
+            Mode::Ai => Icon::Vector(g::LIGHTBULB),
         }
     }
 
@@ -2062,14 +2062,14 @@ impl Launcher {
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(design::fluent(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
+                            .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
                             .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.title.clone()))
                             .into_any_element()
                     }
                     FieldKind::Dropdown(opts) => {
                         let cur = value.as_str().unwrap_or_default();
                         let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::fluent(g::CHEVRON_DOWN, design::ic::SM, t.text_muted)).into_any_element()
+                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::icon(g::CHEVRON_DOWN, design::ic::SM, t.text_muted)).into_any_element()
                     }
                     FieldKind::Description => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
                     FieldKind::Separator => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
@@ -2135,8 +2135,8 @@ impl Launcher {
     }
 }
 
-/// Fluent glyph for an action in the Ctrl+K panel.
-fn act_glyph(act: &Act) -> char {
+/// Icon for an action in the Ctrl+K panel.
+fn act_glyph(act: &Act) -> &'static str {
     match act {
         Act::Favorite(..) => g::STAR,
         Act::Hide(_) => g::CANCEL,
@@ -2338,9 +2338,9 @@ impl Render for Launcher {
                         .ok();
                     })
                     .when(on, |d| d.child(design::pill(hue, 2. * ROW - LIST_PAD)))
-                    .child(design::fluent(g::CALCULATOR, design::ic::LG, hue))
+                    .child(design::icon(g::CALCULATOR, design::ic::LG, hue))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::HEADING)).text_color(t.text_muted).child(it.subtitle.clone()))
-                    .child(design::fluent(g::FORWARD, design::ic::MD, t.text_faint))
+                    .child(design::icon(g::FORWARD, design::ic::MD, t.text_faint))
                     .child(
                         div()
                             .flex_none()
@@ -2368,7 +2368,7 @@ impl Render for Launcher {
                 }
             }
             (Some(e), _) => {
-                let glyph = if let Icon::Fluent(c) = e.icon { c } else { g::SEARCH };
+                let glyph = if let Icon::Vector(c) = e.icon { c } else { g::SEARCH };
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
             (_, Some(v)) if v.kind == "Form" => self.render_form(&t),
@@ -2416,7 +2416,7 @@ impl Render for Launcher {
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
         let leading = if at_root {
-            div().size(px(design::TILE)).flex_none().flex().items_center().justify_center().child(design::fluent(g::SEARCH, design::ic::LG, t.accent)).into_any_element()
+            div().size(px(design::TILE)).flex_none().flex().items_center().justify_center().child(design::icon(g::SEARCH, design::ic::LG, t.accent)).into_any_element()
         } else {
             div()
                 .id("back")
@@ -2429,7 +2429,7 @@ impl Render for Launcher {
                 .bg(t.surface)
                 .hover(|s| s.bg(t.surface_strong))
                 .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-                .child(design::fluent(g::BACK, design::ic::MD, t.text))
+                .child(design::icon(g::BACK, design::ic::MD, t.text))
                 .into_any_element()
         };
         let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
@@ -2445,9 +2445,9 @@ impl Render for Launcher {
                 .border_1()
                 .border_color(t.border)
                 .text_size(px(design::ts::BODY_SM))
-                .child(design::fluent(g::FILTER, design::ic::SM, t.text_muted))
+                .child(design::icon(g::FILTER, design::ic::SM, t.text_muted))
                 .child(div().max_w(px(180.)).truncate().child(title))
-                .child(design::fluent(g::CHEVRON_DOWN, design::ic::SM, t.text_muted))
+                .child(design::icon(g::CHEVRON_DOWN, design::ic::SM, t.text_muted))
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| {
@@ -2506,7 +2506,7 @@ impl Render for Launcher {
                         Some(c) => div().size(px(8.)).mx(px(4.)).rounded_full().bg(c).into_any_element(),
                         // In root search: the selected row's own icon beside its kind.
                         None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), t.hue_for(it.tint, &it.icon))) {
-                            (Icon::Fluent(ch), hue) => design::fluent(ch, design::ic::MD, hue).into_any_element(),
+                            (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
                             (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
                             (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
                         },
@@ -2590,7 +2590,7 @@ impl Render for Launcher {
                             })
                             .ok();
                         })
-                        .child(design::fluent(act_glyph(&act), design::ic::MD, if on { t.text } else { t.text_muted }))
+                        .child(design::icon(act_glyph(&act), design::ic::MD, if on { t.text } else { t.text_muted }))
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| design::key_cap(k, &t))))
                 })))
@@ -2621,7 +2621,7 @@ impl Render for Launcher {
                     .border_1()
                     .border_color(t.border)
                     .shadow_lg()
-                    .child(div().py(px(4.)).child(design::fluent(if danger { g::WARNING } else { g::INFO }, design::ic::XL, if danger { t.danger } else { t.accent })))
+                    .child(div().py(px(4.)).child(design::icon(if danger { g::WARNING } else { g::INFO }, design::ic::XL, if danger { t.danger } else { t.accent })))
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_center().child(c.title.clone()))
                     .children((!c.message.is_empty()).then(|| div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).text_center().child(c.message.clone())))
                     .child(div().w_full().pt(px(8.)).flex().flex_col().gap(px(8.)).child(button(0, c.primary.clone(), if danger { design::Button::Danger } else { design::Button::Primary })).child(button(1, "Cancel".into(), design::Button::Quiet))),
@@ -2720,7 +2720,7 @@ impl Render for Launcher {
                     .rounded(px(design::r::SM))
                     .bg(t.surface)
                     .text_size(px(design::ts::BODY_SM))
-                    .child(design::fluent(g::WARNING, design::ic::MD, t.warning))
+                    .child(design::icon(g::WARNING, design::ic::MD, t.warning))
                     .child(div().min_w_0().child(n))
             }))
             .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
@@ -2801,7 +2801,8 @@ fn main() {
     if !win::single_instance() {
         return;
     }
-    gpui_ce_platform::application().with_quit_mode(QuitMode::Explicit).run(|cx: &mut App| {
+    gpui_ce_platform::application().with_assets(design::Icons).with_quit_mode(QuitMode::Explicit).run(|cx: &mut App| {
+        design::register_fonts(cx);
         // Defaults first; ours are added later at the same depth, so they win for these keys.
         cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
         cx.bind_keys([

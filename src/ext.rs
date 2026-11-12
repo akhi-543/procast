@@ -635,8 +635,8 @@ pub fn load_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     Some((img.into_raw(), 32, 32))
 }
 
-/// Raycast icon names -> Segoe Fluent Icons glyphs; anything unknown gets a neutral dot.
-pub fn icon_glyph(name: &str) -> char {
+/// Raycast icon names -> icon names (`design::g`); anything unknown gets the command icon.
+pub fn icon_glyph(name: &str) -> &'static str {
     use crate::design::g;
     match name {
         "Checkmark" | "CheckCircle" | "Check" | "CheckList" => g::CHECK,
@@ -673,7 +673,7 @@ pub fn icon_glyph(name: &str) -> char {
         "ArrowClockwise" | "RotateClockwise" => g::REFRESH,
         "Power" => g::POWER,
         "Person" | "PersonCircle" | "TwoPeople" => g::SIGN_OUT,
-        _ => g::BULLETS,
+        _ => g::COMMAND,
     }
 }
 #[cfg(test)]

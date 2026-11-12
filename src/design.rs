@@ -1,18 +1,18 @@
 //! procast's design tokens and small shared components (see docs/design/DESIGN.md).
 //! Views take every colour, size and font from here.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use gpui::{AnyElement, Div, Hsla, Pixels, Window, div, img, prelude::*, rgba};
+use gpui::{AnyElement, App, AssetSource, Div, Hsla, Pixels, SharedString, Svg, Window, div, img, prelude::*, rgba, svg};
 
 use crate::{config, search::Icon};
 
-pub const FONT_UI: &str = "Segoe UI Variable Text";
-pub const FONT_DISPLAY: &str = "Segoe UI Variable Display";
-/// The optical size cut for 12 px and under: wider and more open than Text.
-pub const FONT_SMALL: &str = "Segoe UI Variable Small";
+/// Space Grotesk, the variable font in `assets/fonts` (registered by `register_fonts`).
+pub const FONT_UI: &str = "Space Grotesk";
+pub const FONT_DISPLAY: &str = FONT_UI;
+pub const FONT_SMALL: &str = FONT_UI;
 pub const FONT_MONO: &str = "Cascadia Mono";
-pub const FONT_ICON: &str = "Segoe Fluent Icons";
 pub const FONT_EMOJI: &str = "Segoe UI Emoji";
 
 // Every length goes through `px`, which scales it. The launcher scales by interface size
@@ -158,68 +158,77 @@ impl Tint {
     }
 }
 
-/// Segoe Fluent Icons codepoints (each verified to exist in the font).
-pub mod g {
-    pub const SEARCH: char = '\u{E721}';
-    pub const BACK: char = '\u{E72B}';
-    pub const CHEVRON_DOWN: char = '\u{E70D}';
-    pub const PASTE: char = '\u{E77F}';
-    pub const COPY: char = '\u{E8C8}';
-    pub const EMOJI: char = '\u{E76E}';
-    pub const LOCK: char = '\u{E72E}';
-    pub const SLEEP: char = '\u{E708}';
-    pub const REFRESH: char = '\u{E72C}';
-    pub const POWER: char = '\u{E7E8}';
-    pub const SIGN_OUT: char = '\u{F3B1}';
-    pub const DELETE: char = '\u{E74D}';
-    pub const PERSONALIZE: char = '\u{E771}';
-    pub const DOCK_LEFT: char = '\u{E90C}';
-    pub const DOCK_RIGHT: char = '\u{E90D}';
-    pub const DOCK_BOTTOM: char = '\u{E90E}';
-    pub const FULL_SCREEN: char = '\u{E740}';
-    pub const RESTORE: char = '\u{E73F}';
-    pub const SWITCH_APPS: char = '\u{E8F9}';
-    pub const TILES: char = '\u{ECA5}';
-    pub const DOCUMENT: char = '\u{E8A5}';
-    pub const FOLDER: char = '\u{E8B7}';
-    pub const SETTING: char = '\u{E713}';
-    pub const SHOP: char = '\u{E719}';
-    pub const PUZZLE: char = '\u{EA86}';
-    pub const DOWNLOAD: char = '\u{E896}';
-    pub const COMMAND: char = '\u{E756}';
-    pub const CALCULATOR: char = '\u{E8EF}';
-    pub const GLOBE: char = '\u{E774}';
-    pub const LIGHTBULB: char = '\u{E82F}';
-    pub const LINK: char = '\u{E71B}';
-    pub const EDIT: char = '\u{E70F}';
-    pub const INFO: char = '\u{E946}';
-    pub const WARNING: char = '\u{E7BA}';
-    pub const CHECK: char = '\u{E73E}';
-    pub const CANCEL: char = '\u{E711}';
-    pub const RETURN: char = '\u{E751}';
-    pub const APP: char = '\u{ECAA}';
-    pub const CHECKBOX: char = '\u{E739}';
-    pub const CHECKBOX_ON: char = '\u{E73A}';
-    pub const FILTER: char = '\u{E71C}';
-    pub const STAR: char = '\u{E734}';
-    pub const CLOCK: char = '\u{E823}';
-    pub const PLAY: char = '\u{E768}';
-    pub const CODE: char = '\u{E943}';
-    pub const NETWORK: char = '\u{E968}';
-    pub const CALENDAR: char = '\u{E787}';
-    pub const KEYBOARD: char = '\u{E765}';
-    pub const BULLETS: char = '\u{E8FD}';
-    pub const UP: char = '\u{E74A}';
-    pub const DOWN: char = '\u{E74B}';
-    pub const PICTURE: char = '\u{E8B9}';
-    pub const VIDEO: char = '\u{E714}';
-    pub const AUDIO: char = '\u{E8D6}';
-    pub const ZIP: char = '\u{F012}';
-    pub const PDF: char = '\u{EA90}';
-    pub const FORWARD: char = '\u{E72A}';
-    pub const PIN: char = '\u{E718}';
-    pub const SHIELD: char = '\u{EA18}';
-    pub const MAIL: char = '\u{E715}';
+/// Icon names: the stems of the files in `assets/icons/`. `ALL` lists them for the tests.
+macro_rules! names {
+    ($($k:ident = $v:literal),* $(,)?) => {
+        pub mod g {
+            $(pub const $k: &str = $v;)*
+            pub const ALL: &[&str] = &[$($v),*];
+        }
+    };
+}
+
+names! {
+    SEARCH = "search",
+    BACK = "back",
+    CHEVRON_DOWN = "chevron-down",
+    PASTE = "paste",
+    COPY = "copy",
+    EMOJI = "emoji",
+    LOCK = "lock",
+    SLEEP = "sleep",
+    REFRESH = "restart",
+    POWER = "power",
+    SIGN_OUT = "sign-out",
+    DELETE = "delete",
+    PERSONALIZE = "personalize",
+    DOCK_LEFT = "dock-left",
+    DOCK_RIGHT = "dock-right",
+    DOCK_BOTTOM = "dock-bottom",
+    FULL_SCREEN = "full-screen",
+    RESTORE = "restore",
+    SWITCH_APPS = "switch-apps",
+    TILES = "tiles",
+    DOCUMENT = "document",
+    FOLDER = "folder",
+    SETTING = "settings",
+    SHOP = "store",
+    PUZZLE = "extension",
+    DOWNLOAD = "download",
+    COMMAND = "command",
+    CALCULATOR = "calculator",
+    GLOBE = "web",
+    LIGHTBULB = "idea",
+    LINK = "link",
+    EDIT = "edit",
+    INFO = "info",
+    WARNING = "warning",
+    CHECK = "check",
+    CANCEL = "cancel",
+    RETURN = "return",
+    APP = "app",
+    CHECKBOX = "checkbox",
+    CHECKBOX_ON = "checkbox-on",
+    FILTER = "filter",
+    STAR = "star",
+    CLOCK = "clock",
+    PLAY = "play",
+    CODE = "code",
+    NETWORK = "network",
+    CALENDAR = "calendar",
+    KEYBOARD = "keyboard",
+    BULLETS = "list",
+    UP = "up",
+    DOWN = "down",
+    PICTURE = "picture",
+    VIDEO = "video",
+    AUDIO = "audio",
+    ZIP = "archive",
+    PDF = "file",
+    FORWARD = "forward",
+    PIN = "pin",
+    SHIELD = "shield",
+    MAIL = "mail",
 }
 
 #[derive(Clone, Copy)]
@@ -389,9 +398,124 @@ pub fn image_hue(image: &gpui::RenderImage) -> Option<f32> {
     (*weight > 0.03 * (bytes.len() / 4 / step) as f32 * 0.5).then(|| (best as f32 + 0.5) / N as f32)
 }
 
-/// A Segoe Fluent Icons glyph.
-pub fn fluent(glyph: char, size: f32, color: Hsla) -> Div {
-    div().font_family(FONT_ICON).text_size(px(size)).line_height(px(size)).text_color(color).child(glyph.to_string())
+/// Registers Space Grotesk with the text system. Call before any window opens.
+pub fn register_fonts(cx: &App) {
+    static FONT: &[u8] = include_bytes!("../assets/fonts/SpaceGrotesk[wght].ttf");
+    if let Err(e) = cx.text_system().add_fonts(vec![Cow::Borrowed(FONT)]) {
+        eprintln!("procast: could not load Space Grotesk: {e}");
+    }
+}
+
+macro_rules! icon_files {
+    ($($name:literal),* $(,)?) => {
+        /// (stem, SVG source) for every file in `assets/icons`.
+        const ICONS: &[(&str, &str)] = &[$(($name, include_str!(concat!("../assets/icons/", $name, ".svg")))),*];
+    };
+}
+
+icon_files![
+    "app",
+    "archive",
+    "audio",
+    "back",
+    "calculator",
+    "calendar",
+    "cancel",
+    "check",
+    "checkbox",
+    "checkbox-on",
+    "chevron-down",
+    "clock",
+    "code",
+    "command",
+    "copy",
+    "delete",
+    "dock-bottom",
+    "dock-left",
+    "dock-right",
+    "document",
+    "down",
+    "download",
+    "edit",
+    "emoji",
+    "extension",
+    "file",
+    "filter",
+    "folder",
+    "forward",
+    "full-screen",
+    "idea",
+    "info",
+    "keyboard",
+    "link",
+    "list",
+    "lock",
+    "mail",
+    "network",
+    "paste",
+    "personalize",
+    "picture",
+    "pin",
+    "play",
+    "power",
+    "restart",
+    "restore",
+    "return",
+    "search",
+    "settings",
+    "shield",
+    "sign-out",
+    "sleep",
+    "star",
+    "store",
+    "switch-apps",
+    "tiles",
+    "up",
+    "video",
+    "warning",
+    "web",
+];
+
+/// Serves the embedded icons: `icons/<stem>.svg` as stored (stroke 1.75), `icons/<stem>@xl.svg`
+/// (stroke 1.25, for 40 px) and `icons/<stem>@cap.svg` (stroke 2, for key caps).
+pub struct Icons;
+
+impl Icons {
+    fn names() -> impl Iterator<Item = String> {
+        ICONS.iter().flat_map(|(n, _)| [format!("icons/{n}.svg"), format!("icons/{n}@xl.svg"), format!("icons/{n}@cap.svg")])
+    }
+}
+
+impl AssetSource for Icons {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        let Some(rest) = path.strip_prefix("icons/").and_then(|p| p.strip_suffix(".svg")) else { return Ok(None) };
+        let (stem, stroke) = match rest.split_once('@') {
+            None => (rest, None),
+            Some((stem, "xl")) => (stem, Some("1.25")),
+            Some((stem, "cap")) => (stem, Some("2")),
+            Some(_) => return Ok(None),
+        };
+        let Some((_, src)) = ICONS.iter().find(|(n, _)| *n == stem) else { return Ok(None) };
+        Ok(Some(match stroke {
+            None => Cow::Borrowed(src.as_bytes()),
+            Some(w) => Cow::Owned(src.replace("stroke-width=\"1.75\"", &format!("stroke-width=\"{w}\"")).into_bytes()),
+        }))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(Self::names().filter(|n| n.starts_with(path)).map(Into::into).collect())
+    }
+}
+
+/// A vector icon (a `g::` name) of `size` px in `color`; the 40 px size uses the thinner stroke.
+pub fn icon(name: &'static str, size: f32, color: Hsla) -> Svg {
+    let path = if size >= ic::XL { format!("icons/{name}@xl.svg") } else { format!("icons/{name}.svg") };
+    svg().path(path).size(px(size)).flex_none().text_color(color)
+}
+
+/// An icon inside a key cap: `ic::SM` with the heavier stroke.
+pub fn icon_cap(name: &'static str, color: Hsla) -> Svg {
+    svg().path(format!("icons/{name}@cap.svg")).size(px(ic::SM)).flex_none().text_color(color)
 }
 
 /// A list icon with no kind hue.
@@ -410,13 +534,13 @@ fn tile_colors(t: &Tokens, tint: Option<Tint>, selected: bool) -> (Hsla, Hsla) {
 
 /// A list icon in the shared `TILE` box. Glyphs sit on a wash of the row's kind hue; images
 /// fill the box; emoji draw bare.
-pub fn icon_tile(icon: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
+pub fn icon_tile(kind: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
     let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
-    match icon {
+    match kind {
         Icon::Image(image) => frame().child(img(image.clone()).size(px(TILE - 4.))).into_any_element(),
-        Icon::Fluent(ch) => {
+        Icon::Vector(name) => {
             let (wash, glyph) = tile_colors(t, tint, selected);
-            frame().rounded(px(r::SM)).bg(wash).child(fluent(*ch, ic::LG, glyph)).into_any_element()
+            frame().rounded(px(r::SM)).bg(wash).child(icon(name, ic::LG, glyph)).into_any_element()
         }
         Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(18.)).child(s.clone()).into_any_element(),
     }
@@ -464,7 +588,7 @@ pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option
     )
 }
 
-/// A keyboard key cap; "↵", "↓" and "↑" draw Fluent glyphs.
+/// A keyboard key cap; "↵", "↓" and "↑" draw vector icons.
 pub fn key_cap(label: &str, t: &Tokens) -> Div {
     let cap = div()
         .h(px(CAP))
@@ -482,9 +606,9 @@ pub fn key_cap(label: &str, t: &Tokens) -> Div {
         .text_size(px(ts::CAPTION))
         .text_color(t.text_muted);
     match label {
-        "↵" => cap.child(fluent(g::RETURN, ts::CAPTION, t.text_muted)),
-        "↓" => cap.child(fluent(g::DOWN, ts::CAPTION, t.text_muted)),
-        "↑" => cap.child(fluent(g::UP, ts::CAPTION, t.text_muted)),
+        "↵" => cap.child(icon_cap(g::RETURN, t.text_muted)),
+        "↓" => cap.child(icon_cap(g::DOWN, t.text_muted)),
+        "↑" => cap.child(icon_cap(g::UP, t.text_muted)),
         _ => cap.child(label.to_string()),
     }
 }
@@ -528,7 +652,7 @@ pub fn section_header(title: &str, count: Option<usize>, t: &Tokens) -> Div {
 }
 
 /// Centred icon, title and hint for empty views.
-pub fn empty_state(glyph: char, title: &str, hint: &str, t: &Tokens) -> Div {
+pub fn empty_state(glyph: &'static str, title: &str, hint: &str, t: &Tokens) -> Div {
     div()
         .flex_1()
         .min_h_0()
@@ -537,7 +661,7 @@ pub fn empty_state(glyph: char, title: &str, hint: &str, t: &Tokens) -> Div {
         .items_center()
         .justify_center()
         .gap(px(8.))
-        .child(fluent(glyph, ic::XL, t.text_faint))
+        .child(icon(glyph, ic::XL, t.text_faint))
         .child(div().pt(px(8.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(title.to_string()))
         .children((!hint.is_empty()).then(|| div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(hint.to_string())))
 }
@@ -611,6 +735,27 @@ pub fn toggle(on: bool, t: &Tokens) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_icon_name_is_served() {
+        for name in g::ALL {
+            for (suffix, stroke) in [("", "1.75"), ("@xl", "1.25"), ("@cap", "2")] {
+                let svg = Icons.load(&format!("icons/{name}{suffix}.svg")).unwrap().unwrap_or_else(|| panic!("no icon {name}{suffix}"));
+                assert!(String::from_utf8_lossy(&svg).contains(&format!("stroke-width=\"{stroke}\"")), "{name}{suffix}");
+            }
+        }
+        assert!(Icons.load("icons/nope.svg").unwrap().is_none());
+    }
+
+    /// The family name the embedded font reports is the one `FONT_UI` asks for.
+    #[test]
+    fn space_grotesk_registers_under_font_ui() {
+        gpui_ce_platform::application().run(|cx| {
+            register_fonts(cx);
+            assert!(cx.text_system().all_font_names().iter().any(|n| n == FONT_UI));
+            cx.quit();
+        });
+    }
 
     fn ratio(a: f32, b: f32) -> f32 {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)

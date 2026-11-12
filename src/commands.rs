@@ -76,8 +76,8 @@ pub enum Snap {
 
 use crate::design::g;
 
-/// (command, title, extra search words, Fluent icon)
-pub const ALL: &[(Cmd, &str, &str, char)] = &[
+/// (command, title, extra search words, icon name)
+pub const ALL: &[(Cmd, &str, &str, &'static str)] = &[
     (Cmd::SearchFiles, "Search Files", "find documents folders", g::FOLDER),
     (Cmd::ClipboardHistory, "Clipboard History", "paste copy", g::PASTE),
     (Cmd::ClearClipboardHistory, "Clear Clipboard History", "delete forget", g::DELETE),

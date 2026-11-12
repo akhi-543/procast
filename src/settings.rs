@@ -731,7 +731,7 @@ impl Settings {
                                             cx.stop_propagation();
                                             drop(up.update(cx, |this, cx| this.move_entry_up(path2.clone(), e2.clone(), cx)))
                                         })
-                                        .child(design::fluent(design::g::BACK, design::ic::SM, t.text_muted)),
+                                        .child(design::icon(design::g::BACK, design::ic::SM, t.text_muted)),
                                 )
                             })
                             .child(
@@ -747,7 +747,7 @@ impl Settings {
                                         cx.stop_propagation();
                                         drop(rm.update(cx, |this, cx| this.remove_entry(path.clone(), e1.clone(), cx)))
                                     })
-                                    .child(design::fluent(design::g::CANCEL, design::ic::SM, t.text_muted)),
+                                    .child(design::icon(design::g::CANCEL, design::ic::SM, t.text_muted)),
                             )
                     }))
                     .when(entries.is_empty() && r.kind == Kind::Keys, |d| d.child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child("None yet")))
@@ -960,7 +960,7 @@ impl Render for Settings {
                     .bg(t.surface)
                     .border_r_1()
                     .border_color(t.hairline)
-                    .child(div().h(px(design::ROW)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(8.)).child(design::fluent(design::g::SETTING, design::ic::LG, t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("procast")))
+                    .child(div().h(px(design::ROW)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(8.)).child(design::icon(design::g::SETTING, design::ic::LG, t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("procast")))
                     .children(SECTIONS.iter().enumerate().map(|(i, name)| {
                         let me = me.clone();
                         let on = i == self.section;
@@ -1077,8 +1077,8 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
 /// Theme studio: a small launcher drawn with the current theme, updated as you edit. Built
 /// from the launcher's own components, so what you see here is what you get.
 fn preview(t: &design::Tokens) -> impl IntoElement {
-    use design::{Tint, fluent, g, ic, key_cap, list_row, section_header};
-    let row = |glyph: char, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Fluent(glyph), t, on, Some(tint)), title, sub, None, on, tint.hue(t), t);
+    use design::{Tint, icon, g, ic, key_cap, list_row, section_header};
+    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, tint.hue(t), t);
     div()
         .mb(px(16.))
         .flex_none()
@@ -1096,7 +1096,7 @@ fn preview(t: &design::Tokens) -> impl IntoElement {
                 .gap(px(12.))
                 .border_b_1()
                 .border_color(t.hairline)
-                .child(div().size(px(design::TILE)).flex().items_center().justify_center().child(fluent(g::SEARCH, ic::LG, t.accent)))
+                .child(div().size(px(design::TILE)).flex().items_center().justify_center().child(icon(g::SEARCH, ic::LG, t.accent)))
                 .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::QUERY)).text_color(t.text_faint).child("Search apps and commands…")),
         )
         .child(row(g::FOLDER, "Search Files", "Files", Tint::File, false))
@@ -1114,7 +1114,7 @@ fn preview(t: &design::Tokens) -> impl IntoElement {
                 .border_t_1()
                 .border_color(t.hairline)
                 .text_size(px(design::ts::BODY_SM))
-                .child(fluent(g::PASTE, ic::MD, Tint::Paste.hue(t)))
+                .child(icon(g::PASTE, ic::MD, Tint::Paste.hue(t)))
                 .child(div().flex_1().text_color(t.text_muted).child("Command"))
                 .child(div().text_color(t.text).child("Open"))
                 .child(key_cap("↵", t)),
@@ -1127,7 +1127,7 @@ fn hotkey_field(value: &str, recording: bool, t: &design::Tokens) -> AnyElement 
     if recording {
         field.text_color(t.text).child("Press keys. Backspace removes, Esc cancels").into_any_element()
     } else if value.is_empty() {
-        field.text_color(t.text_muted).child(design::fluent(design::g::KEYBOARD, design::ic::MD, t.text_faint)).child("Record").into_any_element()
+        field.text_color(t.text_muted).child(design::icon(design::g::KEYBOARD, design::ic::MD, t.text_faint)).child("Record").into_any_element()
     } else {
         field.child(design::key_caps(value, t)).into_any_element()
     }
