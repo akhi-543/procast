@@ -1052,7 +1052,7 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
 /// from the launcher's own components, so what you see here is what you get.
 fn preview(t: &design::Tokens) -> impl IntoElement {
     use design::{Tint, icon, g, ic, key_cap, list_row, section_header};
-    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, t);
+    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, design::ACCESSORY_MAX, on, t);
     div()
         .mb(px(16.))
         .flex_none()

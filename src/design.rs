@@ -83,6 +83,8 @@ pub const CONTROL: f32 = 32.;
 pub const CAP: f32 = 20.;
 /// Space above and below the list, so the window holds whole rows.
 pub const LIST_PAD: f32 = 4.;
+/// The widest a list row's accessory grows; split views pass a narrower cap.
+pub const ACCESSORY_MAX: f32 = 220.;
 
 /// The type scale. Views use only these sizes for text.
 pub mod ts {
@@ -645,8 +647,8 @@ pub fn selectable(height: f32, on: bool, t: &Tokens) -> Div {
 }
 
 /// A launcher list row in its `ROW` slot: icon, title (up to 70% of the width), a subtitle that
-/// gives way first, and an accessory on the right.
-pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option<AnyElement>, on: bool, t: &Tokens) -> Div {
+/// gives way first, and an accessory on the right (at most `accessory_max` wide).
+pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option<AnyElement>, accessory_max: f32, on: bool, t: &Tokens) -> Div {
     div().h(px(ROW)).w_full().px(px(8.)).flex().items_center().child(
         selectable(ROW - 4., on, t)
             .gap(px(12.))
@@ -661,7 +663,7 @@ pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option
                     .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.to_string()))
                     .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(subtitle.to_string()))),
             )
-            .children(accessory.map(|a| div().flex_none().max_w(px(220.)).truncate().text_size(px(ts::BODY_SM)).text_color(if on { t.text_muted } else { t.text_faint }).child(a))),
+            .children(accessory.map(|a| div().flex_none().max_w(px(accessory_max)).truncate().text_size(px(ts::BODY_SM)).text_color(if on { t.text_muted } else { t.text_faint }).child(a))),
     )
 }
 
@@ -855,7 +857,6 @@ fn rim_border(t: &Tokens) -> Background {
 /// The launcher body: `t.body()` in an `r::XL` shell. On glass it gets a diagonal sheen, the
 /// gradient rim border, `rim` thickness and the `depth` shadow; without glass, a solid rim.
 /// Children go inside; the sheen sits beneath them.
-#[allow(dead_code)] // wired into the launcher window in Task 4
 pub fn glass_window(t: &Tokens) -> Div {
     let shell = div().relative().flex().flex_col().overflow_hidden().rounded(px(r::XL)).bg(t.body()).text_color(t.text).border_1();
     if t.glass {
@@ -868,15 +869,159 @@ pub fn glass_window(t: &Tokens) -> Div {
 
 /// An ActionPanel or Dialog surface: `bg_elevated`, `r::LG`, the rim border, `rim` and `float`
 /// shadows, no blur. The caller sets width and padding.
-#[allow(dead_code)] // wired into the launcher window in Task 4
 pub fn elevated(t: &Tokens) -> Div {
     div().relative().flex().flex_col().rounded(px(r::LG)).bg(t.bg_elevated).text_color(t.text).border_1().border_color(rim_border(t)).shadow([rim(t), float(t)].concat())
 }
 
 /// A full-size overlay of `color` (`t.scrim`, or `t.scrim_soft` behind a panel); it centres its child.
-#[allow(dead_code)] // wired into the launcher window in Task 4
 pub fn scrim(color: Hsla) -> Div {
     div().absolute().inset_0().flex().items_center().justify_center().bg(color)
+}
+
+/// The leading mark of the root search bar: the search icon in the accent.
+pub fn search_mark(t: &Tokens) -> Div {
+    div().size(px(TILE)).flex_none().flex().items_center().justify_center().child(icon(g::SEARCH, ic::LG, t.accent))
+}
+
+/// The Back tile that leads every other view: `surface`, `r::SM`. The caller adds `.id` and the click.
+pub fn back_tile(t: &Tokens) -> Div {
+    let hover = t.surface_strong;
+    div().size(px(TILE)).flex_none().flex().items_center().justify_center().rounded(px(r::SM)).bg(t.surface).hover(move |s| s.bg(hover)).child(icon(g::BACK, ic::MD, t.text))
+}
+
+/// The search bar's filter dropdown: the current choice between a filter and a chevron.
+pub fn dropdown(label: &str, t: &Tokens) -> Div {
+    div()
+        .flex_none()
+        .h(px(CONTROL))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(px(r::SM))
+        .border_1()
+        .border_color(t.border)
+        .text_size(px(ts::BODY_SM))
+        .child(icon(g::FILTER, ic::SM, t.text_muted))
+        .child(div().max_w(px(180.)).truncate().child(label.to_string()))
+        .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+}
+
+/// The bare compact bar's hint, "Recent" and a key cap: what the key does.
+pub fn search_hint(label: &str, key: &str, t: &Tokens) -> Div {
+    div().flex_none().flex().items_center().gap(px(8.)).text_size(px(ts::BODY_SM)).text_color(t.text_faint).child(label.to_string()).child(key_cap(key, t))
+}
+
+/// The top of the launcher, `BAR` tall over a hairline: `leading` (mark or Back), the query
+/// `input` (which sets its own size and flex) and at most one thing on the right.
+pub fn search_bar(leading: impl IntoElement, input: impl IntoElement, trailing: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> Div {
+    div().h(px(BAR)).flex_none().px(px(16.)).flex().items_center().gap(px(12.)).border_b_1().border_color(t.hairline).child(leading).child(input).children(trailing)
+}
+
+/// The calculator card's slot: two row slots tall, so the list below still holds whole rows.
+pub fn answer_slot(card: impl IntoElement) -> Div {
+    div().h(px(2. * ROW)).flex_none().px(px(8.)).pt(px(LIST_PAD)).child(card)
+}
+
+/// The calculator's answer: a `surface` card at rest, the neutral lozenge and pill when `on`.
+/// Only the calculator icon carries a hue. `full` is the whole value when `answer` is rounded.
+pub fn answer_card(question: &str, answer: &str, full: &str, on: bool, t: &Tokens) -> Div {
+    let card = div().relative().size_full().px(px(16.)).flex().items_center().gap(px(16.)).rounded(px(r::LG)).bg(t.surface);
+    let card = if on { lozenge(card, t).child(pill(2. * ROW - LIST_PAD, t)) } else { card };
+    card.child(icon(g::CALCULATOR, ic::LG, Tint::Calc.hue(t)))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(ts::HEADING)).font_weight(gpui::FontWeight::NORMAL).text_color(t.text_muted).child(question.to_string()))
+        .child(icon(g::FORWARD, ic::MD, t.text_faint))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(div().font_family(FONT_DISPLAY).text_size(px(ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(answer.to_string()))
+                .when(!full.is_empty() && full != answer, |d| d.child(div().font_family(FONT_SMALL).text_size(px(ts::SMALL)).text_color(if on { t.text_muted } else { t.text_faint }).child(full.to_string()))),
+        )
+}
+
+/// The 8 px tone dot of a status line.
+pub fn status_dot(color: Hsla) -> Div {
+    div().size(px(8.)).mx(px(4.)).flex_none().rounded_full().bg(color)
+}
+
+/// The bottom of the launcher, `FOOTER` tall under a hairline: `mark` and `message` on the left
+/// (`text` for a status, `text_muted` for the selected row's kind), `right` on the right.
+pub fn action_bar(mark: AnyElement, message: &str, status: bool, right: Vec<AnyElement>, t: &Tokens) -> Div {
+    div()
+        .h(px(FOOTER))
+        .flex_none()
+        .px(px(16.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.))
+        .border_t_1()
+        .border_color(t.hairline)
+        .text_size(px(ts::BODY_SM))
+        .child(div().flex_1().min_w_0().flex().items_center().gap(px(8.)).child(mark).child(div().min_w_0().truncate().text_color(if status { t.text } else { t.text_muted }).child(message.to_string())))
+        .child(div().flex_none().flex().items_center().gap(px(12.)).children(right))
+}
+
+/// The ActionPanel: `elevated`, 320 wide, at most 320 tall, anchored 8 px above the ActionBar on
+/// the right. `head` is a `panel_head`; `rows` are `panel_row`s. Put it above a `scrim(t.scrim_soft)`.
+pub fn action_panel(head: impl IntoElement, rows: impl IntoIterator<Item = impl IntoElement>, t: &Tokens) -> Div {
+    elevated(t)
+        .absolute()
+        .right(px(8.))
+        .bottom(px(FOOTER + 8.))
+        .w(px(320.))
+        .max_h(px(320.))
+        .p(px(4.))
+        .child(head)
+        .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(rows))
+}
+
+/// The panel's header: the item's icon tile and title over a hairline.
+pub fn panel_head(icon: AnyElement, title: &str, t: &Tokens) -> Div {
+    div()
+        .h(px(ROW))
+        .px(px(8.))
+        .mb(px(4.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(12.))
+        .border_b_1()
+        .border_color(t.hairline)
+        .child(icon)
+        .child(div().min_w_0().truncate().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
+}
+
+/// One action: a `selectable` at control height with an icon, a label and a KeyCap for each key.
+/// `danger` draws the icon and label in `danger`. The caller adds `.id` and the click.
+pub fn panel_row(glyph: &'static str, label: &str, keys: &[&str], on: bool, danger: bool, t: &Tokens) -> Div {
+    let glyph_color = if danger { t.danger } else if on { t.text } else { t.text_muted };
+    selectable(CONTROL, on, t)
+        .flex_none()
+        .gap(px(12.))
+        .child(icon(glyph, ic::MD, glyph_color))
+        .child(div().flex_1().min_w_0().truncate().when(danger, |d| d.text_color(t.danger)).child(label.to_string()))
+        .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| key_cap(k, t))))
+}
+
+/// A confirmation over the whole window: `scrim` and a 320 wide `elevated` card with a 40 px icon
+/// (a `danger` warning when destructive, an accent info otherwise), the title, a one-line
+/// `message`, and `buttons` stacked full width.
+pub fn dialog(danger: bool, title: &str, message: &str, buttons: impl IntoIterator<Item = impl IntoElement>, t: &Tokens) -> Div {
+    scrim(t.scrim).occlude().child(
+        elevated(t)
+            .w(px(320.))
+            .p(px(16.))
+            .items_center()
+            .gap(px(8.))
+            .child(div().py(px(4.)).child(icon(if danger { g::WARNING } else { g::INFO }, ic::XL, if danger { t.danger } else { t.accent })))
+            .child(div().font_weight(gpui::FontWeight::SEMIBOLD).text_center().child(title.to_string()))
+            .children((!message.is_empty()).then(|| div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).text_center().child(message.to_string())))
+            .child(div().w_full().pt(px(8.)).flex().flex_col().gap(px(8.)).children(buttons)),
+    )
 }
 
 #[cfg(test)]
