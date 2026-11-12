@@ -85,6 +85,8 @@ pub const CAP: f32 = 20.;
 pub const LIST_PAD: f32 = 4.;
 /// The widest a list row's accessory grows; split views pass a narrower cap.
 pub const ACCESSORY_MAX: f32 = 220.;
+/// The Settings sidebar's width.
+pub const SIDEBAR: f32 = 192.;
 
 /// The type scale. Views use only these sizes for text.
 pub mod ts {
@@ -626,9 +628,9 @@ pub fn icon_tile(kind: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) ->
     }
 }
 
-/// The 3 × 16 accent selection pill, centred on the left edge of a `height`-tall box.
-pub fn pill(height: f32, t: &Tokens) -> Div {
-    div().absolute().left(px(0.)).top(px((height - 16.) / 2.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)
+/// The 3 × 16 accent selection pill, centred on the left edge of its box at any height.
+pub fn pill(t: &Tokens) -> Div {
+    div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))
 }
 
 /// The selected lozenge on `el`: a vertical `sel_top` → `sel_bottom` fill, a 1 px `sel_ring`
@@ -643,7 +645,7 @@ pub fn lozenge<E: Styled>(el: E, t: &Tokens) -> E {
 pub fn selectable(height: f32, on: bool, t: &Tokens) -> Div {
     let hover = t.hover;
     let row = div().relative().h(px(height)).w_full().px(px(8.)).flex().items_center().rounded(px(r::MD));
-    if on { lozenge(row, t).child(pill(height, t)) } else { row.hover(move |s| s.bg(hover)) }
+    if on { lozenge(row, t).child(pill(t)) } else { row.hover(move |s| s.bg(hover)) }
 }
 
 /// A launcher list row in its `ROW` slot: icon, title (up to 70% of the width), a subtitle that
@@ -759,6 +761,12 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
         .border_1()
         .border_color(if focused { t.accent } else { t.border })
         .when(focused, |d| d.shadow(ring(t)))
+}
+
+/// One of many: a `field` showing the current choice and a chevron. The caller sets the width,
+/// `.id` and the click.
+pub fn select_field(label: &str, focused: bool, t: &Tokens) -> Div {
+    field(focused, t).flex_none().gap(px(8.)).text_size(px(ts::BODY_SM)).child(div().flex_1().min_w_0().truncate().child(label.to_string())).child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -929,7 +937,7 @@ pub fn answer_slot(card: impl IntoElement) -> Div {
 /// Only the calculator icon carries a hue. `full` is the whole value when `answer` is rounded.
 pub fn answer_card(question: &str, answer: &str, full: &str, on: bool, t: &Tokens) -> Div {
     let card = div().relative().size_full().px(px(16.)).flex().items_center().gap(px(16.)).rounded(px(r::LG)).bg(t.surface);
-    let card = if on { lozenge(card, t).child(pill(2. * ROW - LIST_PAD, t)) } else { card };
+    let card = if on { lozenge(card, t).child(pill(t)) } else { card };
     card.child(icon(g::CALCULATOR, ic::LG, Tint::Calc.hue(t)))
         .child(div().flex_1().min_w_0().truncate().text_size(px(ts::HEADING)).font_weight(gpui::FontWeight::NORMAL).text_color(t.text_muted).child(question.to_string()))
         .child(icon(g::FORWARD, ic::MD, t.text_faint))

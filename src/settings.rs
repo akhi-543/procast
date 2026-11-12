@@ -65,6 +65,11 @@ struct Row {
 }
 
 const SECTIONS: [&str; 9] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+/// The sidebar icon of each section, in `SECTIONS` order.
+const SECTION_ICONS: [&str; 9] = [design::g::SETTING, design::g::SEARCH, design::g::KEYBOARD, design::g::APP, design::g::PASTE, design::g::FOLDER, design::g::PERSONALIZE, design::g::PUZZLE, design::g::CODE];
+
+/// More options than this is a dropdown, not a segmented control.
+const SEGMENTS_MAX: usize = 5;
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
     Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: "" }
@@ -85,7 +90,7 @@ fn choice_label(v: &str) -> String {
         "close" => "Close".into(),
         "default" => "Arrows".into(),
         "immediately" => "Now".into(),
-        "system" => "Follow Windows".into(),
+        "system" => "System".into(),
         "expanded" => "Full list".into(),
         "compact" => "Search bar only".into(),
         "off" => "Off".into(),
@@ -126,7 +131,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             (
                 "Appearance",
                 vec![
-                    row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "Follow Windows switches with your system's light/dark setting."),
+                    row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "System follows the light or dark setting of Windows."),
                     row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Scales text, rows and the window together."),
                 ],
             ),
@@ -249,7 +254,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
             ] {
                 colours.push(row(label, &format!("theme.{key}"), Kind::Text, "A colour like #1e1e2e. Leave empty to use the theme's own."));
             }
-            groups(vec![("Mode", vec![row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "Follow Windows switches with your system setting.")]), ("Colours", colours)])
+            groups(vec![("Mode", vec![row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "System follows the light or dark setting of Windows.")]), ("Colours", colours)])
         }
         "Extensions" => {
             let mut r = groups(vec![(
@@ -433,7 +438,10 @@ impl Settings {
                 Ok(()) => {
                     self.launcher = config::parse(&text).map(|c| c.launcher).unwrap_or_default();
                     self.text = text;
-                    self.status = Some((false, format!("Saved {}", path.join("."))));
+                    // Named by its row; a hotkey saved from a Shortcuts row has no row of its own path.
+                    let rows = self.rows();
+                    let name = rows.iter().find(|r| r.path == path).or(rows.get(self.selected)).map_or_else(|| path.join("."), |r| r.label.clone());
+                    self.status = Some((false, format!("{name} saved")));
                 }
                 Err(e) => self.status = Some((true, format!("Could not write config.toml: {e}"))),
             },
@@ -550,7 +558,7 @@ impl Settings {
             Kind::Hotkey | Kind::Command(_) => {
                 self.commit(cx);
                 self.recording = true;
-                self.status = Some((false, "Press the new shortcut (Backspace removes it, Esc cancels)".into()));
+                self.status = Some((false, "Recording a hotkey".into()));
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
@@ -672,9 +680,9 @@ impl Settings {
                 text_input(SharedString::from(format!("set-{}", r.path.join("."))))
                     .state(input.downgrade())
                     .placeholder(match r.kind {
-                        Kind::List => "Add, then Enter",
-                        Kind::Filter => "Type to filter",
-                        Kind::Command(_) => "Alias",
+                        Kind::List => "Add an entry…",
+                        Kind::Filter => "Filter by name or alias…",
+                        Kind::Command(_) => "Alias…",
                         _ => "",
                     })
                     .placeholder_color(t.text_faint)
@@ -701,14 +709,10 @@ impl Settings {
                     .children(entries.iter().enumerate().map(|(n, e)| {
                         let (rm, up) = (me.clone(), me.clone());
                         let (path, path2, e1, e2) = (r.path.clone(), r.path.clone(), e.clone(), e.clone());
-                        div()
-                            .flex()
-                            .items_center()
-                            .h(px(design::CONTROL - 4.))
-                            .pl(px(8.))
+                        // An entry is a Field holding its name and its buttons.
+                        design::field(false, t)
                             .pr(px(4.))
-                            .rounded(px(design::r::SM))
-                            .bg(t.surface_strong)
+                            .gap(px(4.))
                             .text_size(px(design::ts::BODY_SM))
                             .child(self.entry_label(&kind, e))
                             .when(ordered && n > 0, |d| {
@@ -720,7 +724,7 @@ impl Settings {
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(design::r::XS))
-                                        .hover(|s| s.bg(t.surface))
+                                        .hover(|s| s.bg(t.surface_strong))
                                         .on_click(move |_, _, cx| {
                                             cx.stop_propagation();
                                             drop(up.update(cx, |this, cx| this.move_entry_up(path2.clone(), e2.clone(), cx)))
@@ -736,7 +740,7 @@ impl Settings {
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(design::r::XS))
-                                    .hover(|s| s.bg(t.surface))
+                                    .hover(|s| s.bg(t.surface_strong))
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
                                         drop(rm.update(cx, |this, cx| this.remove_entry(path.clone(), e1.clone(), cx)))
@@ -752,7 +756,7 @@ impl Settings {
             Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
-                choices(opts, &value, t, &r.path.join("."), move |v, cx| {
+                choices(opts, &value, on, t, &r.path.join("."), move |v, cx| {
                     let path = path.clone();
                     drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
                 })
@@ -761,7 +765,7 @@ impl Settings {
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Category => {
                 let me = me.clone();
-                choices(CATEGORIES, CATEGORIES[self.category], t, "category", move |v, cx| {
+                choices(CATEGORIES, CATEGORIES[self.category], on, t, "category", move |v, cx| {
                     drop(me.update(cx, |this, cx| {
                         this.category = CATEGORIES.iter().position(|c| *c == v).unwrap_or(0);
                         cx.notify();
@@ -829,7 +833,6 @@ impl Settings {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .pb(px(16.))
                     .when(!group.is_empty(), |d| d.child(div().px(px(4.)).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child(group)))
                     .child(
                         div()
@@ -860,7 +863,7 @@ impl Settings {
             .py(px(12.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| design::lozenge(d.rounded(px(design::r::LG)), t).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
+            .when(on, |d| design::lozenge(d.rounded(px(design::r::LG)), t).child(design::pill(t)))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -945,7 +948,7 @@ impl Render for Settings {
             }))
             .child(
                 div()
-                    .w(px(192.))
+                    .w(px(design::SIDEBAR))
                     .flex_none()
                     .p(px(12.))
                     .flex()
@@ -960,9 +963,10 @@ impl Render for Settings {
                         let on = i == self.section;
                         design::selectable(design::CONTROL, on, &t)
                             .id(("section", i))
-                            .px(px(12.))
-                            .when(!on, |d| d.text_color(t.text_muted))
+                            .gap(px(8.))
+                            .text_color(if on { t.text } else { t.text_muted })
                             .on_click(move |_, window, cx| drop(me.update(cx, |this, cx| this.set_section(i, window, cx))))
+                            .child(design::icon(SECTION_ICONS[i], design::ic::MD, if on { t.text } else { t.text_muted }))
                             .child(*name)
                     })),
             )
@@ -981,8 +985,8 @@ impl Render for Settings {
                             .p(px(16.))
                             .flex()
                             .flex_col()
-                            .gap(px(4.))
-                            .child(div().h(px(design::ROW)).mb(px(8.)).flex().flex_none().items_center().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]))
+                            .gap(px(24.))
+                            .child(div().h(px(design::ROW)).flex().flex_none().items_center().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]))
                             .children((SECTIONS[self.section] == "Theme").then(|| preview(&t)))
                             .children(self.cards(&rows, &t, &me))
                             .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
@@ -1001,7 +1005,7 @@ impl Render for Settings {
                             .text_size(px(design::ts::BODY_SM))
                             .text_color(t.text_muted)
                             .map(|d| match &self.status {
-                                Some((error, m)) => d.child(div().size(px(8.)).flex_none().rounded_full().bg(if *error { t.danger } else { t.success })).child(div().min_w_0().truncate().text_color(t.text).child(m.clone())),
+                                Some((error, m)) => d.gap(px(8.)).child(design::status_dot(if *error { t.danger } else { t.success })).child(div().min_w_0().truncate().text_color(t.text).child(m.clone())),
                                 None if SECTIONS[self.section] == "Shortcuts" => d.child(design::shortcut("Record hotkey", &["↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Turn on or off", &["Ctrl", "D"], &t)),
                                 None => d
                                     .child(design::shortcut("Rows", &["↑", "↓"], &t))
@@ -1017,8 +1021,20 @@ impl Render for Settings {
     }
 }
 
-/// A segmented control with the current option highlighted; clicking an option picks it.
-fn choices(opts: &[&'static str], current: &str, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
+/// One of a few: a segmented control, clicking an option picks it. One of many: a dropdown
+/// showing the current option; a click (or Enter on the row) moves to the next one.
+fn choices(opts: &[&'static str], current: &str, on: bool, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
+    if opts.len() > SEGMENTS_MAX {
+        let next = opts[opts.iter().position(|o| *o == current).map_or(0, |i| (i + 1) % opts.len())];
+        return design::select_field(&choice_label(current), on, t)
+            .w(px(200.))
+            .id(SharedString::from(format!("{id}=menu")))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                pick(next, cx)
+            })
+            .into_any_element();
+    }
     design::segment_track(
         opts.iter().map(|o| {
             let pick = pick.clone();
@@ -1051,46 +1067,15 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
 /// Theme studio: a small launcher drawn with the current theme, updated as you edit. Built
 /// from the launcher's own components, so what you see here is what you get.
 fn preview(t: &design::Tokens) -> impl IntoElement {
-    use design::{Tint, icon, g, ic, key_cap, list_row, section_header};
+    use design::{Tint, g, ic, icon, list_row, section_header};
+    // Settings is opaque, so the preview shows the launcher's solid body.
+    let t = &design::Tokens { glass: false, ..*t };
     let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, design::ACCESSORY_MAX, on, t);
-    div()
-        .mb(px(16.))
+    let query = div().flex_1().font_family(design::FONT_DISPLAY).text_size(px(design::ts::QUERY)).text_color(t.text_faint).child("Search apps and commands…");
+    let keys = |label: &str, keys: &[&str]| design::shortcut(label, keys, t).into_any_element();
+    design::glass_window(t)
         .flex_none()
-        .rounded(px(design::r::LG))
-        .border_1()
-        .border_color(t.border)
-        .bg(t.body())
-        .overflow_hidden()
-        .child(
-            div()
-                .h(px(design::BAR))
-                .px(px(16.))
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .border_b_1()
-                .border_color(t.hairline)
-                .child(div().size(px(design::TILE)).flex().items_center().justify_center().child(icon(g::SEARCH, ic::LG, t.accent)))
-                .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::QUERY)).text_color(t.text_faint).child("Search apps and commands…")),
-        )
-        .child(row(g::FOLDER, "Search Files", "Files", Tint::File, false))
-        .child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true))
-        .child(row(g::DOCK_LEFT, "Left Half", "Window", Tint::Window, false))
-        .child(section_header("Use \"42\" with", None, t))
-        .child(row(g::GLOBE, "Search the web", "", Tint::Web, false))
-        .child(
-            div()
-                .h(px(design::FOOTER))
-                .px(px(16.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .border_t_1()
-                .border_color(t.hairline)
-                .text_size(px(design::ts::BODY_SM))
-                .child(icon(g::PASTE, ic::MD, Tint::Paste.hue(t)))
-                .child(div().flex_1().text_color(t.text_muted).child("Command"))
-                .child(div().text_color(t.text).child("Open"))
-                .child(key_cap("↵", t)),
-        )
+        .child(design::search_bar(design::search_mark(t), query, [], t))
+        .child(div().py(px(design::LIST_PAD)).child(row(g::FOLDER, "Search Files", "Files", Tint::File, false)).child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true)).child(row(g::DOCK_LEFT, "Left Half", "Window", Tint::Window, false)).child(section_header("Use \"42\" with", None, t)).child(row(g::GLOBE, "Search the web", "", Tint::Web, false)))
+        .child(design::action_bar(icon(g::PASTE, ic::MD, Tint::Paste.hue(t)).into_any_element(), "Command", false, vec![keys("Open", &["↵"]), design::vdivider(t).into_any_element(), keys("Actions", &["Ctrl", "K"])], t))
 }
