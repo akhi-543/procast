@@ -336,6 +336,8 @@ pub struct Settings {
     status: Option<(bool, String)>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
+    /// The caption bar's mode as last set, with Windows' appearance then, so DWM is called only when either changes.
+    dark_caption: Option<(bool, gpui::WindowAppearance)>,
 }
 
 impl Settings {
@@ -355,6 +357,7 @@ impl Settings {
             status: None,
             focus: cx.focus_handle(),
             _subs: vec![],
+            dark_caption: None,
         };
         this.build_inputs(cx);
         this.focus_row(window, cx);
@@ -753,7 +756,7 @@ impl Settings {
             Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
-                choices(opts, &value, t, &r.path.join("."), move |v, cx| {
+                choices(opts, &value, stacked(&r.kind), t, &r.path.join("."), move |v, cx| {
                     let path = path.clone();
                     drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
                 })
@@ -762,7 +765,7 @@ impl Settings {
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Category => {
                 let me = me.clone();
-                choices(CATEGORIES, CATEGORIES[self.category], t, "category", move |v, cx| {
+                choices(CATEGORIES, CATEGORIES[self.category], stacked(&r.kind), t, "category", move |v, cx| {
                     drop(me.update(cx, |this, cx| {
                         this.category = CATEGORIES.iter().position(|c| *c == v).unwrap_or(0);
                         cx.notify();
@@ -851,11 +854,11 @@ impl Settings {
     fn row_view(&self, i: usize, r: &Row, divider: bool, t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
         let on = i == self.selected;
         let click = me.clone();
+        let stack = stacked(&r.kind);
         div()
             .id(("row", i))
             .flex()
-            .items_center()
-            .gap(px(16.))
+            .map(|d| if stack { d.flex_col().gap(px(8.)) } else { d.items_center().gap(px(16.)) })
             .px(px(16.))
             .py(px(12.))
             .relative()
@@ -878,7 +881,7 @@ impl Settings {
             })
             .child(
                 div()
-                    .w(px(if matches!(r.kind, Kind::Command(_)) { 240. } else { 280. }))
+                    .map(|d| if stack { d.w_full() } else { d.w(px(if matches!(r.kind, Kind::Command(_)) { 240. } else { 280. })) })
                     .flex_none()
                     .flex()
                     .flex_col()
@@ -886,7 +889,7 @@ impl Settings {
                     .child(div().child(r.label.clone()))
                     .children((!r.help.is_empty()).then(|| div().text_size(px(design::ts::SMALL)).line_height(px(16.)).text_color(t.text_muted).child(r.help.clone()))),
             )
-            .child(div().flex_1().min_w_0().flex().items_center().child(match r.kind {
+            .child(div().map(|d| if stack { d.w_full() } else { d.flex_1() }).min_w_0().flex().items_center().child(match r.kind {
                 Kind::Command(c) => self.command_control(c, r, on, t, me.clone()),
                 _ => self.control(r, on, t, me),
             }))
@@ -904,6 +907,13 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
         let t = design::Tokens::from_theme(&theme, window);
+        // Every mode change (setting, Windows theme under "system") re-renders, so this covers them all.
+        // Keyed on Windows' appearance too: gpui resets the caption to it when that changes.
+        let caption = (t.dark, window.appearance());
+        if self.dark_caption != Some(caption) {
+            crate::win::dark_title_bar(crate::win::hwnd(window), t.dark);
+            self.dark_caption = Some(caption);
+        }
         design::scale_settings();
         window.set_rem_size(px(16.));
         let rows = self.rows();
@@ -1018,19 +1028,36 @@ impl Render for Settings {
     }
 }
 
-/// A segmented control (it wraps when the options outrun the row); clicking an option picks it.
-fn choices(opts: &[&'static str], current: &str, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
+/// A segmented row (`Choice`, or the Shortcuts `Category`) whose options outrun the control
+/// column (more than the spec's five, or long labels) stacks: label and help on top, the track
+/// the full row width underneath. Weight is label characters plus 4 per option (its padding);
+/// 44 is about the column at the default interface size.
+/// ponytail: an estimate, not a measurement; at the large size a row weighing near 44 can still
+/// wrap. Measure the column from the viewport if that matters.
+fn stacked(kind: &Kind) -> bool {
+    let opts = match kind {
+        Kind::Choice(o) => o,
+        Kind::Category => CATEGORIES,
+        _ => return false,
+    };
+    opts.len() > 5 || opts.iter().map(|o| choice_label(o).chars().count() + 4).sum::<usize>() > 44
+}
+
+/// A segmented control; clicking an option picks it. `stretch` spreads the segments over the
+/// full width (a stacked row).
+fn choices(opts: &[&'static str], current: &str, stretch: bool, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
     design::segment_track(
         opts.iter().map(|o| {
             let pick = pick.clone();
             let o: &'static str = o;
-            design::segment(&choice_label(o), o == current, t).id(SharedString::from(format!("{id}={o}"))).on_click(move |_, _, cx| {
+            design::segment(&choice_label(o), o == current, t).when(stretch, |d| d.flex_1().justify_center()).id(SharedString::from(format!("{id}={o}"))).on_click(move |_, _, cx| {
                 cx.stop_propagation();
                 pick(o, cx)
             })
         }),
         t,
     )
+    .when(stretch, |d| d.w_full())
     .into_any_element()
 }
 
@@ -1063,4 +1090,16 @@ fn preview(t: &design::Tokens) -> impl IntoElement {
         .child(design::search_bar(design::search_mark(t), query, [], t))
         .child(div().py(px(design::LIST_PAD)).child(row(g::FOLDER, "Search Files", "Files", Tint::File, false)).child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true)).child(row(g::DOCK_LEFT, "Left Half", "Window", Tint::Window, false)).child(section_header("Use \"42\" with", None, t)).child(row(g::GLOBE, "Search the web", "", Tint::Web, false)))
         .child(design::action_bar(icon(g::PASTE, ic::MD, Tint::Paste.hue(t)).into_any_element(), "Command", false, vec![keys("Open", &["↵"]), design::vdivider(t).into_any_element(), keys("Actions", &["Ctrl", "K"])], t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_choice_rows_stack() {
+        let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[])).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
+        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey"]);
+        assert!(stacked(&Kind::Category));
+    }
 }

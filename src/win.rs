@@ -11,7 +11,7 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
         Graphics::{
-            Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute},
+            Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateRoundRectRgn, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
                 MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SetWindowRgn,
@@ -216,6 +216,13 @@ fn round_region(hwnd: HWND) {
             let _ = DeleteObject(rgn.into());
         }
     }
+}
+
+/// A dark or light caption bar (DWMWA_USE_IMMERSIVE_DARK_MODE), so it follows procast's mode
+/// rather than Windows'.
+pub fn dark_title_bar(hwnd: HWND, dark: bool) {
+    let v = dark as i32;
+    unsafe { _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &v as *const _ as _, 4) };
 }
 
 /// Cloaked windows keep their swap chain, so un-cloaking shows the next frame
