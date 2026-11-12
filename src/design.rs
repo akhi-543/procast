@@ -874,8 +874,10 @@ pub fn elevated(t: &Tokens) -> Div {
 }
 
 /// A full-size overlay of `color` (`t.scrim`, or `t.scrim_soft` behind a panel); it centres its child.
+/// It follows the window's inner corner (gpui clips to rectangles, so `overflow_hidden` on the
+/// body does not round its children).
 pub fn scrim(color: Hsla) -> Div {
-    div().absolute().inset_0().flex().items_center().justify_center().bg(color)
+    div().absolute().inset_0().rounded(px(r::XL - 1.)).flex().items_center().justify_center().bg(color)
 }
 
 /// The leading mark of the root search bar: the search icon in the accent.
@@ -996,14 +998,15 @@ pub fn panel_head(icon: AnyElement, title: &str, t: &Tokens) -> Div {
 }
 
 /// One action: a `selectable` at control height with an icon, a label and a KeyCap for each key.
-/// `danger` draws the icon and label in `danger`. The caller adds `.id` and the click.
+/// `danger` draws the icon in `danger` and the label in `danger` at rest, `text` when selected
+/// (`danger` text on the selected fill falls under 4.5:1). The caller adds `.id` and the click.
 pub fn panel_row(glyph: &'static str, label: &str, keys: &[&str], on: bool, danger: bool, t: &Tokens) -> Div {
     let glyph_color = if danger { t.danger } else if on { t.text } else { t.text_muted };
     selectable(CONTROL, on, t)
         .flex_none()
         .gap(px(12.))
         .child(icon(glyph, ic::MD, glyph_color))
-        .child(div().flex_1().min_w_0().truncate().when(danger, |d| d.text_color(t.danger)).child(label.to_string()))
+        .child(div().flex_1().min_w_0().truncate().when(danger && !on, |d| d.text_color(t.danger)).child(label.to_string()))
         .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| key_cap(k, t))))
 }
 
@@ -1118,6 +1121,15 @@ mod tests {
     #[ignore = "Light warning on glass over #404040 is 4.39:1"]
     fn warning_text_holds_4_5_on_glass_over_the_worst_backdrop() {
         hold(4.5, |t, back| vec![("warning on bg over the worst backdrop".into(), lum_ratio(t.warning, over(t.bg, back)))])
+    }
+
+    /// A destructive ActionPanel row: the `danger` label at rest on `bg_elevated` (4.5:1) and the
+    /// `danger` icon on the selected lozenge over it (3:1); the selected label is `text`.
+    #[test]
+    fn destructive_panel_rows_hold_their_contrast() {
+        hold(4.5, |t, _| vec![("danger label at rest on bg_elevated".into(), lum_ratio(t.danger, over(t.bg_elevated, t.bg_solid)))]);
+        hold(3., |t, _| vec![("danger icon on sel_top over bg_elevated".into(), lum_ratio(t.danger, over(t.sel_top, over(t.bg_elevated, t.bg_solid))))]);
+        hold(4.5, |t, _| vec![("text label on sel_top over bg_elevated".into(), lum_ratio(t.text, over(t.sel_top, over(t.bg_elevated, t.bg_solid))))]);
     }
 
     /// A kind's icon is its hue on a 14% wash of itself.
