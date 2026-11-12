@@ -68,9 +68,6 @@ const SECTIONS: [&str; 9] = ["General", "Launcher", "Shortcuts", "Apps", "Clipbo
 /// The sidebar icon of each section, in `SECTIONS` order.
 const SECTION_ICONS: [&str; 9] = [design::g::SETTING, design::g::SEARCH, design::g::KEYBOARD, design::g::APP, design::g::PASTE, design::g::FOLDER, design::g::PERSONALIZE, design::g::PUZZLE, design::g::CODE];
 
-/// More options than this is a dropdown, not a segmented control.
-const SEGMENTS_MAX: usize = 5;
-
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
     Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: "" }
 }
@@ -250,7 +247,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 ("Background", "background"),
                 ("Text", "text"),
                 ("Muted text", "muted"),
-                ("Selection", "selected"),
+                ("Accent", "selected"),
             ] {
                 colours.push(row(label, &format!("theme.{key}"), Kind::Text, "A colour like #1e1e2e. Leave empty to use the theme's own."));
             }
@@ -382,7 +379,7 @@ impl Settings {
     /// The Shortcuts table: category and filter, then every matching item.
     fn shortcut_rows(&self) -> Vec<Row> {
         let mut out = vec![
-            Row { label: "Show".into(), help: "Click a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: "" },
+            Row { label: "Show".into(), help: "Pick a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: "" },
             Row { label: "Find".into(), help: "Type part of a name or alias.".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter, group: "" },
         ];
         let want = CATEGORIES[self.category];
@@ -756,7 +753,7 @@ impl Settings {
             Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
-                choices(opts, &value, on, t, &r.path.join("."), move |v, cx| {
+                choices(opts, &value, t, &r.path.join("."), move |v, cx| {
                     let path = path.clone();
                     drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
                 })
@@ -765,7 +762,7 @@ impl Settings {
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Category => {
                 let me = me.clone();
-                choices(CATEGORIES, CATEGORIES[self.category], on, t, "category", move |v, cx| {
+                choices(CATEGORIES, CATEGORIES[self.category], t, "category", move |v, cx| {
                     drop(me.update(cx, |this, cx| {
                         this.category = CATEGORIES.iter().position(|c| *c == v).unwrap_or(0);
                         cx.notify();
@@ -1021,20 +1018,8 @@ impl Render for Settings {
     }
 }
 
-/// One of a few: a segmented control, clicking an option picks it. One of many: a dropdown
-/// showing the current option; a click (or Enter on the row) moves to the next one.
-fn choices(opts: &[&'static str], current: &str, on: bool, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
-    if opts.len() > SEGMENTS_MAX {
-        let next = opts[opts.iter().position(|o| *o == current).map_or(0, |i| (i + 1) % opts.len())];
-        return design::select_field(&choice_label(current), on, t)
-            .w(px(200.))
-            .id(SharedString::from(format!("{id}=menu")))
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                pick(next, cx)
-            })
-            .into_any_element();
-    }
+/// A segmented control (it wraps when the options outrun the row); clicking an option picks it.
+fn choices(opts: &[&'static str], current: &str, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
     design::segment_track(
         opts.iter().map(|o| {
             let pick = pick.clone();

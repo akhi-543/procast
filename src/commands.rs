@@ -119,7 +119,7 @@ pub const ALL: &[(Cmd, &str, &str, &'static str)] = &[
 impl Cmd {
     /// Asks for a second Enter before running.
     pub fn destructive(self) -> bool {
-        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory)
+        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory)
     }
 
     pub fn key(self) -> String {

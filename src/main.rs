@@ -73,6 +73,13 @@ const FAV_ROW: f32 = 48.;
 /// keeps that share (and its proportions) on every monitor, and its content scales with it.
 const BASE_WIDTH: f32 = 750.;
 
+/// The launcher's backdrop: acrylic under the translucent glass body; with glass off the body
+/// is solid and the acrylic goes (Transparent, not Opaque: Opaque clears to white, which would
+/// show in the anti-aliased corners inside the rounded window region).
+fn backdrop(glass: bool) -> gpui::WindowsWindowBackground {
+    if glass { gpui::WindowsWindowBackground::Blurred } else { gpui::WindowsWindowBackground::Transparent }
+}
+
 fn base_width(cfg: &Config) -> f32 {
     if cfg.width <= 1. { BASE_WIDTH } else { cfg.width }
 }
@@ -789,7 +796,7 @@ impl Launcher {
     }
 
     fn show(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
-        design::refresh_glass();
+        window.set_background_appearance(backdrop(design::refresh_glass()).into());
         let fg = win::foreground();
         if fg != self.hwnd {
             self.prev = fg;
@@ -1739,8 +1746,8 @@ impl Launcher {
         });
     }
 
+    /// The caller refreshes the glass decision first (it holds the window, for the backdrop).
     fn reload(&mut self, cx: &mut Context<Self>) {
-        design::refresh_glass();
         match config::load() {
             Ok(cfg) => {
                 if hotkey_specs(&cfg) != hotkey_specs(&self.cfg) {
@@ -2466,7 +2473,11 @@ impl Render for Launcher {
                 })
             });
             // The window steps back under `scrim_soft` so the panel is plainly the top layer.
-            [design::scrim(t.scrim_soft).occlude(), design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t)]
+            // A click on it closes the panel; the panel occludes it, so clicks inside stay with the panel.
+            [
+                design::scrim(t.scrim_soft).id("panel-scrim").occlude().on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element(),
+                design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t).occlude().into_any_element(),
+            ]
         });
         let dialog = self.confirm.as_ref().map(|c| {
             let me = cx.weak_entity();
@@ -2691,7 +2702,7 @@ fn main() {
         net::load_rates();
         design::set_size(&cfg.size);
         // Before the first render, so the body is not drawn as glass on a machine with transparency off.
-        design::refresh_glass();
+        let glass = design::refresh_glass();
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
         let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
@@ -2703,8 +2714,7 @@ fn main() {
             kind: WindowKind::PopUp,
             show: false,
             focus: false,
-            // The body is translucent (`Tokens::body`), so acrylic shows through it unless glass is off.
-            windows_window_background: gpui::WindowsWindowBackground::Blurred,
+            windows_window_background: backdrop(glass),
             ..Default::default()
         };
         let handle = cx.open_window(options, |window, cx| cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))).unwrap();
@@ -2780,7 +2790,10 @@ fn main() {
                 let now = config::modified();
                 if now != last {
                     last = now;
-                    let _ = handle.update(cx, |this, _, cx| this.reload(cx));
+                    let _ = handle.update(cx, |this, window, cx| {
+                        window.set_background_appearance(backdrop(design::refresh_glass()).into());
+                        this.reload(cx);
+                    });
                 }
                 if ticks % 5 == 0 {
                     let _ = tick_tx.unbounded_send(Msg::Tick);

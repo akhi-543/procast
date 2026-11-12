@@ -176,6 +176,7 @@ macro_rules! names {
     ($($k:ident = $v:literal),* $(,)?) => {
         pub mod g {
             $(pub const $k: &str = $v;)*
+            #[cfg(test)]
             pub const ALL: &[&str] = &[$($v),*];
         }
     };
@@ -300,8 +301,11 @@ static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 
 /// Reads the Windows state into the cache `Tokens::from_theme` uses. Call when the launcher is
 /// shown, the settings window opens and the config reloads, never per frame.
-pub fn refresh_glass() {
-    GLASS.store(glass_enabled(), Ordering::Relaxed);
+/// Returns the decision, for the launcher's window backdrop.
+pub fn refresh_glass() -> bool {
+    let on = glass_enabled();
+    GLASS.store(on, Ordering::Relaxed);
+    on
 }
 
 /// Whether the window body may be glass: false with Windows transparency effects off, high
@@ -401,9 +405,11 @@ impl Tokens {
         k.bg_solid = Hsla { alpha: 1., ..k.bg };
         set(&mut k.text, &t.text);
         set(&mut k.text_muted, &t.muted);
-        set(&mut k.accent, &t.selected);
-        // Text on the accent is white or ink, whichever reads better.
-        k.accent_text = on_color(k.accent);
+        // Text on an overridden accent is white or ink, whichever reads better; the palette's own pair stays as specified.
+        if t.selected.as_deref().and_then(config::parse_hex).is_some() {
+            set(&mut k.accent, &t.selected);
+            k.accent_text = on_color(k.accent);
+        }
         k
     }
 
@@ -413,18 +419,16 @@ impl Tokens {
     }
 }
 
+/// A shadow from CSS values. gpui-ce's `blur_radius` is the Gaussian sigma; a CSS blur is two sigma.
 fn shadow(x: f32, y: f32, blur: f32, spread: f32, hex: u32) -> BoxShadow {
-    BoxShadow::new(px(x), px(y), c(hex)).blur_radius(px(blur)).spread_radius(px(spread))
+    BoxShadow::new(px(x), px(y), c(hex)).blur_radius(px(blur / 2.)).spread_radius(px(spread))
 }
 
-/// The focus ring: `color` at 32%, 2 px spread, no blur. Paired with a solid 1 px border.
-pub fn ring_color(color: Hsla) -> Vec<BoxShadow> {
-    vec![BoxShadow::new(px(0.), px(0.), Hsla { alpha: 0.32, ..color }).spread_radius(px(2.))]
-}
-
-/// The accent focus ring.
-pub fn ring(t: &Tokens) -> Vec<BoxShadow> {
-    ring_color(t.accent)
+/// The focus ring on `el`: a hollow 2 px band of `color` at 32% outside the border, which
+/// stays solid. gpui's ring, not a spread shadow: a shadow fills the whole rect under a
+/// see-through control.
+fn focus_ring(el: Div, color: Hsla) -> Div {
+    el.ring(px(2.)).ring_color(alpha(color, 0.32))
 }
 
 /// The deep, close shadow of an ActionPanel or Dialog.
@@ -439,15 +443,6 @@ pub fn float(t: &Tokens) -> Vec<BoxShadow> {
 /// Thickness: a bright line inside the top edge and a shade inside the bottom edge (inset).
 pub fn rim(t: &Tokens) -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.), px(1.), t.edge).inset(), BoxShadow::new(px(0.), px(-1.), c(if t.dark { 0x00000059 } else { 0x0000000f })).inset()]
-}
-
-/// The wide soft shadow that lifts the glass window off the desktop.
-pub fn depth(t: &Tokens) -> Vec<BoxShadow> {
-    if t.dark {
-        vec![shadow(0., 24., 60., -12., 0x00000099), shadow(0., 2., 8., 0., 0x0000004d)]
-    } else {
-        vec![shadow(0., 24., 60., -12., 0x00000040), shadow(0., 2., 8., 0., 0x0000001a)]
-    }
 }
 
 const INK: u32 = 0x121216ff;
@@ -760,13 +755,7 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
         .bg(t.surface)
         .border_1()
         .border_color(if focused { t.accent } else { t.border })
-        .when(focused, |d| d.shadow(ring(t)))
-}
-
-/// One of many: a `field` showing the current choice and a chevron. The caller sets the width,
-/// `.id` and the click.
-pub fn select_field(label: &str, focused: bool, t: &Tokens) -> Div {
-    field(focused, t).flex_none().gap(px(8.)).text_size(px(ts::BODY_SM)).child(div().flex_1().min_w_0().truncate().child(label.to_string())).child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+        .when(focused, |d| focus_ring(d, t.accent))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -797,7 +786,7 @@ pub fn button(label: &str, kind: Button, focused: bool, t: &Tokens) -> Div {
         .border_color(border)
         .text_size(px(ts::BODY_SM))
         .text_color(text)
-        .when(focused, |d| d.shadow(ring_color(if kind == Button::Quiet { t.accent } else { border })))
+        .when(focused, |d| focus_ring(d, if kind == Button::Quiet { t.accent } else { border }))
         .child(label.to_string())
 }
 
@@ -857,19 +846,33 @@ pub fn hotkey_control(keys: &str, recording: bool, t: &Tokens) -> Div {
 }
 
 /// The glass rim: `edge` at the top left, `border` at the bottom right (CSS has an `edge_dim`
-/// plateau between; gpui-ce gradients take two stops).
+/// plateau between; gpui-ce gradients take two stops). gpui-ce blends the stops in Oklab
+/// without premultiplying alpha, so Light's white `edge` into its black `border` would pass
+/// through a grey darker than either: there the end is `border` laid over `bg_solid`, an
+/// opaque near-white grey, and the middle stays light. Dark's stops are both white and
+/// blend cleanly as they are.
 fn rim_border(t: &Tokens) -> Background {
-    linear_gradient(135., linear_color_stop(t.edge, 0.), linear_color_stop(t.border, 1.))
+    let end = if t.dark { t.border } else { over(t.border, t.bg_solid) };
+    linear_gradient(135., linear_color_stop(t.edge, 0.), linear_color_stop(end, 1.))
+}
+
+/// `top` drawn over an opaque `under`.
+fn over(top: Hsla, under: Hsla) -> Hsla {
+    let (t, u, a) = (gpui::hsla_to_rgba(top), gpui::hsla_to_rgba(under), top.alpha);
+    let mix = |x: f32, y: f32| x * a + y * (1. - a);
+    gpui::rgb_to_hsla(gpui::Rgba::new(mix(t.red, u.red), mix(t.green, u.green), mix(t.blue, u.blue), 1.))
 }
 
 /// The launcher body: `t.body()` in an `r::XL` shell. On glass it gets a diagonal sheen, the
-/// gradient rim border, `rim` thickness and the `depth` shadow; without glass, a solid rim.
+/// gradient rim border and `rim` thickness; without glass, a solid rim. No `depth` shadow: the
+/// shell fills the window and the rounded window region clips outside it, so an outer shadow
+/// could only darken the glass from below.
 /// Children go inside; the sheen sits beneath them.
 pub fn glass_window(t: &Tokens) -> Div {
     let shell = div().relative().flex().flex_col().overflow_hidden().rounded(px(r::XL)).bg(t.body()).text_color(t.text).border_1();
     if t.glass {
         let sheen = linear_gradient(135., linear_color_stop(t.edge_dim, 0.), linear_color_stop(alpha(t.edge_dim, 0.), 0.42));
-        shell.border_color(rim_border(t)).shadow([rim(t), depth(t)].concat()).child(div().absolute().inset_0().rounded(px(r::XL - 1.)).bg(sheen))
+        shell.border_color(rim_border(t)).shadow(rim(t)).child(div().absolute().inset_0().rounded(px(r::XL - 1.)).bg(sheen))
     } else {
         shell.border_color(t.border).shadow(rim(t))
     }
@@ -1064,13 +1067,6 @@ mod tests {
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
-    /// `top` drawn over an opaque `under`.
-    fn over(top: Hsla, under: Hsla) -> Hsla {
-        let (t, u, a) = (gpui::hsla_to_rgba(top), gpui::hsla_to_rgba(under), top.alpha);
-        let mix = |x: f32, y: f32| x * a + y * (1. - a);
-        gpui::rgb_to_hsla(gpui::Rgba::new(mix(t.red, u.red), mix(t.green, u.green), mix(t.blue, u.blue), 1.))
-    }
-
     /// (name, tokens, the stand-in worst backdrop under the glass). The backdrop is levelled by
     /// the OS material, so no wallpaper is worse than mid grey on Dark or dark grey on Light.
     fn modes() -> [(&'static str, Tokens, Hsla); 2] {
@@ -1110,7 +1106,8 @@ mod tests {
 
     #[test]
     fn muted_text_holds_4_5_on_the_selected_fill() {
-        hold(4.5, |t, _| vec![("text_muted on sel_top over bg_solid".into(), lum_ratio(t.text_muted, over(t.sel_top, t.bg_solid)))])
+        hold(4.5, |t, _| vec![("text_muted on sel_top over bg_solid".into(), lum_ratio(t.text_muted, over(t.sel_top, t.bg_solid)))]);
+        hold(4.5, |t, back| vec![("text_muted on sel_top over glass over the worst backdrop".into(), lum_ratio(t.text_muted, over(t.sel_top, over(t.bg, back))))])
     }
 
     #[test]
@@ -1146,6 +1143,14 @@ mod tests {
         hold(3., |t, _| TINTS.map(|k| (format!("{k:?} on its wash over bg_solid"), lum_ratio(k.hue(t), over(wash(k.hue(t)), t.bg_solid)))).into())
     }
 
+    /// Spec values kept: on Light glass over the #404040 stand-in four hues fall a hair under
+    /// 3:1 on their wash: System 2.86, File 2.95, Window 2.97, Danger 2.99 (all hold on `bg_solid`).
+    #[test]
+    #[ignore = "Light glass over #404040: System 2.86, File 2.95, Window 2.97, Danger 2.99 on their wash"]
+    fn tint_icons_hold_3_on_their_wash_over_glass() {
+        hold(3., |t, back| TINTS.map(|k| (format!("{k:?} on its wash over glass over the worst backdrop"), lum_ratio(k.hue(t), over(wash(k.hue(t)), over(t.bg, back))))).into())
+    }
+
     /// In a selected row the icon steps up to `text`, on the tile wash over the selected fill.
     #[test]
     fn selected_tile_icons_hold_3_on_their_wash() {
@@ -1158,7 +1163,9 @@ mod tests {
     #[test]
     fn shadows_have_the_spec_shape() {
         for (_, t, _) in modes() {
-            assert_eq!((ring(&t).len(), float(&t).len(), depth(&t).len()), (1, 2, 2));
+            assert_eq!(float(&t).len(), 2);
+            // The 44 px CSS blur is a 22 px sigma.
+            assert_eq!(float(&t)[0].blur_radius, px(22.));
             assert!(rim(&t).iter().all(|s| s.inset) && rim(&t).len() == 2 && !float(&t).iter().any(|s| s.inset));
         }
     }

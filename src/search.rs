@@ -594,6 +594,7 @@ mod tests {
     #[test]
     fn destructive_actions_are_the_ones_that_remove_or_end_something() {
         assert!(Act::DeleteClip("x".into()).destructive() && Act::ForceQuit(1).destructive() && Act::Cmd(Cmd::ShutDown).destructive());
+        assert!(Act::Cmd(Cmd::ClearClipboardHistory).destructive() && Act::Cmd(Cmd::ClearSearchHistory).destructive());
         assert!(!Act::Copy("x".into()).destructive() && !Act::Hide("k".into()).destructive() && !Act::Cmd(Cmd::Settings).destructive());
     }
 
