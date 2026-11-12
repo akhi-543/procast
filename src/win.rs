@@ -184,7 +184,11 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
-/// Windows 11 rounded corners (no-op on Windows 10).
+/// Windows 11 rounded corners (no-op on Windows 10). DWM rounds to 8 px; the glass body paints
+/// r-xl 16, so on acrylic a thin wedge of blur shows in each corner.
+// ponytail: unverified without running the app. Upgrade: CreateRoundRectRgn(0, 0, w + 1, h + 1,
+// 2r, 2r) + SetWindowRgn(hwnd, rgn, true) with r = 16 * launcher_scale * dpi, re-set after
+// SetWindowPos in `place` and `resize`; costs aliased corner pixels.
 pub fn round_corners(hwnd: HWND) {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: i32 = 2;

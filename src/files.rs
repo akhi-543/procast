@@ -319,12 +319,29 @@ pub fn item(path: &str, dir: bool, home: &str) -> Item {
         "exe" | "msi" | "lnk" => (g::APP, "Program"),
         _ => (g::DOCUMENT, "File"),
     };
-    Item::new(name, parent, Icon::Vector(glyph), Act::File(path.to_string())).acc(kind)
+    Item::new(name, parent, Icon::Vector(glyph), Act::File(path.to_string())).acc(kind).tinted(crate::design::Tint::File)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_pick_their_icon_by_type() {
+        use crate::design::{Tint, g};
+        let icon = |path: &str, dir: bool| match item(path, dir, "").icon {
+            Icon::Vector(name) => name,
+            _ => "",
+        };
+        assert_eq!(icon("/a/photo.PNG", false), g::PICTURE);
+        assert_eq!(icon("/a/clip.mkv", false), g::VIDEO);
+        assert_eq!(icon("/a/song.flac", false), g::AUDIO);
+        assert_eq!(icon("/a/all.7z", false), g::ZIP);
+        assert_eq!(icon("/a/main.rs", false), g::CODE);
+        assert_eq!(icon("/a/notes.txt", false), g::DOCUMENT);
+        assert_eq!(icon("/a/folder.png", true), g::FOLDER);
+        assert_eq!(item("/a/x.txt", false, "").tint, Some(Tint::File));
+    }
 
     #[test]
     fn crawl_skips_excluded_and_search_ranks_names() {

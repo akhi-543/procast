@@ -103,6 +103,11 @@ impl Act {
             Act::None => "",
         }
     }
+
+    /// Removes or ends something; the action panel draws these in `danger`.
+    pub fn destructive(&self) -> bool {
+        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_)) || matches!(self, Act::Cmd(c) if c.destructive())
+    }
 }
 
 #[derive(Clone)]
@@ -585,6 +590,12 @@ fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destructive_actions_are_the_ones_that_remove_or_end_something() {
+        assert!(Act::DeleteClip("x".into()).destructive() && Act::ForceQuit(1).destructive() && Act::Cmd(Cmd::ShutDown).destructive());
+        assert!(!Act::Copy("x".into()).destructive() && !Act::Hide("k".into()).destructive() && !Act::Cmd(Cmd::Settings).destructive());
+    }
 
     #[test]
     fn root_search_modes_and_helpers() {

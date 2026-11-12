@@ -648,7 +648,7 @@ impl Launcher {
             },
             Mode::Ext => self.ext_rows(&query),
             Mode::Store => match &self.store {
-                None => vec![empty_row(g::DOWNLOAD, "Loading the store index…".into(), "The first time fetches every extension's manifest (~1 min)".into(), vec![])],
+                None => vec![empty_row(g::CLOCK, "Loading the store index…".into(), "The first time fetches every extension's manifest (~1 min)".into(), vec![])],
                 Some(entries) => {
                     let installed: Vec<&str> = self.exts.iter().map(|(x, _)| x.name.as_str()).collect();
                     let rows: Vec<Item> = entries
@@ -2272,7 +2272,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) { 110. } else { 220. };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) { 110. } else { design::ACCESSORY_MAX };
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {
@@ -2285,11 +2285,11 @@ impl Render for Launcher {
                             let accessory = if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
                             } else if !accessory.is_empty() {
-                                Some(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(design::ts::BODY_SM)).text_color(if on { t.text_muted } else { t.text_faint }).child(accessory.clone()).into_any_element())
+                                Some(accessory.clone().into_any_element())
                             } else {
                                 None
                             };
-                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, on, &t)
+                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, acc_max, on, &t)
                                 .id(k)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
@@ -2313,46 +2313,18 @@ impl Render for Launcher {
         // ---- calculator answer card (two rows tall, so the list below keeps whole rows) ----
         let answer = (self.mode == Mode::Root && is_answer(&self.items, 0)).then(|| {
             let it = &self.items[0];
-            let on = self.selected == 0;
-            let hue = design::Tint::Calc.hue(&t);
             let full = match &it.act {
-                Act::Copy(v) => v.clone(),
-                _ => String::new(),
+                Act::Copy(v) => v.as_str(),
+                _ => "",
             };
             let me = cx.weak_entity();
-            div().h(px(2. * ROW)).flex_none().px(px(8.)).pt(px(LIST_PAD)).child(
-                div()
-                    .id("answer")
-                    .relative()
-                    .size_full()
-                    .px(px(16.))
-                    .flex()
-                    .items_center()
-                    .gap(px(16.))
-                    .rounded(px(design::r::LG))
-                    .bg(t.surface)
-                    .when(on, |d| design::lozenge(d, &t))
-                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-                        me.update(cx, |this, cx| {
-                            this.selected = 0;
-                            this.launch(window, cx);
-                        })
-                        .ok();
-                    })
-                    .when(on, |d| d.child(design::pill(2. * ROW - LIST_PAD, &t)))
-                    .child(design::icon(g::CALCULATOR, design::ic::LG, hue))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::HEADING)).text_color(t.text_muted).child(it.subtitle.clone()))
-                    .child(design::icon(g::FORWARD, design::ic::MD, t.text_faint))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .items_end()
-                            .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(it.title.clone()))
-                            .when(full != it.title, |d| d.child(div().font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).text_color(if on { t.text_muted } else { t.text_faint }).child(full))),
-                    ),
-            )
+            design::answer_slot(design::answer_card(&it.subtitle, &it.title, full, self.selected == 0, &t).id("answer").on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                me.update(cx, |this, cx| {
+                    this.selected = 0;
+                    this.launch(window, cx);
+                })
+                .ok();
+            }))
         });
 
         // ---- body ----
@@ -2417,68 +2389,28 @@ impl Render for Launcher {
 
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
-        let leading = if at_root {
-            div().size(px(design::TILE)).flex_none().flex().items_center().justify_center().child(design::icon(g::SEARCH, design::ic::LG, t.accent)).into_any_element()
-        } else {
-            div()
-                .id("back")
-                .size(px(design::TILE))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(design::r::SM))
-                .bg(t.surface)
-                .hover(|s| s.bg(t.surface_strong))
-                .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-                .child(design::icon(g::BACK, design::ic::MD, t.text))
-                .into_any_element()
-        };
+        let leading = if at_root { design::search_mark(&t).into_any_element() } else { design::back_tile(&t).id("back").on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element() };
         let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
-            let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-            div()
-                .flex_none()
-                .h(px(design::CONTROL))
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .rounded(px(design::r::SM))
-                .border_1()
-                .border_color(t.border)
-                .text_size(px(design::ts::BODY_SM))
-                .child(design::icon(g::FILTER, design::ic::SM, t.text_muted))
-                .child(div().max_w(px(180.)).truncate().child(title))
-                .child(design::icon(g::CHEVRON_DOWN, design::ic::SM, t.text_muted))
+            let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.as_str()).unwrap_or_default();
+            design::dropdown(title, &t).into_any_element()
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
-        let hint = (collapsed && !self.fav_strip()).then(|| {
-            div().flex_none().flex().items_center().gap(px(8.)).text_size(px(design::ts::BODY_SM)).text_color(t.text_faint).child("Recent").child(design::key_cap("↓", &t))
-        });
-        let search_bar = div()
-            .h(px(design::BAR))
-            .flex_none()
-            .px(px(16.))
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .border_b_1()
-            .border_color(t.hairline)
-            .child(leading)
-            .child(
-                text_input("query")
-                    .state(self.input.downgrade())
-                    .placeholder(self.placeholder())
-                    .placeholder_color(t.text_faint)
-                    .caret_color(t.accent)
-                    .caret_blink_interval_500ms()
-                    .flex_1()
-                    .font_family(design::FONT_DISPLAY)
-                    .text_size(px(design::ts::QUERY))
-                    .whitespace_nowrap(),
-            )
-            .children(hint)
-            .children(dropdown);
+        let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
+        let search_bar = design::search_bar(
+            leading,
+            text_input("query")
+                .state(self.input.downgrade())
+                .placeholder(self.placeholder())
+                .placeholder_color(t.text_faint)
+                .caret_color(t.accent)
+                .caret_blink_interval_500ms()
+                .flex_1()
+                .font_family(design::FONT_DISPLAY)
+                .text_size(px(design::ts::QUERY))
+                .whitespace_nowrap(),
+            hint.into_iter().chain(dropdown),
+            &t,
+        );
 
         // ---- action bar ----
         let tone = self.status.as_ref().map(|(tone, _)| match tone {
@@ -2486,120 +2418,61 @@ impl Render for Launcher {
             Tone::Ok => t.success,
             Tone::Info => t.accent,
         });
-        let footer = div()
-            .h(px(design::FOOTER))
-            .flex_none()
-            .px(px(16.))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.))
-            .border_t_1()
-            .border_color(t.hairline)
-            .text_size(px(design::ts::BODY_SM))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(match tone {
-                        Some(c) => div().size(px(8.)).mx(px(4.)).rounded_full().bg(c).into_any_element(),
-                        // In root search: the selected row's own icon beside its kind.
-                        None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.accent, |k| k.hue(&t)))) {
-                            (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
-                            (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
-                            (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
-                        },
-                    })
-                    .child(div().min_w_0().truncate().text_color(if tone.is_some() { t.text } else { t.text_muted }).child(self.footer_left())),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .map(|d| {
-                        if self.panel.is_some() {
-                            d.child(design::shortcut("Run", &["↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Close", &["Esc"], &t))
-                        } else if self.is_form() {
-                            d.child(design::shortcut("Submit", &["Ctrl", "↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Actions", &["Ctrl", "K"], &t))
-                        } else if self.armed == Some(self.selected) {
-                            d.child(div().text_color(t.warning).child("Press ↵ again to confirm"))
-                        } else if let Some(p) = &primary {
-                            let d = d.child(design::shortcut(p, &["↵"], &t));
-                            if actions.len() > 1 { d.child(design::vdivider(&t)).child(design::shortcut("Actions", &["Ctrl", "K"], &t)) } else { d }
-                        } else {
-                            d
-                        }
-                    }),
-            );
+        // A status shows its tone dot; in root search the selected row's own icon in its hue; else the view's icon.
+        let mark = match tone {
+            Some(c) => design::status_dot(c).into_any_element(),
+            None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.text_muted, |k| k.hue(&t)))) {
+                (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
+                (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
+                (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
+            },
+        };
+        let keys = |label: &str, keys: &[&str]| design::shortcut(label, keys, &t).into_any_element();
+        let right = if self.panel.is_some() {
+            vec![keys("Run", &["↵"]), design::vdivider(&t).into_any_element(), keys("Close", &["Esc"])]
+        } else if self.is_form() {
+            vec![keys("Submit", &["Ctrl", "↵"]), design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]
+        } else if self.armed == Some(self.selected) {
+            vec![div().text_color(t.warning).child("Press ↵ again to confirm").into_any_element()]
+        } else if let Some(p) = &primary {
+            let mut v = vec![keys(p, &["↵"])];
+            if actions.len() > 1 {
+                v.extend([design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]);
+            }
+            v
+        } else {
+            vec![]
+        };
+        let footer = design::action_bar(mark, &self.footer_left(), tone.is_some(), right, &t);
 
         // ---- overlays ----
         let popover = self.panel.as_ref().map(|(item, sel)| {
-            let acts = item.actions();
             let me = cx.weak_entity();
-            div()
-                .absolute()
-                .right(px(8.))
-                .bottom(px(design::FOOTER + 8.))
-                .w(px(320.))
-                .max_h(px(320.))
-                .p(px(4.))
-                .flex()
-                .flex_col()
-                .rounded(px(design::r::LG))
-                .bg(t.bg_elevated)
-                .border_1()
-                .border_color(t.border)
-                .shadow_lg()
-                .child(
-                    div()
-                        .h(px(ROW))
-                        .px(px(8.))
-                        .mb(px(4.))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap(px(12.))
-                        .border_b_1()
-                        .border_color(t.hairline)
-                        .child(design::icon_tile(&item.icon, &t, false, item.tint))
-                        .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(item.title.clone())),
-                )
-                .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(acts.into_iter().enumerate().map(|(i, (label, act))| {
-                    let on = i == *sel;
-                    let me = me.clone();
-                    let keys: &[&str] = match i {
-                        0 => &["↵"],
-                        1 => &["Ctrl", "↵"],
-                        _ => &[],
-                    };
-                    design::selectable(design::CONTROL, on, &t)
-                        .id(("act", i))
-                        .flex_none()
-                        .gap(px(12.))
-                        .on_click(move |_, window, cx| {
-                            me.update(cx, |this, cx| {
-                                if let Some((_, p)) = &mut this.panel {
-                                    *p = i;
-                                }
-                                this.launch(window, cx);
-                            })
-                            .ok();
-                        })
-                        .child(design::icon(act_glyph(&act), design::ic::MD, if on { t.text } else { t.text_muted }))
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| design::key_cap(k, &t))))
-                })))
+            let rows = item.actions().into_iter().enumerate().map(|(i, (label, act))| {
+                let me = me.clone();
+                let keys: &[&str] = match i {
+                    0 => &["↵"],
+                    1 => &["Ctrl", "↵"],
+                    _ => &[],
+                };
+                design::panel_row(act_glyph(&act), &label, keys, i == *sel, act.destructive(), &t).id(("act", i)).on_click(move |_, window, cx| {
+                    me.update(cx, |this, cx| {
+                        if let Some((_, p)) = &mut this.panel {
+                            *p = i;
+                        }
+                        this.launch(window, cx);
+                    })
+                    .ok();
+                })
+            });
+            // The window steps back under `scrim_soft` so the panel is plainly the top layer.
+            [design::scrim(t.scrim_soft).occlude(), design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t)]
         });
         let dialog = self.confirm.as_ref().map(|c| {
             let me = cx.weak_entity();
-            let button = |i: usize, label: String, kind: design::Button| {
+            let button = |i: usize, label: &str, kind: design::Button| {
                 let me = me.clone();
-                design::button(&label, kind, i == selected, &t).id(("dialog", i)).w_full().on_click(move |_, window, cx| {
+                design::button(label, kind, i == selected, &t).id(("dialog", i)).w_full().on_click(move |_, window, cx| {
                     me.update(cx, |this, cx| {
                         this.selected = i;
                         this.launch(window, cx);
@@ -2607,40 +2480,14 @@ impl Render for Launcher {
                     .ok();
                 })
             };
-            let danger = c.danger;
-            div().absolute().inset_0().flex().items_center().justify_center().bg(t.scrim).child(
-                div()
-                    .w(px(320.))
-                    .p(px(16.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(design::r::LG))
-                    .bg(t.bg_elevated)
-                    .border_1()
-                    .border_color(t.border)
-                    .shadow_lg()
-                    .child(div().py(px(4.)).child(design::icon(if danger { g::WARNING } else { g::INFO }, design::ic::XL, if danger { t.danger } else { t.accent })))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).text_center().child(c.title.clone()))
-                    .children((!c.message.is_empty()).then(|| div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).text_center().child(c.message.clone())))
-                    .child(div().w_full().pt(px(8.)).flex().flex_col().gap(px(8.)).child(button(0, c.primary.clone(), if danger { design::Button::Danger } else { design::Button::Primary })).child(button(1, "Cancel".into(), design::Button::Quiet))),
-            )
+            let primary = if c.danger { design::Button::Danger } else { design::Button::Primary };
+            design::dialog(c.danger, &c.title, &c.message, [button(0, &c.primary, primary), button(1, "Cancel", design::Button::Quiet)], &t)
         });
 
-        div()
+        design::glass_window(&t)
             .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
-            .bg(t.body())
-            .text_color(t.text)
-            .border_1()
-            .border_color(t.border)
-            .rounded(px(design::r::MD))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
@@ -2725,7 +2572,7 @@ impl Render for Launcher {
             }))
             .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
             .when(!collapsed, |d| d.child(body).child(footer))
-            .children(popover)
+            .children(popover.into_iter().flatten())
             .children(dialog)
     }
 }
@@ -2843,6 +2690,8 @@ fn main() {
         win::set_start_at_login(cfg.start_at_login);
         net::load_rates();
         design::set_size(&cfg.size);
+        // Before the first render, so the body is not drawn as glass on a machine with transparency off.
+        design::refresh_glass();
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
         let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
