@@ -170,12 +170,15 @@ const EMPTY: &str = "\u{0}empty";
 fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
+    // A header says something only when there is more than one section, and "Results"
+    // right under the search field says nothing.
+    let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
         if is_answer(items, i) {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last {
+        if sec.is_some() && sec != last && !one && sec != Some("Results") {
             out.push(None);
         }
         last = sec;
@@ -220,6 +223,8 @@ struct Confirm {
     title: String,
     message: String,
     primary: String,
+    /// The primary action destroys something (the extension says so).
+    danger: bool,
 }
 
 struct Launcher {
@@ -1147,6 +1152,7 @@ impl Launcher {
                             title: p["title"].as_str().unwrap_or("Are you sure?").into(),
                             message: p["message"].as_str().unwrap_or_default().into(),
                             primary: p["primary"].as_str().unwrap_or("Confirm").into(),
+                            danger: p["destructive"].as_bool().unwrap_or(false),
                         });
                         self.selected = 0;
                         self.refresh(cx);
@@ -2021,7 +2027,7 @@ impl Launcher {
 
     fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
         let Some(ev) = &self.extv else { return div().into_any_element() };
-        let field_box = |on: bool| div().w_full().h(px(34.)).px(px(10.)).flex().items_center().rounded(px(6.)).bg(t.surface).border_1().border_color(if on { t.accent } else { t.border });
+        let field_box = |on: bool| design::field(on, t).w_full();
         div()
             .id("form")
             .flex_1()
@@ -2029,14 +2035,14 @@ impl Launcher {
             .overflow_y_scroll()
             .flex()
             .justify_center()
-            .pt(px(28.))
-            .child(div().w(px(540.)).flex().flex_col().gap(px(14.)).children(ev.view.fields.iter().enumerate().map(|(i, f)| {
+            .pt(px(24.))
+            .child(div().w(px(520.)).flex().flex_col().gap(px(12.)).children(ev.view.fields.iter().enumerate().map(|(i, f)| {
                 let on = i == ev.field;
                 let value = ev.values.get(&f.id).cloned().unwrap_or(Value::Null);
                 let control = match &f.kind {
                     FieldKind::Text | FieldKind::Password | FieldKind::TextArea => match ev.inputs.get(&f.id) {
                         Some(input) => field_box(on)
-                            .when(f.kind == FieldKind::TextArea, |d| d.h(px(64.)).items_start().py(px(8.)))
+                            .when(f.kind == FieldKind::TextArea, |d| d.h(px(2. * design::CONTROL)).items_start().py(px(8.)))
                             .child(
                                 text_input(SharedString::from(format!("field-{}", f.id)))
                                     .state(input.downgrade())
@@ -2052,28 +2058,28 @@ impl Launcher {
                     FieldKind::Checkbox => {
                         let checked = value.as_bool().unwrap_or(false);
                         div()
-                            .h(px(34.))
+                            .h(px(design::CONTROL))
                             .flex()
                             .items_center()
                             .gap(px(8.))
-                            .child(design::fluent(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, 16., if checked { t.accent } else { t.text_muted }))
+                            .child(design::fluent(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
                             .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.title.clone()))
                             .into_any_element()
                     }
                     FieldKind::Dropdown(opts) => {
                         let cur = value.as_str().unwrap_or_default();
                         let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::fluent(g::CHEVRON_DOWN, 11., t.text_muted)).into_any_element()
+                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::fluent(g::CHEVRON_DOWN, design::ic::SM, t.text_muted)).into_any_element()
                     }
-                    FieldKind::Description => div().text_size(px(13.)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
+                    FieldKind::Description => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
                     FieldKind::Separator => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
                 };
                 let label = if matches!(f.kind, FieldKind::Checkbox | FieldKind::Separator) { String::new() } else { f.title.clone() };
                 div()
                     .flex()
                     .items_start()
-                    .gap(px(14.))
-                    .child(div().w(px(130.)).flex_none().h(px(34.)).flex().items_center().justify_end().text_size(px(13.)).text_color(t.text_muted).child(label))
+                    .gap(px(12.))
+                    .child(div().w(px(120.)).flex_none().h(px(design::CONTROL)).flex().items_center().justify_end().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(label))
                     .child(
                         div()
                             .flex_1()
@@ -2082,7 +2088,7 @@ impl Launcher {
                             .flex_col()
                             .gap(px(4.))
                             .child(control)
-                            .children(f.error.clone().map(|e| div().text_size(px(12.)).text_color(t.danger).child(e))),
+                            .children(f.error.clone().map(|e| div().text_size(px(design::ts::SMALL)).text_color(t.danger).child(e))),
                     )
             })))
             .into_any_element()
@@ -2095,23 +2101,23 @@ impl Launcher {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px(px(20.))
+            .px(px(24.))
             .py(px(16.))
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(4.))
             .children(ext::markdown_lines(md).into_iter().map(|(level, text)| {
                 let line = div().line_height(px(21.)).child(if text.is_empty() { " ".to_string() } else { text });
                 match level {
-                    1 => line.pt(px(4.)).font_family(design::FONT_DISPLAY).text_size(px(20.)).font_weight(FontWeight::SEMIBOLD),
-                    2 => line.pt(px(4.)).text_size(px(16.)).font_weight(FontWeight::SEMIBOLD),
-                    3 => line.font_weight(FontWeight::SEMIBOLD),
-                    9 => line.font_family(design::FONT_MONO).text_size(px(13.)).px(px(10.)).bg(t.surface).rounded(px(4.)),
+                    1 => line.pt(px(4.)).line_height(px(28.)).font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD),
+                    2 => line.pt(px(4.)).text_size(px(design::ts::HEADING)).font_weight(FontWeight::SEMIBOLD),
+                    3 => line.pt(px(4.)).font_weight(FontWeight::SEMIBOLD),
+                    9 => line.font_family(design::FONT_MONO).text_size(px(design::ts::BODY_SM)).px(px(12.)).bg(t.surface).rounded(px(design::r::XS)),
                     _ => line.text_color(t.text),
                 }
             }))
             .when(!metadata.is_empty(), |d| {
-                d.child(div().mt(px(14.)).pt(px(12.)).border_t_1().border_color(t.hairline).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information"))
+                d.child(div().mt(px(12.)).pt(px(12.)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information"))
                     .children(metadata.iter().map(|(k, v)| {
                         div()
                             .flex()
@@ -2120,7 +2126,7 @@ impl Launcher {
                             .py(px(8.))
                             .border_b_1()
                             .border_color(t.hairline)
-                            .text_size(px(13.))
+                            .text_size(px(design::ts::BODY_SM))
                             .child(div().flex_none().text_color(t.text_muted).child(k.clone()))
                             .child(div().min_w_0().truncate().child(v.clone()))
                     }))
@@ -2171,7 +2177,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, icon: Icon, tint: Option<design::Tint> },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint> },
 }
 
 impl Render for Launcher {
@@ -2222,21 +2228,38 @@ impl Render for Launcher {
             }),
         );
 
+        let collapsed = self.collapsed(cx);
+
         // ---- results list ----
         let slots: Vec<Slot> = {
             let mut out = vec![];
             let rows = display_rows(&self.items);
             let count = |sec: &Option<String>| self.items.iter().filter(|it| &it.section == sec).count();
+            // The right-hand column shows what tells rows apart. In root search that is a
+            // row's own hotkey or alias (its kind is in the action bar); elsewhere it is the
+            // row's accessory, said once per run of rows that share it.
+            let root = self.mode == Mode::Root;
+            let mut above = String::new();
             for (k, r) in rows.iter().enumerate() {
                 match r {
                     None => {
                         let it = &self.items[rows[k + 1].unwrap_or(0)];
                         let sec = it.section.clone();
+                        above.clear();
                         out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root).then(|| count(&sec))));
                     }
                     Some(i) => {
                         let it = &self.items[*i];
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory: it.accessory.clone(), icon: it.icon.clone(), tint: it.tint });
+                        let hotkey = it.key.as_ref().filter(|_| root).and_then(|k| self.cfg.launcher.hotkeys.get(k)).cloned().unwrap_or_default();
+                        let accessory = if root {
+                            it.alias.clone()
+                        } else if it.accessory == above {
+                            String::new()
+                        } else {
+                            above = it.accessory.clone();
+                            above.clone()
+                        };
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory, hotkey, icon: it.icon.clone(), tint: it.tint });
                     }
                 }
             }
@@ -2253,51 +2276,27 @@ impl Render for Launcher {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, icon, tint } => {
+                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
-                            div()
+                            // The selected row lights up in the colour of what it is.
+                            let hue = if on { t.hue_for(*tint, icon) } else { t.accent };
+                            let accessory = if !hotkey.is_empty() {
+                                Some(design::key_caps(hotkey, &t).into_any_element())
+                            } else if !accessory.is_empty() {
+                                Some(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(design::ts::BODY_SM)).text_color(if on { t.text_muted } else { t.text_faint }).child(accessory.clone()).into_any_element())
+                            } else {
+                                None
+                            };
+                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, on, hue, &t)
                                 .id(k)
-                                .h(px(design::ROW))
-                                .w_full()
-                                .px(px(6.))
-                                .flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .relative()
-                                        .h(px(36.))
-                                        .w_full()
-                                        .px(px(10.))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(12.))
-                                        .rounded(px(8.))
-                                        .when(on, |d| d.bg(t.surface_strong))
-                                        .when(!on, |d| d.hover(|s| s.bg(t.hover)))
-                                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-                                            me.update(cx, |this, cx| {
-                                                this.selected = i;
-                                                this.launch(window, cx);
-                                            })
-                                            .ok();
-                                        })
-                                        // Fluent selection pill.
-                                        .child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(16.)).rounded_full().when(on, |d| d.bg(t.accent)))
-                                        .child(design::icon_tile(icon, &t, on, *tint))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(10.))
-                                                // Title keeps priority; the subtitle gives way first.
-                                                .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.clone()))
-                                                .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(subtitle.clone()))),
-                                        )
-                                        .when(!accessory.is_empty(), |d| d.child(div().flex_none().max_w(px(acc_max)).truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_faint).child(accessory.clone()))),
-                                )
+                                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.selected = i;
+                                        this.launch(window, cx);
+                                    })
+                                    .ok();
+                                })
                                 .into_any_element()
                         }
                     })
@@ -2320,7 +2319,7 @@ impl Render for Launcher {
                 _ => String::new(),
             };
             let me = cx.weak_entity();
-            div().h(px(2. * ROW)).flex_none().px(px(6.)).pt(px(LIST_PAD)).child(
+            div().h(px(2. * ROW)).flex_none().px(px(8.)).pt(px(LIST_PAD)).child(
                 div()
                     .id("answer")
                     .relative()
@@ -2329,8 +2328,8 @@ impl Render for Launcher {
                     .flex()
                     .items_center()
                     .gap(px(16.))
-                    .rounded(px(10.))
-                    .bg(if on { t.surface_strong } else { t.surface })
+                    .rounded(px(design::r::LG))
+                    .bg(if on { t.selected(hue) } else { t.surface })
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         me.update(cx, |this, cx| {
                             this.selected = 0;
@@ -2338,10 +2337,10 @@ impl Render for Launcher {
                         })
                         .ok();
                     })
-                    .child(div().absolute().left(px(0.)).top(px(24.)).w(px(3.)).h(px(24.)).rounded_full().when(on, |d| d.bg(t.accent)))
-                    .child(design::fluent(g::CALCULATOR, 18., hue))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::TITLE)).text_color(t.text_muted).child(it.subtitle.clone()))
-                    .child(design::fluent(g::FORWARD, 14., t.text_faint))
+                    .when(on, |d| d.child(design::pill(hue, 2. * ROW - LIST_PAD)))
+                    .child(design::fluent(g::CALCULATOR, design::ic::LG, hue))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::HEADING)).text_color(t.text_muted).child(it.subtitle.clone()))
+                    .child(design::fluent(g::FORWARD, design::ic::MD, t.text_faint))
                     .child(
                         div()
                             .flex_none()
@@ -2349,7 +2348,7 @@ impl Render for Launcher {
                             .flex_col()
                             .items_end()
                             .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(it.title.clone()))
-                            .when(full != it.title, |d| d.child(div().text_size(px(design::ts::SMALL)).text_color(t.text_faint).child(full))),
+                            .when(full != it.title, |d| d.child(div().font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).text_color(if on { t.text_muted } else { t.text_faint }).child(full))),
                     ),
             )
         });
@@ -2391,7 +2390,6 @@ impl Render for Launcher {
         };
 
         // ---- compact mode: favourites as icons ----
-        let collapsed = self.collapsed(cx);
         let fav_strip = div()
             .h(px(FAV_ROW))
             .flex_none()
@@ -2405,12 +2403,12 @@ impl Render for Launcher {
                 let (act, key) = (it.act.clone(), it.key.clone());
                 div()
                     .id(("fav", i))
-                    .size(px(36.))
+                    .size(px(ROW - 4.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.))
-                    .hover(|s| s.bg(t.surface_strong))
+                    .rounded(px(design::r::MD))
+                    .hover(|s| s.bg(t.hover))
                     .on_click(cx.listener(move |this, _, window, cx| this.run(act.clone(), key.clone(), window, cx)))
                     .child(design::icon_view(&it.icon, &t, false))
             }));
@@ -2418,43 +2416,47 @@ impl Render for Launcher {
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
         let leading = if at_root {
-            div().size(px(28.)).flex_none().flex().items_center().justify_center().child(design::fluent(g::SEARCH, 17., t.accent)).into_any_element()
+            div().size(px(design::TILE)).flex_none().flex().items_center().justify_center().child(design::fluent(g::SEARCH, design::ic::LG, t.accent)).into_any_element()
         } else {
             div()
                 .id("back")
-                .size(px(28.))
+                .size(px(design::TILE))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(6.))
+                .rounded(px(design::r::SM))
                 .bg(t.surface)
                 .hover(|s| s.bg(t.surface_strong))
                 .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx)))
-                .child(design::fluent(g::BACK, 13., t.text))
+                .child(design::fluent(g::BACK, design::ic::MD, t.text))
                 .into_any_element()
         };
         let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
             let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
             div()
                 .flex_none()
-                .h(px(32.))
-                .px(px(10.))
+                .h(px(design::CONTROL))
+                .px(px(12.))
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .rounded(px(6.))
+                .rounded(px(design::r::SM))
                 .border_1()
                 .border_color(t.border)
-                .text_size(px(13.))
-                .child(design::fluent(g::FILTER, 12., t.text_muted))
+                .text_size(px(design::ts::BODY_SM))
+                .child(design::fluent(g::FILTER, design::ic::SM, t.text_muted))
                 .child(div().max_w(px(180.)).truncate().child(title))
-                .child(design::fluent(g::CHEVRON_DOWN, 10., t.text_muted))
+                .child(design::fluent(g::CHEVRON_DOWN, design::ic::SM, t.text_muted))
+        });
+        // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
+        let hint = (collapsed && !self.fav_strip()).then(|| {
+            div().flex_none().flex().items_center().gap(px(8.)).text_size(px(design::ts::BODY_SM)).text_color(t.text_faint).child("Recent").child(design::key_cap("↓", &t))
         });
         let search_bar = div()
             .h(px(design::BAR))
             .flex_none()
-            .px(px(14.))
+            .px(px(16.))
             .flex()
             .items_center()
             .gap(px(12.))
@@ -2470,9 +2472,10 @@ impl Render for Launcher {
                     .caret_blink_interval_500ms()
                     .flex_1()
                     .font_family(design::FONT_DISPLAY)
-                    .text_size(px(design::ts::TITLE))
+                    .text_size(px(design::ts::QUERY))
                     .whitespace_nowrap(),
             )
+            .children(hint)
             .children(dropdown);
 
         // ---- action bar ----
@@ -2484,7 +2487,7 @@ impl Render for Launcher {
         let footer = div()
             .h(px(design::FOOTER))
             .flex_none()
-            .px(px(14.))
+            .px(px(16.))
             .flex()
             .items_center()
             .justify_between()
@@ -2501,9 +2504,11 @@ impl Render for Launcher {
                     .gap(px(8.))
                     .child(match tone {
                         Some(c) => div().size(px(8.)).mx(px(4.)).rounded_full().bg(c).into_any_element(),
-                        None => match self.context_icon() {
-                            Icon::Fluent(ch) => design::fluent(ch, 14., if at_root { t.accent } else { t.text_muted }).into_any_element(),
-                            other => div().size(px(16.)).flex().items_center().justify_center().child(design::icon_view(&other, &t, false)).into_any_element(),
+                        // In root search: the selected row's own icon beside its kind.
+                        None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), t.hue_for(it.tint, &it.icon))) {
+                            (Icon::Fluent(ch), hue) => design::fluent(ch, design::ic::MD, hue).into_any_element(),
+                            (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
+                            (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
                         },
                     })
                     .child(div().min_w_0().truncate().text_color(if tone.is_some() { t.text } else { t.text_muted }).child(self.footer_left())),
@@ -2534,21 +2539,36 @@ impl Render for Launcher {
         let popover = self.panel.as_ref().map(|(item, sel)| {
             let acts = item.actions();
             let me = cx.weak_entity();
+            // The panel belongs to its item, so it selects in the item's colour.
+            let hue = t.hue_for(item.tint, &item.icon);
             div()
                 .absolute()
-                .right(px(10.))
-                .bottom(px(design::FOOTER + 6.))
-                .w(px(330.))
+                .right(px(8.))
+                .bottom(px(design::FOOTER + 8.))
+                .w(px(320.))
                 .max_h(px(320.))
-                .p(px(6.))
+                .p(px(4.))
                 .flex()
                 .flex_col()
-                .rounded(px(10.))
+                .rounded(px(design::r::LG))
                 .bg(t.bg_elevated)
                 .border_1()
                 .border_color(t.border)
                 .shadow_lg()
-                .child(div().px(px(10.)).pt(px(4.)).pb(px(6.)).text_size(px(12.)).text_color(t.text_faint).truncate().child(item.title.clone()))
+                .child(
+                    div()
+                        .h(px(ROW))
+                        .px(px(8.))
+                        .mb(px(4.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(12.))
+                        .border_b_1()
+                        .border_color(t.hairline)
+                        .child(design::icon_tile(&item.icon, &t, false, item.tint))
+                        .child(div().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(item.title.clone())),
+                )
                 .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(acts.into_iter().enumerate().map(|(i, (label, act))| {
                     let on = i == *sel;
                     let me = me.clone();
@@ -2557,17 +2577,10 @@ impl Render for Launcher {
                         1 => &["Ctrl", "↵"],
                         _ => &[],
                     };
-                    div()
+                    design::selectable(design::CONTROL, on, hue, &t)
                         .id(("act", i))
-                        .relative()
-                        .h(px(34.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .rounded(px(6.))
-                        .when(on, |d| d.bg(t.surface_strong))
-                        .hover(|s| s.bg(t.hover))
+                        .flex_none()
+                        .gap(px(12.))
                         .on_click(move |_, window, cx| {
                             me.update(cx, |this, cx| {
                                 if let Some((_, p)) = &mut this.panel {
@@ -2577,56 +2590,41 @@ impl Render for Launcher {
                             })
                             .ok();
                         })
-                        .child(div().absolute().left(px(0.)).top(px(9.)).w(px(3.)).h(px(16.)).rounded_full().when(on, |d| d.bg(t.accent)))
-                        .child(design::fluent(act_glyph(&act), 14., if on { t.text } else { t.text_muted }))
+                        .child(design::fluent(act_glyph(&act), design::ic::MD, if on { t.text } else { t.text_muted }))
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .child(div().flex().gap(px(4.)).children(keys.iter().map(|k| design::key_cap(k, &t))))
                 })))
         });
         let dialog = self.confirm.as_ref().map(|c| {
             let me = cx.weak_entity();
-            let button = |i: usize, label: String, danger: bool| {
-                let on = i == selected;
+            let button = |i: usize, label: String, kind: design::Button| {
                 let me = me.clone();
-                div()
-                    .id(("dialog", i))
-                    .h(px(34.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(if on { if danger { t.danger } else { t.accent } } else { t.border })
-                    .bg(if on && i == 0 { if danger { t.danger } else { t.accent } } else { t.surface })
-                    .text_color(if on && i == 0 { t.accent_text } else { t.text })
-                    .on_click(move |_, window, cx| {
-                        me.update(cx, |this, cx| {
-                            this.selected = i;
-                            this.launch(window, cx);
-                        })
-                        .ok();
+                design::button(&label, kind, i == selected, &t).id(("dialog", i)).w_full().on_click(move |_, window, cx| {
+                    me.update(cx, |this, cx| {
+                        this.selected = i;
+                        this.launch(window, cx);
                     })
-                    .child(label)
+                    .ok();
+                })
             };
-            let danger = c.primary.to_lowercase().contains("delete") || c.primary.to_lowercase().contains("remove");
-            div().absolute().inset_0().flex().items_center().justify_center().bg(gpui::hsla(0., 0., 0., 0.35)).child(
+            let danger = c.danger;
+            div().absolute().inset_0().flex().items_center().justify_center().bg(t.scrim).child(
                 div()
-                    .w(px(340.))
-                    .p(px(18.))
+                    .w(px(320.))
+                    .p(px(16.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(10.))
-                    .rounded(px(12.))
+                    .gap(px(8.))
+                    .rounded(px(design::r::LG))
                     .bg(t.bg_elevated)
                     .border_1()
                     .border_color(t.border)
                     .shadow_lg()
-                    .child(design::fluent(if danger { g::WARNING } else { g::INFO }, 26., if danger { t.danger } else { t.accent }))
+                    .child(div().py(px(4.)).child(design::fluent(if danger { g::WARNING } else { g::INFO }, design::ic::XL, if danger { t.danger } else { t.accent })))
                     .child(div().font_weight(FontWeight::SEMIBOLD).text_center().child(c.title.clone()))
-                    .children((!c.message.is_empty()).then(|| div().text_size(px(13.)).text_color(t.text_muted).text_center().child(c.message.clone())))
-                    .child(div().w_full().pt(px(6.)).flex().flex_col().gap(px(8.)).child(button(0, c.primary.clone(), danger)).child(button(1, "Cancel".into(), false))),
+                    .children((!c.message.is_empty()).then(|| div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).text_center().child(c.message.clone())))
+                    .child(div().w_full().pt(px(8.)).flex().flex_col().gap(px(8.)).child(button(0, c.primary.clone(), if danger { design::Button::Danger } else { design::Button::Primary })).child(button(1, "Cancel".into(), design::Button::Quiet))),
             )
         });
 
@@ -2637,12 +2635,12 @@ impl Render for Launcher {
             .flex_col()
             .overflow_hidden()
             .font_family(design::FONT_UI)
-            .text_size(px(14.))
+            .text_size(px(design::ts::BODY))
             .bg(t.bg)
             .text_color(t.text)
             .border_1()
             .border_color(t.border)
-            .rounded(px(8.))
+            .rounded(px(design::r::MD))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
@@ -2712,17 +2710,17 @@ impl Render for Launcher {
             .child(search_bar)
             .children(notices.into_iter().map(|n| {
                 div()
-                    .mx(px(14.))
+                    .mx(px(16.))
                     .mt(px(8.))
-                    .px(px(10.))
-                    .py(px(6.))
+                    .px(px(12.))
+                    .py(px(8.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .rounded(px(6.))
+                    .rounded(px(design::r::SM))
                     .bg(t.surface)
-                    .text_size(px(13.))
-                    .child(design::fluent(g::WARNING, 13., t.warning))
+                    .text_size(px(design::ts::BODY_SM))
+                    .child(design::fluent(g::WARNING, design::ic::MD, t.warning))
                     .child(div().min_w_0().child(n))
             }))
             .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
@@ -2855,7 +2853,8 @@ fn main() {
             kind: WindowKind::PopUp,
             show: false,
             focus: false,
-            // Acrylic: the translucent g token lets the blurred desktop show through.
+            // Theme bodies are opaque, so the colour is the theme's on any wallpaper. Acrylic shows
+            // through only where `[theme] background` is given with alpha (#RRGGBBAA).
             windows_window_background: gpui::WindowsWindowBackground::Blurred,
             ..Default::default()
         };

@@ -9,6 +9,8 @@ use crate::{config, search::Icon};
 
 pub const FONT_UI: &str = "Segoe UI Variable Text";
 pub const FONT_DISPLAY: &str = "Segoe UI Variable Display";
+/// The optical size cut for 12 px and under: wider and more open than Text.
+pub const FONT_SMALL: &str = "Segoe UI Variable Small";
 pub const FONT_MONO: &str = "Cascadia Mono";
 pub const FONT_ICON: &str = "Segoe Fluent Icons";
 pub const FONT_EMOJI: &str = "Segoe UI Emoji";
@@ -66,7 +68,12 @@ pub const LIGHT_THEMES: &[&str] = &["procast Light", "Paper", "Mist"];
 pub const BAR: f32 = 56.;
 pub const ROW: f32 = 40.;
 pub const FOOTER: f32 = 40.;
-pub const TILE: f32 = 26.;
+/// The icon box in a row. App images and glyph tiles both fill it, so titles line up.
+pub const TILE: f32 = 28.;
+/// Inputs, buttons, segmented controls, dropdowns and action-panel rows.
+pub const CONTROL: f32 = 32.;
+/// Key caps.
+pub const CAP: f32 = 20.;
 /// Space above and below the list, so the window holds whole rows.
 pub const LIST_PAD: f32 = 4.;
 
@@ -80,10 +87,36 @@ pub mod ts {
     pub const BODY_SM: f32 = 13.;
     /// Rows and body text.
     pub const BODY: f32 = 14.;
-    /// The search field.
-    pub const TITLE: f32 = 17.;
+    /// Card titles, second-level headings, the calculator's question.
+    pub const HEADING: f32 = 16.;
     /// Page headings and the calculator answer.
-    pub const DISPLAY: f32 = 22.;
+    pub const DISPLAY: f32 = 20.;
+    /// The search field: what you typed is the largest text in the window.
+    pub const QUERY: f32 = 22.;
+}
+
+/// Corner radii. Small things get small corners; things that hold other things get large ones.
+pub mod r {
+    /// Key caps, segments inside a control.
+    pub const XS: f32 = 4.;
+    /// Icon tiles, inputs, buttons, chips.
+    pub const SM: f32 = 6.;
+    /// Rows.
+    pub const MD: f32 = 8.;
+    /// Cards, popovers, dialogs.
+    pub const LG: f32 = 12.;
+}
+
+/// Glyph sizes.
+pub mod ic {
+    /// Inside key caps, chips and dropdowns.
+    pub const SM: f32 = 12.;
+    /// The action bar, action-panel rows, notices.
+    pub const MD: f32 = 14.;
+    /// Icon tiles, the search mark, checkboxes.
+    pub const LG: f32 = 16.;
+    /// Empty states and dialogs.
+    pub const XL: f32 = 40.;
 }
 
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
@@ -117,7 +150,7 @@ impl Tint {
             Tint::System => (0xf2b65aff, 0xb27100ff),
             Tint::Window => (0x4fc4cfff, 0x0f8a96ff),
             Tint::Paste => (0x6aa8ffff, 0x2f6fd6ff),
-            Tint::Web => (0x6fd19cff, 0x1f9d61ff),
+            Tint::Web => (0x6fd19cff, 0x1a8a55ff),
             Tint::File => (0xd9b77eff, 0x9a6b1fff),
             Tint::Calc => (0xf08cc0ff, 0xc23d84ff),
         };
@@ -177,6 +210,12 @@ pub mod g {
     pub const KEYBOARD: char = '\u{E765}';
     pub const BULLETS: char = '\u{E8FD}';
     pub const UP: char = '\u{E74A}';
+    pub const DOWN: char = '\u{E74B}';
+    pub const PICTURE: char = '\u{E8B9}';
+    pub const VIDEO: char = '\u{E714}';
+    pub const AUDIO: char = '\u{E8D6}';
+    pub const ZIP: char = '\u{F012}';
+    pub const PDF: char = '\u{EA90}';
     pub const FORWARD: char = '\u{E72A}';
     pub const PIN: char = '\u{E718}';
     pub const SHIELD: char = '\u{EA18}';
@@ -202,6 +241,8 @@ pub struct Tokens {
     pub success: Hsla,
     pub warning: Hsla,
     pub danger: Hsla,
+    /// Behind a dialog.
+    pub scrim: Hsla,
 }
 
 fn c(hex: u32) -> Hsla {
@@ -212,10 +253,10 @@ impl Tokens {
     fn dark() -> Self {
         Self {
             dark: true,
-            bg: c(0x1b1b1fdb),
-            bg_elevated: c(0x26262cff),
-            surface: c(0xffffff10),
-            surface_strong: c(0xffffff1f),
+            bg: c(0x17171cff),
+            bg_elevated: c(0x222229ff),
+            surface: c(0xffffff0f),
+            surface_strong: c(0xffffff1c),
             hover: c(0xffffff0a),
             text: c(0xf2f2f5ff),
             text_muted: c(0xa0a0abff),
@@ -223,31 +264,33 @@ impl Tokens {
             hairline: c(0xffffff14),
             border: c(0xffffff1f),
             accent: c(0x7c6cffff),
-            accent_text: c(0xffffffff),
+            accent_text: c(INK),
             success: c(0x4cc38aff),
             warning: c(0xf5b74fff),
             danger: c(0xff6b6bff),
+            scrim: c(0x00000066),
         }
     }
 
     fn light() -> Self {
         Self {
             dark: false,
-            bg: c(0xf7f7f9e0),
+            bg: c(0xf7f7f9ff),
             bg_elevated: c(0xffffffff),
             surface: c(0x0000000d),
             surface_strong: c(0x00000017),
             hover: c(0x00000008),
             text: c(0x1b1b1fff),
-            text_muted: c(0x5f5f6bff),
-            text_faint: c(0x6b6b77ff),
+            text_muted: c(0x53535dff),
+            text_faint: c(0x60606bff),
             hairline: c(0x00000014),
             border: c(0x0000001f),
             accent: c(0x5b4bf0ff),
             accent_text: c(0xffffffff),
             success: c(0x1f9d61ff),
-            warning: c(0xc98100ff),
-            danger: c(0xd93d3dff),
+            warning: c(0x946000ff),
+            danger: c(0xd43838ff),
+            scrim: c(0x00000040),
         }
     }
 
@@ -256,14 +299,14 @@ impl Tokens {
         let base = if dark { Self::dark() } else { Self::light() };
         // (background, panels, text, muted, faint, accent)
         let (bg, elevated, text, muted, faint, accent) = match (dark, name) {
-            (true, "Midnight") => (0x0f1424db, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x8591b0ff, 0x4fb3ffff),
-            (true, "Graphite") => (0x1f1f1fdb, 0x2a2a2aff, 0xf0f0f0ff, 0xa8a8a8ff, 0x8c8c8cff, 0xff8a3dff),
-            (true, "Forest") => (0x141c18db, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x86a092ff, 0x4cc38aff),
-            (false, "Paper") => (0xfbf8f1e6, 0xffffffff, 0x2b2620ff, 0x6e655aff, 0x776d61ff, 0xc2410cff),
-            (false, "Mist") => (0xf1f5f9e6, 0xffffffff, 0x14212bff, 0x55667aff, 0x627385ff, 0x0f9b8eff),
+            (true, "Midnight") => (0x0f1424ff, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x8591b0ff, 0x4fb3ffff),
+            (true, "Graphite") => (0x1c1c1cff, 0x2a2a2aff, 0xf0f0f0ff, 0xb2b2b2ff, 0x989898ff, 0xff8a3dff),
+            (true, "Forest") => (0x141c18ff, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x86a092ff, 0x4cc38aff),
+            (false, "Paper") => (0xfbf8f1ff, 0xffffffff, 0x2b2620ff, 0x5c5449ff, 0x675e53ff, 0xc2410cff),
+            (false, "Mist") => (0xf1f5f9ff, 0xffffffff, 0x14212bff, 0x465a6eff, 0x546678ff, 0x0b7f74ff),
             _ => return base,
         };
-        Self { bg: c(bg), bg_elevated: c(elevated), text: c(text), text_muted: c(muted), text_faint: c(faint), accent: c(accent), ..base }
+        Self { bg: c(bg), bg_elevated: c(elevated), text: c(text), text_muted: c(muted), text_faint: c(faint), accent: c(accent), accent_text: on_color(c(accent)), ..base }
     }
 
     /// From `[theme]`: the named palette for the mode (system follows Windows), then overrides.
@@ -283,6 +326,8 @@ impl Tokens {
         set(&mut k.text, &t.text);
         set(&mut k.text_muted, &t.muted);
         set(&mut k.accent, &t.selected);
+        // Text on the accent is white or ink, whichever reads better, unless you set it.
+        k.accent_text = on_color(k.accent);
         set(&mut k.accent_text, &t.selected_text);
         set(&mut k.border, &t.border);
         set(&mut k.hairline, &t.separator);
@@ -290,6 +335,58 @@ impl Tokens {
         k
     }
 
+    /// The colour a row lights up in when selected: its kind's hue, an app icon's own
+    /// dominant colour, or the accent.
+    pub fn hue_for(&self, tint: Option<Tint>, icon: &Icon) -> Hsla {
+        match (tint, icon) {
+            (Some(k), _) => k.hue(self),
+            (None, Icon::Image(image)) => image_hue(image).map_or(self.accent, |h| gpui::hsla(h, 0.75, if self.dark { 0.68 } else { 0.42 }, 1.)),
+            _ => self.accent,
+        }
+    }
+
+    /// The selected fill everywhere: a wash of the hue. Hover is always lighter than this.
+    pub fn selected(&self, hue: Hsla) -> Hsla {
+        Hsla { alpha: if self.dark { 0.18 } else { 0.13 }, ..hue }
+    }
+}
+
+const INK: u32 = 0x121216ff;
+
+fn luminance(color: Hsla) -> f32 {
+    let rgb = gpui::hsla_to_rgba(color);
+    let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * f(rgb.red) + 0.7152 * f(rgb.green) + 0.0722 * f(rgb.blue)
+}
+
+/// White or ink, whichever has more contrast on `bg`. The better one is at least 4.3:1 on
+/// any colour; the tests hold the shipped accents and `danger` to 4.5:1.
+pub fn on_color(bg: Hsla) -> Hsla {
+    let l = luminance(bg) + 0.05;
+    if 1.05 / l >= l / (luminance(c(INK)) + 0.05) { c(0xffffffff) } else { c(INK) }
+}
+
+/// The most common saturated hue in an image (0..1), or None when it's mostly grey.
+// ponytail: recomputed per frame for the one selected row (about a thousand samples);
+// cache it beside the icon if a profile ever shows it.
+pub fn image_hue(image: &gpui::RenderImage) -> Option<f32> {
+    const N: usize = 24;
+    let bytes = image.as_bytes(0)?;
+    let step = (bytes.len() / 4 / 1024).max(1);
+    let mut buckets = [0f32; N];
+    for p in bytes.chunks_exact(4).step_by(step) {
+        let [b, g, r, a] = [p[0], p[1], p[2], p[3]].map(|v| v as f32 / 255.);
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        let d = max - min;
+        if d < 0.2 || a < 0.5 {
+            continue;
+        }
+        let h = if max == r { ((g - b) / d).rem_euclid(6.) } else if max == g { (b - r) / d + 2. } else { (r - g) / d + 4. } / 6.;
+        buckets[((h * N as f32) as usize).min(N - 1)] += d * a;
+    }
+    let (best, weight) = buckets.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    // Under about 3% of the samples being colourful, the icon reads as grey.
+    (*weight > 0.03 * (bytes.len() / 4 / step) as f32 * 0.5).then(|| (best as f32 + 0.5) / N as f32)
 }
 
 /// A Segoe Fluent Icons glyph.
@@ -297,43 +394,104 @@ pub fn fluent(glyph: char, size: f32, color: Hsla) -> Div {
     div().font_family(FONT_ICON).text_size(px(size)).line_height(px(size)).text_color(color).child(glyph.to_string())
 }
 
-/// A list icon: Fluent glyphs sit in a rounded tile; images and emoji draw bare.
+/// A list icon with no kind hue.
 pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
     icon_tile(icon, t, selected, None)
 }
 
-/// A list icon whose tile takes the row's kind hue (a tinted wash with the glyph in the hue).
-pub fn icon_tile(icon: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
-    let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
-    match icon {
-        Icon::Image(image) => frame().child(img(image.clone()).size(px(20.))).into_any_element(),
-        Icon::Fluent(ch) => {
-            let (wash, glyph) = match tint.map(|k| k.hue(t)) {
-                Some(h) => (Hsla { alpha: if selected { 0.30 } else { 0.18 }, ..h }, h),
-                None => (if selected { t.surface_strong } else { t.surface }, if selected { t.text } else { t.text_muted }),
-            };
-            frame().rounded(px(6.)).bg(wash).child(fluent(*ch, 15., glyph)).into_any_element()
-        }
-        Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(17.)).child(s.clone()).into_any_element(),
+/// A glyph tile's (wash, glyph) colours. Selected, the wash deepens and the glyph steps up
+/// to the text colour: a hue on a deeper wash of itself falls under 3:1.
+fn tile_colors(t: &Tokens, tint: Option<Tint>, selected: bool) -> (Hsla, Hsla) {
+    match tint.map(|k| k.hue(t)) {
+        Some(h) => (Hsla { alpha: if selected { 0.26 } else { 0.14 }, ..h }, if selected { t.text } else { h }),
+        None => (if selected { t.surface_strong } else { t.surface }, if selected { t.text } else { t.text_muted }),
     }
 }
 
-/// A keyboard key cap; "↵" draws the Fluent ReturnKey glyph.
-pub fn key_cap(label: &str, t: &Tokens) -> Div {
-    let cap = div()
-        .h(px(20.))
-        .min_w(px(20.))
-        .px(px(5.))
+/// A list icon in the shared `TILE` box. Glyphs sit on a wash of the row's kind hue; images
+/// fill the box; emoji draw bare.
+pub fn icon_tile(icon: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
+    let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
+    match icon {
+        Icon::Image(image) => frame().child(img(image.clone()).size(px(TILE - 4.))).into_any_element(),
+        Icon::Fluent(ch) => {
+            let (wash, glyph) = tile_colors(t, tint, selected);
+            frame().rounded(px(r::SM)).bg(wash).child(fluent(*ch, ic::LG, glyph)).into_any_element()
+        }
+        Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(18.)).child(s.clone()).into_any_element(),
+    }
+}
+
+/// The selection pill, centred on the left edge of a `height`-tall row.
+pub fn pill(hue: Hsla, height: f32) -> Div {
+    div().absolute().left(px(0.)).top(px((height - 16.) / 2.)).w(px(3.)).h(px(16.)).rounded_full().bg(hue)
+}
+
+/// A selectable row's inner box: the shared radius, the selected wash and pill, the hover.
+/// Used by launcher rows, action-panel rows, the settings sidebar and the theme preview.
+pub fn selectable(height: f32, on: bool, hue: Hsla, t: &Tokens) -> Div {
+    let (fill, hover) = (t.selected(hue), t.hover);
+    div()
+        .relative()
+        .h(px(height))
+        .w_full()
+        .px(px(8.))
         .flex()
         .items_center()
+        .rounded(px(r::MD))
+        .when(on, |d| d.bg(fill).child(pill(hue, height)))
+        .when(!on, |d| d.hover(move |s| s.bg(hover)))
+}
+
+/// A launcher list row in its `ROW` slot: icon, title, a subtitle that gives way first, and
+/// an accessory on the right.
+pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option<AnyElement>, on: bool, hue: Hsla, t: &Tokens) -> Div {
+    div().h(px(ROW)).w_full().px(px(8.)).flex().items_center().child(
+        selectable(ROW - 4., on, hue, t)
+            .gap(px(12.))
+            .child(icon)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.to_string()))
+                    .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(subtitle.to_string()))),
+            )
+            .children(accessory),
+    )
+}
+
+/// A keyboard key cap; "↵", "↓" and "↑" draw Fluent glyphs.
+pub fn key_cap(label: &str, t: &Tokens) -> Div {
+    let cap = div()
+        .h(px(CAP))
+        .min_w(px(CAP))
+        .px(px(5.))
+        .flex()
+        .flex_none()
+        .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded(px(r::XS))
         .bg(t.surface)
         .border_1()
         .border_color(t.border)
+        .font_family(FONT_SMALL)
         .text_size(px(ts::CAPTION))
         .text_color(t.text_muted);
-    if label == "↵" { cap.child(fluent(g::RETURN, 11., t.text_muted)) } else { cap.child(label.to_string()) }
+    match label {
+        "↵" => cap.child(fluent(g::RETURN, ts::CAPTION, t.text_muted)),
+        "↓" => cap.child(fluent(g::DOWN, ts::CAPTION, t.text_muted)),
+        "↑" => cap.child(fluent(g::UP, ts::CAPTION, t.text_muted)),
+        _ => cap.child(label.to_string()),
+    }
+}
+
+/// A hotkey like "Ctrl+Shift+V" as caps.
+pub fn key_caps(spec: &str, t: &Tokens) -> Div {
+    div().flex().flex_none().items_center().gap(px(4.)).children(spec.split('+').map(|k| key_cap(k, t)))
 }
 
 /// "Actions  Ctrl K": a label followed by caps.
@@ -341,8 +499,8 @@ pub fn shortcut(label: &str, keys: &[&str], t: &Tokens) -> Div {
     div()
         .flex()
         .items_center()
-        .gap(px(5.))
-        .child(div().pr(px(3.)).text_color(t.text).child(label.to_string()))
+        .gap(px(4.))
+        .child(div().pr(px(4.)).text_color(t.text).child(label.to_string()))
         .children(keys.iter().map(|k| key_cap(k, t)))
 }
 
@@ -350,20 +508,23 @@ pub fn vdivider(t: &Tokens) -> Div {
     div().w(px(1.)).h(px(16.)).bg(t.hairline)
 }
 
-/// Section header: sits on the bottom of a row-height slot (rows are virtualised).
+/// Section header: a label and a rule, so its row-height slot reads as a divider (rows are
+/// virtualised, so the slot is as tall as a row).
 pub fn section_header(title: &str, count: Option<usize>, t: &Tokens) -> Div {
     div()
         .h(px(ROW))
         .w_full()
-        .px(px(12.))
-        .pb(px(4.))
+        .px(px(16.))
+        .pt(px(8.))
         .flex()
-        .items_end()
+        .items_center()
         .gap(px(8.))
+        .font_family(FONT_SMALL)
         .text_size(px(ts::SMALL))
         .text_color(t.text_faint)
-        .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
-        .children(count.map(|n| div().child(n.to_string())))
+        .child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
+        .children(count.map(|n| div().flex_none().child(n.to_string())))
+        .child(div().ml(px(4.)).flex_1().h(px(1.)).bg(t.hairline))
 }
 
 /// Centred icon, title and hint for empty views.
@@ -375,21 +536,158 @@ pub fn empty_state(glyph: char, title: &str, hint: &str, t: &Tokens) -> Div {
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(10.))
-        .child(fluent(glyph, 44., t.text_faint))
-        .child(div().pt(px(6.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(title.to_string()))
+        .gap(px(8.))
+        .child(fluent(glyph, ic::XL, t.text_faint))
+        .child(div().pt(px(8.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(title.to_string()))
         .children((!hint.is_empty()).then(|| div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(hint.to_string())))
+}
+
+/// The focus ring: a soft halo in the control's own colour.
+fn ring(color: Hsla) -> Vec<gpui::BoxShadow> {
+    vec![gpui::BoxShadow::new(px(0.), px(0.), Hsla { alpha: 0.32, ..color }).spread_radius(px(2.))]
+}
+
+/// The one input box: launcher forms, settings text, hotkey capture. Focus shows as an
+/// accent border plus the ring.
+pub fn field(focused: bool, t: &Tokens) -> Div {
+    div()
+        .h(px(CONTROL))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(r::SM))
+        .bg(t.surface)
+        .border_1()
+        .border_color(if focused { t.accent } else { t.border })
+        .when(focused, |d| d.shadow(ring(t.accent)))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Button {
+    /// The one solid accent fill on a screen.
+    Primary,
+    Quiet,
+    Danger,
+}
+
+/// The one button. `focused` adds the same ring as a focused field.
+pub fn button(label: &str, kind: Button, focused: bool, t: &Tokens) -> Div {
+    let (bg, text, border) = match kind {
+        Button::Primary => (t.accent, t.accent_text, t.accent),
+        Button::Danger => (t.danger, on_color(t.danger), t.danger),
+        Button::Quiet => (t.surface, t.text, t.border),
+    };
+    div()
+        .h(px(CONTROL))
+        .px(px(12.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(px(r::SM))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_size(px(ts::BODY_SM))
+        .text_color(text)
+        .when(focused, |d| d.shadow(ring(if kind == Button::Quiet { t.accent } else { border })))
+        .child(label.to_string())
 }
 
 /// On/off switch for settings.
 pub fn toggle(on: bool, t: &Tokens) -> Div {
     div()
         .w(px(36.))
-        .h(px(20.))
+        .h(px(CAP))
+        .flex_none()
         .rounded_full()
         .p(px(2.))
         .flex()
         .when(on, |d| d.justify_end())
         .bg(if on { t.accent } else { t.surface_strong })
         .child(div().size(px(16.)).rounded_full().bg(if on { t.accent_text } else { t.text_muted }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ratio(a: f32, b: f32) -> f32 {
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// `top` drawn over an opaque `under`.
+    fn over(top: Hsla, under: Hsla) -> Hsla {
+        let (t, u, a) = (gpui::hsla_to_rgba(top), gpui::hsla_to_rgba(under), top.alpha);
+        let mix = |x: f32, y: f32| x * a + y * (1. - a);
+        gpui::rgb_to_hsla(gpui::Rgba::new(mix(t.red, u.red), mix(t.green, u.green), mix(t.blue, u.blue), 1.))
+    }
+
+    #[test]
+    fn every_theme_meets_aa_contrast() {
+        let fails = std::cell::RefCell::new(vec![]);
+        for (name, dark) in DARK_THEMES.iter().map(|n| (n, true)).chain(LIGHT_THEMES.iter().map(|n| (n, false))) {
+            let t = Tokens::named(name, dark);
+            let body = luminance(t.bg);
+            let check = |what: &str, r: f32| {
+                if r < 4.5 {
+                    fails.borrow_mut().push(format!("{name}: {what} is {r:.2}:1"));
+                }
+            };
+            check("text on the accent", ratio(luminance(t.accent), luminance(t.accent_text)));
+            check("faint text on the body", ratio(luminance(t.text_faint), body));
+            // The selected row in the accent and in every kind hue; a card; a selected card row.
+            let hues = [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger];
+            for hue in hues.map(|k| k.hue(&t)) {
+                check("muted text on a selected row", ratio(luminance(t.text_muted), luminance(over(t.selected(hue), t.bg))));
+            }
+            let card = over(t.surface, t.bg);
+            check("muted text on a card", ratio(luminance(t.text_muted), luminance(card)));
+            check("faint text on a card", ratio(luminance(t.text_faint), luminance(card)));
+            check("muted text on a selected card row", ratio(luminance(t.text_muted), luminance(over(t.selected(t.accent), card))));
+        }
+        assert!(fails.borrow().is_empty(), "{:#?}", fails.borrow());
+    }
+
+    fn themes() -> impl Iterator<Item = (&'static str, Tokens)> {
+        DARK_THEMES.iter().map(|n| (*n, true)).chain(LIGHT_THEMES.iter().map(|n| (*n, false))).map(|(n, dark)| (n, Tokens::named(n, dark)))
+    }
+
+    /// The armed line in the action bar is `warning` text on the body; a Danger button's
+    /// label is `on_color(danger)` on `danger`.
+    #[test]
+    fn status_colours_meet_aa_as_text() {
+        let mut fails = vec![];
+        for (name, t) in themes() {
+            for (what, r) in [
+                ("warning text on the body", ratio(luminance(t.warning), luminance(t.bg))),
+                ("text on a danger button", ratio(luminance(on_color(t.danger)), luminance(t.danger))),
+            ] {
+                if r < 4.5 {
+                    fails.push(format!("{name}: {what} is {r:.2}:1"));
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{fails:#?}");
+    }
+
+    /// A tile's glyph is the row's icon, so it holds 3:1 against its own wash: at rest on the
+    /// body and on a panel, and in a selected row.
+    #[test]
+    fn tile_glyphs_stand_out_from_their_wash() {
+        let mut fails = vec![];
+        for (name, t) in themes() {
+            for tint in [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger] {
+                let row = over(t.selected(tint.hue(&t)), t.bg);
+                for (what, selected, under) in [("at rest", false, t.bg), ("on a panel", false, t.bg_elevated), ("selected", true, row)] {
+                    let (wash, glyph) = tile_colors(&t, Some(tint), selected);
+                    let r = ratio(luminance(glyph), luminance(over(wash, under)));
+                    if r < 3. {
+                        fails.push(format!("{name}: {tint:?} glyph {what} is {r:.2}:1"));
+                    }
+                }
+            }
+        }
+        assert!(fails.is_empty(), "{fails:#?}");
+    }
 }

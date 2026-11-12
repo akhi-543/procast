@@ -306,7 +306,19 @@ pub fn item(path: &str, dir: bool, home: &str) -> Item {
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
     let parent = p.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let parent = if !home.is_empty() && parent.starts_with(home) { format!("~{}", &parent[home.len()..]) } else { parent };
-    let (glyph, kind) = if dir { (crate::design::g::FOLDER, "Folder") } else { (crate::design::g::DOCUMENT, "File") };
+    use crate::design::g;
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let (glyph, kind) = match ext.as_str() {
+        _ if dir => (g::FOLDER, "Folder"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "heic" => (g::PICTURE, "Image"),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" => (g::VIDEO, "Video"),
+        "mp3" | "wav" | "flac" | "m4a" | "ogg" => (g::AUDIO, "Audio"),
+        "zip" | "7z" | "rar" | "tar" | "gz" => (g::ZIP, "Archive"),
+        "pdf" => (g::PDF, "PDF"),
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "json" | "toml" | "yaml" | "yml" | "html" | "css" | "c" | "cpp" | "h" | "cs" | "go" | "java" | "sh" | "ps1" => (g::CODE, "Code"),
+        "exe" | "msi" | "lnk" => (g::APP, "Program"),
+        _ => (g::DOCUMENT, "File"),
+    };
     Item::new(name, parent, Icon::Fluent(glyph), Act::File(path.to_string())).acc(kind)
 }
 

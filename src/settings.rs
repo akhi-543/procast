@@ -9,7 +9,12 @@ use gpui::{
 };
 use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 
-use crate::{Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config, design::px, ext, search::Item};
+use crate::{
+    Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config,
+    design::{self, px},
+    ext,
+    search::{Icon, Item},
+};
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -122,8 +127,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 "Appearance",
                 vec![
                     row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "Follow Windows switches with your system's light/dark setting."),
-                    row("Dark theme", "theme.dark", Kind::Choice(crate::design::DARK_THEMES), "Used in dark mode. Fine-tune colours under Theme."),
-                    row("Light theme", "theme.light", Kind::Choice(crate::design::LIGHT_THEMES), "Used in light mode."),
+                    row("Dark theme", "theme.dark", Kind::Choice(design::DARK_THEMES), "Used in dark mode. Fine-tune colours under Theme."),
+                    row("Light theme", "theme.light", Kind::Choice(design::LIGHT_THEMES), "Used in light mode."),
                     row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Scales text, rows and the window together."),
                 ],
             ),
@@ -288,7 +293,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
         }
         "Shortcuts" => vec![],
         _ => vec![
-            Row { label: "Open config.toml".into(), help: "Every setting in one text file, with comments. Saved changes apply within 2 seconds.".into(), path: vec![], kind: Kind::Open("config.toml"), group: "Files" },
+            Row { label: "Open config.toml".into(), help: format!("Every setting in one text file, with comments: {}. Saved changes apply within 2 seconds.", config::path().display()), path: vec![], kind: Kind::Open("config.toml"), group: "Files" },
             Row { label: "Open extensions log".into(), help: "Errors and console output from extensions, plus file index status.".into(), path: vec![], kind: Kind::Open("extensions.log"), group: "Files" },
         ],
     }
@@ -387,7 +392,7 @@ impl Settings {
             let hay = format!("{} {} {}", it.title, it.subtitle, it.alias).to_lowercase();
             if (want == "All" || category(it) == want) && words.iter().all(|w| hay.contains(w.as_str())) {
                 let help = [category(it).trim_end_matches('s'), &it.subtitle].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: "Alias · Hotkey · On" });
+                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: if self.category == 0 { "Everything" } else { CATEGORIES[self.category] } });
             }
         }
         out
@@ -641,20 +646,22 @@ impl Settings {
         }
     }
 
-    fn control(&self, r: &Row, on: bool, t: &crate::design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
+    fn control(&self, r: &Row, on: bool, t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
         if let Some(color) = swatch(r, t) {
             return div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(div().size(px(22.)).flex_none().rounded(px(5.)).border_1().border_color(t.border).bg(color))
+                .child(div().size(px(design::CAP)).flex_none().rounded(px(design::r::XS)).border_1().border_color(t.border).bg(color))
                 .child(self.input_control(r, on, t, me))
                 .into_any_element();
         }
         self.input_control(r, on, t, me)
     }
 
-    fn text_box(&self, r: &Row, on: bool, t: &crate::design::Tokens) -> AnyElement {
+    fn text_box(&self, r: &Row, on: bool, t: &design::Tokens) -> AnyElement {
         let Some(input) = self.inputs.get(&r.path.join(".")) else { return div().into_any_element() };
         let width = match r.kind {
             Kind::Number => 120.,
@@ -663,46 +670,29 @@ impl Settings {
             Kind::Command(_) => 110.,
             _ => 440.,
         };
-        div()
+        design::field(on, t)
             .w(px(width))
-            .max_w_full()
-            .flex_none()
+            .min_w(px(80.))
+            .flex_shrink(1.)
             .child(
                 text_input(SharedString::from(format!("set-{}", r.path.join("."))))
                     .state(input.downgrade())
                     .placeholder(match r.kind {
-                        Kind::List => "Add… (Enter)",
+                        Kind::List => "Add, then Enter",
                         Kind::Filter => "Type to filter",
                         Kind::Command(_) => "Alias",
                         _ => "",
                     })
-                    .placeholder_color(t.text_muted)
+                    .placeholder_color(t.text_faint)
                     .caret_color(t.accent)
                     .w_full()
-                    .whitespace_nowrap()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if on { t.accent } else { t.border })
-                    .bg(t.surface),
+                    .whitespace_nowrap(),
             )
             .into_any_element()
     }
 
-    fn input_control(&self, r: &Row, on: bool, t: &crate::design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
+    fn input_control(&self, r: &Row, on: bool, t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
         let value = config::shown_value(&self.text, &r.path);
-        let pill = |text: String, active: bool| {
-            div()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(if on || active { t.accent } else { t.border })
-                .when(active, |d| d.bg(t.accent).text_color(t.accent_text))
-                .child(text)
-                .into_any_element()
-        };
         match &r.kind {
             Kind::Text | Kind::Number | Kind::Filter | Kind::Command(_) => self.text_box(r, on, t),
             Kind::List | Kind::Keys => {
@@ -713,61 +703,58 @@ impl Settings {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .children(entries.iter().enumerate().map(|(n, e)| {
                         let (rm, up) = (me.clone(), me.clone());
                         let (path, path2, e1, e2) = (r.path.clone(), r.path.clone(), e.clone(), e.clone());
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .h(px(design::CONTROL - 4.))
                             .pl(px(8.))
                             .pr(px(4.))
-                            .py(px(2.))
-                            .rounded(px(5.))
+                            .rounded(px(design::r::SM))
                             .bg(t.surface_strong)
-                            .text_size(px(crate::design::ts::BODY_SM))
+                            .text_size(px(design::ts::BODY_SM))
                             .child(self.entry_label(&kind, e))
                             .when(ordered && n > 0, |d| {
                                 d.child(
                                     div()
                                         .id(SharedString::from(format!("up-{}-{e}", r.path.join("."))))
-                                        .size(px(22.))
+                                        .size(px(design::CAP + 4.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .rounded(px(4.))
-                                        .text_color(t.text_muted)
-                                        .hover(|s| s.bg(t.surface).text_color(t.text))
+                                        .rounded(px(design::r::XS))
+                                        .hover(|s| s.bg(t.surface))
                                         .on_click(move |_, _, cx| {
                                             cx.stop_propagation();
                                             drop(up.update(cx, |this, cx| this.move_entry_up(path2.clone(), e2.clone(), cx)))
                                         })
-                                        .child("←"),
+                                        .child(design::fluent(design::g::BACK, design::ic::SM, t.text_muted)),
                                 )
                             })
                             .child(
                                 div()
                                     .id(SharedString::from(format!("rm-{}-{e}", r.path.join("."))))
-                                    .size(px(22.))
+                                    .size(px(design::CAP + 4.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded(px(4.))
-                                    .text_color(t.text_muted)
-                                    .hover(|s| s.bg(t.surface).text_color(t.danger))
+                                    .rounded(px(design::r::XS))
+                                    .hover(|s| s.bg(t.surface))
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
                                         drop(rm.update(cx, |this, cx| this.remove_entry(path.clone(), e1.clone(), cx)))
                                     })
-                                    .child("×"),
+                                    .child(design::fluent(design::g::CANCEL, design::ic::SM, t.text_muted)),
                             )
                     }))
-                    .when(entries.is_empty() && r.kind == Kind::Keys, |d| d.child(div().text_size(px(crate::design::ts::BODY_SM)).text_color(t.text_muted).child("None yet")))
+                    .when(entries.is_empty() && r.kind == Kind::Keys, |d| d.child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child("None yet")))
                     .when(r.kind == Kind::List, |d| d.child(self.text_box(r, on, t)))
                     .into_any_element()
             }
-            Kind::Bool => crate::design::toggle(value == "true", t).into_any_element(),
+            Kind::Bool => design::toggle(value == "true", t).into_any_element(),
             Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
@@ -776,16 +763,8 @@ impl Settings {
                     drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
                 })
             }
-            Kind::Hotkey if self.recording && on => pill("Press keys… (Backspace removes, Esc cancels)".into(), true),
-            Kind::Hotkey if value.is_empty() => div().text_size(px(crate::design::ts::BODY_SM)).child(pill("Record Hotkey".into(), false)).into_any_element(),
-            Kind::Hotkey => div()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .children(value.split('+').map(|k| crate::design::key_cap(k, t)))
-                .child(div().pl(px(8.)).text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child("Click to change"))
-                .into_any_element(),
-            Kind::Open(_) => pill("Open".into(), false),
+            Kind::Hotkey => hotkey_field(&value, self.recording && on, t),
+            Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Category => {
                 let me = me.clone();
                 choices(CATEGORIES, CATEGORIES[self.category], t, "category", move |v, cx| {
@@ -799,26 +778,22 @@ impl Settings {
     }
 
     /// A Shortcuts row: alias input, hotkey, on/off switch.
-    fn command_control(&self, i: usize, r: &Row, on: bool, t: &crate::design::Tokens, me: gpui::WeakEntity<Self>) -> AnyElement {
+    fn command_control(&self, i: usize, r: &Row, on: bool, t: &design::Tokens, me: gpui::WeakEntity<Self>) -> AnyElement {
         let hotkey = self.launcher.hotkeys.get(&key_of(&self.items[i])).cloned().unwrap_or_default();
-        let keys = if self.recording && on {
-            div().px_2().py_1().rounded_md().bg(t.accent).text_color(t.accent_text).text_size(px(crate::design::ts::SMALL)).child("Press keys…").into_any_element()
-        } else if hotkey.is_empty() {
-            div().px_2().py_1().rounded_md().border_1().border_color(t.border).text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child("Record Hotkey").into_any_element()
-        } else {
-            div().flex().gap(px(4.)).children(hotkey.split('+').map(|k| crate::design::key_cap(k, t))).into_any_element()
-        };
+        let keys = hotkey_field(&hotkey, self.recording && on, t);
         let (me2, me3) = (me.clone(), me);
         div()
+            .flex_1()
+            .min_w_0()
             .flex()
             .items_center()
-            .gap(px(10.))
+            .justify_end()
+            .gap(px(8.))
             .child(self.text_box(r, on, t))
             .child(
                 div()
                     .id(("hotkey", i))
-                    .flex_1()
-                    .min_w_0()
+                    .flex_none()
                     .flex()
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
@@ -839,7 +814,7 @@ impl Settings {
                         cx.stop_propagation();
                         drop(me3.update(cx, |this, cx| this.toggle_enabled(i, cx)))
                     })
-                    .child(crate::design::toggle(!self.is_off(i), t)),
+                    .child(design::toggle(!self.is_off(i), t)),
             )
             .into_any_element()
     }
@@ -847,7 +822,7 @@ impl Settings {
 
 impl Settings {
     /// Rows under their headings, each group in one rounded card.
-    fn cards(&self, rows: &[Row], t: &crate::design::Tokens, me: &gpui::WeakEntity<Self>) -> Vec<AnyElement> {
+    fn cards(&self, rows: &[Row], t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> Vec<AnyElement> {
         let mut out = vec![];
         let mut i = 0;
         while i < rows.len() {
@@ -859,17 +834,17 @@ impl Settings {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
-                    .pb(px(14.))
-                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).text_size(px(crate::design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_muted).child(group)))
+                    .gap(px(8.))
+                    .pb(px(16.))
+                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child(group)))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .rounded(px(10.))
+                            .rounded(px(design::r::LG))
                             .border_1()
                             .border_color(t.hairline)
-                            .bg(t.bg_elevated)
+                            .bg(t.surface)
                             .overflow_hidden()
                             .children((start..i).map(|j| self.row_view(j, &rows[j], j > start, t, me))),
                     )
@@ -879,19 +854,19 @@ impl Settings {
         out
     }
 
-    fn row_view(&self, i: usize, r: &Row, divider: bool, t: &crate::design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
+    fn row_view(&self, i: usize, r: &Row, divider: bool, t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
         let on = i == self.selected;
         let click = me.clone();
         div()
             .id(("row", i))
             .flex()
             .items_center()
-            .gap_4()
-            .px_4()
-            .py(px(10.))
+            .gap(px(16.))
+            .px(px(16.))
+            .py(px(12.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(10.)).bottom(px(10.)).w(px(3.)).rounded_full().bg(t.accent)))
+            .when(on, |d| d.rounded(px(design::r::LG)).bg(t.selected(t.accent)).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -904,18 +879,18 @@ impl Settings {
             })
             .when(matches!(r.kind, Kind::Command(c) if self.is_off(c)), |d| d.text_color(t.text_muted))
             .children(match r.kind {
-                Kind::Command(c) => Some(crate::design::icon_view(&self.items[c].icon, t, on)),
+                Kind::Command(c) => Some(design::icon_view(&self.items[c].icon, t, on)),
                 _ => None,
             })
             .child(
                 div()
-                    .w(px(300.))
+                    .w(px(if matches!(r.kind, Kind::Command(_)) { 240. } else { 280. }))
                     .flex_none()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
                     .child(div().child(r.label.clone()))
-                    .children((!r.help.is_empty()).then(|| div().text_size(px(crate::design::ts::SMALL)).line_height(px(17.)).text_color(t.text_muted).child(r.help.clone()))),
+                    .children((!r.help.is_empty()).then(|| div().text_size(px(design::ts::SMALL)).line_height(px(16.)).text_color(t.text_muted).child(r.help.clone()))),
             )
             .child(div().flex_1().min_w_0().flex().items_center().child(match r.kind {
                 Kind::Command(c) => self.command_control(c, r, on, t, me.clone()),
@@ -934,8 +909,8 @@ impl Focusable for Settings {
 impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
-        let t = crate::design::Tokens::from_theme(&theme, window);
-        crate::design::scale_settings();
+        let t = design::Tokens::from_theme(&theme, window);
+        design::scale_settings();
         window.set_rem_size(px(16.));
         let rows = self.rows();
         let me = cx.weak_entity();
@@ -952,8 +927,8 @@ impl Render for Settings {
         div()
             .size_full()
             .flex()
-            .font_family(crate::design::FONT_UI)
-            .text_size(px(crate::design::ts::BODY))
+            .font_family(design::FONT_UI)
+            .text_size(px(design::ts::BODY))
             .bg(t.bg)
             .text_color(t.text)
             .key_context("Settings")
@@ -976,31 +951,26 @@ impl Render for Settings {
             }))
             .child(
                 div()
-                    .w(px(190.))
+                    .w(px(192.))
                     .flex_none()
-                    .p_3()
+                    .p(px(12.))
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(4.))
                     .bg(t.surface)
                     .border_r_1()
                     .border_color(t.hairline)
-                    .child(div().px_2().pb_3().flex().items_center().gap(px(8.)).child(crate::design::fluent(crate::design::g::SETTING, 16., t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("procast")))
+                    .child(div().h(px(design::ROW)).px(px(8.)).mb(px(4.)).flex().items_center().gap(px(8.)).child(design::fluent(design::g::SETTING, design::ic::LG, t.accent)).child(div().font_weight(FontWeight::SEMIBOLD).child("procast")))
                     .children(SECTIONS.iter().enumerate().map(|(i, name)| {
                         let me = me.clone();
-                        div()
+                        let on = i == self.section;
+                        design::selectable(design::CONTROL, on, t.accent, &t)
                             .id(("section", i))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .relative()
-                            .when(i == self.section, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(8.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)))
-                            .when(i != self.section, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.hover)))
+                            .px(px(12.))
+                            .when(!on, |d| d.text_color(t.text_muted))
                             .on_click(move |_, window, cx| drop(me.update(cx, |this, cx| this.set_section(i, window, cx))))
                             .child(*name)
-                    }))
-                    .child(div().flex_1())
-                    .child(div().px_2().text_size(px(crate::design::ts::SMALL)).text_color(t.text_muted).child(if SECTIONS[self.section] == "Shortcuts" { "Type an alias · Enter record hotkey · Ctrl+D switch on/off" } else { "Up/Down rows · Ctrl+Up/Down pages · Enter change · Esc close" })),
+                    })),
             )
             .child(
                 div()
@@ -1014,43 +984,53 @@ impl Render for Settings {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .p_4()
+                            .p(px(16.))
                             .flex()
                             .flex_col()
-                            .gap_1()
-                            .child(div().font_family(crate::design::FONT_DISPLAY).text_size(px(crate::design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).pb_3().child(SECTIONS[self.section]))
+                            .gap(px(4.))
+                            .child(div().h(px(design::ROW)).mb(px(8.)).flex().flex_none().items_center().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]))
                             .children((SECTIONS[self.section] == "Theme").then(|| preview(&t)))
                             .children(self.cards(&rows, &t, &me))
                             .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
                     )
                     .child(
+                        // Key hints, or the last save's outcome.
                         div()
-                            .h(px(34.))
+                            .h(px(design::FOOTER))
                             .flex_none()
-                            .px_4()
+                            .px(px(16.))
                             .flex()
                             .items_center()
+                            .gap(px(16.))
                             .border_t_1()
                             .border_color(t.hairline)
-                            .text_size(px(crate::design::ts::SMALL))
-                            .text_color(match self.status.as_ref().map(|(error, _)| *error) {
-                                Some(true) => t.danger,
-                                _ => t.text_muted,
-                            })
-                            .child(self.status.as_ref().map(|(_, m)| m.clone()).unwrap_or_else(|| format!("Changes save to {} and apply within 2 s", config::path().display()))),
+                            .text_size(px(design::ts::BODY_SM))
+                            .text_color(t.text_muted)
+                            .map(|d| match &self.status {
+                                Some((error, m)) => d.child(div().size(px(8.)).flex_none().rounded_full().bg(if *error { t.danger } else { t.success })).child(div().min_w_0().truncate().text_color(t.text).child(m.clone())),
+                                None if SECTIONS[self.section] == "Shortcuts" => d.child(design::shortcut("Record hotkey", &["↵"], &t)).child(design::vdivider(&t)).child(design::shortcut("Turn on or off", &["Ctrl", "D"], &t)),
+                                None => d
+                                    .child(design::shortcut("Rows", &["↑", "↓"], &t))
+                                    .child(design::vdivider(&t))
+                                    .child(design::shortcut("Pages", &["Ctrl", "↑", "↓"], &t))
+                                    .child(design::vdivider(&t))
+                                    .child(design::shortcut("Change", &["↵"], &t))
+                                    .child(div().flex_1())
+                                    .child(design::shortcut("Close", &["Esc"], &t)),
+                            }),
                     ),
             )
     }
 }
 
 /// A segmented control with the current option highlighted; clicking an option picks it.
-fn choices(opts: &[&'static str], current: &str, t: &crate::design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
+fn choices(opts: &[&'static str], current: &str, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
     div()
         .flex()
         .flex_wrap()
         .p(px(2.))
         .gap(px(2.))
-        .rounded(px(6.))
+        .rounded(px(design::r::SM))
         .bg(t.surface)
         .children(opts.iter().map(|o| {
             let cur = *o == current;
@@ -1058,12 +1038,14 @@ fn choices(opts: &[&'static str], current: &str, t: &crate::design::Tokens, id: 
             let o: &'static str = o;
             div()
                 .id(SharedString::from(format!("{id}={o}")))
-                .px(px(10.))
-                .py(px(3.))
-                .rounded(px(4.))
-                .text_size(px(crate::design::ts::BODY_SM))
-                .when(cur, |d| d.bg(t.accent).text_color(t.accent_text))
-                .when(!cur, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.surface_strong).text_color(t.text)))
+                .h(px(design::CONTROL - 4.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .rounded(px(design::r::XS))
+                .text_size(px(design::ts::BODY_SM))
+                .when(cur, |d| d.bg(t.surface_strong).text_color(t.text).font_weight(FontWeight::SEMIBOLD).child(div().mr(px(8.)).size(px(6.)).flex_none().rounded_full().bg(t.accent)))
+                .when(!cur, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.hover).text_color(t.text)))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     pick(o, cx)
@@ -1074,7 +1056,7 @@ fn choices(opts: &[&'static str], current: &str, t: &crate::design::Tokens, id: 
 }
 
 /// Theme rows show the colour in use: the override, or the palette's own.
-fn swatch(r: &Row, t: &crate::design::Tokens) -> Option<gpui::Hsla> {
+fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
     let [section, key] = r.path.as_slice() else { return None };
     if section != "theme" {
         return None;
@@ -1092,66 +1074,61 @@ fn swatch(r: &Row, t: &crate::design::Tokens) -> Option<gpui::Hsla> {
     })
 }
 
-/// Theme studio: a small launcher drawn with the current theme, updated as you edit.
-fn preview(t: &crate::design::Tokens) -> impl IntoElement {
-    use crate::design::{FONT_UI, fluent, g, key_cap};
-    let row = |glyph: char, title: &str, sub: &str, acc: &str, on: bool| {
-        div()
-            .h(px(36.))
-            .mx(px(6.))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .rounded(px(6.))
-            .relative()
-            .when(on, |d| d.bg(t.surface_strong).child(div().absolute().left(px(0.)).top(px(10.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)))
-            .child(div().size(px(24.)).flex().items_center().justify_center().rounded(px(6.)).bg(t.surface).child(fluent(glyph, 13., t.text_muted)))
-            .child(div().child(title.to_string()))
-            .child(div().text_color(t.text_muted).child(sub.to_string()))
-            .child(div().flex_1())
-            .child(div().text_size(px(crate::design::ts::SMALL)).text_color(t.text_faint).child(acc.to_string()))
-    };
+/// Theme studio: a small launcher drawn with the current theme, updated as you edit. Built
+/// from the launcher's own components, so what you see here is what you get.
+fn preview(t: &design::Tokens) -> impl IntoElement {
+    use design::{Tint, fluent, g, ic, key_cap, list_row, section_header};
+    let row = |glyph: char, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Fluent(glyph), t, on, Some(tint)), title, sub, None, on, tint.hue(t), t);
     div()
-        .mb(px(14.))
-        .rounded(px(10.))
+        .mb(px(16.))
+        .flex_none()
+        .rounded(px(design::r::LG))
         .border_1()
         .border_color(t.border)
         .bg(t.bg)
-        .font_family(FONT_UI)
-        .text_size(px(crate::design::ts::BODY_SM))
-        .text_color(t.text)
         .overflow_hidden()
         .child(
             div()
-                .h(px(44.))
-                .px(px(14.))
+                .h(px(design::BAR))
+                .px(px(16.))
                 .flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(px(12.))
                 .border_b_1()
                 .border_color(t.hairline)
-                .child(fluent(g::SEARCH, 15., t.accent))
-                .child(div().text_color(t.text_muted).child("Search apps and commands…")),
+                .child(div().size(px(design::TILE)).flex().items_center().justify_center().child(fluent(g::SEARCH, ic::LG, t.accent)))
+                .child(div().font_family(design::FONT_DISPLAY).text_size(px(design::ts::QUERY)).text_color(t.text_faint).child("Search apps and commands…")),
         )
-        .child(div().px(px(14.)).pt(px(8.)).pb(px(4.)).text_size(px(crate::design::ts::CAPTION)).text_color(t.text_faint).child("Results"))
-        .child(row(g::FOLDER, "Search Files", "procast", "Command", true))
-        .child(row(g::PASTE, "Clipboard History", "procast", "Command", false))
-        .child(row(g::CALCULATOR, "42", "6 × 7 =", "Calculator", false))
+        .child(row(g::FOLDER, "Search Files", "Files", Tint::File, false))
+        .child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true))
+        .child(row(g::DOCK_LEFT, "Left Half", "Window", Tint::Window, false))
+        .child(section_header("Use \"42\" with", None, t))
+        .child(row(g::GLOBE, "Search the web", "", Tint::Web, false))
         .child(
             div()
-                .h(px(36.))
-                .mt(px(6.))
-                .px(px(14.))
+                .h(px(design::FOOTER))
+                .px(px(16.))
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(8.))
                 .border_t_1()
                 .border_color(t.hairline)
-                .bg(t.bg_elevated)
-                .child(div().size(px(8.)).rounded_full().bg(t.success))
-                .child(div().flex_1().text_color(t.text_muted).child("Preview"))
+                .text_size(px(design::ts::BODY_SM))
+                .child(fluent(g::PASTE, ic::MD, Tint::Paste.hue(t)))
+                .child(div().flex_1().text_color(t.text_muted).child("Command"))
                 .child(div().text_color(t.text).child("Open"))
                 .child(key_cap("↵", t)),
         )
+}
+
+/// The one hotkey control: a field holding the keys, or an invitation to record them.
+fn hotkey_field(value: &str, recording: bool, t: &design::Tokens) -> AnyElement {
+    let field = design::field(recording, t).flex_none().gap(px(8.)).text_size(px(design::ts::BODY_SM));
+    if recording {
+        field.text_color(t.text).child("Press keys. Backspace removes, Esc cancels").into_any_element()
+    } else if value.is_empty() {
+        field.text_color(t.text_muted).child(design::fluent(design::g::KEYBOARD, design::ic::MD, t.text_faint)).child("Record").into_any_element()
+    } else {
+        field.child(design::key_caps(value, t)).into_any_element()
+    }
 }
