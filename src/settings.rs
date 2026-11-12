@@ -757,7 +757,7 @@ impl Settings {
                     drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
                 })
             }
-            Kind::Hotkey => hotkey_field(&value, self.recording && on, t),
+            Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Category => {
                 let me = me.clone();
@@ -774,7 +774,7 @@ impl Settings {
     /// A Shortcuts row: alias input, hotkey, on/off switch.
     fn command_control(&self, i: usize, r: &Row, on: bool, t: &design::Tokens, me: gpui::WeakEntity<Self>) -> AnyElement {
         let hotkey = self.launcher.hotkeys.get(&key_of(&self.items[i])).cloned().unwrap_or_default();
-        let keys = hotkey_field(&hotkey, self.recording && on, t);
+        let keys = design::hotkey_control(&hotkey, self.recording && on, t).into_any_element();
         let (me2, me3) = (me.clone(), me);
         div()
             .flex_1()
@@ -860,7 +860,7 @@ impl Settings {
             .py(px(12.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| d.rounded(px(design::r::LG)).bg(t.selected()).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
+            .when(on, |d| design::lozenge(d.rounded(px(design::r::LG)), t).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -958,7 +958,7 @@ impl Render for Settings {
                     .children(SECTIONS.iter().enumerate().map(|(i, name)| {
                         let me = me.clone();
                         let on = i == self.section;
-                        design::selectable(design::CONTROL, on, t.accent, &t)
+                        design::selectable(design::CONTROL, on, &t)
                             .id(("section", i))
                             .px(px(12.))
                             .when(!on, |d| d.text_color(t.text_muted))
@@ -1019,34 +1019,18 @@ impl Render for Settings {
 
 /// A segmented control with the current option highlighted; clicking an option picks it.
 fn choices(opts: &[&'static str], current: &str, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
-    div()
-        .flex()
-        .flex_wrap()
-        .p(px(2.))
-        .gap(px(2.))
-        .rounded(px(design::r::SM))
-        .bg(t.surface)
-        .children(opts.iter().map(|o| {
-            let cur = *o == current;
+    design::segment_track(
+        opts.iter().map(|o| {
             let pick = pick.clone();
             let o: &'static str = o;
-            div()
-                .id(SharedString::from(format!("{id}={o}")))
-                .h(px(design::CONTROL - 4.))
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .rounded(px(design::r::XS))
-                .text_size(px(design::ts::BODY_SM))
-                .when(cur, |d| d.bg(t.surface_strong).text_color(t.text).font_weight(FontWeight::SEMIBOLD).child(div().mr(px(8.)).size(px(6.)).flex_none().rounded_full().bg(t.accent)))
-                .when(!cur, |d| d.text_color(t.text_muted).hover(|s| s.bg(t.hover).text_color(t.text)))
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    pick(o, cx)
-                })
-                .child(choice_label(o))
-        }))
-        .into_any_element()
+            design::segment(&choice_label(o), o == current, t).id(SharedString::from(format!("{id}={o}"))).on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                pick(o, cx)
+            })
+        }),
+        t,
+    )
+    .into_any_element()
 }
 
 /// Theme rows show the colour in use: the override, or the palette's own.
@@ -1068,7 +1052,7 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
 /// from the launcher's own components, so what you see here is what you get.
 fn preview(t: &design::Tokens) -> impl IntoElement {
     use design::{Tint, icon, g, ic, key_cap, list_row, section_header};
-    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, t.accent, t);
+    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, t);
     div()
         .mb(px(16.))
         .flex_none()
@@ -1109,16 +1093,4 @@ fn preview(t: &design::Tokens) -> impl IntoElement {
                 .child(div().text_color(t.text).child("Open"))
                 .child(key_cap("↵", t)),
         )
-}
-
-/// The one hotkey control: a field holding the keys, or an invitation to record them.
-fn hotkey_field(value: &str, recording: bool, t: &design::Tokens) -> AnyElement {
-    let field = design::field(recording, t).flex_none().gap(px(8.)).text_size(px(design::ts::BODY_SM));
-    if recording {
-        field.text_color(t.text).child("Press keys. Backspace removes, Esc cancels").into_any_element()
-    } else if value.is_empty() {
-        field.text_color(t.text_muted).child(design::icon(design::g::KEYBOARD, design::ic::MD, t.text_faint)).child("Record").into_any_element()
-    } else {
-        field.child(design::key_caps(value, t)).into_any_element()
-    }
 }

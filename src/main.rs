@@ -2282,7 +2282,6 @@ impl Render for Launcher {
                         Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
-                            let hue = t.accent;
                             let accessory = if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
                             } else if !accessory.is_empty() {
@@ -2290,7 +2289,7 @@ impl Render for Launcher {
                             } else {
                                 None
                             };
-                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, on, hue, &t)
+                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, on, &t)
                                 .id(k)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
@@ -2331,7 +2330,8 @@ impl Render for Launcher {
                     .items_center()
                     .gap(px(16.))
                     .rounded(px(design::r::LG))
-                    .bg(if on { t.selected() } else { t.surface })
+                    .bg(t.surface)
+                    .when(on, |d| design::lozenge(d, &t))
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         me.update(cx, |this, cx| {
                             this.selected = 0;
@@ -2339,7 +2339,7 @@ impl Render for Launcher {
                         })
                         .ok();
                     })
-                    .when(on, |d| d.child(design::pill(t.accent, 2. * ROW - LIST_PAD)))
+                    .when(on, |d| d.child(design::pill(2. * ROW - LIST_PAD, &t)))
                     .child(design::icon(g::CALCULATOR, design::ic::LG, hue))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::HEADING)).text_color(t.text_muted).child(it.subtitle.clone()))
                     .child(design::icon(g::FORWARD, design::ic::MD, t.text_faint))
@@ -2541,7 +2541,6 @@ impl Render for Launcher {
         let popover = self.panel.as_ref().map(|(item, sel)| {
             let acts = item.actions();
             let me = cx.weak_entity();
-            let hue = t.accent;
             div()
                 .absolute()
                 .right(px(8.))
@@ -2578,7 +2577,7 @@ impl Render for Launcher {
                         1 => &["Ctrl", "↵"],
                         _ => &[],
                     };
-                    design::selectable(design::CONTROL, on, hue, &t)
+                    design::selectable(design::CONTROL, on, &t)
                         .id(("act", i))
                         .flex_none()
                         .gap(px(12.))

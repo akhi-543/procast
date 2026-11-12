@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use gpui::{AnyElement, App, AssetSource, BoxShadow, Div, Hsla, Pixels, SharedString, Svg, Window, div, img, prelude::*, rgba, svg};
+use gpui::{AnyElement, App, AssetSource, Background, BoxShadow, Div, Hsla, Pixels, SharedString, Svg, Window, div, img, linear_color_stop, linear_gradient, prelude::*, rgba, svg};
 use windows::{
     Win32::{
         System::{
@@ -112,6 +112,8 @@ pub mod r {
     pub const MD: f32 = 8.;
     /// Cards, popovers, dialogs.
     pub const LG: f32 = 12.;
+    /// The launcher window on glass: 16 outside, an 8 px inset, 8 on the rows.
+    pub const XL: f32 = 16.;
 }
 
 /// Glyph sizes.
@@ -405,12 +407,6 @@ impl Tokens {
     pub fn body(&self) -> Hsla {
         if self.glass { self.bg } else { self.bg_solid }
     }
-
-    /// The selected fill everywhere: a neutral lozenge, never a hue. Hover is lighter.
-    // ponytail: a flat `sel_bottom` until the lozenge gradient and ring are drawn.
-    pub fn selected(&self) -> Hsla {
-        self.sel_bottom
-    }
 }
 
 fn shadow(x: f32, y: f32, blur: f32, spread: f32, hex: u32) -> BoxShadow {
@@ -590,55 +586,69 @@ pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
     icon_tile(icon, t, selected, None)
 }
 
-/// A glyph tile's (wash, glyph) colours. Selected, the wash deepens and the glyph steps up
-/// to the text colour: a hue on a deeper wash of itself falls under 3:1.
-fn tile_colors(t: &Tokens, tint: Option<Tint>, selected: bool) -> (Hsla, Hsla) {
+/// A kind tile's wash and rim strengths, as shares of the hue.
+const TILE_WASH: f32 = 0.14;
+const TILE_RIM: f32 = 0.24;
+
+fn alpha(color: Hsla, a: f32) -> Hsla {
+    Hsla { alpha: a, ..color }
+}
+
+/// A 1 px ring drawn inside the box (CSS `inset 0 0 0 1px`): it takes no layout space, so
+/// nothing shifts when it comes and goes.
+fn inset_ring(color: Hsla) -> BoxShadow {
+    BoxShadow::new(gpui::px(0.), gpui::px(0.), color).spread_radius(gpui::px(1.)).inset()
+}
+
+/// A glyph tile's (fill, rim, glyph) colours. Tinted: the hue on a 14% wash of itself with a
+/// 24% rim; selected, the wash stays and the glyph steps up to `text` (a hue on a deeper wash
+/// of itself falls under 3:1). Untinted: surface and hairline, `surface_strong` when selected.
+fn tile_colors(t: &Tokens, tint: Option<Tint>, selected: bool) -> (Hsla, Hsla, Hsla) {
     match tint.map(|k| k.hue(t)) {
-        Some(h) => (Hsla { alpha: if selected { 0.26 } else { 0.14 }, ..h }, if selected { t.text } else { h }),
-        None => (if selected { t.surface_strong } else { t.surface }, if selected { t.text } else { t.text_muted }),
+        Some(h) => (alpha(h, TILE_WASH), alpha(h, TILE_RIM), if selected { t.text } else { h }),
+        None => (if selected { t.surface_strong } else { t.surface }, t.hairline, if selected { t.text } else { t.text_muted }),
     }
 }
 
 /// A list icon in the shared `TILE` box. Glyphs sit on a wash of the row's kind hue; images
-/// fill the box; emoji draw bare.
+/// are 24 px in the box with no wash; emoji draw bare.
 pub fn icon_tile(kind: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
     let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
     match kind {
         Icon::Image(image) => frame().child(img(image.clone()).size(px(TILE - 4.))).into_any_element(),
         Icon::Vector(name) => {
-            let (wash, glyph) = tile_colors(t, tint, selected);
-            frame().rounded(px(r::SM)).bg(wash).child(icon(name, ic::LG, glyph)).into_any_element()
+            let (wash, rim, glyph) = tile_colors(t, tint, selected);
+            frame().rounded(px(r::MD)).bg(wash).shadow(vec![inset_ring(rim)]).child(icon(name, ic::LG, glyph)).into_any_element()
         }
         Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(18.)).child(s.clone()).into_any_element(),
     }
 }
 
-/// The selection pill, centred on the left edge of a `height`-tall row.
-pub fn pill(hue: Hsla, height: f32) -> Div {
-    div().absolute().left(px(0.)).top(px((height - 16.) / 2.)).w(px(3.)).h(px(16.)).rounded_full().bg(hue)
+/// The 3 × 16 accent selection pill, centred on the left edge of a `height`-tall box.
+pub fn pill(height: f32, t: &Tokens) -> Div {
+    div().absolute().left(px(0.)).top(px((height - 16.) / 2.)).w(px(3.)).h(px(16.)).rounded_full().bg(t.accent)
 }
 
-/// A selectable row's inner box: the shared radius, the selected wash and pill, the hover.
-/// Used by launcher rows, action-panel rows, the settings sidebar and the theme preview.
-pub fn selectable(height: f32, on: bool, hue: Hsla, t: &Tokens) -> Div {
-    let (fill, hover) = (t.selected(), t.hover);
-    div()
-        .relative()
-        .h(px(height))
-        .w_full()
-        .px(px(8.))
-        .flex()
-        .items_center()
-        .rounded(px(r::MD))
-        .when(on, |d| d.bg(fill).child(pill(hue, height)))
-        .when(!on, |d| d.hover(move |s| s.bg(hover)))
+/// The selected lozenge on `el`: a vertical `sel_top` → `sel_bottom` fill, a 1 px `sel_ring`
+/// edge and a highlight along the top. Neutral, never a hue. The caller adds the `pill`.
+pub fn lozenge<E: Styled>(el: E, t: &Tokens) -> E {
+    el.bg(linear_gradient(180., linear_color_stop(t.sel_top, 0.), linear_color_stop(t.sel_bottom, 1.))).shadow(vec![inset_ring(t.sel_ring), BoxShadow::new(gpui::px(0.), gpui::px(1.), t.edge_dim).inset()])
 }
 
-/// A launcher list row in its `ROW` slot: icon, title, a subtitle that gives way first, and
-/// an accessory on the right.
-pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option<AnyElement>, on: bool, hue: Hsla, t: &Tokens) -> Div {
+/// The one selected recipe, for anything moved through with the arrow keys: radius `r::MD`,
+/// a hover fill, and when `on` the lozenge and the pill. 36 high in a list slot, `CONTROL`
+/// in panels and the sidebar.
+pub fn selectable(height: f32, on: bool, t: &Tokens) -> Div {
+    let hover = t.hover;
+    let row = div().relative().h(px(height)).w_full().px(px(8.)).flex().items_center().rounded(px(r::MD));
+    if on { lozenge(row, t).child(pill(height, t)) } else { row.hover(move |s| s.bg(hover)) }
+}
+
+/// A launcher list row in its `ROW` slot: icon, title (up to 70% of the width), a subtitle that
+/// gives way first, and an accessory on the right.
+pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option<AnyElement>, on: bool, t: &Tokens) -> Div {
     div().h(px(ROW)).w_full().px(px(8.)).flex().items_center().child(
-        selectable(ROW - 4., on, hue, t)
+        selectable(ROW - 4., on, t)
             .gap(px(12.))
             .child(icon)
             .child(
@@ -651,7 +661,7 @@ pub fn list_row(icon: AnyElement, title: &str, subtitle: &str, accessory: Option
                     .child(div().min_w(px(48.)).flex_shrink_0().max_w(gpui::relative(0.7)).truncate().text_color(t.text).child(title.to_string()))
                     .when(!subtitle.is_empty(), |d| d.child(div().min_w_0().flex_1().truncate().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(subtitle.to_string()))),
             )
-            .children(accessory),
+            .children(accessory.map(|a| div().flex_none().max_w(px(220.)).truncate().text_size(px(ts::BODY_SM)).text_color(if on { t.text_muted } else { t.text_faint }).child(a))),
     )
 }
 
@@ -670,6 +680,7 @@ pub fn key_cap(label: &str, t: &Tokens) -> Div {
         .border_1()
         .border_color(t.border)
         .font_family(FONT_SMALL)
+        .font_weight(gpui::FontWeight::MEDIUM)
         .text_size(px(ts::CAPTION))
         .text_color(t.text_muted);
     match label {
@@ -794,6 +805,80 @@ pub fn toggle(on: bool, t: &Tokens) -> Div {
         .child(div().size(px(16.)).rounded_full().bg(if on { t.accent_text } else { t.text_muted }))
 }
 
+/// One segment of a segmented control. Apart from `segmented` so a caller can add `.id` and a
+/// click handler to it.
+pub fn segment(label: &str, on: bool, t: &Tokens) -> Div {
+    let hover = (t.hover, t.text);
+    div()
+        .h(px(CONTROL - 4.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(r::XS))
+        .text_size(px(ts::BODY_SM))
+        .when(on, |d| d.bg(t.surface_strong).text_color(t.text).font_weight(gpui::FontWeight::SEMIBOLD).child(div().mr(px(8.)).size(px(6.)).flex_none().rounded_full().bg(t.accent)))
+        .when(!on, |d| d.text_color(t.text_muted).hover(move |s| s.bg(hover.0).text_color(hover.1)))
+        .child(label.to_string())
+}
+
+/// A segmented control around ready-made `segment`s: a `surface` track with 2 px padding.
+pub fn segment_track(segments: impl IntoIterator<Item = impl IntoElement>, t: &Tokens) -> Div {
+    div().flex().flex_wrap().p(px(2.)).gap(px(2.)).rounded(px(r::SM)).bg(t.surface).children(segments)
+}
+
+/// One of a few options, all visible, the current one raised. Not clickable: for that, build
+/// the `segment`s yourself and wrap them in `segment_track`.
+#[allow(dead_code)] // Settings builds its clickable segments with `segment` and `segment_track`.
+pub fn segmented(options: &[&str], current: &str, t: &Tokens) -> Div {
+    segment_track(options.iter().map(|o| segment(o, *o == current, t)), t)
+}
+
+/// The one hotkey control: a field holding the keys as caps, an invitation to record them
+/// when empty, or the recording prompt (the field's focus border and ring).
+pub fn hotkey_control(keys: &str, recording: bool, t: &Tokens) -> Div {
+    let f = field(recording, t).flex_none().gap(px(8.)).text_size(px(ts::BODY_SM));
+    if recording {
+        f.text_color(t.text).child("Press keys. Backspace removes, Esc cancels")
+    } else if keys.is_empty() {
+        f.text_color(t.text_muted).child(icon(g::KEYBOARD, ic::MD, t.text_faint)).child("Record")
+    } else {
+        f.child(key_caps(keys, t))
+    }
+}
+
+/// The glass rim: `edge` at the top left, `border` at the bottom right (CSS has an `edge_dim`
+/// plateau between; gpui-ce gradients take two stops).
+fn rim_border(t: &Tokens) -> Background {
+    linear_gradient(135., linear_color_stop(t.edge, 0.), linear_color_stop(t.border, 1.))
+}
+
+/// The launcher body: `t.body()` in an `r::XL` shell. On glass it gets a diagonal sheen, the
+/// gradient rim border, `rim` thickness and the `depth` shadow; without glass, a solid rim.
+/// Children go inside; the sheen sits beneath them.
+#[allow(dead_code)] // wired into the launcher window in Task 4
+pub fn glass_window(t: &Tokens) -> Div {
+    let shell = div().relative().flex().flex_col().overflow_hidden().rounded(px(r::XL)).bg(t.body()).text_color(t.text).border_1();
+    if t.glass {
+        let sheen = linear_gradient(135., linear_color_stop(t.edge_dim, 0.), linear_color_stop(alpha(t.edge_dim, 0.), 0.42));
+        shell.border_color(rim_border(t)).shadow([rim(t), depth(t)].concat()).child(div().absolute().inset_0().rounded(px(r::XL - 1.)).bg(sheen))
+    } else {
+        shell.border_color(t.border).shadow(rim(t))
+    }
+}
+
+/// An ActionPanel or Dialog surface: `bg_elevated`, `r::LG`, the rim border, `rim` and `float`
+/// shadows, no blur. The caller sets width and padding.
+#[allow(dead_code)] // wired into the launcher window in Task 4
+pub fn elevated(t: &Tokens) -> Div {
+    div().relative().flex().flex_col().rounded(px(r::LG)).bg(t.bg_elevated).text_color(t.text).border_1().border_color(rim_border(t)).shadow([rim(t), float(t)].concat())
+}
+
+/// A full-size overlay of `color` (`t.scrim`, or `t.scrim_soft` behind a panel); it centres its child.
+#[allow(dead_code)] // wired into the launcher window in Task 4
+pub fn scrim(color: Hsla) -> Div {
+    div().absolute().inset_0().flex().items_center().justify_center().bg(color)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,9 +934,9 @@ mod tests {
     /// The tint of every kind, `Accent` and `Danger` included.
     const TINTS: [Tint; 8] = [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger];
 
-    /// A hue's 14% tile wash.
+    /// A hue's tile wash, as the tile draws it.
     fn wash(h: Hsla) -> Hsla {
-        Hsla { alpha: 0.14, ..h }
+        alpha(h, TILE_WASH)
     }
 
     #[test]
@@ -910,6 +995,21 @@ mod tests {
         for (_, t, _) in modes() {
             assert_eq!((ring(&t).len(), float(&t).len(), depth(&t).len()), (1, 2, 2));
             assert!(rim(&t).iter().all(|s| s.inset) && rim(&t).len() == 2 && !float(&t).iter().any(|s| s.inset));
+        }
+    }
+
+    /// The tile recipe: tinted keeps its 14% wash and steps the glyph up to `text` when selected;
+    /// untinted raises to `surface_strong`.
+    #[test]
+    fn tile_colours_follow_the_recipe() {
+        for (_, t, _) in modes() {
+            for k in TINTS {
+                let h = k.hue(&t);
+                assert_eq!(tile_colors(&t, Some(k), false), (alpha(h, 0.14), alpha(h, 0.24), h));
+                assert_eq!(tile_colors(&t, Some(k), true), (alpha(h, 0.14), alpha(h, 0.24), t.text));
+            }
+            assert_eq!(tile_colors(&t, None, false), (t.surface, t.hairline, t.text_muted));
+            assert_eq!(tile_colors(&t, None, true), (t.surface_strong, t.hairline, t.text));
         }
     }
 }
