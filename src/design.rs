@@ -290,6 +290,14 @@ struct HighContrast {
 }
 const HCF_HIGHCONTRASTON: u32 = 1;
 
+static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Reads the Windows state into the cache `Tokens::from_theme` uses. Call when the launcher is
+/// shown, the settings window opens and the config reloads, never per frame.
+pub fn refresh_glass() {
+    GLASS.store(glass_enabled(), Ordering::Relaxed);
+}
+
 /// Whether the window body may be glass: false with Windows transparency effects off, high
 /// contrast on, or battery saver on. Any failure to read counts as glass on.
 pub fn glass_enabled() -> bool {
@@ -369,7 +377,7 @@ impl Tokens {
     }
 
     /// From `[theme]`: Dark or Light (system follows Windows), the glass decision read from
-    /// Windows once here, then the overrides that remain: background, text, muted, selected.
+    /// Windows (cached by `refresh_glass`), then the overrides that remain: background, text, muted, selected.
     pub fn from_theme(t: &config::Theme, window: &Window) -> Self {
         let dark = match t.mode.as_str() {
             "dark" => true,
@@ -377,7 +385,7 @@ impl Tokens {
             _ => !matches!(window.appearance(), gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight),
         };
         let mut k = if dark { Self::dark() } else { Self::light() };
-        k.glass = glass_enabled();
+        k.glass = GLASS.load(Ordering::Relaxed);
         let set = |slot: &mut Hsla, v: &Option<String>| {
             if let Some(hex) = v.as_deref().and_then(config::parse_hex) {
                 *slot = c(hex);

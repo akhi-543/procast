@@ -789,6 +789,7 @@ impl Launcher {
     }
 
     fn show(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        design::refresh_glass();
         let fg = win::foreground();
         if fg != self.hwnd {
             self.prev = fg;
@@ -1631,6 +1632,7 @@ impl Launcher {
             windows_window_background: gpui::WindowsWindowBackground::MicaBackdrop,
             ..Default::default()
         };
+        design::refresh_glass();
         self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, window, cx))).ok();
     }
 
@@ -1738,6 +1740,7 @@ impl Launcher {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        design::refresh_glass();
         match config::load() {
             Ok(cfg) => {
                 if hotkey_specs(&cfg) != hotkey_specs(&self.cfg) {

@@ -923,7 +923,7 @@ impl Render for Settings {
             .flex()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
-            .bg(t.bg)
+            .bg(t.bg_solid)
             .text_color(t.text)
             .key_context("Settings")
             .track_focus(&self.focus)
