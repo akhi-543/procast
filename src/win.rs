@@ -37,8 +37,9 @@ use windows::{
             },
             WindowsAndMessaging::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-                GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-                SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_EX_TOOLWINDOW,
+                GWL_STYLE, GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_CAPTION,
+                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP,
             },
         },
     },
@@ -176,11 +177,16 @@ pub fn hwnd(window: &gpui::Window) -> HWND {
     }
 }
 
-/// Keep the launcher out of the taskbar and Alt+Tab.
+/// Keep the launcher out of the taskbar and Alt+Tab, and make it frameless: gpui creates a
+/// PopUp with style 0, which Windows turns into a captioned window; gpui strips only the top
+/// of that frame, leaving a 9 px border left, right and bottom where the acrylic shows through.
 pub fn make_tool_window(hwnd: HWND) {
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW.0 as isize) & !(WS_EX_WINDOWEDGE.0 as isize));
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_CAPTION.0 as isize)) | WS_POPUP.0 as isize);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -189,7 +195,14 @@ pub fn make_tool_window(hwnd: HWND) {
 pub fn round_corners(hwnd: HWND) {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: i32 = 2;
-    unsafe { _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE as i32), &DWMWCP_ROUND as *const _ as _, 4) };
+    // DWM draws its 1 px border at its own 8 px radius on top of the 16 px region, a second
+    // curve at each corner; the glass shell draws the rim itself.
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    unsafe {
+        _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE as i32), &DWMWCP_ROUND as *const _ as _, 4);
+        _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_BORDER_COLOR as i32), &DWMWA_COLOR_NONE as *const _ as _, 4);
+    }
 }
 
 /// Clips the launcher to the r-xl corner radius (16 x launcher scale, in physical pixels), so no
