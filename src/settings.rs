@@ -338,6 +338,8 @@ pub struct Settings {
     _subs: Vec<Subscription>,
     /// The caption bar's mode as last set, with Windows' appearance then, so DWM is called only when either changes.
     dark_caption: Option<(bool, gpui::WindowAppearance)>,
+    /// Kept apart from `_subs`, which `build_inputs` clears on every page change.
+    _appearance: Subscription,
 }
 
 impl Settings {
@@ -358,6 +360,9 @@ impl Settings {
             focus: cx.focus_handle(),
             _subs: vec![],
             dark_caption: None,
+            // gpui doesn't repaint on a Windows theme change: without this the content and the
+            // caption wait for an unrelated repaint.
+            _appearance: cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
         };
         this.build_inputs(cx);
         this.focus_row(window, cx);
@@ -907,7 +912,7 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = config::parse(&self.text).map(|c| c.theme).unwrap_or_default();
         let t = design::Tokens::from_theme(&theme, window);
-        // Every mode change (setting, Windows theme under "system") re-renders, so this covers them all.
+        // Every mode change re-renders (a save, or the Windows theme through `_appearance`), so this covers them all.
         // Keyed on Windows' appearance too: gpui resets the caption to it when that changes.
         let caption = (t.dark, window.appearance());
         if self.dark_caption != Some(caption) {

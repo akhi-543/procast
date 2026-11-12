@@ -222,7 +222,7 @@ fn round_region(hwnd: HWND) {
 /// rather than Windows'.
 pub fn dark_title_bar(hwnd: HWND, dark: bool) {
     let v = dark as i32;
-    unsafe { _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &v as *const _ as _, 4) };
+    unsafe { _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &v as *const _ as _, std::mem::size_of::<i32>() as u32) };
 }
 
 /// Cloaked windows keep their swap chain, so un-cloaking shows the next frame
