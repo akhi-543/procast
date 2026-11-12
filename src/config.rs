@@ -212,7 +212,7 @@ impl Files {
 pub struct Theme {
     /// system (follow Windows) | dark | light
     pub mode: String,
-    /// Named palettes used in dark and light mode (see design::DARK_THEMES / LIGHT_THEMES).
+    /// Old palette names: still parsed so existing files load, no longer used.
     pub dark: String,
     pub light: String,
     pub background: Option<String>,
@@ -462,17 +462,11 @@ menu_bar = false              # also show menu-bar commands as tray icons
 
 [theme]
 mode = "system"               # system (follow Windows) | dark | light
-dark = "procast Dark"         # procast Dark | Midnight | Graphite | Forest
-light = "procast Light"       # procast Light | Paper | Mist
-# Any colour can be overridden ("#rrggbb" or "#rrggbbaa"):
+# These colours can be overridden ("#rrggbb" or "#rrggbbaa"):
 # background = "#1e1e2e"
 # text = "#cdd6f4"
 # muted = "#7f849c"
 # selected = "#89b4fa"
-# selected_text = "#11111b"
-# border = "#313244"
-# separator = "#313244"
-# container = "#181825"
 
 # Preference values per extension, by the names in its package.json:
 # [extension.obsidian]

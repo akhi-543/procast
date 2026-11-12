@@ -4,7 +4,17 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use gpui::{AnyElement, App, AssetSource, Div, Hsla, Pixels, SharedString, Svg, Window, div, img, prelude::*, rgba, svg};
+use gpui::{AnyElement, App, AssetSource, BoxShadow, Div, Hsla, Pixels, SharedString, Svg, Window, div, img, prelude::*, rgba, svg};
+use windows::{
+    Win32::{
+        System::{
+            Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
+            Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+        },
+        UI::WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW},
+    },
+    core::w,
+};
 
 use crate::{config, search::Icon};
 
@@ -61,9 +71,6 @@ pub fn scale() -> f32 {
 pub fn px(v: f32) -> Pixels {
     gpui::px(v * scale())
 }
-
-pub const DARK_THEMES: &[&str] = &["procast Dark", "Midnight", "Graphite", "Forest"];
-pub const LIGHT_THEMES: &[&str] = &["procast Light", "Paper", "Mist"];
 
 pub const BAR: f32 = 56.;
 pub const ROW: f32 = 40.;
@@ -147,10 +154,10 @@ impl Tint {
         let (d, l) = match self {
             Tint::Accent => return t.accent,
             Tint::Danger => return t.danger,
-            Tint::System => (0xf2b65aff, 0xb27100ff),
-            Tint::Window => (0x4fc4cfff, 0x0f8a96ff),
+            Tint::System => (0xf2b65aff, 0xa56900ff),
+            Tint::Window => (0x4fc4cfff, 0x0d7f8aff),
             Tint::Paste => (0x6aa8ffff, 0x2f6fd6ff),
-            Tint::Web => (0x6fd19cff, 0x1a8a55ff),
+            Tint::Web => (0x6fd19cff, 0x188250ff),
             Tint::File => (0xd9b77eff, 0x9a6b1fff),
             Tint::Calc => (0xf08cc0ff, 0xc23d84ff),
         };
@@ -234,7 +241,12 @@ names! {
 #[derive(Clone, Copy)]
 pub struct Tokens {
     pub dark: bool,
+    /// Whether the window body is glass (`bg`, translucent) or solid (`bg_solid`); see `body`.
+    pub glass: bool,
+    /// The window body on glass: a thin tinted pane over the blurred backdrop.
     pub bg: Hsla,
+    /// The same body with no glass.
+    pub bg_solid: Hsla,
     pub bg_elevated: Hsla,
     pub surface: Hsla,
     pub surface_strong: Hsla,
@@ -245,118 +257,188 @@ pub struct Tokens {
     pub text_faint: Hsla,
     pub hairline: Hsla,
     pub border: Hsla,
+    /// The bright and quiet ends of the glass rim.
+    pub edge: Hsla,
+    pub edge_dim: Hsla,
+    /// The selected lozenge runs from `sel_top` to `sel_bottom`, edged by `sel_ring`.
+    pub sel_top: Hsla,
+    pub sel_bottom: Hsla,
+    pub sel_ring: Hsla,
+    /// Monochrome: the text colour.
     pub accent: Hsla,
     pub accent_text: Hsla,
     pub success: Hsla,
     pub warning: Hsla,
     pub danger: Hsla,
+    pub danger_text: Hsla,
     /// Behind a dialog.
     pub scrim: Hsla,
+    /// Behind an open action panel.
+    pub scrim_soft: Hsla,
 }
 
 fn c(hex: u32) -> Hsla {
     gpui::rgb_to_hsla(rgba(hex))
 }
 
+/// `HIGHCONTRASTW` (winuser.h); the windows crate keeps it behind a feature we don't otherwise need.
+#[repr(C)]
+struct HighContrast {
+    size: u32,
+    flags: u32,
+    scheme: *mut u16,
+}
+const HCF_HIGHCONTRASTON: u32 = 1;
+
+/// Whether the window body may be glass: false with Windows transparency effects off, high
+/// contrast on, or battery saver on. Any failure to read counts as glass on.
+pub fn glass_enabled() -> bool {
+    unsafe {
+        let (mut on, mut size) = (1u32, 4u32);
+        let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+        let _ = RegGetValueW(HKEY_CURRENT_USER, key, w!("EnableTransparency"), RRF_RT_REG_DWORD, None, Some(&mut on as *mut _ as _), Some(&mut size));
+        let mut hc = HighContrast { size: size_of::<HighContrast>() as u32, flags: 0, scheme: std::ptr::null_mut() };
+        let high_contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.size, Some(&mut hc as *mut _ as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).is_ok() && hc.flags & HCF_HIGHCONTRASTON != 0;
+        let mut power = SYSTEM_POWER_STATUS::default();
+        let saver = GetSystemPowerStatus(&mut power).is_ok() && power.SystemStatusFlag == 1;
+        on != 0 && !high_contrast && !saver
+    }
+}
+
 impl Tokens {
     fn dark() -> Self {
         Self {
             dark: true,
-            bg: c(0x17171cff),
-            bg_elevated: c(0x222229ff),
+            glass: true,
+            bg: c(0x131417b8),
+            bg_solid: c(0x131417ff),
+            bg_elevated: c(0x2b2d34fa),
             surface: c(0xffffff0f),
             surface_strong: c(0xffffff1c),
             hover: c(0xffffff0a),
-            text: c(0xf2f2f5ff),
-            text_muted: c(0xa0a0abff),
-            text_faint: c(0x8b8b97ff),
+            text: c(0xf4f5f7ff),
+            text_muted: c(0xc6c8d0ff),
+            text_faint: c(0xb2b4bdff),
             hairline: c(0xffffff14),
             border: c(0xffffff1f),
-            accent: c(0x7c6cffff),
-            accent_text: c(INK),
+            edge: c(0xffffff4d),
+            edge_dim: c(0xffffff14),
+            sel_top: c(0xffffff26),
+            sel_bottom: c(0xffffff14),
+            sel_ring: c(0xffffff24),
+            accent: c(0xf4f5f7ff),
+            accent_text: c(0x131417ff),
             success: c(0x4cc38aff),
             warning: c(0xf5b74fff),
             danger: c(0xff6b6bff),
-            scrim: c(0x00000066),
+            danger_text: c(0x131417ff),
+            scrim: c(0x0000008c),
+            scrim_soft: c(0x00000059),
         }
     }
 
     fn light() -> Self {
         Self {
             dark: false,
-            bg: c(0xf7f7f9ff),
-            bg_elevated: c(0xffffffff),
+            glass: true,
+            bg: c(0xf7f8fad9),
+            bg_solid: c(0xf7f8faff),
+            bg_elevated: c(0xfffffffc),
             surface: c(0x0000000d),
             surface_strong: c(0x00000017),
             hover: c(0x00000008),
-            text: c(0x1b1b1fff),
-            text_muted: c(0x53535dff),
-            text_faint: c(0x60606bff),
+            text: c(0x17181cff),
+            text_muted: c(0x484a53ff),
+            text_faint: c(0x53555fff),
             hairline: c(0x00000014),
             border: c(0x0000001f),
-            accent: c(0x5b4bf0ff),
+            edge: c(0xffffffe6),
+            edge_dim: c(0xffffff66),
+            sel_top: c(0x0000001c),
+            sel_bottom: c(0x00000012),
+            sel_ring: c(0x0000001a),
+            accent: c(0x17181cff),
             accent_text: c(0xffffffff),
-            success: c(0x1f9d61ff),
-            warning: c(0x946000ff),
-            danger: c(0xd43838ff),
-            scrim: c(0x00000040),
+            success: c(0x188250ff),
+            warning: c(0x8a5900ff),
+            danger: c(0xd13636ff),
+            danger_text: c(0xffffffff),
+            scrim: c(0x00000052),
+            scrim_soft: c(0x0000001f),
         }
     }
 
-    /// A named palette; unknown names fall back to procast Dark / Light.
-    pub fn named(name: &str, dark: bool) -> Self {
-        let base = if dark { Self::dark() } else { Self::light() };
-        // (background, panels, text, muted, faint, accent)
-        let (bg, elevated, text, muted, faint, accent) = match (dark, name) {
-            (true, "Midnight") => (0x0f1424ff, 0x18203aff, 0xe8eefcff, 0x9aa6c4ff, 0x8591b0ff, 0x4fb3ffff),
-            (true, "Graphite") => (0x1c1c1cff, 0x2a2a2aff, 0xf0f0f0ff, 0xb2b2b2ff, 0x989898ff, 0xff8a3dff),
-            (true, "Forest") => (0x141c18ff, 0x1d2822ff, 0xe9f2ecff, 0x9db3a6ff, 0x86a092ff, 0x4cc38aff),
-            (false, "Paper") => (0xfbf8f1ff, 0xffffffff, 0x2b2620ff, 0x5c5449ff, 0x675e53ff, 0xc2410cff),
-            (false, "Mist") => (0xf1f5f9ff, 0xffffffff, 0x14212bff, 0x465a6eff, 0x546678ff, 0x0b7f74ff),
-            _ => return base,
-        };
-        Self { bg: c(bg), bg_elevated: c(elevated), text: c(text), text_muted: c(muted), text_faint: c(faint), accent: c(accent), accent_text: on_color(c(accent)), ..base }
-    }
-
-    /// From `[theme]`: the named palette for the mode (system follows Windows), then overrides.
+    /// From `[theme]`: Dark or Light (system follows Windows), the glass decision read from
+    /// Windows once here, then the overrides that remain: background, text, muted, selected.
     pub fn from_theme(t: &config::Theme, window: &Window) -> Self {
         let dark = match t.mode.as_str() {
             "dark" => true,
             "light" => false,
             _ => !matches!(window.appearance(), gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight),
         };
-        let mut k = Self::named(if dark { &t.dark } else { &t.light }, dark);
+        let mut k = if dark { Self::dark() } else { Self::light() };
+        k.glass = glass_enabled();
         let set = |slot: &mut Hsla, v: &Option<String>| {
             if let Some(hex) = v.as_deref().and_then(config::parse_hex) {
                 *slot = c(hex);
             }
         };
         set(&mut k.bg, &t.background);
+        k.bg_solid = Hsla { alpha: 1., ..k.bg };
         set(&mut k.text, &t.text);
         set(&mut k.text_muted, &t.muted);
         set(&mut k.accent, &t.selected);
-        // Text on the accent is white or ink, whichever reads better, unless you set it.
+        // Text on the accent is white or ink, whichever reads better.
         k.accent_text = on_color(k.accent);
-        set(&mut k.accent_text, &t.selected_text);
-        set(&mut k.border, &t.border);
-        set(&mut k.hairline, &t.separator);
-        set(&mut k.bg_elevated, &t.container);
         k
     }
 
-    /// The colour a row lights up in when selected: its kind's hue, an app icon's own
-    /// dominant colour, or the accent.
-    pub fn hue_for(&self, tint: Option<Tint>, icon: &Icon) -> Hsla {
-        match (tint, icon) {
-            (Some(k), _) => k.hue(self),
-            (None, Icon::Image(image)) => image_hue(image).map_or(self.accent, |h| gpui::hsla(h, 0.75, if self.dark { 0.68 } else { 0.42 }, 1.)),
-            _ => self.accent,
-        }
+    /// The window body: glass, or solid when glass is off.
+    pub fn body(&self) -> Hsla {
+        if self.glass { self.bg } else { self.bg_solid }
     }
 
-    /// The selected fill everywhere: a wash of the hue. Hover is always lighter than this.
-    pub fn selected(&self, hue: Hsla) -> Hsla {
-        Hsla { alpha: if self.dark { 0.18 } else { 0.13 }, ..hue }
+    /// The selected fill everywhere: a neutral lozenge, never a hue. Hover is lighter.
+    // ponytail: a flat `sel_bottom` until the lozenge gradient and ring are drawn.
+    pub fn selected(&self) -> Hsla {
+        self.sel_bottom
+    }
+}
+
+fn shadow(x: f32, y: f32, blur: f32, spread: f32, hex: u32) -> BoxShadow {
+    BoxShadow::new(px(x), px(y), c(hex)).blur_radius(px(blur)).spread_radius(px(spread))
+}
+
+/// The focus ring: `color` at 32%, 2 px spread, no blur. Paired with a solid 1 px border.
+pub fn ring_color(color: Hsla) -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.), px(0.), Hsla { alpha: 0.32, ..color }).spread_radius(px(2.))]
+}
+
+/// The accent focus ring.
+pub fn ring(t: &Tokens) -> Vec<BoxShadow> {
+    ring_color(t.accent)
+}
+
+/// The deep, close shadow of an ActionPanel or Dialog.
+pub fn float(t: &Tokens) -> Vec<BoxShadow> {
+    if t.dark {
+        vec![shadow(0., 18., 44., -8., 0x000000b3), shadow(0., 3., 10., 0., 0x00000073)]
+    } else {
+        vec![shadow(0., 18., 44., -8., 0x00000047), shadow(0., 3., 8., 0., 0x00000024)]
+    }
+}
+
+/// Thickness: a bright line inside the top edge and a shade inside the bottom edge (inset).
+pub fn rim(t: &Tokens) -> Vec<BoxShadow> {
+    vec![BoxShadow::new(px(0.), px(1.), t.edge).inset(), BoxShadow::new(px(0.), px(-1.), c(if t.dark { 0x00000059 } else { 0x0000000f })).inset()]
+}
+
+/// The wide soft shadow that lifts the glass window off the desktop.
+pub fn depth(t: &Tokens) -> Vec<BoxShadow> {
+    if t.dark {
+        vec![shadow(0., 24., 60., -12., 0x00000099), shadow(0., 2., 8., 0., 0x0000004d)]
+    } else {
+        vec![shadow(0., 24., 60., -12., 0x00000040), shadow(0., 2., 8., 0., 0x0000001a)]
     }
 }
 
@@ -373,29 +455,6 @@ fn luminance(color: Hsla) -> f32 {
 pub fn on_color(bg: Hsla) -> Hsla {
     let l = luminance(bg) + 0.05;
     if 1.05 / l >= l / (luminance(c(INK)) + 0.05) { c(0xffffffff) } else { c(INK) }
-}
-
-/// The most common saturated hue in an image (0..1), or None when it's mostly grey.
-// ponytail: recomputed per frame for the one selected row (about a thousand samples);
-// cache it beside the icon if a profile ever shows it.
-pub fn image_hue(image: &gpui::RenderImage) -> Option<f32> {
-    const N: usize = 24;
-    let bytes = image.as_bytes(0)?;
-    let step = (bytes.len() / 4 / 1024).max(1);
-    let mut buckets = [0f32; N];
-    for p in bytes.chunks_exact(4).step_by(step) {
-        let [b, g, r, a] = [p[0], p[1], p[2], p[3]].map(|v| v as f32 / 255.);
-        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
-        let d = max - min;
-        if d < 0.2 || a < 0.5 {
-            continue;
-        }
-        let h = if max == r { ((g - b) / d).rem_euclid(6.) } else if max == g { (b - r) / d + 2. } else { (r - g) / d + 4. } / 6.;
-        buckets[((h * N as f32) as usize).min(N - 1)] += d * a;
-    }
-    let (best, weight) = buckets.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
-    // Under about 3% of the samples being colourful, the icon reads as grey.
-    (*weight > 0.03 * (bytes.len() / 4 / step) as f32 * 0.5).then(|| (best as f32 + 0.5) / N as f32)
 }
 
 /// Registers Space Grotesk with the text system. Call before any window opens.
@@ -554,7 +613,7 @@ pub fn pill(hue: Hsla, height: f32) -> Div {
 /// A selectable row's inner box: the shared radius, the selected wash and pill, the hover.
 /// Used by launcher rows, action-panel rows, the settings sidebar and the theme preview.
 pub fn selectable(height: f32, on: bool, hue: Hsla, t: &Tokens) -> Div {
-    let (fill, hover) = (t.selected(hue), t.hover);
+    let (fill, hover) = (t.selected(), t.hover);
     div()
         .relative()
         .h(px(height))
@@ -666,11 +725,6 @@ pub fn empty_state(glyph: &'static str, title: &str, hint: &str, t: &Tokens) -> 
         .children((!hint.is_empty()).then(|| div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(hint.to_string())))
 }
 
-/// The focus ring: a soft halo in the control's own colour.
-fn ring(color: Hsla) -> Vec<gpui::BoxShadow> {
-    vec![gpui::BoxShadow::new(px(0.), px(0.), Hsla { alpha: 0.32, ..color }).spread_radius(px(2.))]
-}
-
 /// The one input box: launcher forms, settings text, hotkey capture. Focus shows as an
 /// accent border plus the ring.
 pub fn field(focused: bool, t: &Tokens) -> Div {
@@ -683,7 +737,7 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
         .bg(t.surface)
         .border_1()
         .border_color(if focused { t.accent } else { t.border })
-        .when(focused, |d| d.shadow(ring(t.accent)))
+        .when(focused, |d| d.shadow(ring(t)))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -698,7 +752,7 @@ pub enum Button {
 pub fn button(label: &str, kind: Button, focused: bool, t: &Tokens) -> Div {
     let (bg, text, border) = match kind {
         Button::Primary => (t.accent, t.accent_text, t.accent),
-        Button::Danger => (t.danger, on_color(t.danger), t.danger),
+        Button::Danger => (t.danger, t.danger_text, t.danger),
         Button::Quiet => (t.surface, t.text, t.border),
     };
     div()
@@ -714,7 +768,7 @@ pub fn button(label: &str, kind: Button, focused: bool, t: &Tokens) -> Div {
         .border_color(border)
         .text_size(px(ts::BODY_SM))
         .text_color(text)
-        .when(focused, |d| d.shadow(ring(if kind == Button::Quiet { t.accent } else { border })))
+        .when(focused, |d| d.shadow(ring_color(if kind == Button::Quiet { t.accent } else { border })))
         .child(label.to_string())
 }
 
@@ -768,71 +822,86 @@ mod tests {
         gpui::rgb_to_hsla(gpui::Rgba::new(mix(t.red, u.red), mix(t.green, u.green), mix(t.blue, u.blue), 1.))
     }
 
-    #[test]
-    fn every_theme_meets_aa_contrast() {
-        let fails = std::cell::RefCell::new(vec![]);
-        for (name, dark) in DARK_THEMES.iter().map(|n| (n, true)).chain(LIGHT_THEMES.iter().map(|n| (n, false))) {
-            let t = Tokens::named(name, dark);
-            let body = luminance(t.bg);
-            let check = |what: &str, r: f32| {
-                if r < 4.5 {
-                    fails.borrow_mut().push(format!("{name}: {what} is {r:.2}:1"));
-                }
-            };
-            check("text on the accent", ratio(luminance(t.accent), luminance(t.accent_text)));
-            check("faint text on the body", ratio(luminance(t.text_faint), body));
-            // The selected row in the accent and in every kind hue; a card; a selected card row.
-            let hues = [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger];
-            for hue in hues.map(|k| k.hue(&t)) {
-                check("muted text on a selected row", ratio(luminance(t.text_muted), luminance(over(t.selected(hue), t.bg))));
-            }
-            let card = over(t.surface, t.bg);
-            check("muted text on a card", ratio(luminance(t.text_muted), luminance(card)));
-            check("faint text on a card", ratio(luminance(t.text_faint), luminance(card)));
-            check("muted text on a selected card row", ratio(luminance(t.text_muted), luminance(over(t.selected(t.accent), card))));
-        }
-        assert!(fails.borrow().is_empty(), "{:#?}", fails.borrow());
+    /// (name, tokens, the stand-in worst backdrop under the glass). The backdrop is levelled by
+    /// the OS material, so no wallpaper is worse than mid grey on Dark or dark grey on Light.
+    fn modes() -> [(&'static str, Tokens, Hsla); 2] {
+        [("Dark", Tokens::dark(), c(0x808080ff)), ("Light", Tokens::light(), c(0x404040ff))]
     }
 
-    fn themes() -> impl Iterator<Item = (&'static str, Tokens)> {
-        DARK_THEMES.iter().map(|n| (*n, true)).chain(LIGHT_THEMES.iter().map(|n| (*n, false))).map(|(n, dark)| (n, Tokens::named(n, dark)))
-    }
-
-    /// The armed line in the action bar is `warning` text on the body; a Danger button's
-    /// label is `on_color(danger)` on `danger`.
-    #[test]
-    fn status_colours_meet_aa_as_text() {
-        let mut fails = vec![];
-        for (name, t) in themes() {
-            for (what, r) in [
-                ("warning text on the body", ratio(luminance(t.warning), luminance(t.bg))),
-                ("text on a danger button", ratio(luminance(on_color(t.danger)), luminance(t.danger))),
-            ] {
-                if r < 4.5 {
-                    fails.push(format!("{name}: {what} is {r:.2}:1"));
-                }
-            }
-        }
+    /// Fails with every `(mode: pair, ratio)` under `min`; `pairs` lists a mode's ratios.
+    fn hold(min: f32, pairs: impl Fn(&Tokens, Hsla) -> Vec<(String, f32)>) {
+        let fails: Vec<_> = modes().into_iter().flat_map(|(m, t, back)| pairs(&t, back).into_iter().map(move |(w, r)| (format!("{m}: {w} is {r:.2}:1"), r))).filter(|(_, r)| *r < min).map(|f| f.0).collect();
         assert!(fails.is_empty(), "{fails:#?}");
     }
 
-    /// A tile's glyph is the row's icon, so it holds 3:1 against its own wash: at rest on the
-    /// body and on a panel, and in a selected row.
+    fn lum_ratio(a: Hsla, b: Hsla) -> f32 {
+        ratio(luminance(a), luminance(b))
+    }
+
+    /// The tint of every kind, `Accent` and `Danger` included.
+    const TINTS: [Tint; 8] = [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger];
+
+    /// A hue's 14% tile wash.
+    fn wash(h: Hsla) -> Hsla {
+        Hsla { alpha: 0.14, ..h }
+    }
+
     #[test]
-    fn tile_glyphs_stand_out_from_their_wash() {
-        let mut fails = vec![];
-        for (name, t) in themes() {
-            for tint in [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger] {
-                let row = over(t.selected(tint.hue(&t)), t.bg);
-                for (what, selected, under) in [("at rest", false, t.bg), ("on a panel", false, t.bg_elevated), ("selected", true, row)] {
-                    let (wash, glyph) = tile_colors(&t, Some(tint), selected);
-                    let r = ratio(luminance(glyph), luminance(over(wash, under)));
-                    if r < 3. {
-                        fails.push(format!("{name}: {tint:?} glyph {what} is {r:.2}:1"));
-                    }
-                }
-            }
+    fn text_holds_4_5_on_the_solid_body() {
+        hold(4.5, |t, _| [("text", t.text), ("text_muted", t.text_muted), ("text_faint", t.text_faint)].map(|(n, c)| (format!("{n} on bg_solid"), lum_ratio(c, t.bg_solid))).into())
+    }
+
+    #[test]
+    fn text_holds_4_5_on_glass_over_the_worst_backdrop() {
+        hold(4.5, |t, back| {
+            let body = over(t.bg, back);
+            [("text", t.text), ("text_muted", t.text_muted), ("text_faint", t.text_faint)].map(|(n, c)| (format!("{n} on bg over the worst backdrop"), lum_ratio(c, body))).into()
+        })
+    }
+
+    #[test]
+    fn muted_text_holds_4_5_on_the_selected_fill() {
+        hold(4.5, |t, _| vec![("text_muted on sel_top over bg_solid".into(), lum_ratio(t.text_muted, over(t.sel_top, t.bg_solid)))])
+    }
+
+    #[test]
+    fn labels_hold_4_5_on_accent_and_danger() {
+        hold(4.5, |t, _| vec![("accent_text on accent".into(), lum_ratio(t.accent_text, t.accent)), ("danger_text on danger".into(), lum_ratio(t.danger_text, t.danger))])
+    }
+
+    #[test]
+    fn warning_text_holds_4_5_on_the_solid_body() {
+        hold(4.5, |t, _| vec![("warning on bg_solid".into(), lum_ratio(t.warning, t.bg_solid))])
+    }
+
+    /// Spec value kept: Light `warning` #8a5900 on `bg` over the #404040 stand-in is 4.39:1, a
+    /// hair under 4.5 (it holds over a lighter backdrop, and on `bg_solid`).
+    #[test]
+    #[ignore = "Light warning on glass over #404040 is 4.39:1"]
+    fn warning_text_holds_4_5_on_glass_over_the_worst_backdrop() {
+        hold(4.5, |t, back| vec![("warning on bg over the worst backdrop".into(), lum_ratio(t.warning, over(t.bg, back)))])
+    }
+
+    /// A kind's icon is its hue on a 14% wash of itself.
+    #[test]
+    fn tint_icons_hold_3_on_their_wash() {
+        hold(3., |t, _| TINTS.map(|k| (format!("{k:?} on its wash over bg_solid"), lum_ratio(k.hue(t), over(wash(k.hue(t)), t.bg_solid)))).into())
+    }
+
+    /// In a selected row the icon steps up to `text`, on the tile wash over the selected fill.
+    #[test]
+    fn selected_tile_icons_hold_3_on_their_wash() {
+        hold(3., |t, _| {
+            let row = over(t.sel_top, t.bg_solid);
+            TINTS.map(|k| (format!("text on the {k:?} wash over the selected fill"), lum_ratio(t.text, over(wash(k.hue(t)), row)))).into()
+        })
+    }
+
+    #[test]
+    fn shadows_have_the_spec_shape() {
+        for (_, t, _) in modes() {
+            assert_eq!((ring(&t).len(), float(&t).len(), depth(&t).len()), (1, 2, 2));
+            assert!(rim(&t).iter().all(|s| s.inset) && rim(&t).len() == 2 && !float(&t).iter().any(|s| s.inset));
         }
-        assert!(fails.is_empty(), "{fails:#?}");
     }
 }

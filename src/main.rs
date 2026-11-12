@@ -2279,8 +2279,7 @@ impl Render for Launcher {
                         Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
-                            // The selected row lights up in the colour of what it is.
-                            let hue = if on { t.hue_for(*tint, icon) } else { t.accent };
+                            let hue = t.accent;
                             let accessory = if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
                             } else if !accessory.is_empty() {
@@ -2329,7 +2328,7 @@ impl Render for Launcher {
                     .items_center()
                     .gap(px(16.))
                     .rounded(px(design::r::LG))
-                    .bg(if on { t.selected(hue) } else { t.surface })
+                    .bg(if on { t.selected() } else { t.surface })
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         me.update(cx, |this, cx| {
                             this.selected = 0;
@@ -2337,7 +2336,7 @@ impl Render for Launcher {
                         })
                         .ok();
                     })
-                    .when(on, |d| d.child(design::pill(hue, 2. * ROW - LIST_PAD)))
+                    .when(on, |d| d.child(design::pill(t.accent, 2. * ROW - LIST_PAD)))
                     .child(design::icon(g::CALCULATOR, design::ic::LG, hue))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(design::ts::HEADING)).text_color(t.text_muted).child(it.subtitle.clone()))
                     .child(design::icon(g::FORWARD, design::ic::MD, t.text_faint))
@@ -2505,7 +2504,7 @@ impl Render for Launcher {
                     .child(match tone {
                         Some(c) => div().size(px(8.)).mx(px(4.)).rounded_full().bg(c).into_any_element(),
                         // In root search: the selected row's own icon beside its kind.
-                        None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), t.hue_for(it.tint, &it.icon))) {
+                        None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.accent, |k| k.hue(&t)))) {
                             (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
                             (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
                             (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
@@ -2539,8 +2538,7 @@ impl Render for Launcher {
         let popover = self.panel.as_ref().map(|(item, sel)| {
             let acts = item.actions();
             let me = cx.weak_entity();
-            // The panel belongs to its item, so it selects in the item's colour.
-            let hue = t.hue_for(item.tint, &item.icon);
+            let hue = t.accent;
             div()
                 .absolute()
                 .right(px(8.))
@@ -2636,7 +2634,7 @@ impl Render for Launcher {
             .overflow_hidden()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
-            .bg(t.bg)
+            .bg(t.body())
             .text_color(t.text)
             .border_1()
             .border_color(t.border)
@@ -2854,8 +2852,7 @@ fn main() {
             kind: WindowKind::PopUp,
             show: false,
             focus: false,
-            // Theme bodies are opaque, so the colour is the theme's on any wallpaper. Acrylic shows
-            // through only where `[theme] background` is given with alpha (#RRGGBBAA).
+            // The body is translucent (`Tokens::body`), so acrylic shows through it unless glass is off.
             windows_window_background: gpui::WindowsWindowBackground::Blurred,
             ..Default::default()
         };

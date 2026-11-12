@@ -127,8 +127,6 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 "Appearance",
                 vec![
                     row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "Follow Windows switches with your system's light/dark setting."),
-                    row("Dark theme", "theme.dark", Kind::Choice(design::DARK_THEMES), "Used in dark mode. Fine-tune colours under Theme."),
-                    row("Light theme", "theme.light", Kind::Choice(design::LIGHT_THEMES), "Used in light mode."),
                     row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Scales text, rows and the window together."),
                 ],
             ),
@@ -248,10 +246,6 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 ("Text", "text"),
                 ("Muted text", "muted"),
                 ("Selection", "selected"),
-                ("Selected text", "selected_text"),
-                ("Border", "border"),
-                ("Separator", "separator"),
-                ("Panels", "container"),
             ] {
                 colours.push(row(label, &format!("theme.{key}"), Kind::Text, "A colour like #1e1e2e. Leave empty to use the theme's own."));
             }
@@ -866,7 +860,7 @@ impl Settings {
             .py(px(12.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| d.rounded(px(design::r::LG)).bg(t.selected(t.accent)).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
+            .when(on, |d| d.rounded(px(design::r::LG)).bg(t.selected()).child(div().absolute().left(px(0.)).top(px(0.)).bottom(px(0.)).flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded_full().bg(t.accent))))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -1066,10 +1060,6 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
         "text" => t.text,
         "muted" => t.text_muted,
         "selected" => t.accent,
-        "selected_text" => t.accent_text,
-        "border" => t.border,
-        "separator" => t.hairline,
-        "container" => t.bg_elevated,
         _ => return None,
     })
 }
@@ -1078,14 +1068,14 @@ fn swatch(r: &Row, t: &design::Tokens) -> Option<gpui::Hsla> {
 /// from the launcher's own components, so what you see here is what you get.
 fn preview(t: &design::Tokens) -> impl IntoElement {
     use design::{Tint, icon, g, ic, key_cap, list_row, section_header};
-    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, tint.hue(t), t);
+    let row = |glyph: &'static str, title: &str, sub: &str, tint: Tint, on: bool| list_row(design::icon_tile(&Icon::Vector(glyph), t, on, Some(tint)), title, sub, None, on, t.accent, t);
     div()
         .mb(px(16.))
         .flex_none()
         .rounded(px(design::r::LG))
         .border_1()
         .border_color(t.border)
-        .bg(t.bg)
+        .bg(t.body())
         .overflow_hidden()
         .child(
             div()
