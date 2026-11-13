@@ -846,6 +846,40 @@ fn open_pipe() -> Option<std::fs::File> {
 mod tests {
     use super::*;
 
+    /// Times searches over this machine's real index (needs the helper running).
+    #[test]
+    #[ignore = "cargo test bench_real_index -- --ignored --nocapture"]
+    fn bench_real_index() {
+        let cfg = crate::config::load().unwrap().files;
+        let filter = Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let t = Instant::now();
+        let client = connect(filter, Arc::default(), Arc::default(), tx);
+        while !client.ready.load(Ordering::SeqCst) || client.index.read().unwrap().complete.len() < 3 {
+            assert!(t.elapsed() < Duration::from_secs(300), "index not ready");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let ix = client.index.read().unwrap();
+        println!("ready after {:.1?}: {} nodes, {} live", t.elapsed(), ix.nodes.len(), ix.len());
+        for q in ["pro", "proc", "procast", "readme", "cargo toml", r"pro\cargo"] {
+            let mut times = vec![];
+            for _ in 0..5 {
+                let t = Instant::now();
+                std::hint::black_box(ix.search(q, 5));
+                times.push(t.elapsed());
+            }
+            times.sort();
+            println!("{q:>12}: median {:.1?}  max {:.1?}", times[2], times[4]);
+        }
+        drop(ix);
+        let mut ix = client.index.write().unwrap();
+        ix.dirty = true;
+        let t = Instant::now();
+        ix.refresh_excluded();
+        println!("refresh_excluded: {:.1?}", t.elapsed());
+    }
+
     #[test]
     fn index_builds_paths_applies_changes_and_searches() {
         let mut wire = vec![];

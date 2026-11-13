@@ -13,6 +13,7 @@ mod ntfs;
 mod scripts;
 mod search;
 mod settings;
+mod snippets;
 mod win;
 
 use std::{
@@ -55,6 +56,8 @@ use search::{Act, Frecency, Icon, Item};
 use win::{BINDS, Bind, Msg, TrayCmd};
 
 actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
+// Left and Right in the emoji grid (the search bar keeps them elsewhere).
+actions!(procast, [SelectLeft, SelectRight]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
@@ -98,7 +101,7 @@ enum Mode {
     Clipboard,
     Emoji,
     Files,
-    /// Collecting script arguments (see `Launcher::pending`).
+    /// Collecting script or snippet arguments (see `Launcher::pending`).
     Args,
     /// Showing a script's output (see `Launcher::output`).
     Output,
@@ -205,6 +208,26 @@ fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(Str
     it
 }
 
+/// Something waiting for its arguments, typed one at a time in the search bar.
+enum Pending {
+    /// A script (index) and what it has so far.
+    Script(usize, Vec<String>),
+    /// A snippet with `{argument}`s; `erase` and `then` as in `snippets::Job` (typed keywords).
+    Snippet { name: String, template: String, args: Vec<snippets::Arg>, got: Vec<String>, erase: usize, then: String },
+}
+
+/// Hook settings: Hyper, double tap, and the snippet keywords and emoji shortcodes typed anywhere.
+fn configure_keys(cfg: &Config, tx: &UnboundedSender<Msg>) {
+    let keywords = cfg.snippet.iter().enumerate().filter(|(_, s)| cfg.snippets.expand && !cfg.launcher.is_disabled(&format!("sn:{}", s.name))).map(|(i, s)| (i, s.keyword.clone())).collect();
+    let x = snippets::Expander::new(keywords, snippets::Trigger::of(&cfg.snippets.trigger), cfg.snippets.within_words, cfg.emoji.shortcodes);
+    keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, Some(x), tx.clone());
+}
+
+/// What `configure_keys` reads, to tell when a reload must redo it.
+fn key_settings(cfg: &Config) -> (config::Keyboard, Vec<config::Snippet>, config::Snippets, bool, Vec<String>) {
+    (cfg.keyboard.clone(), cfg.snippet.clone(), cfg.snippets.clone(), cfg.emoji.shortcodes, cfg.launcher.disabled.clone())
+}
+
 /// The extension command currently on screen.
 struct ExtView {
     run: u64,
@@ -276,8 +299,12 @@ struct Launcher {
     panel: Option<(Item, usize)>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
-    /// Script waiting for arguments: (index, collected so far).
-    pending: Option<(usize, Vec<String>)>,
+    pending: Option<Pending>,
+    /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
+    clip_images: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Emoji picker: the grid's scroll position, by grid row.
+    /// The emoji grid's rows; only the ones on screen are laid out.
+    grid_list: gpui::ListState,
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     ai: Option<AiChat>,
@@ -316,8 +343,8 @@ impl Launcher {
                 }
             }),
         ];
-        // ponytail: ignore_apps is read once at start; changing it needs a restart.
-        clipboard::watch(cfg.clipboard.ignore_apps.clone(), tx.clone());
+        clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
+        clipboard::watch(tx.clone());
         for (dir, recursive) in win::app_dirs() {
             let tx = tx.clone();
             std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
@@ -325,10 +352,10 @@ impl Launcher {
         let mut this = Self {
             input,
             hotkeys: {
-                keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, tx.clone());
+                configure_keys(&cfg, &tx);
                 win::Hotkeys::spawn(hotkey_specs(&cfg), tx.clone())
             },
-            history: clipboard::History::load(config::dir().join("clipboard.bin"), cfg.clipboard.history),
+            history: clipboard::History::load(config::dir().join("clipboard.bin"), cfg.clipboard.history, &cfg.clipboard.keep),
             files: start_files(&cfg, &tx),
             scripts: scripts::scan(&cfg.scripts.dirs()),
             exts: vec![],
@@ -361,6 +388,8 @@ impl Launcher {
             panel: None,
             armed: None,
             pending: None,
+            clip_images: HashMap::new(),
+            grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
             ai: None,
             ai_scroll: ScrollHandle::new(),
@@ -619,8 +648,15 @@ impl Launcher {
                 }
                 search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher)
             }
-            Mode::Clipboard => search::clipboard(&query, &self.history.entries, 200, &mut self.matcher),
-            Mode::Emoji => search::emoji(&query, 200, &mut self.matcher),
+            Mode::Clipboard => {
+                if self.clip_images.len() > 300 {
+                    self.clip_images.clear();
+                }
+                let (history, cache) = (&self.history, &mut self.clip_images);
+                let mut thumb = |id: &str| cache.entry(format!("t:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 64))).clone();
+                search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
+            }
+            Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
             Mode::Files => {
                 // Results arrive later as Msg::Files; keep showing the previous ones meanwhile.
                 self.file_gen += 1;
@@ -634,10 +670,14 @@ impl Launcher {
                 }
             }
             Mode::Args => match &self.pending {
-                Some((i, got)) => {
+                Some(Pending::Script(i, got)) => {
                     let s = &self.scripts[*i];
                     let n = s.args.len();
                     vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::COMMAND), Act::Script(*i))]
+                }
+                Some(Pending::Snippet { name, template, args, got, .. }) => {
+                    let sub = format!("{} · {} of {}", args[got.len()].name, got.len() + 1, args.len());
+                    vec![Item::new(format!("Paste {name}"), sub, Icon::Vector(g::EDIT), Act::Snippet(template.clone()))]
                 }
                 None => vec![],
             },
@@ -712,7 +752,14 @@ impl Launcher {
             }
         };
         if self.items.is_empty() && self.mode == Mode::Clipboard {
-            self.items = vec![empty_row(g::PASTE, "Nothing copied yet".into(), "Text you copy shows up here".into(), vec![])];
+            let hint = if query.trim().is_empty() { "Text, images and files you copy show up here" } else { "Nothing copied matches" };
+            self.items = vec![empty_row(g::PASTE, if query.trim().is_empty() { "Nothing copied yet" } else { "No matches" }.into(), hint.into(), vec![])];
+        }
+        if self.items.is_empty() && self.mode == Mode::Emoji {
+            self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
+        }
+        if self.mode == Mode::Emoji {
+            self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
         }
         let _ = max;
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
@@ -864,6 +911,80 @@ impl Launcher {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.hide(true, cx);
         clipboard::paste_soon();
+    }
+
+    // ---- clipboard history and snippets --------------------------------------------
+
+    /// Puts a history entry (text, image or files) back on the clipboard.
+    fn put_clip(&mut self, key: &str) -> bool {
+        let Some(e) = self.history.get(key) else { return false };
+        match &e.kind {
+            clipboard::Kind::Text => clipboard::set(self.hwnd, clipboard::Put::Text(&e.text), false),
+            clipboard::Kind::Image { id, .. } => self.history.png(id).is_some_and(|png| clipboard::set(self.hwnd, clipboard::Put::Image(&png), false)),
+            clipboard::Kind::Files(f) => clipboard::set(self.hwnd, clipboard::Put::Files(f), false),
+        }
+    }
+
+    /// A clipboard image fitted for the detail pane, cached.
+    fn clip_preview(&mut self, id: &str) -> Option<Arc<RenderImage>> {
+        let history = &self.history;
+        self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
+    }
+
+    /// A snippet chosen in the launcher (`erase` 0) or typed in an app: asks for its
+    /// arguments first if it has any, then goes into the app.
+    fn start_snippet(&mut self, name: String, template: String, erase: usize, then: String, window: &mut Window, cx: &mut Context<Self>) {
+        let args = snippets::arguments(&template);
+        if !args.is_empty() {
+            self.pending = Some(Pending::Snippet { name, template, args, got: vec![], erase, then });
+            if !self.visible {
+                self.show(Mode::Args, window, cx);
+            }
+            return self.set_mode(Mode::Args, cx);
+        }
+        self.insert_snippet(template, vec![], erase, then, cx);
+    }
+
+    fn insert_snippet(&mut self, template: String, args: Vec<String>, erase: usize, then: String, cx: &mut Context<Self>) {
+        let opened = self.visible;
+        if opened {
+            self.hide(true, cx);
+        }
+        let s = &self.cfg.snippets;
+        // From the launcher: the app needs a moment to get focus back first.
+        let pause = if opened { snippets::pause(&s.speed).max(Duration::from_millis(80)) } else { snippets::pause(&s.speed) };
+        let sound = if erase > 0 { snippets::sound(&s.sound) } else { None };
+        snippets::insert(snippets::Job { owner: self.hwnd, template, args, erase, then, pause, sound });
+    }
+
+    /// Whether a typed keyword should expand where it was typed.
+    fn expands_here(&self) -> bool {
+        !snippets::procast_focused() && !self.cfg.snippets.ignore_apps.iter().any(|a| a.eq_ignore_ascii_case(&clipboard::exe_of(win::foreground())))
+    }
+
+    /// The snippet a typed keyword asks for, when it must open the launcher for its arguments.
+    fn expand_opens(&self, hit: &snippets::Hit) -> bool {
+        matches!(hit, snippets::Hit::Snippet { index, .. } if self.cfg.snippet.get(*index).is_some_and(|s| !snippets::arguments(&s.text).is_empty())) && self.expands_here()
+    }
+
+    fn on_expand(&mut self, hit: snippets::Hit, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.expands_here() {
+            return;
+        }
+        match hit {
+            snippets::Hit::Emoji { emoji, erase } => {
+                let e = search::toned(emoji, &self.cfg.emoji.skin_tone).to_string();
+                self.insert_snippet(e, vec![], erase, String::new(), cx);
+            }
+            snippets::Hit::Snippet { index, erase, then } => {
+                let Some(s) = self.cfg.snippet.get(index).cloned() else { return };
+                let fg = win::foreground();
+                if fg != self.hwnd {
+                    self.prev = fg;
+                }
+                self.start_snippet(s.name, s.text, erase, then, window, cx);
+            }
+        }
     }
 
     // ---- Quick AI -------------------------------------------------------------------
@@ -1451,21 +1572,40 @@ impl Launcher {
             Act::Reveal(path) => win::reveal(&path),
             Act::Run(cmdline) => win::run(&cmdline),
             Act::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
-            Act::Paste(text) | Act::Clip(text) => return self.paste(text, cx),
-            Act::DeleteClip(text) => {
-                self.history.remove(&text);
+            Act::Paste(text) => return self.paste(text, cx),
+            Act::Clip(key) => {
+                if self.put_clip(&key) {
+                    self.hide(true, cx);
+                    return clipboard::paste_soon();
+                }
+                self.status = Some((Tone::Error, "Could not put that on the clipboard".into()));
+                return cx.notify();
+            }
+            Act::CopyClip(key) => {
+                if !self.put_clip(&key) {
+                    self.status = Some((Tone::Error, "Could not put that on the clipboard".into()));
+                    return cx.notify();
+                }
+            }
+            Act::PinClip(key, on) => {
+                self.history.pin(&key, on);
+                self.status = Some((Tone::Ok, if on { "Pinned" } else { "Unpinned" }.into()));
+                return self.refresh(cx);
+            }
+            Act::DeleteClip(key) => {
+                self.history.remove(&key);
                 self.status = Some((Tone::Ok, "Deleted from clipboard history".into()));
                 return self.refresh(cx);
             }
             Act::Snippet(template) => {
-                let clip = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
-                return self.paste(search::expand(&template, &clip, win::local_date_time()), cx);
+                let name = key.as_deref().and_then(|k| k.strip_prefix("sn:")).unwrap_or("snippet").to_string();
+                return self.start_snippet(name, template, 0, String::new(), window, cx);
             }
             Act::Script(i) => {
                 if self.scripts[i].args.is_empty() {
                     return self.start_script(i, vec![], cx);
                 }
-                self.pending = Some((i, vec![]));
+                self.pending = Some(Pending::Script(i, vec![]));
                 return self.set_mode(Mode::Args, cx);
             }
             Act::Fill(text) => return self.input.update(cx, |s, cx| s.emplace(&text, cx)),
@@ -1709,22 +1849,36 @@ impl Launcher {
     }
 
     fn next_argument(&mut self, cx: &mut Context<Self>) {
-        let Some((i, mut got)) = self.pending.take() else { return };
         let value = self.query(cx).trim().to_string();
-        let spec = &self.scripts[i].args[got.len()];
-        if value.is_empty() && !spec.optional {
-            self.pending = Some((i, got));
-            self.status = Some((Tone::Error, format!("{} is required", spec.placeholder)));
-            return cx.notify();
+        match self.pending.take() {
+            None => {}
+            Some(Pending::Script(i, mut got)) => {
+                let spec = &self.scripts[i].args[got.len()];
+                if value.is_empty() && !spec.optional {
+                    self.status = Some((Tone::Error, format!("{} is required", spec.placeholder)));
+                    self.pending = Some(Pending::Script(i, got));
+                    return cx.notify();
+                }
+                got.push(value);
+                if got.len() < self.scripts[i].args.len() {
+                    self.pending = Some(Pending::Script(i, got));
+                    self.status = None;
+                    self.input.update(cx, |s, cx| s.emplace("", cx));
+                    return self.refresh(cx);
+                }
+                self.start_script(i, got, cx);
+            }
+            Some(Pending::Snippet { name, template, args, mut got, erase, then }) => {
+                got.push(value);
+                if got.len() < args.len() {
+                    self.pending = Some(Pending::Snippet { name, template, args, got, erase, then });
+                    self.input.update(cx, |s, cx| s.emplace("", cx));
+                    return self.refresh(cx);
+                }
+                self.mode = Mode::Root;
+                self.insert_snippet(template, got, erase, then, cx);
+            }
         }
-        got.push(value);
-        if got.len() < self.scripts[i].args.len() {
-            self.pending = Some((i, got));
-            self.status = None;
-            self.input.update(cx, |s, cx| s.emplace("", cx));
-            return self.refresh(cx);
-        }
-        self.start_script(i, got, cx);
     }
 
     fn start_script(&mut self, i: usize, args: Vec<String>, cx: &mut Context<Self>) {
@@ -1755,8 +1909,12 @@ impl Launcher {
                     self.hotkey_errors.clear();
                     self.hotkeys.set(hotkey_specs(&cfg));
                 }
-                if cfg.keyboard != self.cfg.keyboard {
-                    keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, self.tx.clone());
+                if key_settings(&cfg) != key_settings(&self.cfg) {
+                    configure_keys(&cfg, &self.tx);
+                }
+                if cfg.clipboard != self.cfg.clipboard {
+                    clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
+                    self.history.set_limits(cfg.clipboard.history, &cfg.clipboard.keep);
                 }
                 if cfg.apps.folders != self.cfg.apps.folders || cfg.apps.deep != self.cfg.apps.deep {
                     self.scanned = None;
@@ -1796,9 +1954,10 @@ impl Launcher {
                 self.apps = apps;
                 self.rebuild_catalog(cx);
             }
-            Msg::Clip(text) => {
+            Msg::Expand(hit) => self.on_expand(hit, window, cx),
+            Msg::Clip(entry, png) => {
                 if self.cfg.clipboard.enabled {
-                    self.history.push(text, search::now());
+                    self.history.push(entry, png);
                     if self.visible && self.mode == Mode::Clipboard {
                         self.refresh(cx);
                     }
@@ -1868,6 +2027,8 @@ impl Launcher {
                 if self.scanned.is_none() {
                     self.scan_apps(true, false);
                 }
+                // Entries kept for a time leave once it's up.
+                self.history.prune(search::now());
                 let idle = Duration::from_secs(self.cfg.apps.auto_quit_minutes.max(1) * 60);
                 self.autoquit.tick(&self.cfg.apps.auto_quit, idle, win::foreground());
                 self.tick(cx);
@@ -1926,7 +2087,10 @@ impl Launcher {
             Mode::Install => Some("Install Extension".into()),
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
-            Mode::Args => self.pending.as_ref().map(|(i, _)| self.scripts[*i].title.clone()),
+            Mode::Args => self.pending.as_ref().map(|p| match p {
+                Pending::Script(i, _) => self.scripts[*i].title.clone(),
+                Pending::Snippet { name, .. } => name.clone(),
+            }),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -1949,9 +2113,15 @@ impl Launcher {
             Mode::Args => self
                 .pending
                 .as_ref()
-                .map(|(i, got)| {
-                    let a = &self.scripts[*i].args[got.len()];
-                    if a.optional { format!("{} (optional)", a.placeholder) } else { a.placeholder.clone() }
+                .map(|p| match p {
+                    Pending::Script(i, got) => {
+                        let a = &self.scripts[*i].args[got.len()];
+                        if a.optional { format!("{} (optional)", a.placeholder) } else { a.placeholder.clone() }
+                    }
+                    Pending::Snippet { args, got, .. } => {
+                        let a = &args[got.len()];
+                        if a.default.is_empty() { format!("{}…", a.name) } else { format!("{} (empty: {})", a.name, a.default) }
+                    }
                 })
                 .unwrap_or_default()
                 .into(),
@@ -1975,6 +2145,12 @@ impl Launcher {
         }
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
+        }
+        // The grid shows no names: the selected emoji's is here.
+        if self.grid() && self.panel.is_none()
+            && let Some(it) = self.items.get(self.selected)
+        {
+            return it.title.clone();
         }
         if let Some(label) = self.label() {
             return label;
@@ -2127,23 +2303,200 @@ impl Launcher {
                     _ => line.text_color(t.text),
                 }
             }))
-            .when(!metadata.is_empty(), |d| {
-                d.child(div().mt(px(12.)).pt(px(12.)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information"))
-                    .children(metadata.iter().map(|(k, v)| {
-                        div()
-                            .flex()
-                            .justify_between()
-                            .gap(px(16.))
-                            .py(px(8.))
-                            .border_b_1()
-                            .border_color(t.hairline)
-                            .text_size(px(design::ts::BODY_SM))
-                            .child(div().flex_none().text_color(t.text_muted).child(k.clone()))
-                            .child(div().min_w_0().truncate().child(v.clone()))
-                    }))
-            })
+            .when(!metadata.is_empty(), |d| d.children(info_rows(metadata, t)))
             .into_any_element()
     }
+
+    /// Clipboard History's right-hand pane: the whole entry, then where and when it came from.
+    fn clip_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
+        let key = match self.items.get(self.selected).map(|it| &it.act) {
+            Some(Act::Clip(k)) => k.clone(),
+            _ => return div().flex_1().into_any_element(),
+        };
+        let Some(e) = self.history.get(&key).cloned() else { return div().flex_1().into_any_element() };
+        let lines = |text: &str, mono: bool| {
+            div()
+                .flex()
+                .flex_col()
+                .when(mono, |d| d.font_family(design::FONT_MONO))
+                .text_size(px(design::ts::BODY_SM))
+                .line_height(px(20.))
+                .children(text.lines().take(300).map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.chars().take(2000).collect() })))
+        };
+        let mut meta: Vec<(String, String)> = vec![];
+        let top = match &e.kind {
+            clipboard::Kind::Text => {
+                let (chars, words) = (e.text.chars().count(), e.text.split_whitespace().count());
+                meta.push(("Content".into(), format!("{chars} characters · {words} words")));
+                lines(&e.text, e.text.contains(['{', ';']) && e.text.lines().count() > 1).into_any_element()
+            }
+            clipboard::Kind::Image { id, w, h, bytes } => {
+                meta.push(("Dimensions".into(), format!("{w} × {h}")));
+                meta.push(("Size".into(), format!("{:.1} KB", *bytes as f64 / 1024.)));
+                let preview = self.clip_preview(id);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .h(px(200.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(design::r::MD))
+                            .bg(t.surface)
+                            .border_1()
+                            .border_color(t.hairline)
+                            .overflow_hidden()
+                            .children(preview.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain))),
+                    )
+                    .when(!e.text.is_empty(), |d| d.child(div().text_color(t.text_muted).child(lines(&e.text, false))))
+                    .into_any_element()
+            }
+            clipboard::Kind::Files(files) => {
+                meta.push(("Files".into(), files.len().to_string()));
+                lines(&e.text, false).into_any_element()
+            }
+        };
+        meta.insert(0, ("Application".into(), if e.app.is_empty() { "Unknown".into() } else { e.app.clone() }));
+        meta.push(("Copied".into(), format!("{} · {}", win::local_time_of(e.at), search::ago(e.at))));
+        if e.pinned {
+            meta.push(("Pinned".into(), "Yes".into()));
+        }
+        div()
+            .id("clip-detail")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(16.))
+            .py(px(12.))
+            .flex()
+            .flex_col()
+            .child(top)
+            .children(info_rows(&meta, t))
+            .into_any_element()
+    }
+
+    /// Emoji picker: moves the selection by `dx` cells or `dy` grid rows.
+    fn grid_move(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
+        let rows = grid_rows(&self.items, self.cfg.emoji.columns);
+        let cells: Vec<&Vec<usize>> = rows.iter().filter_map(|r| if let GridRow::Cells(c) = r { Some(c) } else { None }).collect();
+        let Some((r, c)) = cells.iter().enumerate().find_map(|(r, row)| row.iter().position(|&i| i == self.selected).map(|c| (r, c))) else { return };
+        self.selected = if dy != 0 {
+            let r = (r as isize + dy).clamp(0, cells.len() as isize - 1) as usize;
+            cells[r][c.min(cells[r].len() - 1)]
+        } else {
+            (self.selected as isize + dx).clamp(0, self.items.len() as isize - 1) as usize
+        };
+        if let Some(at) = rows.iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
+            self.grid_list.scroll_to_reveal_item(at);
+        }
+        cx.notify();
+    }
+
+    /// The emoji picker shows a grid (it falls back to the list for its empty state).
+    fn grid(&self) -> bool {
+        self.mode == Mode::Emoji && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cols = self.cfg.emoji.columns.clamp(4, 16);
+        let me = cx.weak_entity();
+        let (selected, t) = (self.selected, t.clone());
+        let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
+        let rows = Rc::new(grid_rows(&self.items, cols));
+        // ponytail: rows are laid out only while on screen; 400 emoji cells per keystroke made typing lag.
+        let list = gpui::list(self.grid_list.clone(), move |k, _, _| match &rows[k] {
+                GridRow::Header(s) => design::section_header(s, None, &t).into_any_element(),
+                GridRow::Cells(cells) => {
+                    let pad = cols - cells.len();
+                    div()
+                        .flex()
+                        .w_full()
+                        .gap(px(4.))
+                        .children(cells.iter().map(|&i| {
+                            let on = i == selected;
+                            let me = me.clone();
+                            let glyph = glyphs[i].clone();
+                            let t = &t;
+                            let hover = t.hover;
+                            div()
+                                .id(("emoji", i))
+                                .flex_1()
+                                .h(px(EMOJI_CELL))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(design::r::MD))
+                                .map(|d| if on { design::lozenge(d, t) } else { d.hover(move |s| s.bg(hover)) })
+                                .font_family(design::FONT_EMOJI)
+                                .text_size(px(30.))
+                                .child(glyph)
+                                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                    me.update(cx, |this, cx| {
+                                        this.selected = i;
+                                        this.launch(window, cx);
+                                    })
+                                    .ok();
+                                })
+                                .into_any_element()
+                        }))
+                        .children((0..pad).map(|_| div().flex_1().into_any_element()))
+                        .into_any_element()
+                }
+            });
+        div().flex_1().min_h_0().flex().flex_col().px(px(8.)).py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
+    }
+}
+
+/// An emoji cell's height.
+const EMOJI_CELL: f32 = 56.;
+
+enum GridRow {
+    Header(String),
+    /// Item indices, at most `columns`.
+    Cells(Vec<usize>),
+}
+
+/// The emoji picker's layout: each section's header, then its emoji in rows of `cols`.
+fn grid_rows(items: &[Item], cols: usize) -> Vec<GridRow> {
+    let cols = cols.clamp(4, 16);
+    let mut out = vec![];
+    let mut last: Option<&str> = None;
+    for (i, it) in items.iter().enumerate() {
+        let sec = it.section.as_deref();
+        let new_sec = i == 0 || sec != last;
+        if new_sec && let Some(s) = sec {
+            out.push(GridRow::Header(s.to_string()));
+        }
+        match out.last_mut() {
+            Some(GridRow::Cells(c)) if !new_sec && c.len() < cols => c.push(i),
+            _ => out.push(GridRow::Cells(vec![i])),
+        }
+        last = sec;
+    }
+    out
+}
+
+/// "Information" and key / value rows under a detail view.
+fn info_rows(metadata: &[(String, String)], t: &Tokens) -> Vec<gpui::AnyElement> {
+    let head = div().mt(px(12.)).pt(px(12.)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information");
+    std::iter::once(head.into_any_element())
+        .chain(metadata.iter().map(|(k, v)| {
+            div()
+                .flex()
+                .justify_between()
+                .gap(px(16.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(t.hairline)
+                .text_size(px(design::ts::BODY_SM))
+                .child(div().flex_none().text_color(t.text_muted).child(k.clone()))
+                .child(div().min_w_0().truncate().child(v.clone()))
+                .into_any_element()
+        }))
+        .collect()
 }
 
 /// Icon for an action in the Ctrl+K panel.
@@ -2151,7 +2504,8 @@ fn act_glyph(act: &Act) -> &'static str {
     match act {
         Act::Favorite(..) => g::STAR,
         Act::Hide(_) => g::CANCEL,
-        Act::Copy(_) => g::COPY,
+        Act::Copy(_) | Act::CopyClip(_) => g::COPY,
+        Act::PinClip(..) => g::PIN,
         Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => g::PASTE,
         Act::Open(_) => g::GLOBE,
         Act::File(_) => g::DOCUMENT,
@@ -2199,6 +2553,9 @@ impl Render for Launcher {
         let t = Tokens::from_theme(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
+        // Views with their own body: the emoji grid, and clipboard history's detail pane.
+        let grid = self.grid().then(|| self.grid_view(&t, cx));
+        let side = (self.mode == Mode::Clipboard && empty.is_none()).then(|| self.clip_detail(&t));
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
         let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());
@@ -2280,7 +2637,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || self.mode == Mode::Clipboard { 110. } else { design::ACCESSORY_MAX };
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {
@@ -2336,7 +2693,21 @@ impl Render for Launcher {
         });
 
         // ---- body ----
-        let body = match (&empty, &view) {
+        let split = |list: gpui::AnyElement, detail: gpui::AnyElement, cfg: &Config| {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(div().w(px(base_width(cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
+                .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(detail))
+                .into_any_element()
+        };
+        let body = if let Some(g) = grid {
+            g
+        } else if let Some(d) = side {
+            split(list.into_any_element(), d, &self.cfg)
+        } else {
+            match (&empty, &view) {
             _ if self.mode == Mode::Ai => {
                 match self.ai.as_ref().filter(|a| !a.turns.is_empty()) {
                     None => Self::render_markdown("Type a question, then press Enter.", &[], &t, "ai", Some(&self.ai_scroll)),
@@ -2359,16 +2730,11 @@ impl Render for Launcher {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
                 let md = it.and_then(|it| it.detail.clone()).unwrap_or_default();
                 let meta = it.map(|it| it.detail_meta.clone()).unwrap_or_default();
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(div().w(px(base_width(&self.cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
-                    .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(Self::render_markdown(&md, &meta, &t, "item-detail", None)))
-                    .into_any_element()
+                split(list.into_any_element(), Self::render_markdown(&md, &meta, &t, "item-detail", None), &self.cfg)
             }
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
             _ => div().flex_1().min_h_0().flex().flex_col().children(answer).child(list).into_any_element(),
+            }
         };
 
         // ---- compact mode: favourites as icons ----
@@ -2511,6 +2877,9 @@ impl Render for Launcher {
                     this.peek = true;
                     return this.refresh(cx);
                 }
+                if this.panel.is_none() && this.grid() {
+                    return this.grid_move(0, 1, cx);
+                }
                 match &mut this.panel {
                     Some((item, i)) => *i = (*i + 1).min(item.actions().len().saturating_sub(1)),
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
@@ -2529,6 +2898,9 @@ impl Render for Launcher {
                 if this.panel.is_none() && this.selected == 0 && this.recall_search(cx) {
                     return;
                 }
+                if this.panel.is_none() && this.grid() {
+                    return this.grid_move(0, -1, cx);
+                }
                 match &mut this.panel {
                     Some((_, i)) => *i = i.saturating_sub(1),
                     None => this.selected = this.selected.saturating_sub(1),
@@ -2544,6 +2916,10 @@ impl Render for Launcher {
                 };
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
+            // Left and Right move through the emoji grid instead of the search text.
+            .when(self.grid() && self.panel.is_none(), |d| d.key_context("EmojiGrid"))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(cx.listener(|this, _: &EmacsNext, window, cx| this.nav("emacs", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsPrev, window, cx| this.nav("emacs", Box::new(SelectPrev), window, cx)))
@@ -2681,6 +3057,8 @@ fn main() {
             KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),
@@ -2761,6 +3139,7 @@ fn main() {
                 // proc re-borrows the app, so the window is moved here, between updates.
                 let opens = match msg {
                     Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
+                    Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
                     _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..)),
                 };
                 let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
@@ -2809,6 +3188,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_grid_rows_break_at_sections_and_columns() {
+        let it = |sec: &str| Item::new("x", "", Icon::glyph("x"), Act::None).sec(sec);
+        let items: Vec<Item> = (0..6).map(|_| it("Smileys")).chain((0..2).map(|_| it("People"))).collect();
+        let shape: Vec<String> = grid_rows(&items, 4).iter().map(|r| match r { GridRow::Header(h) => h.clone(), GridRow::Cells(c) => format!("{c:?}") }).collect();
+        assert_eq!(shape, ["Smileys", "[0, 1, 2, 3]", "[4, 5]", "People", "[6, 7]"]);
+        let searched: Vec<Item> = (0..5).map(|_| Item::new("x", "", Icon::glyph("x"), Act::None)).collect();
+        assert_eq!(grid_rows(&searched, 4).len(), 2, "no sections: just rows");
+    }
 
     #[test]
     fn ai_chat_markdown_pins_the_newest_question() {

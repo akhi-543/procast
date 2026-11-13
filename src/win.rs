@@ -55,7 +55,10 @@ pub enum Msg {
     HotkeyStatus(usize, Result<(), String>),
     Apps(Vec<App>),
     Tray(TrayCmd),
-    Clip(String),
+    /// A new copy, with its PNG when it is an image.
+    Clip(crate::clipboard::Entry, Option<Vec<u8>>),
+    /// A snippet keyword or emoji shortcode was typed in some app.
+    Expand(crate::snippets::Hit),
     /// File search results for one query generation.
     Files(u64, Vec<crate::search::Item>),
     FilesIndexed,
@@ -541,6 +544,22 @@ pub fn watch_dir(dir: &Path, recursive: bool, mut on_change: impl FnMut(Vec<Path
 pub fn local_date_time() -> (String, String) {
     let t = unsafe { GetLocalTime() };
     (format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay), format!("{:02}:{:02}", t.wHour, t.wMinute))
+}
+
+/// Unix seconds as "YYYY-MM-DD HH:MM" in local time.
+pub fn local_time_of(unix: u64) -> String {
+    use windows::Win32::{Foundation::FILETIME, System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime}};
+    // FILETIME counts 100 ns steps since 1601.
+    let ft = (unix + 11_644_473_600) * 10_000_000;
+    let ft = FILETIME { dwLowDateTime: ft as u32, dwHighDateTime: (ft >> 32) as u32 };
+    let (mut utc, mut local) = Default::default();
+    unsafe {
+        if FileTimeToSystemTime(&ft, &mut utc).is_err() || SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err() {
+            return String::new();
+        }
+    }
+    let t: windows::Win32::Foundation::SYSTEMTIME = local;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
 }
 
 /// Windows Run: first token is the program, the rest its arguments.

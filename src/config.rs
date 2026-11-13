@@ -37,17 +37,47 @@ pub struct Config {
     #[serde(alias = "alias")]
     pub quicklink: Vec<Quicklink>,
     pub snippet: Vec<Snippet>,
+    pub snippets: Snippets,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Clipboard {
     pub enabled: bool,
+    /// Entries kept when `keep` is "count".
     pub history: usize,
+    /// How long entries are kept: count (the `history` number) | 1h | 1d | 7d | 30d | 90d | 180d | 365d | unlimited.
+    pub keep: String,
+    /// Find the text in copied images (Windows' own OCR, offline) so search finds them.
+    pub ocr: bool,
     /// Opens straight into clipboard history, e.g. "Ctrl+Shift+V". Empty = none.
     pub hotkey: String,
     /// Executable names whose copies are never recorded.
     pub ignore_apps: Vec<String>,
+}
+
+/// Snippets typed anywhere turn into their text.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Snippets {
+    /// Typing a snippet's keyword in any app replaces it with the snippet.
+    pub expand: bool,
+    /// immediately | delimiter (after a space or punctuation, which is kept) | delimiter_discard (the delimiter goes).
+    pub trigger: String,
+    /// Also expand when the keyword ends a longer word ("my;sig").
+    pub within_words: bool,
+    /// Pause before the text goes in, for slow apps: instant | quick | default | delayed | extended.
+    pub speed: String,
+    /// off | default | asterisk | exclamation | question (Windows system sounds).
+    pub sound: String,
+    /// Program file names where typing never expands.
+    pub ignore_apps: Vec<String>,
+}
+
+impl Default for Snippets {
+    fn default() -> Self {
+        Self { expand: true, trigger: "immediately".into(), within_words: false, speed: "default".into(), sound: "off".into(), ignore_apps: vec![] }
+    }
 }
 
 /// Root search behaviour (Raycast's "Launcher" settings).
@@ -161,11 +191,27 @@ impl Default for Apps {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Emoji {
     pub hotkey: String,
+    /// Emoji per row in the picker.
+    pub columns: usize,
+    /// What Enter does: paste (into the app you came from) | copy.
+    pub action: String,
+    /// none | light | medium_light | medium | medium_dark | dark: used for emoji that come in skin tones.
+    pub skin_tone: String,
+    /// Typing ":name:" in any app (e.g. ":thumbsup:") turns into the emoji.
+    pub shortcodes: bool,
 }
+
+impl Default for Emoji {
+    fn default() -> Self {
+        Self { hotkey: String::new(), columns: 8, action: "paste".into(), skin_tone: "none".into(), shortcodes: true }
+    }
+}
+
+pub const SKIN_TONES: &[&str] = &["none", "light", "medium_light", "medium", "medium_dark", "dark"];
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
@@ -313,7 +359,7 @@ pub struct Snippet {
     pub name: String,
     #[serde(default)]
     pub keyword: String,
-    /// Placeholders: {clipboard}, {date}, {time}.
+    /// Placeholders: see `snippets::expand`.
     pub text: String,
 }
 
@@ -322,6 +368,8 @@ impl Default for Clipboard {
         Self {
             enabled: true,
             history: 500,
+            keep: "count".into(),
+            ocr: true,
             hotkey: String::new(),
             ignore_apps: ["keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe"].map(String::from).to_vec(),
         }
@@ -363,6 +411,7 @@ impl Default for Config {
             extension: Default::default(),
             quicklink: vec![],
             snippet: vec![],
+            snippets: Snippets::default(),
         }
     }
 }
@@ -432,13 +481,27 @@ fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "ch
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus
 
 [clipboard]
-enabled = true                # text history, encrypted at rest for your Windows account
-history = 500
+enabled = true                # text, images and copied files, encrypted at rest for your Windows account
+history = 500                 # entries kept when keep = "count"
+keep = "count"                # count | 1h | 1d | 7d | 30d | 90d | 180d | 365d | unlimited (pinned entries always stay)
+ocr = true                    # find text inside copied images (Windows' own OCR, offline)
 hotkey = "Ctrl+Shift+V"       # opens clipboard history directly; "" for none
 ignore_apps = ["keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe"]
 
+[snippets]
+expand = true                 # typing a snippet's keyword in any app replaces it with the snippet
+trigger = "immediately"       # immediately | delimiter (after a space or punctuation) | delimiter_discard (and drop it)
+within_words = false          # also expand when the keyword ends a longer word
+speed = "default"             # pause before the text goes in: instant | quick | default | delayed | extended
+sound = "off"                 # off | default | asterisk | exclamation | question
+ignore_apps = []              # program names where typing never expands, e.g. ["code.exe"]
+
 [emoji]
 hotkey = ""                   # e.g. "Ctrl+Alt+E"
+columns = 8                   # emoji per row in the picker
+action = "paste"              # Enter: paste (into the app you came from) | copy
+skin_tone = "none"            # none | light | medium_light | medium | medium_dark | dark
+shortcodes = true             # typing :name: in any app (e.g. :thumbsup:) turns into the emoji
 
 [files]
 enabled = true
@@ -483,7 +546,8 @@ name = "YouTube"
 keyword = "yt"
 url = "https://www.youtube.com/results?search_query={query}"
 
-# Snippets: search by name, Enter pastes. Placeholders: {clipboard} {date} {time}
+# Snippets: search by name, Enter pastes; or type the keyword in any app. Settings → Snippets edits them.
+# Placeholders: {clipboard} {selection} {date} {time} {cursor} {argument name="To" default="you"}
 [[snippet]]
 name = "Today's date"
 keyword = ";date"
@@ -568,14 +632,30 @@ pub fn parse(text: &str) -> Result<Config, String> {
 /// The value in effect: the file's, or the default when the key isn't there (older
 /// config files lack settings added since).
 pub fn shown_value(text: &str, path: &[String]) -> String {
-    read_opt(text, path).or_else(|| read_opt(TEMPLATE, path)).unwrap_or_default()
+    // A snippet or quicklink field has no default: the template's own examples are not yours.
+    let default = || if table_field(path).is_some() { None } else { read_opt(TEMPLATE, path) };
+    read_opt(text, path).or_else(default).unwrap_or_default()
+}
+
+/// `snippet.2.name`: field `name` of the third `[[snippet]]`.
+fn table_field(path: &[String]) -> Option<(&str, usize, &str)> {
+    match path {
+        [list, i, field] => Some((list.as_str(), i.parse().ok()?, field.as_str())),
+        _ => None,
+    }
 }
 
 fn read_opt(text: &str, path: &[String]) -> Option<String> {
     let doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().ok()?;
     let mut item = doc.as_item();
-    for key in path {
-        item = item.get(key)?;
+    if let Some((list, i, field)) = table_field(path)
+        && let Some(tables) = item.get(list).and_then(|t| t.as_array_of_tables())
+    {
+        item = tables.get(i)?.get(field)?;
+    } else {
+        for key in path {
+            item = item.get(key)?;
+        }
     }
     Some(match item.as_value()? {
         toml_edit::Value::String(s) => s.value().clone(),
@@ -593,6 +673,20 @@ fn read_opt(text: &str, path: &[String]) -> Option<String> {
 /// tables (e.g. `[extension.youtube]`) are created.
 pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Result<String, String> {
     let mut doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
+    if let Some((list, i, field)) = table_field(path)
+        && let Some(tables) = doc.get_mut(list).and_then(|t| t.as_array_of_tables_mut())
+    {
+        let t = tables.get_mut(i).ok_or(format!("no {list} number {}", i + 1))?;
+        match t.get_mut(field).and_then(|v| v.as_value_mut()) {
+            Some(old) => {
+                let decor = old.decor().clone();
+                *old = value;
+                *old.decor_mut() = decor;
+            }
+            None => _ = t.insert(field, toml_edit::Item::Value(value)),
+        }
+        return Ok(doc.to_string());
+    }
     let (last, tables) = path.split_last().ok_or("empty setting path")?;
     let mut table = doc.as_table_mut();
     for key in tables {
@@ -610,6 +704,41 @@ pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Resu
         *old.decor_mut() = decor;
     } else {
         table.insert(last, toml_edit::Item::Value(value));
+    }
+    Ok(doc.to_string())
+}
+
+/// Adds, copies or removes one `[[list]]` table (a snippet or quicklink); comments elsewhere stay.
+pub enum TableEdit<'a> {
+    Add(&'a [(&'a str, &'a str)]),
+    Duplicate(usize),
+    Remove(usize),
+}
+
+pub fn edit_table(text: &str, list: &str, edit: TableEdit) -> Result<String, String> {
+    let mut doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
+    if !doc.contains_key(list) {
+        doc.insert(list, toml_edit::Item::ArrayOfTables(Default::default()));
+    }
+    let tables = doc[list].as_array_of_tables_mut().ok_or(format!("{list} is not a list of [[{list}]] tables in config.toml"))?;
+    match edit {
+        TableEdit::Add(fields) => {
+            let mut t = toml_edit::Table::new();
+            for (k, v) in fields {
+                t.insert(k, toml_edit::value(*v));
+            }
+            tables.push(t);
+        }
+        TableEdit::Duplicate(i) => {
+            let mut t = tables.get(i).ok_or("nothing to copy")?.clone();
+            t.decor_mut().clear();
+            if let Some(name) = t.get("name").and_then(|n| n.as_str()).map(|n| format!("{n} copy")) {
+                t.insert("name", toml_edit::value(name));
+            }
+            tables.push(t);
+        }
+        TableEdit::Remove(i) if i < tables.len() => _ = tables.remove(i),
+        TableEdit::Remove(_) => return Err("already gone".into()),
     }
     Ok(doc.to_string())
 }
@@ -719,6 +848,19 @@ mod tests {
         assert_eq!(shown_value(&edited, &p("extension.youtube.apikey")), "abc");
         assert_eq!(shown_value(&edited, &p("files.exclude")).split("; ").next(), Some("AppData"));
         assert_eq!(read_opt(&edited, &p("nope.missing")), None);
+
+        // Snippets and quicklinks are edited one field, one table at a time.
+        assert_eq!(shown_value(&edited, &p("snippet.0.keyword")), ";date");
+        let edited = write_value(&edited, &p("snippet.0.text"), "{time}".into()).unwrap();
+        let edited = edit_table(&edited, "snippet", TableEdit::Duplicate(0)).unwrap();
+        let edited = edit_table(&edited, "snippet", TableEdit::Add(&[("name", "Sig"), ("keyword", ";sig"), ("text", "Cheers")])).unwrap();
+        let c = parse(&edited).unwrap();
+        assert_eq!(c.snippet.iter().map(|s| (s.name.as_str(), s.text.as_str())).collect::<Vec<_>>(), [("Today's date", "{time}"), ("Today's date copy", "{time}"), ("Sig", "Cheers")]);
+        let edited = edit_table(&edited, "snippet", TableEdit::Remove(0)).unwrap();
+        assert_eq!(parse(&edited).unwrap().snippet.len(), 2);
+        assert!(edited.contains("# Quicklinks: search by name"), "comments elsewhere survive:\n{edited}");
+        let none = edit_table("", "quicklink", TableEdit::Add(&[("name", "X"), ("url", "https://x")])).unwrap();
+        assert_eq!(parse(&none).unwrap().quicklink[0].url, "https://x");
 
         let t = parse("[theme]\nmode = 'dark'\nselected = '#ff0000'").unwrap().theme;
         assert_eq!((t.mode.as_str(), t.selected.as_deref()), ("dark", Some("#ff0000")));

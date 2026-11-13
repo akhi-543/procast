@@ -37,8 +37,10 @@ pub enum Act {
     Run(String),
     Copy(String),
     Paste(String),
-    /// A clipboard history entry (paste, or delete from history).
+    /// Clipboard history entries, by `Entry::key`: paste, copy, pin (true) or unpin, delete.
     Clip(String),
+    CopyClip(String),
+    PinClip(String, bool),
     DeleteClip(String),
     /// Snippet template, expanded at paste time.
     Snippet(String),
@@ -83,7 +85,9 @@ impl Act {
             Act::Reveal(_) => "Show in Explorer",
             Act::Run(_) | Act::Script(_) => "Run",
             Act::Ask(_) => "Ask",
-            Act::Copy(_) => "Copy",
+            Act::Copy(_) | Act::CopyClip(_) => "Copy",
+            Act::PinClip(_, true) => "Pin Entry",
+            Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
             Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) => "Open",
@@ -199,7 +203,6 @@ impl Item {
             Act::Open(url) | Act::Run(url) => acts.push(Act::Copy(url.clone())),
             Act::Copy(text) => acts.push(Act::Paste(text.clone())),
             Act::Paste(text) => acts.push(Act::Copy(text.clone())),
-            Act::Clip(text) => acts.extend([Act::Copy(text.clone()), Act::DeleteClip(text.clone())]),
             Act::QuitApp(pid) => acts.push(Act::ForceQuit(*pid)),
             _ => {}
         }
@@ -490,32 +493,84 @@ fn clip_kind(text: &str) -> (&'static str, &'static str) {
     }
 }
 
-pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Matcher) -> Vec<Item> {
+/// "3 min ago".
+pub fn ago(at: u64) -> String {
+    match now().saturating_sub(at) {
+        a @ 0..60 => if a < 10 { "just now".into() } else { format!("{a} s ago") },
+        a @ 60..3600 => format!("{} min ago", a / 60),
+        a @ 3600..86400 => format!("{} h ago", a / 3600),
+        a => format!("{} d ago", a / 86400),
+    }
+}
+
+fn file_name(path: &str) -> &str {
+    path.trim_end_matches('\\').rsplit('\\').next().unwrap_or(path)
+}
+
+/// Clipboard history rows, pinned entries first. `thumb` gives an image entry's thumbnail by id.
+pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Matcher, thumb: &mut dyn FnMut(&str) -> Option<Arc<RenderImage>>) -> Vec<Item> {
+    use crate::clipboard::Kind;
     let now = now();
     let row = |e: &Entry| {
-        let first = e.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        let title: String = first.chars().take(120).collect();
-        let age = now.saturating_sub(e.at);
-        let when = match age {
-            0..60 => "just now".to_string(),
-            60..3600 => format!("{} min ago", age / 60),
-            3600..86400 => format!("{} h ago", age / 3600),
-            _ => format!("{} d ago", age / 86400),
+        let first = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(120).collect::<String>();
+        let (title, sub, icon, hay) = match &e.kind {
+            Kind::Text => {
+                let (glyph, kind) = clip_kind(&e.text);
+                (first(&e.text), kind.to_string(), Icon::Vector(glyph), e.text.chars().take(500).collect())
+            }
+            Kind::Image { id, w, h, .. } => {
+                let icon = thumb(id).map(Icon::Image).unwrap_or(Icon::Vector(g::PICTURE));
+                (format!("Image {w} × {h}"), first(&e.text), icon, format!("image picture {}", e.text.chars().take(2000).collect::<String>()))
+            }
+            Kind::Files(files) => {
+                let name = file_name(&files[0]).to_string();
+                let title = if files.len() > 1 { format!("{name} and {} more", files.len() - 1) } else { name };
+                let folder = files.len() == 1 && std::path::Path::new(&files[0]).is_dir();
+                let sub = if files.len() > 1 { format!("{} files", files.len()) } else if folder { "Folder".into() } else { "File".into() };
+                (title, sub, Icon::Vector(if folder { g::FOLDER } else { g::DOCUMENT }), format!("file {}", e.text))
+            }
         };
-        let (glyph, kind) = clip_kind(&e.text);
-        let mut it = Item::new(title, kind, Icon::Vector(glyph), Act::Clip(e.text.clone())).acc(when).sec(if age < 86400 { "Today" } else { "Earlier" }).tinted(Tint::Paste);
-        it.hay = e.text.chars().take(500).collect();
+        let key = e.key();
+        let section = if e.pinned { "Pinned" } else if now.saturating_sub(e.at) < 86400 { "Today" } else { "Earlier" };
+        let mut it = Item::new(title, sub, icon, Act::Clip(key.clone())).acc(ago(e.at)).sec(section).tinted(Tint::Paste).with_hay(hay);
+        it.extra = [Act::Clip(key.clone()), Act::CopyClip(key.clone()), Act::PinClip(key.clone(), !e.pinned)].map(|a| (a.label().to_string(), a)).to_vec();
+        if let Kind::Files(files) = &e.kind {
+            it.extra.push(("Show in Explorer".into(), Act::Reveal(files[0].clone())));
+        }
+        it.extra.push(("Delete Entry".into(), Act::DeleteClip(key)));
         it
     };
+    let ordered = entries.iter().filter(|e| e.pinned).chain(entries.iter().filter(|e| !e.pinned));
     let q = query.trim();
     if q.is_empty() {
-        return entries.iter().take(max).map(row).collect();
+        return ordered.take(max).map(row).collect();
     }
-    let rows: Vec<Item> = entries.iter().map(row).collect();
+    let rows: Vec<Item> = ordered.map(row).collect();
     fuzzy(q, rows.iter(), &Frecency::default(), matcher).into_iter().take(max).map(|(_, it)| it.clone()).collect()
 }
 
-pub fn emoji(query: &str, max: usize, matcher: &mut Matcher) -> Vec<Item> {
+/// `[emoji] skin_tone` for the emojis crate.
+fn skin_tone(name: &str) -> Option<emojis::SkinTone> {
+    use emojis::SkinTone as S;
+    Some(match name {
+        "light" => S::Light,
+        "medium_light" => S::MediumLight,
+        "medium" => S::Medium,
+        "medium_dark" => S::MediumDark,
+        "dark" => S::Dark,
+        _ => return None,
+    })
+}
+
+/// An emoji in the chosen skin tone, when it comes in tones.
+pub fn toned(e: &'static str, tone: &str) -> &'static str {
+    match (emojis::get(e), skin_tone(tone)) {
+        (Some(e), Some(t)) => e.with_skin_tone(t).map_or(e.as_str(), |x| x.as_str()),
+        _ => e,
+    }
+}
+
+pub fn emoji(query: &str, max: usize, matcher: &mut Matcher, cfg: &crate::config::Emoji) -> Vec<Item> {
     let row = |e: &'static emojis::Emoji| {
         use emojis::Group as G;
         let group = match e.group() {
@@ -529,21 +584,22 @@ pub fn emoji(query: &str, max: usize, matcher: &mut Matcher) -> Vec<Item> {
             G::Symbols => "Symbols",
             G::Flags => "Flags",
         };
-        let mut it = Item::new(e.name(), "", Icon::glyph(e.as_str()), Act::Paste(e.as_str().into())).acc(group);
+        let shown = toned(e.as_str(), &cfg.skin_tone);
+        let act = if cfg.action == "copy" { Act::Copy(shown.into()) } else { Act::Paste(shown.into()) };
+        let mut it = Item::new(e.name(), "", Icon::glyph(shown), act).acc(group);
         it.hay = std::iter::once(e.name()).chain(e.shortcodes()).collect::<Vec<_>>().join(" ");
         it
     };
+    // The tone variants have their own entries; the chosen tone is applied to the base ones.
+    // ponytail: Segoe UI Emoji draws up to Emoji 15.1; newer ones would be empty boxes. Raise when Windows ships them.
+    let drawn = |e: &emojis::Emoji| e.unicode_version() <= emojis::UnicodeVersion::new(15, 1);
+    let all = || emojis::iter().filter(move |e| drawn(e) && e.skin_tone().is_none_or(|t| t == emojis::SkinTone::Default));
     let q = query.trim();
     if q.is_empty() {
-        return emojis::iter().take(max).map(|e| { let it = row(e); let s = it.accessory.clone(); it.sec(s) }).collect();
+        return all().take(max).map(|e| { let it = row(e); let s = it.accessory.clone(); it.sec(s) }).collect();
     }
-    let rows: Vec<Item> = emojis::iter().map(row).collect();
+    let rows: Vec<Item> = all().map(row).collect();
     fuzzy(q, rows.iter(), &Frecency::default(), matcher).into_iter().take(max).map(|(_, it)| it.clone()).collect()
-}
-
-/// Fills snippet placeholders.
-pub fn expand(template: &str, clipboard: &str, (date, time): (String, String)) -> String {
-    template.replace("{clipboard}", clipboard).replace("{date}", &date).replace("{time}", &time)
 }
 
 struct Deadline(Instant);
@@ -590,6 +646,17 @@ fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "cargo test bench_emoji_search -- --ignored --nocapture"]
+    fn bench_emoji_search() {
+        let (mut m, e) = (Matcher::new(nucleo_matcher::Config::DEFAULT), crate::config::Emoji::default());
+        for q in ["", "s", "sm", "smi", "smile", "thumbs up"] {
+            let t = Instant::now();
+            let n = (0..20).map(|_| emoji(q, 400, &mut m, &e).len()).last().unwrap();
+            println!("{q:>10}: {n} rows, {:.2?} each", t.elapsed() / 20);
+        }
+    }
 
     #[test]
     fn destructive_actions_are_the_ones_that_remove_or_end_something() {
@@ -663,15 +730,25 @@ mod tests {
         assert_eq!(root("github", &cat, &cfg, &frec, &mut m)[0].act, Act::Fill("gh ".into()));
         assert_eq!(root("> cmd /k dir", &cat, &cfg, &frec, &mut m)[0].act, Act::Run("cmd /k dir".into()));
         assert_eq!(root(";sig", &cat, &cfg, &frec, &mut m)[0].title, "Signature");
-        assert_eq!(expand("Cheers, {clipboard} {date}", "Ann", ("2026-11-03".into(), "10:00".into())), "Cheers, Ann 2026-11-03");
 
-        let clips = [Entry { text: "fn main() {}".into(), at: now() }, Entry { text: "hello world".into(), at: now() - 7200 }];
-        let c = clipboard("hel", &clips, 5, &mut m);
-        assert_eq!(c[0].act, Act::Clip("hello world".into()));
-        assert_eq!(c[0].actions().last().map(|a| &a.1), Some(&Act::DeleteClip("hello world".into())));
-        assert_eq!(clipboard("", &clips, 5, &mut m)[1].accessory, "2 h ago");
+        use crate::clipboard::Kind;
+        let mut clips = vec![Entry::text("fn main() {}", now()), Entry::text("hello world", now() - 7200)];
+        clips.push(Entry { kind: Kind::Image { id: "ab".into(), w: 640, h: 480, bytes: 9 }, ..Entry::text("Invoice 42", now() - 90_000) });
+        clips.push(Entry { kind: Kind::Files(vec![r"C:\a\report.pdf".into(), r"C:\a\b.txt".into()]), pinned: true, ..Entry::text("C:\\a\\report.pdf\nC:\\a\\b.txt", now()) });
+        let mut none = |_: &str| None;
+        let c = clipboard("hel", &clips, 5, &mut m, &mut none);
+        assert_eq!(c[0].act, Act::Clip("text:hello world".into()));
+        assert_eq!(c[0].actions().last().map(|a| &a.1), Some(&Act::DeleteClip("text:hello world".into())));
+        let all = clipboard("", &clips, 5, &mut m, &mut none);
+        assert_eq!((all[0].title.as_str(), all[0].section.as_deref()), ("report.pdf and 1 more", Some("Pinned")), "pinned first");
+        assert!(all[0].actions().iter().any(|a| a.1 == Act::PinClip(clips[3].key(), false)), "pinned entries offer Unpin");
+        assert_eq!(all[2].accessory, "2 h ago");
+        assert_eq!(clipboard("invoice", &clips, 5, &mut m, &mut none)[0].title, "Image 640 × 480", "text found in an image is searchable");
 
-        assert_eq!(emoji("thumbs up", 5, &mut m)[0].act, Act::Paste("👍".into()));
+        let e = crate::config::Emoji::default();
+        assert_eq!(emoji("thumbs up", 5, &mut m, &e)[0].act, Act::Paste("👍".into()));
+        let e = crate::config::Emoji { action: "copy".into(), skin_tone: "dark".into(), ..e };
+        assert_eq!(emoji("thumbs up", 5, &mut m, &e)[0].act, Act::Copy("👍🏿".into()), "copy, in the chosen skin tone");
     }
 
     #[test]

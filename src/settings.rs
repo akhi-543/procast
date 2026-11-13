@@ -35,6 +35,48 @@ enum Kind {
     Filter,
     /// Shortcuts: one item (index into `Settings::items`); its input edits the alias.
     Command(usize),
+    /// Adds a `[[snippet]]` / `[[quicklink]]` table.
+    TableAdd(&'static str),
+    /// Copy and Delete for one table of that list.
+    TableItem(&'static str, usize),
+}
+
+/// The fields a `[[list]]` table is edited by, with their labels and help.
+fn table_fields(list: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    match list {
+        "snippet" => &[
+            ("name", "Name", "What you search for in procast."),
+            ("keyword", "Keyword", "Typed in any app, it turns into the text, e.g. ;sig. Empty: search only."),
+            ("text", "Text", "\\n for a new line. {clipboard} {selection} {date} {time} {cursor} {argument name=\"To\"}"),
+        ],
+        _ => &[
+            ("name", "Name", "What you search for in procast."),
+            ("keyword", "Keyword", "Type it, a space, then your search, e.g. gh rust."),
+            ("url", "Link", "{query} becomes what you type, e.g. https://github.com/search?q={query}"),
+        ],
+    }
+}
+
+/// A snippet's text edits on one line, with "\n" for its line breaks.
+fn multiline(path: &[String]) -> bool {
+    matches!(path, [list, _, field] if list == "snippet" && field == "text")
+}
+
+/// The Snippets / Quicklinks page: add, then each table's fields, Copy and Delete.
+fn table_rows(list: &'static str, text: &str) -> Vec<Row> {
+    let doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().ok();
+    let count = doc.as_ref().and_then(|d| d.get(list)).and_then(|t| t.as_array_of_tables()).map_or(0, |t| t.len());
+    let what = if list == "snippet" { "snippet" } else { "quicklink" };
+    let mut out = vec![Row { label: format!("Add a {what}"), help: String::new(), path: vec![], kind: Kind::TableAdd(list), group: format!("{}s", choice_label(what)) }];
+    for i in 0..count {
+        let name = config::shown_value(text, &[list.into(), i.to_string(), "name".into()]);
+        let group = format!("{} {} · {}", choice_label(what), i + 1, if name.is_empty() { "unnamed" } else { &name });
+        for (field, label, help) in table_fields(list) {
+            out.push(Row { label: (*label).into(), help: (*help).into(), path: vec![list.into(), i.to_string(), (*field).into()], kind: Kind::Text, group: group.clone() });
+        }
+        out.push(Row { label: "Copy or delete".into(), help: "Ctrl+D copies it, Delete removes it.".into(), path: vec![], kind: Kind::TableItem(list, i), group });
+    }
+    out
 }
 
 const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts"];
@@ -61,20 +103,33 @@ struct Row {
     path: Vec<String>,
     kind: Kind,
     /// Heading of the card the row sits in; consecutive rows with the same group share one.
-    group: &'static str,
+    group: String,
 }
 
-const SECTIONS: [&str; 9] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Files", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 12] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Theme", "Extensions", "Advanced"];
 /// The sidebar icon of each section, in `SECTIONS` order.
-const SECTION_ICONS: [&str; 9] = [design::g::SETTING, design::g::SEARCH, design::g::KEYBOARD, design::g::APP, design::g::PASTE, design::g::FOLDER, design::g::PERSONALIZE, design::g::PUZZLE, design::g::CODE];
+const SECTION_ICONS: [&str; 12] = [
+    design::g::SETTING,
+    design::g::SEARCH,
+    design::g::KEYBOARD,
+    design::g::APP,
+    design::g::PASTE,
+    design::g::EDIT,
+    design::g::LINK,
+    design::g::EMOJI,
+    design::g::FOLDER,
+    design::g::PERSONALIZE,
+    design::g::PUZZLE,
+    design::g::CODE,
+];
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
-    Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: "" }
+    Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: String::new() }
 }
 
 /// Rows under card headings.
 fn groups(list: Vec<(&'static str, Vec<Row>)>) -> Vec<Row> {
-    list.into_iter().flat_map(|(g, rows)| rows.into_iter().map(move |r| Row { group: g, ..r })).collect()
+    list.into_iter().flat_map(|(g, rows)| rows.into_iter().map(move |r| Row { group: g.into(), ..r })).collect()
 }
 
 /// How a choice value reads on screen.
@@ -85,7 +140,7 @@ fn choice_label(v: &str) -> String {
         "primary" => "Main screen".into(),
         "back" => "Go back".into(),
         "close" => "Close".into(),
-        "default" => "Arrows".into(),
+        "default" => "Default".into(),
         "immediately" => "Now".into(),
         "system" => "System".into(),
         "expanded" => "Full list".into(),
@@ -98,15 +153,26 @@ fn choice_label(v: &str) -> String {
         "launch" => "New window".into(),
         "focus" => "Switch to it".into(),
         "toggle" => "Switch or hide".into(),
+        "count" => "By count".into(),
+        "1h" => "1 hour".into(),
+        "1d" => "1 day".into(),
+        "7d" => "1 week".into(),
+        "30d" => "1 month".into(),
+        "90d" => "3 months".into(),
+        "180d" => "6 months".into(),
+        "365d" => "1 year".into(),
+        "unlimited" => "Forever".into(),
+        "delimiter" => "After a space".into(),
+        "delimiter_discard" => "Space dropped".into(),
         s if s.ends_with('s') && s[..s.len() - 1].parse::<u32>().is_ok() => format!("{} s", &s[..s.len() - 1]),
         s => {
             let mut c = s.chars();
-            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default().replace('_', " ")
         }
     }
 }
 
-fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
+fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
     match SECTIONS[section] {
         "General" => groups(vec![
             (
@@ -120,7 +186,6 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 "Hotkeys",
                 vec![
                     row("Open procast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
-                    row("Emoji picker", "emoji.hotkey", Kind::Hotkey, "Opens emoji search straight away. Other commands get hotkeys under Shortcuts."),
                     row("Double-tap to open", "keyboard.double_tap", Kind::Choice(crate::keys::TAP_KEYS), "Press this key twice quickly to open procast, besides the hotkey above."),
                     row("Hyper key", "keyboard.hyper", Kind::Choice(crate::keys::HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
                 ],
@@ -208,13 +273,51 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                 ],
             ),
         ]),
-        "Clipboard" => groups(vec![(
-            "Clipboard history",
+        "Clipboard" => groups(vec![
+            (
+                "Clipboard history",
+                vec![
+                    row("Keep clipboard history", "clipboard.enabled", Kind::Bool, "Remember text, images and files you copy. Stored encrypted, readable only by your Windows account."),
+                    row("Hotkey", "clipboard.hotkey", Kind::Hotkey, "Opens clipboard history straight away."),
+                    row("Never record from", "clipboard.ignore_apps", Kind::List, "Program file names, e.g. keepass.exe. Copies made in them are not saved."),
+                ],
+            ),
+            (
+                "Keeping",
+                vec![
+                    row("Keep entries for", "clipboard.keep", Kind::Choice(crate::clipboard::KEEP), "How long copies stay. By count keeps the newest ones below. Pinned entries (Ctrl+K → Pin Entry) always stay; Forever grows on disk."),
+                    row("Entries kept", "clipboard.history", Kind::Number, "With By count: the oldest entries are dropped beyond this many, e.g. 500."),
+                ],
+            ),
+            (
+                "Images",
+                vec![row("Find text in images", "clipboard.ocr", Kind::Bool, "Read the text in copied pictures with Windows' own text recognition (offline), so search finds them.")],
+            ),
+        ]),
+        "Snippets" => {
+            let mut r = groups(vec![(
+                "Typing anywhere",
+                vec![
+                    row("Expand keywords", "snippets.expand", Kind::Bool, "Typing a snippet's keyword in any app replaces it with the snippet."),
+                    row("Expand", "snippets.trigger", Kind::Choice(&["immediately", "delimiter", "delimiter_discard"]), "Now: as the keyword's last letter goes in. After a space: once you type a space or punctuation after it, which stays or is dropped."),
+                    row("Inside words", "snippets.within_words", Kind::Bool, "Also expand when the keyword ends a longer word (my;sig)."),
+                    row("Speed", "snippets.speed", Kind::Choice(&["instant", "quick", "default", "delayed", "extended"]), "A slower setting gives slow apps time before the text goes in."),
+                    row("Sound", "snippets.sound", Kind::Choice(&["off", "default", "asterisk", "exclamation", "question"]), "A Windows sound when a snippet goes in."),
+                    row("Not in these apps", "snippets.ignore_apps", Kind::List, "Program file names, e.g. code.exe. Keywords typed there stay as they are."),
+                ],
+            )]);
+            r.extend(table_rows("snippet", text));
+            r
+        }
+        "Quicklinks" => table_rows("quicklink", text),
+        "Emoji" => groups(vec![(
+            "Emoji picker",
             vec![
-                row("Keep clipboard history", "clipboard.enabled", Kind::Bool, "Remember text you copy. Stored encrypted, readable only by your Windows account."),
-                row("Entries kept", "clipboard.history", Kind::Number, "The oldest entries are dropped beyond this many, e.g. 500."),
-                row("Hotkey", "clipboard.hotkey", Kind::Hotkey, "Opens clipboard history straight away."),
-                row("Never record from", "clipboard.ignore_apps", Kind::List, "Program file names, e.g. keepass.exe. Copies made in them are not saved."),
+                row("Hotkey", "emoji.hotkey", Kind::Hotkey, "Opens the emoji picker straight away."),
+                row("Columns", "emoji.columns", Kind::Number, "Emoji per row in the picker, 4 to 16."),
+                row("Enter", "emoji.action", Kind::Choice(&["paste", "copy"]), "Paste into the app you came from, or only copy."),
+                row("Skin tone", "emoji.skin_tone", Kind::Choice(config::SKIN_TONES), "Used for every emoji that comes in skin tones."),
+                row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
             ],
         )]),
         "Files" => groups(vec![
@@ -281,7 +384,7 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
                         help,
                         path: vec!["extension".into(), x.name.clone(), p.name.clone()],
                         kind,
-                        group: "Extension preferences",
+                        group: "Extension preferences".into(),
                     });
                 }
             }
@@ -289,8 +392,8 @@ fn rows(section: usize, exts: &[ext::Extension]) -> Vec<Row> {
         }
         "Shortcuts" => vec![],
         _ => vec![
-            Row { label: "Open config.toml".into(), help: format!("Every setting in one text file, with comments: {}. Saved changes apply within 2 seconds.", config::path().display()), path: vec![], kind: Kind::Open("config.toml"), group: "Files" },
-            Row { label: "Open extensions log".into(), help: "Errors and console output from extensions, plus file index status.".into(), path: vec![], kind: Kind::Open("extensions.log"), group: "Files" },
+            Row { label: "Open config.toml".into(), help: format!("Every setting in one text file, with comments: {}. Saved changes apply within 2 seconds.", config::path().display()), path: vec![], kind: Kind::Open("config.toml"), group: "Files".into() },
+            Row { label: "Open extensions log".into(), help: "Errors and console output from extensions, plus file index status.".into(), path: vec![], kind: Kind::Open("extensions.log"), group: "Files".into() },
         ],
     }
 }
@@ -381,14 +484,14 @@ impl Settings {
         if SECTIONS[self.section] == "Shortcuts" {
             return self.shortcut_rows();
         }
-        rows(self.section, &self.exts)
+        rows(self.section, &self.exts, &self.text)
     }
 
     /// The Shortcuts table: category and filter, then every matching item.
     fn shortcut_rows(&self) -> Vec<Row> {
         let mut out = vec![
-            Row { label: "Show".into(), help: "Pick a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: "" },
-            Row { label: "Find".into(), help: "Type part of a name or alias.".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter, group: "" },
+            Row { label: "Show".into(), help: "Pick a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: String::new() },
+            Row { label: "Find".into(), help: "Type part of a name or alias.".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter, group: String::new() },
         ];
         let want = CATEGORIES[self.category];
         let words: Vec<String> = self.filter.split_whitespace().map(str::to_lowercase).collect();
@@ -396,7 +499,7 @@ impl Settings {
             let hay = format!("{} {} {}", it.title, it.subtitle, it.alias).to_lowercase();
             if (want == "All" || category(it) == want) && words.iter().all(|w| hay.contains(w.as_str())) {
                 let help = [category(it).trim_end_matches('s'), &it.subtitle].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: if self.category == 0 { "Everything" } else { CATEGORIES[self.category] } });
+                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: if self.category == 0 { "Everything" } else { CATEGORIES[self.category] }.into() });
             }
         }
         out
@@ -411,6 +514,7 @@ impl Settings {
                     Kind::Command(i) => self.launcher.aliases.get(&key_of(&self.items[i])).cloned().unwrap_or_default(),
                     // A list's input is its Add field.
                     Kind::List => String::new(),
+                    _ if multiline(&r.path) => config::shown_value(&self.text, &r.path).replace('\n', "\\n"),
                     _ => config::shown_value(&self.text, &r.path),
                 };
                 let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
@@ -460,7 +564,10 @@ impl Settings {
         let rows = self.rows();
         let Some(r) = rows.get(self.selected).filter(|r| r.kind != Kind::Filter) else { return };
         let Some(input) = self.inputs.get(&r.path.join(".")).cloned() else { return };
-        let typed = input.read(cx).as_str().trim().to_string();
+        let mut typed = input.read(cx).as_str().trim().to_string();
+        if multiline(&r.path) {
+            typed = typed.replace("\\n", "\n");
+        }
         if r.kind == Kind::List {
             // The Add field: append what was typed ("a; b" adds both).
             if typed.is_empty() {
@@ -492,6 +599,39 @@ impl Settings {
         };
         let path = r.path.clone();
         self.save(&path, value, cx);
+    }
+
+    /// Adds, copies or deletes a snippet or quicklink, then selects what changed.
+    fn edit_table(&mut self, list: &'static str, edit: config::TableEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let current = std::fs::read_to_string(config::path()).unwrap_or_else(|_| self.text.clone());
+        let (verb, removed) = match edit {
+            config::TableEdit::Add(_) => ("added", None),
+            config::TableEdit::Duplicate(_) => ("copied", None),
+            config::TableEdit::Remove(i) => ("deleted", Some(i)),
+        };
+        let text = match config::edit_table(&current, list, edit).and_then(|t| config::parse(&t).map(|_| t)) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = Some((true, e));
+                return cx.notify();
+            }
+        };
+        if let Err(e) = std::fs::write(config::path(), &text) {
+            self.status = Some((true, format!("Could not write config.toml: {e}")));
+            return cx.notify();
+        }
+        self.text = text;
+        self.build_inputs(cx);
+        let rows = self.rows();
+        let name_rows: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.path.len() == 3 && r.path[2] == "name").map(|(i, _)| i).collect();
+        // A new one is last; after a delete, the one that took its place (or the new last).
+        let at = match removed {
+            None => name_rows.last(),
+            Some(i) => name_rows.get(i).or(name_rows.last()),
+        };
+        self.selected = at.copied().unwrap_or(0);
+        self.status = Some((false, format!("{} {verb}", choice_label(list))));
+        self.focus_row(window, cx);
     }
 
     /// A list setting's entries (the default when the file doesn't set it).
@@ -573,7 +713,11 @@ impl Settings {
                 self.category = (self.category + 1) % CATEGORIES.len();
                 cx.notify();
             }
-            Kind::Filter | Kind::Keys => {}
+            Kind::TableAdd(list) => {
+                let fields: &[(&str, &str)] = if *list == "snippet" { &[("name", "New snippet"), ("keyword", ""), ("text", "")] } else { &[("name", "New quicklink"), ("keyword", ""), ("url", "https://www.google.com/search?q={query}")] };
+                self.edit_table(list, config::TableEdit::Add(fields), window, cx);
+            }
+            Kind::Filter | Kind::Keys | Kind::TableItem(..) => {}
         }
     }
 
@@ -617,19 +761,18 @@ impl Settings {
         self.launcher.is_disabled(&key_of(&self.items[i]))
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.rows();
         let Some(r) = rows.get(self.selected) else { return };
         let k = &ev.keystroke;
         if !self.recording {
-            if let Kind::Command(i) = r.kind
-                && k.modifiers.control
-                && k.key == "d"
-            {
-                self.toggle_enabled(i, cx);
-                cx.stop_propagation();
+            match r.kind {
+                Kind::Command(i) if k.modifiers.control && k.key == "d" => self.toggle_enabled(i, cx),
+                Kind::TableItem(list, i) if k.modifiers.control && k.key == "d" => self.edit_table(list, config::TableEdit::Duplicate(i), window, cx),
+                Kind::TableItem(list, i) if k.key == "delete" && !k.modifiers.modified() => self.edit_table(list, config::TableEdit::Remove(i), window, cx),
+                _ => return,
             }
-            return;
+            return cx.stop_propagation();
         }
         let path = self.hotkey_path(r);
         if matches!(k.key.as_str(), "backspace" | "delete") && !k.modifiers.modified() {
@@ -768,6 +911,22 @@ impl Settings {
             }
             Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
+            Kind::TableAdd(_) => design::button("Add", design::Button::Quiet, on, t).into_any_element(),
+            &Kind::TableItem(list, i) => {
+                let (copy, delete) = (me.clone(), me.clone());
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(design::button("Copy", design::Button::Quiet, false, t).id(SharedString::from(format!("copy-{list}-{i}"))).on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        drop(copy.update(cx, |this, cx| this.edit_table(list, config::TableEdit::Duplicate(i), window, cx)))
+                    }))
+                    .child(design::button("Delete", design::Button::Danger, false, t).id(SharedString::from(format!("delete-{list}-{i}"))).on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        drop(delete.update(cx, |this, cx| this.edit_table(list, config::TableEdit::Remove(i), window, cx)))
+                    }))
+                    .into_any_element()
+            }
             Kind::Category => {
                 let me = me.clone();
                 choices(CATEGORIES, CATEGORIES[self.category], stacked(&r.kind), t, "category", move |v, cx| {
@@ -829,7 +988,7 @@ impl Settings {
         let mut out = vec![];
         let mut i = 0;
         while i < rows.len() {
-            let (group, start) = (rows[i].group, i);
+            let (group, start) = (rows[i].group.clone(), i);
             while i < rows.len() && rows[i].group == group {
                 i += 1;
             }
@@ -838,7 +997,7 @@ impl Settings {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child(group)))
+                    .when(!group.is_empty(), |d| d.child(div().px(px(4.)).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child(group.clone())))
                     .child(
                         div()
                             .flex()
@@ -949,7 +1108,7 @@ impl Render for Settings {
             .text_color(t.text)
             .key_context("Settings")
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.on_key(ev, cx)))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.select(this.selected + 1, window, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| this.select(this.selected.saturating_sub(1), window, cx)))
             .on_action(cx.listener(|this, _: &NextSection, window, cx| this.set_section(this.section + 1, window, cx)))
@@ -1147,8 +1306,8 @@ mod tests {
 
     #[test]
     fn long_choice_rows_stack() {
-        let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[])).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
-        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey"]);
+        let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[], "")).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
+        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone"]);
         assert!(stacked(&Kind::Category));
     }
 }
