@@ -204,11 +204,15 @@ pub fn round_corners(hwnd: HWND) {
     }
 }
 
-/// A dark or light caption bar (DWMWA_USE_IMMERSIVE_DARK_MODE), so it follows procast's mode
-/// rather than Windows'.
-pub fn dark_title_bar(hwnd: HWND, dark: bool) {
-    let v = dark as i32;
-    unsafe { _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &v as *const _ as _, std::mem::size_of::<i32>() as u32) };
+/// The caption bar in procast's theme, not Windows': `bg` behind `text` (COLORREFs, 0x00BBGGRR).
+/// The colours need Windows 11; on Windows 10 only the dark/light switch applies.
+pub fn title_bar(hwnd: HWND, dark: bool, bg: u32, text: u32) {
+    const DWMWA_CAPTION_COLOR: i32 = 35;
+    const DWMWA_TEXT_COLOR: i32 = 36;
+    let set = |attr, v: u32| unsafe { _ = DwmSetWindowAttribute(hwnd, attr, &v as *const _ as _, 4) };
+    set(DWMWA_USE_IMMERSIVE_DARK_MODE, dark as u32);
+    set(windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_CAPTION_COLOR), bg);
+    set(windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_TEXT_COLOR), text);
 }
 
 /// Cloaked windows keep their swap chain, so un-cloaking shows the next frame

@@ -336,8 +336,8 @@ pub struct Settings {
     status: Option<(bool, String)>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
-    /// The caption bar's mode as last set, with Windows' appearance then, so DWM is called only when either changes.
-    dark_caption: Option<(bool, gpui::WindowAppearance)>,
+    /// The caption bar's colours as last set, with Windows' appearance then, so DWM is called only when either changes.
+    dark_caption: Option<(u32, u32, gpui::WindowAppearance)>,
     /// Kept apart from `_subs`, which `build_inputs` clears on every page change.
     _appearance: Subscription,
 }
@@ -914,9 +914,14 @@ impl Render for Settings {
         let t = design::Tokens::from_theme(&theme, window);
         // Every mode change re-renders (a save, or the Windows theme through `_appearance`), so this covers them all.
         // Keyed on Windows' appearance too: gpui resets the caption to it when that changes.
-        let caption = (t.dark, window.appearance());
+        let colorref = |c: gpui::Hsla| {
+            let c = gpui::hsla_to_rgba(c);
+            let b = |v: f32| (v * 255.).round() as u32;
+            b(c.red) | b(c.green) << 8 | b(c.blue) << 16
+        };
+        let caption = (colorref(t.bg_solid), colorref(t.text), window.appearance());
         if self.dark_caption != Some(caption) {
-            crate::win::dark_title_bar(crate::win::hwnd(window), t.dark);
+            crate::win::title_bar(crate::win::hwnd(window), t.dark, caption.0, caption.1);
             self.dark_caption = Some(caption);
         }
         design::scale_settings();
