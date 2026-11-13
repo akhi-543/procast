@@ -14,3 +14,13 @@ __pycache__/
 
 # Screenshots of third-party apps used as design reference (not redistributed)
 docs/design/reference/
+
+# Local-only: experiments, test harnesses, demo pages and screenshots (kept on disk, not published)
+/spikes/
+/exthost/smoke.mjs
+/docs/design/before/
+/docs/design/after/
+/docs/design/system/components/*/preview.html
+
+# Tool scratch
+.superpowers/
