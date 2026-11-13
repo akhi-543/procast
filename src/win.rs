@@ -342,7 +342,7 @@ pub fn scan_apps() -> Vec<App> {
             }
         }
     }
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by_key(|a| a.name.to_lowercase());
     apps.dedup_by(|a, b| a.name == b.name && a.id == b.id);
     apps
 }
@@ -517,16 +517,15 @@ pub fn watch_dir(dir: &Path, recursive: bool, mut on_change: impl FnMut(Vec<Path
             }
             let mut changes = vec![];
             let mut at = 0usize;
-            while got > 0 {
+            let mut more = got > 0;
+            while more {
                 let rec = &*((buf.as_ptr() as *const u8).add(at) as *const FILE_NOTIFY_INFORMATION);
                 let name = std::slice::from_raw_parts(rec.FileName.as_ptr(), rec.FileNameLength as usize / 2);
                 // 1 added, 2 removed, 4 renamed from, 5 renamed to (3, modified, can't occur with these filters).
                 if rec.Action.0 != 3 {
                     changes.push(PathBuf::from(String::from_utf16_lossy(name)));
                 }
-                if rec.NextEntryOffset == 0 {
-                    break;
-                }
+                more = rec.NextEntryOffset != 0;
                 at += rec.NextEntryOffset as usize;
             }
             if got > 0 && changes.is_empty() {

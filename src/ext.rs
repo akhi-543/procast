@@ -174,7 +174,7 @@ pub fn read_store(repo: &Path) -> Vec<StoreEntry> {
             })
         })
         .collect();
-    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    out.sort_by_key(|a| a.title.to_lowercase());
     out
 }
 
@@ -303,8 +303,11 @@ pub struct View {
     pub metadata: Vec<(String, String)>,
     pub actions: Vec<ExtAction>,
     pub fields: Vec<Field>,
-    pub dropdown: Option<(Vec<(String, String)>, String, Option<String>)>,
+    pub dropdown: Option<Dropdown>,
 }
+
+/// A search-bar dropdown: options as (value, title), the current value, and the field it sets.
+pub type Dropdown = (Vec<(String, String)>, String, Option<String>);
 
 fn s(v: &Value) -> String {
     match v {

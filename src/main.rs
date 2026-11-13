@@ -2403,7 +2403,7 @@ impl Launcher {
     fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
         let cols = self.cfg.emoji.columns.clamp(4, 16);
         let me = cx.weak_entity();
-        let (selected, t) = (self.selected, t.clone());
+        let (selected, t) = (self.selected, *t);
         let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
         let rows = Rc::new(grid_rows(&self.items, cols));
         // ponytail: rows are laid out only while on screen; 400 emoji cells per keystroke made typing lag.
@@ -3175,7 +3175,7 @@ fn main() {
                         this.reload(cx);
                     });
                 }
-                if ticks % 5 == 0 {
+                if ticks.is_multiple_of(5) {
                     let _ = tick_tx.unbounded_send(Msg::Tick);
                 }
                 ticks += 1;

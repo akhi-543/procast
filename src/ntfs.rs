@@ -791,8 +791,7 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
             let mut buf = vec![0u8; 4 << 20];
             let mut have = 0;
             let mut last_note = Instant::now();
-            loop {
-                let Ok(n) = pipe.read(&mut buf[have..]) else { break };
+            while let Ok(n) = pipe.read(&mut buf[have..]) {
                 if n == 0 {
                     break;
                 }
