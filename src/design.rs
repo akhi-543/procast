@@ -116,8 +116,10 @@ pub mod r {
     pub const MD: f32 = 8.;
     /// Cards, popovers, dialogs.
     pub const LG: f32 = 12.;
-    /// The launcher window on glass: 16 outside, an 8 px inset, 8 on the rows.
-    pub const XL: f32 = 16.;
+    /// The launcher window. The spec's r-xl is 16, but Windows only anti-aliases its own
+    /// corner (DWM, 8 px at any interface size); a 16 px window region is jagged. Not scaled:
+    /// use `gpui::px`, not `px`.
+    pub const WINDOW: f32 = 8.;
 }
 
 /// Glyph sizes.
@@ -863,16 +865,16 @@ fn over(top: Hsla, under: Hsla) -> Hsla {
     gpui::rgb_to_hsla(gpui::Rgba::new(mix(t.red, u.red), mix(t.green, u.green), mix(t.blue, u.blue), 1.))
 }
 
-/// The launcher body: `t.body()` in an `r::XL` shell. On glass it gets a diagonal sheen, the
-/// gradient rim border and `rim` thickness; without glass, a solid rim. No `depth` shadow: the
-/// shell fills the window and the rounded window region clips outside it, so an outer shadow
-/// could only darken the glass from below.
+/// The launcher body: `t.body()` in an `r::WINDOW` shell, the corner DWM cuts the window to.
+/// On glass it gets a diagonal sheen, the gradient rim border and `rim` thickness; without
+/// glass, a solid rim. No `depth` shadow: the shell fills the window, so an outer shadow could
+/// only darken the glass from below; DWM's own shadow lifts the window.
 /// Children go inside; the sheen sits beneath them.
 pub fn glass_window(t: &Tokens) -> Div {
-    let shell = div().relative().flex().flex_col().overflow_hidden().rounded(px(r::XL)).bg(t.body()).text_color(t.text).border_1();
+    let shell = div().relative().flex().flex_col().overflow_hidden().rounded(gpui::px(r::WINDOW)).bg(t.body()).text_color(t.text).border_1();
     if t.glass {
         let sheen = linear_gradient(135., linear_color_stop(t.edge_dim, 0.), linear_color_stop(alpha(t.edge_dim, 0.), 0.42));
-        shell.border_color(rim_border(t)).shadow(rim(t)).child(div().absolute().inset_0().rounded(px(r::XL - 1.)).bg(sheen))
+        shell.border_color(rim_border(t)).shadow(rim(t)).child(div().absolute().inset_0().rounded(gpui::px(r::WINDOW - 1.)).bg(sheen))
     } else {
         shell.border_color(t.border).shadow(rim(t))
     }
@@ -888,7 +890,7 @@ pub fn elevated(t: &Tokens) -> Div {
 /// It follows the window's inner corner (gpui clips to rectangles, so `overflow_hidden` on the
 /// body does not round its children).
 pub fn scrim(color: Hsla) -> Div {
-    div().absolute().inset_0().rounded(px(r::XL - 1.)).flex().items_center().justify_center().bg(color)
+    div().absolute().inset_0().rounded(gpui::px(r::WINDOW - 1.)).flex().items_center().justify_center().bg(color)
 }
 
 /// The leading mark of the root search bar: the search icon in the accent.

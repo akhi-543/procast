@@ -13,8 +13,8 @@ use windows::{
         Graphics::{
             Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
-                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateRoundRectRgn, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
-                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SetWindowRgn,
+                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
+                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
             },
         },
         Storage::FileSystem::{
@@ -190,44 +190,17 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
-/// Windows 11 rounded corners (no-op on Windows 10). DWM rounds to 8 px; kept as the fallback
-/// and for the system's own shadow/animation, while `round_region` cuts the window to r-xl.
+/// Windows 11 rounded corners (no-op on Windows 10). DWM rounds to 8 px (`design::r::WINDOW`),
+/// anti-aliased, and clips the acrylic with it; a `SetWindowRgn` at any other radius is jagged.
 pub fn round_corners(hwnd: HWND) {
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_ROUND: i32 = 2;
-    // DWM draws its 1 px border at its own 8 px radius on top of the 16 px region, a second
-    // curve at each corner; the glass shell draws the rim itself.
+    // No DWM border: the glass shell draws the rim itself.
     const DWMWA_BORDER_COLOR: u32 = 34;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
     unsafe {
         _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_WINDOW_CORNER_PREFERENCE as i32), &DWMWCP_ROUND as *const _ as _, 4);
         _ = DwmSetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(DWMWA_BORDER_COLOR as i32), &DWMWA_COLOR_NONE as *const _ as _, 4);
-    }
-}
-
-/// Clips the launcher to the r-xl corner radius (16 x launcher scale, in physical pixels), so no
-/// bare backdrop shows between the body's corners and DWM's 8 px ones. Call after every
-/// `SetWindowPos` that may change the size. The system owns the region once it is set.
-/// To disable: set `ROUND_REGION` to false (DWM's corners remain, with a ~3 px wedge on acrylic).
-fn round_region(hwnd: HWND) {
-    const ROUND_REGION: bool = true;
-    if !ROUND_REGION {
-        return;
-    }
-    unsafe {
-        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let (mut dx, mut dy) = (96, 96);
-        let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-        let mut r = RECT::default();
-        if GetWindowRect(hwnd, &mut r).is_err() {
-            return;
-        }
-        let diameter = (2. * crate::design::r::XL * crate::design::launcher_scale() * dx as f32 / 96.).round() as i32;
-        // The right and bottom edges are exclusive in a region: one more than the size.
-        let rgn = CreateRoundRectRgn(0, 0, r.right - r.left + 1, r.bottom - r.top + 1, diameter, diameter);
-        if SetWindowRgn(hwnd, Some(rgn), true) == 0 {
-            let _ = DeleteObject(rgn.into());
-        }
     }
 }
 
@@ -313,7 +286,6 @@ pub fn place(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
-    round_region(hwnd);
 }
 
 /// Changes only the window's height (logical px), keeping its top-left corner.
@@ -329,7 +301,6 @@ pub fn resize(hwnd: HWND, height: f32) {
             let _ = SetWindowPos(hwnd, None, 0, 0, cur.right - cur.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
-    round_region(hwnd);
 }
 
 // ---- apps ---------------------------------------------------------------------------
