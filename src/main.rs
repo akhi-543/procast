@@ -1635,7 +1635,8 @@ impl Launcher {
         let bounds = Bounds::centered(None, size(px(880.), px(620.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(gpui::TitlebarOptions { title: Some("procast Settings".into()), ..Default::default() }),
+            // Hidden: Settings draws its own caption bar in the theme (`settings::title_bar`).
+            titlebar: Some(gpui::TitlebarOptions { title: Some("procast Settings".into()), appears_transparent: true, ..Default::default() }),
             windows_window_background: gpui::WindowsWindowBackground::MicaBackdrop,
             ..Default::default()
         };

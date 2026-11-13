@@ -245,6 +245,8 @@ names! {
     PIN = "pin",
     SHIELD = "shield",
     MAIL = "mail",
+    MINUS = "minus",
+    SQUARE = "square",
 }
 
 #[derive(Clone, Copy)]
@@ -515,6 +517,7 @@ icon_files![
     "list",
     "lock",
     "mail",
+    "minus",
     "network",
     "paste",
     "personalize",
@@ -530,6 +533,7 @@ icon_files![
     "shield",
     "sign-out",
     "sleep",
+    "square",
     "star",
     "store",
     "switch-apps",

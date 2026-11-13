@@ -938,9 +938,11 @@ impl Render for Settings {
                 "status": self.status,
             }),
         );
+        let maximized = window.is_maximized();
         div()
             .size_full()
             .flex()
+            .flex_col()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
             .bg(t.bg_solid)
@@ -963,7 +965,8 @@ impl Render for Settings {
                     window.remove_window();
                 }
             }))
-            .child(
+            .child(title_bar(&t, maximized))
+            .child(div().flex_1().min_h_0().flex().child(
                 div()
                     .w(px(design::SIDEBAR))
                     .flex_none()
@@ -1034,8 +1037,44 @@ impl Render for Settings {
                                     .child(design::shortcut("Close", &["Esc"], &t)),
                             }),
                     ),
-            )
+            ))
     }
+}
+
+/// The window's caption bar, drawn in the theme. gpui hides the system one
+/// (`appears_transparent`); Windows still drags, snaps, minimises, maximises and closes the
+/// window through these control areas.
+fn title_bar(t: &design::Tokens, maximized: bool) -> impl IntoElement {
+    use gpui::WindowControlArea::{Close, Drag, Max, Min};
+    let (hover, ink, muted, danger) = (t.hover, t.text, t.text_muted, t.danger);
+    let button = move |id: &'static str, area, glyph: &'static str| {
+        // Close turns red under the mouse, as on every Windows caption.
+        let (bg, on) = if id == "close" { (danger, gpui::white()) } else { (hover, ink) };
+        div()
+            .id(id)
+            .group(id)
+            .w(px(46.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .window_control_area(area)
+            .hover(move |s| s.bg(bg))
+            .child(design::icon(glyph, design::ic::MD, muted).group_hover(id, move |s| s.text_color(on)))
+    };
+    div()
+        .h(px(design::CONTROL))
+        .flex_none()
+        .flex()
+        .items_center()
+        .border_b_1()
+        .border_color(t.hairline)
+        .window_control_area(Drag)
+        .child(div().flex_1().min_w_0().px(px(12.)).truncate().text_size(px(design::ts::SMALL)).text_color(muted).child("procast Settings"))
+        .child(button("minimise", Min, design::g::MINUS))
+        // Two overlapping squares: the restore glyph.
+        .child(button("maximise", Max, if maximized { design::g::COPY } else { design::g::SQUARE }))
+        .child(button("close", Close, design::g::CANCEL))
 }
 
 /// A segmented row (`Choice`, or the Shortcuts `Category`) whose options outrun the control
