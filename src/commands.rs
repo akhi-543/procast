@@ -396,25 +396,52 @@ pub fn snap_by_name(name: &str) -> Option<Snap> {
 fn window_of(app: &str) -> Option<HWND> {
     let want = std::path::Path::new(app).file_name()?;
     let me = std::process::id();
-    crate::apps::app_windows().into_iter().find(|&(_, pid)| {
-        pid != me && crate::apps::exe_path(pid).is_some_and(|e| std::path::Path::new(&e).file_name().is_some_and(|n| n.eq_ignore_ascii_case(want)))
-    }).map(|(h, _)| h)
+    crate::apps::app_windows()
+        .into_iter()
+        .find(|&(h, pid)| {
+            let (pid, exe) = crate::apps::window_exe(h, pid);
+            pid != me && std::path::Path::new(&exe).file_name().is_some_and(|n| n.eq_ignore_ascii_case(want))
+        })
+        .map(|(h, _)| h)
+}
+
+/// How a layout starts a program that has no window.
+#[derive(Debug, PartialEq)]
+enum Launch {
+    /// A Start-menu app, by launcher id.
+    App(String),
+    /// A full path or bare name, for ShellExecute.
+    Open(String),
+}
+
+/// A full path opens as is; a bare exe name goes through the first launcher app (from `ids`)
+/// whose shortcut targets that program; anything else is left to ShellExecute's own search.
+fn pick_launch(app: &str, ids: &[String], target_of: impl Fn(&str) -> Option<String>) -> Launch {
+    let path = std::path::Path::new(app);
+    if let Some(name) = path.file_name().filter(|_| !path.is_absolute()) {
+        let same = |id: &&String| target_of(id).is_some_and(|t| std::path::Path::new(&t).file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)));
+        if let Some(id) = ids.iter().find(same) {
+            return Launch::App(id.clone());
+        }
+    }
+    Launch::Open(app.to_string())
 }
 
 /// Runs a layout preset: each slot's program gets a window (started if none is open,
 /// waiting up to 5 s) and is snapped, never cycled. A failing slot doesn't stop the
-/// rest; the first error is returned.
-pub fn run_layout(l: &config::Layout, w: &config::Window) -> Result<(), String> {
+/// rest; the first error is returned. `ids` are the launcher apps (Start menu) a bare exe
+/// name is looked up in before falling back to ShellExecute.
+pub fn run_layout(l: &config::Layout, w: &config::Window, ids: &[String]) -> Result<(), String> {
     let mut first = None;
     for slot in &l.slots {
-        if let Err(e) = run_slot(slot, w) {
+        if let Err(e) = run_slot(slot, w, ids) {
             first.get_or_insert(format!("Layout {}: {e}", l.name));
         }
     }
     first.map_or(Ok(()), Err)
 }
 
-fn run_slot(slot: &config::Slot, w: &config::Window) -> Result<(), String> {
+fn run_slot(slot: &config::Slot, w: &config::Window, ids: &[String]) -> Result<(), String> {
     let s = snap_by_name(&slot.snap).ok_or_else(|| format!("unknown snap {}", slot.snap))?;
     let mon = match slot.display {
         Some(n) => Some(n.checked_sub(1).and_then(|i| monitors().get(i).copied()).ok_or_else(|| format!("no display {n}"))?),
@@ -423,7 +450,10 @@ fn run_slot(slot: &config::Slot, w: &config::Window) -> Result<(), String> {
     let hwnd = match window_of(&slot.app) {
         Some(h) => h,
         None => {
-            crate::win::open(&slot.app);
+            match pick_launch(&slot.app, ids, crate::win::app_target) {
+                Launch::App(id) => crate::win::launch_app_wait(&id),
+                Launch::Open(t) => crate::win::open_wait(&t),
+            }?;
             let h = (0..50).find_map(|_| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 window_of(&slot.app)
@@ -599,9 +629,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_prefers_start_menu_then_path_then_shell() {
+        let ids = [
+            r"{Programs}\Visual Studio Code\Code.lnk".to_string(),
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_string(),
+            r"C:\Tools\x.lnk".to_string(),
+        ];
+        let target = |id: &str| match id {
+            i if i.contains("Code") => Some(r"C:\Users\a\AppData\Local\Programs\Microsoft VS Code\Code.exe".to_string()),
+            r"C:\Tools\x.lnk" => Some(r"D:\x\Tool.exe".to_string()),
+            _ => None,
+        };
+        assert_eq!(pick_launch("code.exe", &ids, target), Launch::App(ids[0].clone()), "case-insensitive exe name");
+        assert_eq!(pick_launch("Tool.exe", &ids, target), Launch::App(ids[2].clone()));
+        assert_eq!(pick_launch("WindowsTerminal.exe", &ids, target), Launch::Open("WindowsTerminal.exe".into()), "an AUMID has no exe to match");
+        assert_eq!(pick_launch(r"C:\Tools\Code.exe", &ids, target), Launch::Open(r"C:\Tools\Code.exe".into()), "a full path opens as is");
+    }
+
+    #[test]
     fn layout_errors_name_the_layout() {
         let l = config::Layout { name: "Coding".into(), slots: vec![config::Slot { app: "x.exe".into(), snap: "Nope".into(), display: None }] };
-        assert_eq!(run_layout(&l, &config::Window::default()), Err("Layout Coding: unknown snap Nope".into()));
+        assert_eq!(run_layout(&l, &config::Window::default(), &[]), Err("Layout Coding: unknown snap Nope".into()));
     }
 
     #[test]

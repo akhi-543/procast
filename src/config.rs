@@ -573,6 +573,7 @@ screen_gap = 0                # pixels between snapped windows and the screen ed
 cycle = true                  # repeating Left Half, Right Half, thirds... cycles through sizes
 auto_close_empty_desktops = false  # close a virtual desktop when its last window leaves it
 # Layout presets: each becomes a command "Layout: <name>" that finds (or starts) each app and snaps it.
+# app = the program's exe name (or a full path); a Start-menu app is launched from there, else Windows searches PATH.
 # snap = a Snap name (LeftHalf, RightHalf, FirstTwoThirds, LastThird ...); display = 2 puts it on that monitor.
 # [[window.layouts]]
 # name = "Coding"

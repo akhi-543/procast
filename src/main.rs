@@ -1722,9 +1722,10 @@ impl Launcher {
                 self.hide(true, cx);
                 let Some(layout) = self.cfg.window.layouts.iter().find(|l| l.name == name).cloned() else { return };
                 let w = self.cfg.window.clone();
+                let ids: Vec<String> = self.apps.iter().map(|a| a.id.clone()).collect();
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = commands::run_layout(&layout, &w) {
+                    if let Err(e) = commands::run_layout(&layout, &w, &ids) {
                         let _ = tx.unbounded_send(Msg::Notice(e));
                     }
                 });

@@ -590,11 +590,29 @@ fn scan_lists_installed_apps() {
 }
 
 pub fn launch_app(id: &str) {
-    // Apps from extra folders are plain paths.
-    if Path::new(id).is_absolute() {
-        return open(id);
+    open(&app_open_target(id));
+}
+
+/// What ShellExecute opens for a launcher app id: apps from extra folders are plain paths.
+fn app_open_target(id: &str) -> String {
+    if Path::new(id).is_absolute() { id.to_string() } else { format!("shell:AppsFolder\\{id}") }
+}
+
+/// `launch_app`, but waits for ShellExecute and reports its failure. For worker threads only
+/// (see `shell`).
+pub fn launch_app_wait(id: &str) -> Result<(), String> {
+    open_wait(&app_open_target(id))
+}
+
+/// `open`, but waits for ShellExecute and reports its failure (a bare name it can't find, say).
+/// For worker threads only (see `shell`).
+pub fn open_wait(target: &str) -> Result<(), String> {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let r = ShellExecuteW(None, w!("open"), &HSTRING::from(target), &HSTRING::new(), PCWSTR::null(), SW_SHOWNORMAL);
+        if r.0 as isize > 32 { Ok(()) } else { Err(format!("couldn't start {target}")) }
     }
-    open(&format!("shell:AppsFolder\\{id}"));
 }
 
 /// The program a Start menu entry's shortcut points at (None for Store apps).

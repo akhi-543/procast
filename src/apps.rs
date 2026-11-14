@@ -118,17 +118,23 @@ fn title(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+/// The process and program behind a window from `app_windows`: Store apps draw inside
+/// ApplicationFrameHost, so those map to the app's own process. The path is empty when unknown.
+pub fn window_exe(h: HWND, pid: u32) -> (u32, String) {
+    let exe = exe_path(pid).unwrap_or_default();
+    if exe.to_lowercase().ends_with("\\applicationframehost.exe") {
+        let real = real_pid(h, pid);
+        return (real, exe_path(real).unwrap_or(exe));
+    }
+    (pid, exe)
+}
+
 /// Running apps, most recently used window first (EnumWindows walks the z-order).
 pub fn running() -> Vec<Running> {
     let me = std::process::id();
     let mut out: Vec<Running> = vec![];
     for (h, pid) in app_windows() {
-        let mut pid = pid;
-        let mut exe = exe_path(pid).unwrap_or_default();
-        if exe.to_lowercase().ends_with("\\applicationframehost.exe") {
-            pid = real_pid(h, pid);
-            exe = exe_path(pid).unwrap_or(exe);
-        }
+        let (pid, exe) = window_exe(h, pid);
         if pid == me || exe.is_empty() || exe.to_lowercase().ends_with("\\explorer.exe") && title(h) == "Program Manager" {
             continue;
         }
