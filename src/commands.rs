@@ -304,6 +304,19 @@ pub fn with_gaps(target: RECT, wa: RECT, gap: i32) -> RECT {
     }
 }
 
+/// Whether `s` tiles against neighbours, so the window gap applies. The others
+/// (centred and floating sizes) only respect the screen gap.
+fn takes_gap(s: Snap) -> bool {
+    !matches!(s, Snap::Center | Snap::AlmostMaximize | Snap::ReasonableSize)
+}
+
+/// Final rect for `s` on work area `wa` with the screen gap, then the window gap where it applies.
+pub fn target_rect(s: Snap, wa: RECT, cur: RECT, g: Gaps) -> RECT {
+    let wa = inset(wa, g.screen);
+    let t = layout(s, wa, cur);
+    if takes_gap(s) { with_gaps(t, wa, g.gap) } else { t }
+}
+
 /// The desktop and taskbar: opening procast from them leaves no window to move.
 fn is_shell(hwnd: HWND) -> bool {
     let mut buf = [0u16; 32];
@@ -349,9 +362,7 @@ fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
         } else {
             let (mut dx, mut dy) = (96, 96);
             let _ = GetDpiForMonitor(here, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-            let g = Gaps::for_dpi(w, dx);
-            let wa = inset(work_area(here), g.screen);
-            with_gaps(layout(s, wa, vis), wa, g.gap)
+            target_rect(s, work_area(here), vis, Gaps::for_dpi(w, dx))
         };
         t.left -= vis.left - cur.left;
         t.top -= vis.top - cur.top;
@@ -384,6 +395,24 @@ mod tests {
         let cur = rc(100, 100, 500, 400);
         assert!(same(with_gaps(layout(Snap::LeftHalf, WA, cur), WA, 10), rc(0, 0, 595, 900)));
         assert!(same(with_gaps(layout(Snap::RightHalf, WA, cur), WA, 10), rc(605, 0, 1200, 900)));
+    }
+
+    #[test]
+    fn center_ignores_window_gap() {
+        let g = Gaps { gap: 16, screen: 0 };
+        let t = target_rect(Snap::Center, WA, rc(100, 100, 500, 400), g);
+        assert!(same(t, rc(400, 300, 800, 600)), "{t:?}");
+    }
+
+    #[test]
+    fn almost_maximize_and_reasonable_size_use_only_the_screen_gap() {
+        let g = Gaps { gap: 16, screen: 8 };
+        let cur = rc(100, 100, 500, 400);
+        for s in [Snap::AlmostMaximize, Snap::ReasonableSize] {
+            assert!(same(target_rect(s, WA, cur, g), layout(s, inset(WA, 8), cur)), "{s:?}");
+        }
+        // Halves still get the gap.
+        assert!(same(target_rect(Snap::LeftHalf, WA, cur, Gaps { gap: 10, screen: 0 }), rc(0, 0, 595, 900)));
     }
 
     #[test]
