@@ -21,7 +21,10 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -308,6 +311,8 @@ struct Launcher {
     /// changes), and its decoded pictures (`p:`) and shell icons (`i:`) by path.
     file_info: Option<(String, Option<files::FileInfo>)>,
     file_images: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Counts selection changes in File Search; a preview worker waits for its count to hold.
+    file_seq: Arc<AtomicU64>,
     /// Emoji picker: the grid's scroll position, by grid row.
     /// The emoji grid's rows; only the ones on screen are laid out.
     grid_list: gpui::ListState,
@@ -398,6 +403,7 @@ impl Launcher {
             clip_images: HashMap::new(),
             file_info: None,
             file_images: HashMap::new(),
+            file_seq: Arc::new(AtomicU64::new(0)),
             grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
             ai: None,
@@ -950,8 +956,15 @@ impl Launcher {
             return img.clone();
         }
         self.file_images.insert(key.clone(), None);
-        let tx = self.tx.clone();
+        let (tx, seq) = (self.tx.clone(), self.file_seq.clone());
+        let at = seq.load(Ordering::Relaxed);
         std::thread::spawn(move || {
+            // Settle first: arrowing through a folder only decodes where the selection stops.
+            std::thread::sleep(Duration::from_millis(100));
+            if seq.load(Ordering::Relaxed) != at {
+                let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
+                return;
+            }
             let path = &key[2..];
             let img = if key.starts_with("p:") { std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)) } else { win::file_icon(path) };
             let _ = tx.unbounded_send(Msg::FilePreview(key, img));
@@ -2102,6 +2115,13 @@ impl Launcher {
                     cx.notify();
                 }
             }
+            Msg::FilePreviewDropped(key) => {
+                self.file_images.remove(&key);
+                // Re-selected meanwhile? The next render asks again.
+                if self.visible && self.mode == Mode::Files {
+                    cx.notify();
+                }
+            }
             Msg::Running(list) => {
                 for (r, icon) in &list {
                     self.exe_icons.insert(r.exe.clone(), icon.clone());
@@ -2430,6 +2450,7 @@ impl Launcher {
         if self.file_info.as_ref().is_none_or(|f| f.0 != path) {
             let info = files::file_info(&path, &std::env::var("USERPROFILE").unwrap_or_default());
             self.file_info = Some((path.clone(), info));
+            self.file_seq.fetch_add(1, Ordering::Relaxed);
         }
         let pane = div().id("file-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col();
         let Some(info) = self.file_info.as_ref().and_then(|f| f.1.as_ref()) else {

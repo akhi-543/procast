@@ -553,6 +553,9 @@ pub struct FileInfo {
     pub preview: Preview,
 }
 
+/// Pictures larger than this show their icon instead of being decoded.
+const MAX_PICTURE: u64 = 50 * 1024 * 1024;
+
 /// What the detail pane needs for one path; None when it is gone.
 pub fn file_info(path: &str, home: &str) -> Option<FileInfo> {
     let p = Path::new(path);
@@ -562,7 +565,7 @@ pub fn file_info(path: &str, home: &str) -> Option<FileInfo> {
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let preview = if dir {
         Preview::Folder(std::fs::read_dir(p).map_or(0, |d| d.take(10_000).count()))
-    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") {
+    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") && meta.len() <= MAX_PICTURE {
         Preview::Image(p.to_path_buf())
     } else if (kind == "Code" || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "ini" | "xml")) && meta.len() < 256 * 1024 {
         match std::fs::read(p) {
@@ -639,6 +642,8 @@ mod tests {
         assert_eq!(file_info(&at("pic.png"), &home).unwrap().preview, Preview::Image(root.join("pic.png")));
         let sub = file_info(&at("sub"), &home).unwrap();
         assert_eq!((sub.kind, sub.size, sub.preview), ("Folder", None, Preview::Folder(3)));
+        std::fs::File::create(root.join("huge.png")).unwrap().set_len(MAX_PICTURE + 1).unwrap();
+        assert_eq!(file_info(&at("huge.png"), &home).unwrap().preview, Preview::Icon, "too big to decode");
         assert!(file_info(&at("nope.txt"), &home).is_none());
         assert_eq!(file_info(&at("a.txt"), "").unwrap().folder, home);
         let _ = std::fs::remove_dir_all(&root);

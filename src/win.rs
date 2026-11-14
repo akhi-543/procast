@@ -64,6 +64,8 @@ pub enum Msg {
     FilesIndexed,
     /// A File Search detail picture (`p:path`) or shell icon (`i:path`) is ready.
     FilePreview(String, Option<Arc<gpui::RenderImage>>),
+    /// The selection moved on before that preview started: forget it so it can be asked for again.
+    FilePreviewDropped(String),
     /// Settings → Files → Rebuild: start the file index over.
     RebuildIndex,
     /// The window's content height changed (compact mode); resize between updates.
