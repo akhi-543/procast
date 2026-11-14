@@ -768,6 +768,27 @@ mod tests {
     }
 
     #[test]
+    fn more_layouts_tile_the_work_area() {
+        use windows::Win32::Foundation::RECT;
+        use commands::{Snap, layout};
+        let rect = |l, t, r, b| RECT { left: l, top: t, right: r, bottom: b };
+        let wa = rect(0, 0, 1200, 900);
+        let cur = rect(100, 100, 900, 700);
+        let at = |s| layout(s, wa, cur);
+        assert_eq!((at(Snap::TopLeftQuarter), at(Snap::BottomRightQuarter)), (rect(0, 0, 600, 450), rect(600, 450, 1200, 900)));
+        assert_eq!((at(Snap::TopRightQuarter), at(Snap::BottomLeftQuarter)), (rect(600, 0, 1200, 450), rect(0, 450, 600, 900)));
+        assert_eq!((at(Snap::TopCenterSixth), at(Snap::BottomRightSixth)), (rect(400, 0, 800, 450), rect(800, 450, 1200, 900)));
+        assert_eq!((at(Snap::TopLeftSixth), at(Snap::TopRightSixth)), (rect(0, 0, 400, 450), rect(800, 0, 1200, 450)));
+        assert_eq!((at(Snap::BottomLeftSixth), at(Snap::BottomCenterSixth)), (rect(0, 450, 400, 900), rect(400, 450, 800, 900)));
+        assert_eq!((at(Snap::TopThird), at(Snap::MiddleThird), at(Snap::BottomThird)), (rect(0, 0, 1200, 300), rect(0, 300, 1200, 600), rect(0, 600, 1200, 900)));
+        assert_eq!(at(Snap::ReasonableSize), rect(240, 135, 960, 765));
+
+        let odd = rect(0, 0, 1201, 901);
+        let (q, s, t) = (layout(Snap::BottomRightQuarter, odd, cur), layout(Snap::BottomRightSixth, odd, cur), layout(Snap::BottomThird, odd, cur));
+        assert_eq!((q.right, q.bottom, s.right, s.bottom, t.right, t.bottom), (1201, 901, 1201, 901, 1201, 901), "right and bottom pieces end on the work area");
+    }
+
+    #[test]
     fn launcher_favorites_hidden_sensitivity_and_fallbacks() {
         let apps: Vec<App> = ["Notepad", "Paint", "Photos"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
         let mut cfg = crate::config::parse(
