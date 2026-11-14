@@ -205,13 +205,14 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 /// Whether a file or folder name is skipped: an exact name or a wildcard pattern.
-/// Patterns are lowercased once when the list is built, not per name.
+/// Patterns are ASCII-lowercased once when the list is built (matching the ASCII
+/// fold here), and only entries with a wildcard pay for `glob_match`.
 pub fn excluded(exclude: &[String], name: &str) -> bool {
-    exclude.iter().any(|e| name.eq_ignore_ascii_case(e) || glob_match(e, name))
+    exclude.iter().any(|e| name.eq_ignore_ascii_case(e) || (e.contains(['*', '?']) && glob_match(e, name)))
 }
 
 pub fn crawl(roots: &[String], exclude: &[String]) -> Vec<Entry> {
-    let exclude: Vec<String> = exclude.iter().map(|e| e.to_lowercase()).collect();
+    let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
     for root in roots {
         let skip = exclude.clone();
@@ -230,7 +231,7 @@ pub fn crawl(roots: &[String], exclude: &[String]) -> Vec<Entry> {
 /// index changed. Each changed path is dropped with everything under it, then added back
 /// (a folder with its contents) if it exists now, so renames, moves and repeats come out right.
 pub fn apply(index: &mut Vec<Entry>, root: &str, exclude: &[String], changes: Vec<PathBuf>) -> bool {
-    let exclude: Vec<String> = exclude.iter().map(|e| e.to_lowercase()).collect();
+    let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
     let mut dropped: HashSet<String> = HashSet::new();
     let mut added = vec![];
     for c in changes {
@@ -389,6 +390,9 @@ mod tests {
         assert!(excluded(&ex, "Node_Modules"));
         assert!(excluded(&ex, "x.log"));
         assert!(!excluded(&ex, "node_modules2"));
+        assert!(excluded(&["Éclair".to_ascii_lowercase()], "Éclair"), "non-ASCII names fold the same on both sides");
+        assert!(glob_match("?.tmp", "é.tmp"));
+        assert!(!glob_match("*.log", ""));
         for p in ["*", "?", "**"] {
             assert!(!glob_match(p, "anything"), "{p} alone matches nothing");
             assert!(!excluded(&[p.to_string()], "anything"));

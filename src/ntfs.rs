@@ -476,7 +476,7 @@ impl Index {
         let skip: Vec<String> = f.skip.iter().map(|p| p.trim().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase()).filter(|p| p.len() > 2).collect();
         Self {
             slots: vec![vec![]; 26],
-            exclude: f.exclude.iter().map(|e| e.to_lowercase()).collect(),
+            exclude: f.exclude.iter().map(|e| e.to_ascii_lowercase()).collect(),
             skip_names: skip.iter().filter_map(|p| p.rsplit('\\').next().map(str::to_string)).collect(),
             skip,
             drives: f.drives.iter().filter_map(|d| d.trim().bytes().next()).map(|b| b.to_ascii_uppercase()).collect(),
