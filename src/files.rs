@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::{Duration, Instant},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::channel::mpsc::UnboundedSender;
@@ -51,7 +51,7 @@ pub struct Files {
     queries: mpsc::Sender<(u64, String, usize)>,
     pub count: Arc<AtomicUsize>,
     pub indexing: Arc<AtomicBool>,
-    built: Arc<RwLock<Option<Instant>>>,
+    built: Arc<RwLock<Option<SystemTime>>>,
     roots: Vec<String>,
     rules: Rules,
     tx: UnboundedSender<Msg>,
@@ -125,7 +125,7 @@ impl Files {
         if self.whole_drives() {
             return;
         }
-        let fresh = self.built.read().unwrap().is_some_and(|t| t.elapsed() < max_age);
+        let fresh = self.built.read().unwrap().is_some_and(|t| t.elapsed().is_ok_and(|e| e < max_age));
         if fresh || self.indexing.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -136,7 +136,7 @@ impl Files {
             let _ = save(&cache_path(), &cache_key(&roots, &rules), &entries);
             count.store(entries.len(), Ordering::SeqCst);
             *index.write().unwrap() = entries;
-            *built.write().unwrap() = Some(Instant::now());
+            *built.write().unwrap() = Some(SystemTime::now());
             indexing.store(false, Ordering::SeqCst);
             let _ = tx.unbounded_send(Msg::FilesIndexed);
         });
@@ -175,6 +175,59 @@ impl Files {
     /// Searching every NTFS drive (the admin helper is connected).
     pub fn whole_drives(&self) -> bool {
         self.ntfs.as_ref().is_some_and(|c| c.ready.load(Ordering::SeqCst))
+    }
+
+    /// What Settings shows about the index in use.
+    pub fn status(&self) -> IndexStatus {
+        let (entries, indexing) = (self.count.load(Ordering::SeqCst), self.indexing.load(Ordering::SeqCst));
+        match self.ntfs.as_ref().filter(|c| c.ready.load(Ordering::SeqCst)) {
+            Some(c) => {
+                let (drives, updated) = c.index.read().unwrap().ready_drives();
+                IndexStatus { entries, whole_drives: true, drives, updated, indexing }
+            }
+            None => IndexStatus { entries, whole_drives: false, drives: vec![], updated: *self.built.read().unwrap(), indexing },
+        }
+    }
+}
+
+/// The index in use, as Settings → Files reports it.
+pub struct IndexStatus {
+    pub entries: usize,
+    /// The whole-drive index (else the folder crawl).
+    pub whole_drives: bool,
+    /// Drives whose snapshot is complete (whole-drive index only).
+    pub drives: Vec<char>,
+    /// When the last crawl finished, or the last drive became ready.
+    pub updated: Option<SystemTime>,
+    pub indexing: bool,
+}
+
+/// "2,712,340 entries · whole drives C:, D: · updated 10:42"; the clock is the time alone
+/// for today, the full date otherwise.
+pub fn status_line(s: &IndexStatus, now: SystemTime) -> String {
+    if s.indexing {
+        return "Indexing…".into();
+    }
+    let Some(at) = s.updated else { return "Not indexed yet".into() };
+    let unix = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let when = crate::win::local_time_of(unix(at));
+    let when = match when.split_once(' ') {
+        Some((day, time)) if crate::win::local_time_of(unix(now)).starts_with(day) => time.to_string(),
+        _ => when,
+    };
+    let digits = s.entries.to_string();
+    let entries = digits.chars().enumerate().fold(String::new(), |mut out, (i, c)| {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+        out
+    });
+    if s.whole_drives {
+        let drives = s.drives.iter().map(|d| format!("{d}:")).collect::<Vec<_>>().join(", ");
+        format!("{entries} entries · whole drives {drives} · updated {when}")
+    } else {
+        format!("{entries} entries · folders · crawled {when}")
     }
 }
 
@@ -471,6 +524,29 @@ pub fn item(path: &str, dir: bool, home: &str) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_line_reads_plainly() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now();
+        let secs = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // Today's 10:42 local: step back by the minutes since then (wall-clock "HH:MM" from `local_time_of`).
+        let clock = crate::win::local_time_of(secs(now));
+        let (h, m) = (clock[11..13].parse::<i64>().unwrap(), clock[14..16].parse::<i64>().unwrap());
+        let ten42 = UNIX_EPOCH + Duration::from_secs((secs(now) as i64 - ((h * 60 + m) - (10 * 60 + 42)) * 60 - (secs(now) % 60) as i64) as u64);
+        let drives = IndexStatus { entries: 2_712_340, whole_drives: true, drives: vec!['C', 'D', 'E'], updated: Some(ten42), indexing: false };
+        assert_eq!(status_line(&drives, now), "2,712,340 entries · whole drives C:, D:, E: · updated 10:42");
+        let folders = IndexStatus { entries: 138_617, whole_drives: false, drives: vec![], ..drives };
+        assert_eq!(status_line(&folders, now), "138,617 entries · folders · crawled 10:42");
+        // Another day: the full date.
+        let old = now - Duration::from_secs(3 * 86_400);
+        let then = IndexStatus { updated: Some(old), ..folders };
+        assert_eq!(status_line(&then, now), format!("138,617 entries · folders · crawled {}", crate::win::local_time_of(secs(old))));
+        let busy = IndexStatus { indexing: true, ..then };
+        assert_eq!(status_line(&busy, now), "Indexing…");
+        let none = IndexStatus { indexing: false, updated: None, entries: 0, ..busy };
+        assert_eq!(status_line(&none, now), "Not indexed yet");
+    }
 
     #[test]
     fn rows_pick_their_icon_by_type() {

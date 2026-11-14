@@ -516,6 +516,8 @@ pub struct Index {
     /// Drives whose snapshot is complete: their changes are filtered one by one. Until then
     /// records arrive in MFT order (children before parents), so nothing is judged early.
     complete: Vec<u8>,
+    /// When the latest drive finished its snapshot (wall clock, for Settings).
+    ready_at: Option<std::time::SystemTime>,
 }
 
 impl Index {
@@ -535,6 +537,14 @@ impl Index {
 
     pub fn len(&self) -> usize {
         self.live
+    }
+
+    /// The drives with a complete snapshot, as letters, and when the last one finished.
+    pub fn ready_drives(&self) -> (Vec<char>, Option<std::time::SystemTime>) {
+        let mut drives: Vec<char> = self.complete.iter().map(|&d| d as char).collect();
+        drives.sort_unstable();
+        drives.dedup();
+        (drives, self.ready_at)
     }
 
     /// The helper predates this build's protocol: it ignores the hidden and removable settings.
@@ -639,6 +649,7 @@ impl Index {
                 DELETE => self.delete(drive, rec),
                 READY => {
                     self.complete.push(drive);
+                    self.ready_at = Some(std::time::SystemTime::now());
                     self.dirty = true;
                     ready.push(drive);
                 }

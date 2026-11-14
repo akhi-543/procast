@@ -1,12 +1,16 @@
 //! The settings window. Every row edits one key of config.toml in place (comments and
 //! layout kept); the launcher picks the change up through its usual reload.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
     prelude::*,
 };
+use futures::channel::mpsc::UnboundedSender;
 use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 
 use crate::{
@@ -14,6 +18,7 @@ use crate::{
     design::{self, px},
     ext,
     search::{Icon, Item},
+    win::Msg,
 };
 
 #[derive(Clone, PartialEq)]
@@ -29,6 +34,10 @@ enum Kind {
     Keys,
     /// Opens a file.
     Open(&'static str),
+    /// A line of live status (the file index); nothing to edit.
+    Status,
+    /// A button that tells the launcher to do something (by name).
+    Action(&'static str),
     /// Shortcuts: which kind of item the table lists (not saved).
     Category,
     /// Shortcuts: narrows the table by title (not saved).
@@ -338,6 +347,13 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 ],
             ),
             (
+                "Index",
+                vec![
+                    Row { path: vec![], ..row("Status", "", Kind::Status, "") },
+                    Row { path: vec![], ..row("Rebuild index", "", Kind::Action("rebuild-index"), "Crawl the folders again and rescan the whole drives.") },
+                ],
+            ),
+            (
                 "Folders",
                 vec![
                     row("Folders to search", "files.roots", Kind::List, "Full paths, e.g. D:\\Projects. With none, your user folder is searched."),
@@ -440,6 +456,10 @@ pub struct Settings {
     items: Vec<Item>,
     category: usize,
     filter: String,
+    /// To tell the launcher what a button asked for.
+    tx: UnboundedSender<Msg>,
+    /// The file index line, kept current by the launcher.
+    index_status: Arc<RwLock<String>>,
     /// `[launcher]` as last saved: the Shortcuts table reads hotkeys and on/off from here
     /// instead of re-parsing the file for every row.
     launcher: config::Launcher,
@@ -458,9 +478,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(items: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(items: Vec<Item>, tx: UnboundedSender<Msg>, index_status: Arc<RwLock<String>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             text: std::fs::read_to_string(config::path()).unwrap_or_default(),
+            tx,
+            index_status,
             launcher: config::load().map(|c| c.launcher).unwrap_or_default(),
             exts: ext::scan(),
             items,
@@ -729,7 +751,8 @@ impl Settings {
                 let fields: &[(&str, &str)] = if *list == "snippet" { &[("name", "New snippet"), ("keyword", ""), ("text", "")] } else { &[("name", "New quicklink"), ("keyword", ""), ("url", "https://www.google.com/search?q={query}")] };
                 self.edit_table(list, config::TableEdit::Add(fields), window, cx);
             }
-            Kind::Filter | Kind::Keys | Kind::TableItem(..) => {}
+            Kind::Action("rebuild-index") => drop(self.tx.unbounded_send(Msg::RebuildIndex)),
+            Kind::Action(_) | Kind::Status | Kind::Filter | Kind::Keys | Kind::TableItem(..) => {}
         }
     }
 
@@ -923,6 +946,8 @@ impl Settings {
             }
             Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
+            Kind::Action(_) => design::button("Rebuild", design::Button::Quiet, on, t).into_any_element(),
+            Kind::Status => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(self.index_status.read().unwrap().clone()).into_any_element(),
             Kind::TableAdd(_) => design::button("Add", design::Button::Quiet, on, t).into_any_element(),
             &Kind::TableItem(list, i) => {
                 let (copy, delete) = (me.clone(), me.clone());

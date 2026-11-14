@@ -62,6 +62,8 @@ pub enum Msg {
     /// File search results for one query generation.
     Files(u64, Vec<crate::search::Item>),
     FilesIndexed,
+    /// Settings → Files → Rebuild: start the file index over.
+    RebuildIndex,
     /// The window's content height changed (compact mode); resize between updates.
     Resize,
     /// Something was installed or removed: the app list should be rescanned.

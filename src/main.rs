@@ -21,8 +21,8 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, RwLock},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures::{
@@ -270,6 +270,8 @@ struct Launcher {
     frec: Frecency,
     history: clipboard::History,
     files: Option<files::Files>,
+    /// The index line Settings → Files shows, kept current as the index changes.
+    index_status: Arc<RwLock<String>>,
     file_gen: u64,
     host: Option<ext::Host>,
     next_run: u64,
@@ -357,6 +359,7 @@ impl Launcher {
             },
             history: clipboard::History::load(config::dir().join("clipboard.bin"), cfg.clipboard.history, &cfg.clipboard.keep),
             files: start_files(&cfg, &tx),
+            index_status: Arc::default(),
             scripts: scripts::scan(&cfg.scripts.dirs()),
             exts: vec![],
             catalog: vec![],
@@ -1787,7 +1790,18 @@ impl Launcher {
             ..Default::default()
         };
         design::refresh_glass();
-        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, window, cx))).ok();
+        self.refresh_index_status(cx);
+        let (tx, status) = (self.tx.clone(), self.index_status.clone());
+        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, window, cx))).ok();
+    }
+
+    /// Rewrites the Settings index line from the live index and repaints Settings.
+    fn refresh_index_status(&self, cx: &mut Context<Self>) {
+        let line = self.files.as_ref().map_or_else(|| "File search is off".to_string(), |f| files::status_line(&f.status(), SystemTime::now()));
+        *self.index_status.write().unwrap() = line;
+        if let Some(h) = self.settings_window {
+            drop(h.update(cx, |_, _, cx| cx.notify()));
+        }
     }
 
     /// Reads the store index in the background, syncing the sparse clone first when it's
@@ -1936,6 +1950,7 @@ impl Launcher {
                     && self.files.as_ref().is_none_or(|f| f.same_settings(&cfg.files));
                 if !same_files {
                     self.files = start_files(&cfg, &self.tx);
+                    self.refresh_index_status(cx);
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
@@ -1986,7 +2001,14 @@ impl Launcher {
                     cx.notify();
                 }
             }
+            // The old index is dropped; a new one re-crawls the folders (never the saved copy)
+            // and reconnects the helper, which scans every drive's MFT afresh.
+            Msg::RebuildIndex => {
+                self.files = start_files(&self.cfg, &self.tx);
+                self.refresh_index_status(cx);
+            }
             Msg::FilesIndexed => {
+                self.refresh_index_status(cx);
                 if self.visible && self.mode == Mode::Files {
                     self.refresh(cx);
                 } else {
