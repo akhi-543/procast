@@ -324,6 +324,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
         "Window" => groups(vec![(
             "Snapping",
             vec![
+                row("Cycle halves", "window.cycle", Kind::Bool, "Pressing Left Half again makes the window ⅔, then ⅓."),
                 row("Window gap", "window.gap", Kind::Number, "Space between snapped windows, in pixels."),
                 row("Screen gap", "window.screen_gap", Kind::Number, "Space between windows and the screen edges, in pixels."),
             ],

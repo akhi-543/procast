@@ -317,6 +317,34 @@ pub fn target_rect(s: Snap, wa: RECT, cur: RECT, g: Gaps) -> RECT {
     if takes_gap(s) { with_gaps(t, wa, g.gap) } else { t }
 }
 
+/// Like `target_rect`, but pressing a half again while the window already sits on it
+/// steps through ½ → ⅔ → ⅓ → ½ (same edge). Anything else, or `cycle` off, is `target_rect`.
+pub fn cycle_target(s: Snap, wa: RECT, vis: RECT, g: Gaps, cycle: bool) -> RECT {
+    let base = target_rect(s, wa, vis, g);
+    if !cycle || !matches!(s, Snap::LeftHalf | Snap::RightHalf | Snap::TopHalf | Snap::BottomHalf) {
+        return base;
+    }
+    let wa = inset(wa, g.screen);
+    let (w, h) = (wa.right - wa.left, wa.bottom - wa.top);
+    let step = |n: i32, d: i32| {
+        let t = match s {
+            Snap::LeftHalf => RECT { right: wa.left + w * n / d, ..wa },
+            Snap::RightHalf => RECT { left: wa.right - w * n / d, ..wa },
+            Snap::TopHalf => RECT { bottom: wa.top + h * n / d, ..wa },
+            _ => RECT { top: wa.bottom - h * n / d, ..wa },
+        };
+        with_gaps(t, wa, g.gap)
+    };
+    let steps = [step(1, 2), step(2, 3), step(1, 3)];
+    let near = |a: RECT, b: RECT| {
+        (a.left - b.left).abs() <= 2 && (a.top - b.top).abs() <= 2 && (a.right - b.right).abs() <= 2 && (a.bottom - b.bottom).abs() <= 2
+    };
+    match steps.iter().position(|&t| near(vis, t)) {
+        Some(i) => steps[(i + 1) % 3],
+        None => steps[0],
+    }
+}
+
 /// The desktop and taskbar: opening procast from them leaves no window to move.
 fn is_shell(hwnd: HWND) -> bool {
     let mut buf = [0u16; 32];
@@ -336,7 +364,8 @@ fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
             }
             _ => {}
         }
-        if IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        let was_big = IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool();
+        if was_big {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let mut cur = RECT::default();
@@ -344,6 +373,8 @@ fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
         // Windows 10/11 frames have invisible resize borders; size the visible frame instead.
         let mut vis = cur;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut vis as *mut _ as _, size_of::<RECT>() as u32);
+        // A just-restored window is not part of a cycle: its first press gives the plain half.
+        let cycle = w.cycle && !was_big;
         let here = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut t = if s == Snap::NextDisplay {
             let all = monitors();
@@ -362,7 +393,7 @@ fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
         } else {
             let (mut dx, mut dy) = (96, 96);
             let _ = GetDpiForMonitor(here, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
-            target_rect(s, work_area(here), vis, Gaps::for_dpi(w, dx))
+            cycle_target(s, work_area(here), vis, Gaps::for_dpi(w, dx), cycle)
         };
         t.left -= vis.left - cur.left;
         t.top -= vis.top - cur.top;
@@ -413,6 +444,36 @@ mod tests {
         }
         // Halves still get the gap.
         assert!(same(target_rect(Snap::LeftHalf, WA, cur, Gaps { gap: 10, screen: 0 }), rc(0, 0, 595, 900)));
+    }
+
+    const NO_GAPS: Gaps = Gaps { gap: 0, screen: 0 };
+
+    #[test]
+    fn left_half_cycles() {
+        let step = |vis| cycle_target(Snap::LeftHalf, WA, vis, NO_GAPS, true);
+        assert!(same(step(rc(100, 100, 500, 400)), rc(0, 0, 600, 900)));
+        assert!(same(step(rc(0, 0, 600, 900)), rc(0, 0, 800, 900)));
+        assert!(same(step(rc(0, 0, 801, 899)), rc(0, 0, 400, 900)));
+        assert!(same(step(rc(0, 0, 400, 900)), rc(0, 0, 600, 900)));
+    }
+
+    #[test]
+    fn cycle_off_repeats_half() {
+        let t = cycle_target(Snap::LeftHalf, WA, rc(0, 0, 600, 900), NO_GAPS, false);
+        assert!(same(t, rc(0, 0, 600, 900)));
+    }
+
+    #[test]
+    fn bottom_half_cycles_height() {
+        let t = cycle_target(Snap::BottomHalf, WA, rc(0, 450, 1200, 900), NO_GAPS, true);
+        assert!(same(t, rc(0, 300, 1200, 900)));
+    }
+
+    #[test]
+    fn cycling_recognises_the_step_with_gaps() {
+        let g = Gaps { gap: 10, screen: 0 };
+        let t = cycle_target(Snap::LeftHalf, WA, rc(0, 0, 595, 900), g, true);
+        assert!(same(t, rc(0, 0, 795, 900)), "{t:?}");
     }
 
     #[test]
