@@ -850,14 +850,25 @@ struct Stop {
     pipe: Mutex<Option<isize>>,
 }
 
+struct Registered<'a>(&'a Stop);
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        *self.0.pipe.lock().unwrap() = None;
+    }
+}
+
 impl Stop {
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Records the pipe the thread is about to read, or `None` once it is done with it.
-    fn set_pipe(&self, pipe: Option<isize>) {
-        *self.pipe.lock().unwrap() = pipe;
+    /// Records the pipe the thread is about to read, until the guard drops (every way out of
+    /// the read loop, so `stop` never cancels a handle that has been closed).
+    /// Declare the guard after the pipe: it must drop first.
+    fn register(&self, pipe: &std::fs::File) -> Registered<'_> {
+        *self.pipe.lock().unwrap() = Some(pipe.as_raw_handle() as isize);
+        Registered(self)
     }
 
     // ponytail: a stop landing between the thread's `stopped()` check and its ReadFile cancels
@@ -897,12 +908,16 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
             crate::ext_log("file index", "connected to the whole-drive helper");
             ready.store(false, Ordering::SeqCst);
             indexing.store(true, Ordering::SeqCst);
+            // A rebuild shows "Indexing…" at once instead of waiting for the first second of data.
+            if tx.unbounded_send(Msg::FilesIndexed).is_err() {
+                return;
+            }
             *index.write().unwrap() = Index::new(&filter);
             let mut buf = vec![0u8; 4 << 20];
             let mut have = 0;
             let mut last_note = Instant::now();
             let mut warned = false;
-            stop.set_pipe(Some(pipe.as_raw_handle() as isize));
+            let _registered = stop.register(&pipe);
             while let Ok(n) = pipe.read(&mut buf[have..]) {
                 if n == 0 || stop.stopped() {
                     break;
@@ -937,8 +952,6 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
                     }
                 }
             }
-            // Before the pipe closes, so `Stop` never cancels a handle that is gone.
-            stop.set_pipe(None);
             ready.store(false, Ordering::SeqCst);
             if !stop.stopped() {
                 crate::ext_log("file index", "helper disconnected; reconnecting");
@@ -975,7 +988,7 @@ mod tests {
         unsafe { CreatePipe(&mut r, &mut w, None, 0) }.unwrap();
         let mut pipe = unsafe { std::fs::File::from_raw_handle(r.0) };
         let stop = Arc::new(Stop::default());
-        stop.set_pipe(Some(pipe.as_raw_handle() as isize));
+        let registered = stop.register(&pipe);
         let (done_tx, done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // Nothing is ever written: only a cancel can end this read.
@@ -986,6 +999,20 @@ mod tests {
         assert_eq!(done.recv_timeout(Duration::from_secs(5)), Ok(true), "stop cancels the read");
         assert!(stop.stopped());
         unsafe { CloseHandle(w).unwrap() };
+        drop(registered);
+    }
+
+    #[test]
+    fn the_pipe_is_unregistered_on_every_way_out() {
+        let stop = Stop::default();
+        let file = std::fs::File::open("NUL").unwrap();
+        // Leaving the scope any way at all (here a plain return, in `connect` a `return` or `break`) drops the guard.
+        let seen = || {
+            let _registered = stop.register(&file);
+            stop.pipe.lock().unwrap().is_some()
+        };
+        assert!(seen());
+        assert!(stop.pipe.lock().unwrap().is_none(), "the handle is unregistered once the guard is gone");
     }
 
     /// Times searches over this machine's real index (needs the helper running).
