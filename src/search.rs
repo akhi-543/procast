@@ -19,6 +19,7 @@ use nucleo_matcher::{
 use crate::{
     clipboard::Entry,
     commands::{self, Cmd},
+    desktops,
     config::Config,
     design::{Tint, g},
     scripts::Script,
@@ -292,6 +293,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
     for &(cmd, title, words, glyph) in commands::ALL {
         if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled
             || cmd == Cmd::SearchFiles && !cfg.files.enabled
+            || matches!(cmd, Cmd::Desktop(_)) && !desktops::supported()
         {
             continue;
         }

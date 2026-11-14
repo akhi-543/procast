@@ -2,7 +2,7 @@
 //! `run` is called off the UI thread: several of these broadcast or send window messages
 //! that would re-enter GPUI if issued from inside an update.
 
-use crate::{config, design::Tint};
+use crate::{config, design::Tint, desktops};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
@@ -60,7 +60,23 @@ pub enum Cmd {
     QuitApps,
     /// Open the Quick AI view to type a question.
     AskAi,
+    Desktop(Desk),
     Quit,
+}
+
+/// A virtual desktop command. Desktop numbers are 1-based (1 to 10).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Desk {
+    /// Switch to the desktop.
+    Open(u8),
+    /// Move the window there, without switching.
+    MoveTo(u8),
+    MoveNext,
+    MovePrev,
+    /// Close the current desktop; its windows go to the one on the left.
+    Close,
+    /// Needs a name: the launcher asks for it, then calls `desktops::rename`.
+    Rename,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -145,6 +161,30 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::MinimizeOthers, "Minimize Other Windows", "window hide", g::DOWN),
     (Cmd::CloseOthers, "Close Other Windows", "window quit", g::CANCEL),
     (Cmd::ToggleMaximize, "Toggle Maximize", "window full restore", g::FULL_SCREEN),
+    (Cmd::Desktop(Desk::Open(1)), "Open Desktop 1", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(2)), "Open Desktop 2", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(3)), "Open Desktop 3", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(4)), "Open Desktop 4", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(5)), "Open Desktop 5", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(6)), "Open Desktop 6", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(7)), "Open Desktop 7", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(8)), "Open Desktop 8", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(9)), "Open Desktop 9", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::Open(10)), "Open Desktop 10", "virtual desktop switch", g::SWITCH_APPS),
+    (Cmd::Desktop(Desk::MoveTo(1)), "Move to Desktop 1", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(2)), "Move to Desktop 2", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(3)), "Move to Desktop 3", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(4)), "Move to Desktop 4", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(5)), "Move to Desktop 5", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(6)), "Move to Desktop 6", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(7)), "Move to Desktop 7", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(8)), "Move to Desktop 8", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(9)), "Move to Desktop 9", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveTo(10)), "Move to Desktop 10", "virtual desktop window", g::DOCK_RIGHT),
+    (Cmd::Desktop(Desk::MoveNext), "Move to Next Desktop", "virtual desktop window", g::FORWARD),
+    (Cmd::Desktop(Desk::MovePrev), "Move to Previous Desktop", "virtual desktop window", g::BACK),
+    (Cmd::Desktop(Desk::Close), "Close Desktop", "virtual desktop remove", g::CANCEL),
+    (Cmd::Desktop(Desk::Rename), "Rename Desktop", "virtual desktop name", g::EDIT),
     (Cmd::Settings, "procast Settings", "preferences options configure", g::SETTING),
     (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", g::EDIT),
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", g::REFRESH),
@@ -158,7 +198,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
 impl Cmd {
     /// Asks for a second Enter before running.
     pub fn destructive(self) -> bool {
-        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::CloseOthers)
+        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::CloseOthers | Cmd::Desktop(Desk::Close))
     }
 
     pub fn key(self) -> String {
@@ -168,7 +208,7 @@ impl Cmd {
     /// The group a command belongs to, shown after its title.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize => "Window",
+            Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => "Window",
             Cmd::SearchFiles => "Files",
             Cmd::ClipboardHistory | Cmd::ClearClipboardHistory => "Clipboard",
             Cmd::Emoji => "Emoji",
@@ -183,7 +223,8 @@ impl Cmd {
     pub fn tint(self) -> Tint {
         match self {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::ToggleMaximize => Tint::Window,
-            Cmd::CloseOthers => Tint::Danger,
+            Cmd::Desktop(Desk::Close) | Cmd::CloseOthers => Tint::Danger,
+            Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::QuitApps => Tint::Danger,
@@ -205,6 +246,8 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s, w),
+            Cmd::Desktop(Desk::MoveTo(_) | Desk::MoveNext | Desk::MovePrev) if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
+            Cmd::Desktop(d) => return desktop(d, target),
             Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
             Cmd::Minimize => _ = ShowWindow(target, SW_MINIMIZE),
             Cmd::ToggleMaximize => _ = ShowWindow(target, if IsZoomed(target).as_bool() { SW_RESTORE } else { SW_MAXIMIZE }),
@@ -218,6 +261,18 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn desktop(d: Desk, target: HWND) -> Result<(), String> {
+    match d {
+        Desk::Open(n) => desktops::open(n),
+        Desk::MoveTo(n) => desktops::move_window(target, n),
+        Desk::MoveNext => desktops::move_next(target),
+        Desk::MovePrev => desktops::move_prev(target),
+        Desk::Close => desktops::close(),
+        // Asked for on the UI thread, which then calls `desktops::rename`.
+        Desk::Rename => Ok(()),
+    }
 }
 
 /// Every Alt+Tab window except `target` and procast's own windows (Settings and the like).
@@ -674,8 +729,18 @@ mod tests {
     }
 
     #[test]
+    fn desktop_commands_are_listed_once_each() {
+        let titles: Vec<&str> = ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).map(|&(_, t, ..)| t).collect();
+        assert_eq!(titles.len(), 24);
+        assert_eq!((titles[0], titles[9], titles[10], titles[19]), ("Open Desktop 1", "Open Desktop 10", "Move to Desktop 1", "Move to Desktop 10"));
+        assert!(ALL.iter().any(|&(c, t, ..)| c == Cmd::Desktop(Desk::Rename) && t == "Rename Desktop"));
+        assert!(ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).all(|&(c, ..)| c.subtitle() == "Window"));
+    }
+
+    #[test]
     fn close_others_asks_twice() {
-        assert!(Cmd::CloseOthers.destructive());
+        assert!(Cmd::CloseOthers.destructive() && Cmd::Desktop(Desk::Close).destructive());
+        assert!(!Cmd::Desktop(Desk::MoveNext).destructive() && !Cmd::Desktop(Desk::Open(2)).destructive());
         assert!(!Cmd::MinimizeOthers.destructive());
     }
 }

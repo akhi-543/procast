@@ -22,12 +22,16 @@ toml = "1"
 toml_edit = "0.25"
 tray-icon = "0.26"
 ureq = "3"
+winvd = { git = "https://github.com/Ciantic/VirtualDesktopAccessor", rev = "ef74c24", features = ["multiple-windows-versions"] }
+# winvd takes its own HWND type from windows 0.58: this names it to convert at the boundary.
+windows058 = { package = "windows", version = "0.58", features = ["Win32_Foundation"] }
 windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",
     "Graphics_Imaging",
     "Media_Ocr",
     "Storage_Streams",
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",

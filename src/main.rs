@@ -5,6 +5,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod design;
+mod desktops;
 mod ext;
 mod files;
 mod keys;
@@ -50,7 +51,7 @@ use tray_icon::{
 };
 use windows::Win32::Foundation::HWND;
 
-use commands::Cmd;
+use commands::{Cmd, Desk};
 use config::Config;
 use design::{Tokens, g, px};
 use ext::FieldKind;
@@ -217,6 +218,8 @@ enum Pending {
     Script(usize, Vec<String>),
     /// A snippet with `{argument}`s; `erase` and `then` as in `snippets::Job` (typed keywords).
     Snippet { name: String, template: String, args: Vec<snippets::Arg>, got: Vec<String>, erase: usize, then: String },
+    /// The name for the current virtual desktop.
+    RenameDesktop,
 }
 
 /// Hook settings: Hyper, double tap, and the snippet keywords and emoji shortcodes typed anywhere.
@@ -694,6 +697,7 @@ impl Launcher {
                     let sub = format!("{} · {} of {}", args[got.len()].name, got.len() + 1, args.len());
                     vec![Item::new(format!("Paste {name}"), sub, Icon::Vector(g::EDIT), Act::Snippet(template.clone()))]
                 }
+                Some(Pending::RenameDesktop) => vec![Item::new("Rename Desktop", "Name for the current desktop", Icon::Vector(g::EDIT), Act::Cmd(Cmd::Desktop(Desk::Rename)))],
                 None => vec![],
             },
             // Typed text is the next question; with an empty bar, Enter copies the answer.
@@ -1699,6 +1703,10 @@ impl Launcher {
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
+            Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
+                self.pending = Some(Pending::RenameDesktop);
+                return self.set_mode(Mode::Args, cx);
+            }
             Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
                 apps::quit(pid);
@@ -1779,7 +1787,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -1948,6 +1956,20 @@ impl Launcher {
                 }
                 self.mode = Mode::Root;
                 self.insert_snippet(template, got, erase, then, cx);
+            }
+            Some(Pending::RenameDesktop) => {
+                if value.is_empty() {
+                    self.status = Some((Tone::Error, "Name is required".into()));
+                    self.pending = Some(Pending::RenameDesktop);
+                    return cx.notify();
+                }
+                self.hide(true, cx);
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = desktops::rename(&value) {
+                        let _ = tx.unbounded_send(Msg::Notice(e));
+                    }
+                });
             }
         }
     }
@@ -2186,6 +2208,7 @@ impl Launcher {
             Mode::Args => self.pending.as_ref().map(|p| match p {
                 Pending::Script(i, _) => self.scripts[*i].title.clone(),
                 Pending::Snippet { name, .. } => name.clone(),
+                Pending::RenameDesktop => "Rename Desktop".into(),
             }),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
@@ -2218,6 +2241,7 @@ impl Launcher {
                         let a = &args[got.len()];
                         if a.default.is_empty() { format!("{}…", a.name) } else { format!("{} (empty: {})", a.name, a.default) }
                     }
+                    Pending::RenameDesktop => "Desktop name…".into(),
                 })
                 .unwrap_or_default()
                 .into(),
