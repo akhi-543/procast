@@ -185,20 +185,64 @@ fn should_remove(left: u32, current: u32, count: u32, windows_on_left: usize) ->
     count > 1 && left != current && windows_on_left == 0
 }
 
+type Id = windows058::core::GUID;
+
+/// Where a window lives, as far as the desktop code could tell.
+#[derive(Debug, PartialEq)]
+enum Lives {
+    On(Id),
+    /// No desktop for it (winvd's `WindowNotFound`).
+    Nowhere,
+    /// Any other failure: unknown.
+    Unknown,
+}
+
+/// What `close_if_empty` learned about one window.
+struct Seen {
+    pid: u32,
+    pinned: bool,
+    cloak: u32,
+    lives: Lives,
+}
+
+/// How many of `seen` keep desktop `old` in use. Every doubt counts the window (a desktop is only
+/// removed when sure it is empty), except:
+/// - procast's own windows (`me`), which never keep a desktop;
+/// - pinned windows, which show on every desktop and so belong to none;
+/// - ghosts: a shell-cloaked window with no desktop at all (suspended or preloaded Store app
+///   frames, TextInputHost: seen on a real machine, each answers `WindowNotFound`). One of them
+///   would otherwise count on every desktop and auto-close would never fire. A window that is not
+///   shell-cloaked and has no desktop still counts.
+fn windows_on(seen: &[Seen], old: Id, me: u32) -> usize {
+    seen.iter()
+        .filter(|w| w.pid != me && !w.pinned)
+        .filter(|w| match &w.lives {
+            Lives::On(id) => *id == old,
+            Lives::Nowhere => w.cloak & crate::apps::CLOAKED_SHELL == 0,
+            Lives::Unknown => true,
+        })
+        .count()
+}
+
+fn look_at(h: isize, pid: u32, cloak: u32) -> Seen {
+    let hwnd = winvd_hwnd(h);
+    let pinned = winvd::is_pinned_window(hwnd).unwrap_or(false) || winvd::is_pinned_app(hwnd).unwrap_or(false);
+    let lives = match winvd::get_desktop_by_window(hwnd).and_then(|d| d.get_id()) {
+        Ok(id) => Lives::On(id),
+        Err(winvd::Error::WindowNotFound) => Lives::Nowhere,
+        Err(_) => Lives::Unknown,
+    };
+    Seen { pid, pinned, cloak, lives }
+}
+
 /// Removes desktop `old` (by id: indexes shift) if it still exists, is not current and holds no
-/// app windows. Windows that are pinned (shown on every desktop) belong to no desktop, so they
-/// are not counted; one whose desktop cannot be read is counted, to err on the side of keeping.
-fn close_if_empty(old: windows058::core::GUID) -> Result<(), winvd::Error> {
+/// app windows (see `windows_on`).
+fn close_if_empty(old: Id) -> Result<(), winvd::Error> {
     let ids = winvd::get_desktops()?.iter().map(|d| d.get_id()).collect::<Result<Vec<_>, _>>()?;
     let Some(left) = ids.iter().position(|&i| i == old) else { return Ok(()) };
     let current = winvd::get_current_desktop()?;
-    let me = std::process::id();
-    let on_left = crate::apps::app_windows_everywhere()
-        .into_iter()
-        .filter(|&(h, pid)| pid != me && !(winvd::is_pinned_window(winvd_hwnd(handle(h))).unwrap_or(false) || winvd::is_pinned_app(winvd_hwnd(handle(h))).unwrap_or(false)))
-        .filter(|&(h, _)| winvd::get_desktop_by_window(winvd_hwnd(handle(h))).and_then(|d| d.get_id()).map_or(true, |i| i == old))
-        .count();
-    if should_remove(left as u32, current.get_index()?, ids.len() as u32, on_left) { winvd::remove_desktop(winvd::get_desktop(old), current) } else { Ok(()) }
+    let seen: Vec<Seen> = crate::apps::app_windows_everywhere().into_iter().map(|(h, pid, cloak)| look_at(handle(h), pid, cloak)).collect();
+    if should_remove(left as u32, current.get_index()?, ids.len() as u32, windows_on(&seen, old, std::process::id())) { winvd::remove_desktop(winvd::get_desktop(old), current) } else { Ok(()) }
 }
 
 /// Watches desktop changes and removes the desktop you left once it is empty. Dropping it stops
@@ -322,6 +366,27 @@ mod tests {
         assert!(!should_remove(2, 2, 3, 0), "the current desktop stays");
         assert!(!should_remove(0, 0, 1, 0), "the last desktop is never removed");
         assert!(!should_remove(1, 0, 1, 0));
+    }
+
+    fn seen(pid: u32, pinned: bool, cloak: u32, lives: Lives) -> Seen {
+        Seen { pid, pinned, cloak, lives }
+    }
+
+    #[test]
+    fn what_keeps_a_desktop_in_use() {
+        let (old, other) = (Id::from_u128(1), Id::from_u128(2));
+        let me = 100;
+        let count = |v: Vec<Seen>| windows_on(&v, old, me);
+        assert_eq!(count(vec![]), 0);
+        assert_eq!(count(vec![seen(5, false, 2, Lives::On(old))]), 1, "a window on it");
+        assert_eq!(count(vec![seen(5, false, 2, Lives::On(other)), seen(6, false, 0, Lives::On(other))]), 0, "windows elsewhere");
+        assert_eq!(count(vec![seen(5, false, 2, Lives::Unknown)]), 1, "a failed lookup counts");
+        assert_eq!(count(vec![seen(5, false, 0, Lives::Nowhere)]), 1, "a visible window with no desktop counts");
+        assert_eq!(count(vec![seen(5, false, 1, Lives::Nowhere)]), 1, "only a shell cloak marks a ghost");
+        assert_eq!(count(vec![seen(5, false, 2, Lives::Nowhere), seen(6, false, 3, Lives::Nowhere)]), 0, "ghosts do not count");
+        assert_eq!(count(vec![seen(5, true, 0, Lives::On(old))]), 0, "pinned windows belong to no desktop");
+        assert_eq!(count(vec![seen(me, false, 0, Lives::On(old))]), 0, "procast's own windows do not count");
+        assert_eq!(count(vec![seen(5, false, 2, Lives::Nowhere), seen(6, false, 2, Lives::On(old))]), 1, "a ghost beside a real window");
     }
 
     #[test]

@@ -90,31 +90,47 @@ fn real_pid(hwnd: HWND, pid: u32) -> u32 {
 
 /// Windows that show in Alt+Tab: visible, unowned, not tool windows, not cloaked, titled.
 pub fn app_windows() -> Vec<(HWND, u32)> {
-    windows(false)
+    windows(false).into_iter().map(|(h, pid, _)| (h, pid)).collect()
 }
 
-/// `app_windows` plus the windows of other virtual desktops (the shell cloaks those).
-pub fn app_windows_everywhere() -> Vec<(HWND, u32)> {
+/// Every top-level window that could keep a virtual desktop in use, as (window, pid, cloak).
+/// Not the Alt+Tab list: windows of other desktops are cloaked by the shell (DWM_CLOAKED_SHELL),
+/// so cloak bits other than "shell" are tolerated, an unreadable cloak state or an empty title
+/// does not drop a window (a desktop is only removed when sure it is empty). Tool windows stay
+/// out: they are palettes and helpers of another window, not something a desktop is kept for.
+pub fn app_windows_everywhere() -> Vec<(HWND, u32, u32)> {
     windows(true)
 }
 
-fn windows(other_desktops: bool) -> Vec<(HWND, u32)> {
-    /// DWM_CLOAKED_SHELL: hidden by the shell, as a window of another desktop is.
-    const SHELL: u32 = 2;
-    struct Scan(bool, Vec<(HWND, u32)>);
+/// DWM_CLOAKED_SHELL: hidden by the shell, as a window of another desktop is.
+pub const CLOAKED_SHELL: u32 = 2;
+
+/// Whether a window with this cloak state (None: unreadable) is listed. Alt+Tab wants no cloak at
+/// all; "everywhere" wants the shell's cloak (another desktop) whatever other bits come with it,
+/// and keeps a window whose state cannot be read.
+fn cloak_ok(other_desktops: bool, cloak: Option<u32>) -> bool {
+    match (other_desktops, cloak) {
+        (false, c) => c == Some(0),
+        (true, None) => true,
+        (true, Some(c)) => c == 0 || c & CLOAKED_SHELL != 0,
+    }
+}
+
+fn windows(other_desktops: bool) -> Vec<(HWND, u32, u32)> {
+    struct Scan(bool, Vec<(HWND, u32, u32)>);
     unsafe extern "system" fn each(h: HWND, l: LPARAM) -> BOOL {
         let Scan(other_desktops, out) = unsafe { &mut *(l.0 as *mut Scan) };
         unsafe {
             let mut cloaked = 0u32;
+            let read = DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4).is_ok();
             let shown = IsWindowVisible(h).as_bool()
                 && GetWindow(h, GW_OWNER).is_err()
                 && GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize == 0
-                && GetWindowTextLengthW(h) > 0
-                && DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4).is_ok()
-                && (cloaked == 0 || *other_desktops && cloaked == SHELL)
+                && (*other_desktops || GetWindowTextLengthW(h) > 0)
+                && cloak_ok(*other_desktops, read.then_some(cloaked))
                 && GetAncestor(h, GA_ROOTOWNER) == h;
             if shown {
-                out.push((h, pid_of(h)));
+                out.push((h, pid_of(h), if read { cloaked } else { 0 }));
             }
         }
         true.into()
@@ -317,6 +333,17 @@ mod tests {
     }
 
     #[test]
+    fn cloaked_windows_are_judged_for_their_use() {
+        // Alt+Tab: only uncloaked, and unreadable is out.
+        assert!(cloak_ok(false, Some(0)));
+        assert!(!cloak_ok(false, Some(CLOAKED_SHELL)) && !cloak_ok(false, None));
+        // Everywhere: shell cloak alone or with APP (1) / INHERITED (4); unreadable is kept.
+        assert!([0, 2, 3, 6, 7].into_iter().all(|c| cloak_ok(true, Some(c))));
+        assert!(cloak_ok(true, None));
+        assert!(!cloak_ok(true, Some(1)) && !cloak_ok(true, Some(4)), "cloaked by the app alone is not another desktop");
+    }
+
+    #[test]
     fn running_apps_are_listed() {
         // Whatever is open on this machine; at least the call works and finds real programs.
         for r in running() {
@@ -333,6 +360,32 @@ mod tests {
 
 #[cfg(test)]
 mod live {
+    /// READ-ONLY (switches, creates and removes nothing): `cargo test print_everywhere -- --ignored --nocapture`.
+    /// Every window `app_windows_everywhere` finds, with what the desktop code sees of it.
+    #[test]
+    #[ignore]
+    fn print_everywhere() {
+        let wins: Vec<_> = super::app_windows_everywhere().into_iter().map(|(h, pid, cloak)| (h.0 as isize, pid, cloak)).collect();
+        let rows = crate::desktops::call("List", move || {
+            let ids = winvd::get_desktops()?.iter().map(|d| d.get_id()).collect::<Result<Vec<_>, _>>()?;
+            Ok(wins
+                .into_iter()
+                .map(|(h, pid, cloak)| {
+                    let hwnd = windows058::Win32::Foundation::HWND(h as *mut std::ffi::c_void);
+                    let pinned = (winvd::is_pinned_window(hwnd), winvd::is_pinned_app(hwnd));
+                    let at = winvd::get_desktop_by_window(hwnd).and_then(|d| d.get_id()).map(|g| ids.iter().position(|i| *i == g));
+                    (h, pid, cloak, pinned, at)
+                })
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+        for (h, pid, cloak, pinned, at) in rows {
+            let hwnd = windows::Win32::Foundation::HWND(h as *mut std::ffi::c_void);
+            let exe = super::exe_path(pid).unwrap_or_default();
+            println!("{h:#x} pid {pid} cloak {cloak} pinned {pinned:?} desktop {at:?} | {} | {:?}", exe.rsplit('\\').next().unwrap_or(""), super::title(hwnd));
+        }
+    }
+
     /// `cargo test print_running -- --ignored --nocapture`: what this machine has open.
     #[test]
     #[ignore]
