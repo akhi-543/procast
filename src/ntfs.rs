@@ -539,7 +539,7 @@ impl Index {
 
     /// Filtered out by name (AppData, NTFS's own `$` files) or by full path (C:\Windows).
     fn left_out(&self, n: &Node, name: &str) -> bool {
-        if self.exclude.iter().any(|e| name.eq_ignore_ascii_case(e)) || (n.parent == ROOT && name.starts_with('$')) {
+        if crate::files::excluded(&self.exclude, name) || (n.parent == ROOT && name.starts_with('$')) {
             return true;
         }
         let lower = name.to_lowercase();
@@ -888,6 +888,7 @@ mod tests {
         put(&mut wire, UPSERT, b'C', 20, ROOT, true, "Users");
         put(&mut wire, UPSERT, b'C', 50, 20, true, "AppData");
         put(&mut wire, UPSERT, b'C', 51, 50, false, "report-cache.tmp");
+        put(&mut wire, UPSERT, b'C', 55, 20, false, "report-scratch.TMP");
         put(&mut wire, UPSERT, b'C', 60, ROOT, false, "$Secure");
         put(&mut wire, UPSERT, b'C', 70, ROOT, true, "Windows");
         put(&mut wire, UPSERT, b'C', 71, 70, false, "report-system.log");
@@ -896,7 +897,7 @@ mod tests {
         // D: is still loading when C: finishes; its child arrives before its parent.
         put(&mut wire, UPSERT, b'D', 91, 90, false, "report-on-d.txt");
         put(&mut wire, READY, b'C', 0, 0, false, "");
-        let filter = Filter { exclude: vec!["AppData".into()], skip: vec![r"C:\Windows\".into()], drives: vec!["c".into(), "D".into()] };
+        let filter = Filter { exclude: vec!["AppData".into(), "*.tmp".into()], skip: vec![r"C:\Windows\".into()], drives: vec!["c".into(), "D".into()] };
         let mut ix = Index::new(&filter);
         // Split mid-record: the tail is kept for the next read.
         let (used, ready) = ix.apply(&wire[..wire.len() - 3]);

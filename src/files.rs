@@ -177,13 +177,46 @@ impl Files {
     }
 }
 
+/// `*` matches any run of characters, `?` exactly one; ASCII case-insensitive.
+/// A pattern made only of wildcards matches nothing, so a stray `*` can't hide every file.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    if pattern.chars().all(|c| c == '*' || c == '?') {
+        return false;
+    }
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi].eq_ignore_ascii_case(&n[ni])) {
+            pi += 1;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// Whether a file or folder name is skipped: an exact name or a wildcard pattern.
+/// Patterns are lowercased once when the list is built, not per name.
+pub fn excluded(exclude: &[String], name: &str) -> bool {
+    exclude.iter().any(|e| name.eq_ignore_ascii_case(e) || glob_match(e, name))
+}
+
 pub fn crawl(roots: &[String], exclude: &[String]) -> Vec<Entry> {
     let exclude: Vec<String> = exclude.iter().map(|e| e.to_lowercase()).collect();
     let mut out = Vec::new();
     for root in roots {
         let skip = exclude.clone();
         let walk = jwalk::WalkDir::new(root).skip_hidden(false).follow_links(false).process_read_dir(move |_, _, _, children| {
-            children.retain(|c| c.as_ref().is_ok_and(|e| !skip.contains(&e.file_name.to_string_lossy().to_lowercase())));
+            children.retain(|c| c.as_ref().is_ok_and(|e| !excluded(&skip, &e.file_name.to_string_lossy())));
         });
         for entry in walk.into_iter().flatten().skip(1) {
             out.push(Entry::new(entry.path().to_string_lossy().into(), entry.file_type.is_dir()));
@@ -201,7 +234,7 @@ pub fn apply(index: &mut Vec<Entry>, root: &str, exclude: &[String], changes: Ve
     let mut dropped: HashSet<String> = HashSet::new();
     let mut added = vec![];
     for c in changes {
-        if c.components().any(|p| exclude.contains(&p.as_os_str().to_string_lossy().to_lowercase())) {
+        if c.components().any(|p| excluded(&exclude, &p.as_os_str().to_string_lossy())) {
             continue;
         }
         let full = Path::new(root).join(&c).to_string_lossy().into_owned();
@@ -344,17 +377,37 @@ mod tests {
     }
 
     #[test]
+    fn globs_match_names() {
+        assert!(glob_match("*.log", "Build.LOG"));
+        assert!(!glob_match("*.log", "log.txt"));
+        assert!(glob_match("build-*", "build-1"));
+        assert!(glob_match("?.tmp", "a.tmp"));
+        assert!(!glob_match("?.tmp", "ab.tmp"));
+        assert!(glob_match("a*b*c", "aXbYbZc"));
+        assert!(!glob_match("a*b*c", "aXbYbZ"));
+        let ex = vec!["node_modules".to_string(), "*.log".to_string()];
+        assert!(excluded(&ex, "Node_Modules"));
+        assert!(excluded(&ex, "x.log"));
+        assert!(!excluded(&ex, "node_modules2"));
+        for p in ["*", "?", "**"] {
+            assert!(!glob_match(p, "anything"), "{p} alone matches nothing");
+            assert!(!excluded(&[p.to_string()], "anything"));
+        }
+    }
+
+    #[test]
     fn crawl_skips_excluded_and_search_ranks_names() {
         let root = std::env::temp_dir().join(format!("procast-files-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for p in ["docs/Quarterly Report.docx", "docs/report-draft.txt", "node_modules/pkg/report.js", "photos/beach.jpg"] {
+        for p in ["docs/Quarterly Report.docx", "docs/report-draft.txt", "node_modules/pkg/report.js", "photos/beach.jpg", "docs/bundle.js"] {
             let p = root.join(p);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, "").unwrap();
         }
-        let index = crawl(&[root.to_string_lossy().into_owned()], &["node_modules".into()]);
+        let index = crawl(&[root.to_string_lossy().into_owned()], &["node_modules".into(), "*.JS".into()]);
         let _ = std::fs::remove_dir_all(&root);
         assert!(index.iter().all(|e| !e.path.contains("node_modules")), "excluded folders are not walked");
+        assert!(index.iter().all(|e| !e.path.ends_with(".js")), "wildcard names are not indexed");
         assert!(index.iter().any(|e| e.dir && e.name() == "photos"));
 
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT.match_paths());

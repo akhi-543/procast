@@ -341,7 +341,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 "Folders",
                 vec![
                     row("Folders to search", "files.roots", Kind::List, "Full paths, e.g. D:\\Projects. With none, your user folder is searched."),
-                    row("Skip names", "files.exclude", Kind::List, "File or folder names skipped wherever they appear, e.g. node_modules."),
+                    row("Skip names", "files.exclude", Kind::List, "File or folder names skipped wherever they appear, e.g. node_modules or *.log."),
                 ],
             ),
             (
