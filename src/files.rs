@@ -336,6 +336,8 @@ pub fn apply(index: &mut Vec<Entry>, root: &str, rules: &Rules, changes: Vec<Pat
             continue;
         }
         // Hidden, or inside a hidden folder: dropped from the index, never added.
+        // ponytail: the watcher doesn't ask for attribute changes (the archive bit and indexers make
+        // them noisy), so a file hidden or unhidden later is seen only at the next full crawl.
         if !rules.hidden && !at_root && c.ancestors().any(|a| !a.as_os_str().is_empty() && is_hidden(&Path::new(root).join(a))) {
             dropped.insert(full);
             continue;

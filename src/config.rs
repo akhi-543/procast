@@ -669,6 +669,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
     toml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("config.toml: {}", e.message()))
 }
 
+/// Whether this config text asks for removable drives in whole-drive search. The elevated
+/// helper reads the user's file with this; anything unreadable counts as no.
+pub fn removable_wanted(text: &str) -> bool {
+    parse(text).is_ok_and(|c| c.files.removable)
+}
+
 /// The value in effect: the file's, or the default when the key isn't there (older
 /// config files lack settings added since).
 pub fn shown_value(text: &str, path: &[String]) -> String {
@@ -850,6 +856,16 @@ fn key_code(key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removable_is_read_from_config_text() {
+        assert!(removable_wanted("[files]\nremovable = true\n"));
+        assert!(removable_wanted("\u{feff}[files]\nremovable = true # usb\n"), "a byte-order mark is fine");
+        assert!(!removable_wanted("[files]\nremovable = false\n"));
+        assert!(!removable_wanted(""), "unset is off, as is a missing file's empty text");
+        assert!(!removable_wanted(TEMPLATE));
+        assert!(!removable_wanted("[files]\nremovable = true\nroots = 3\n"), "an invalid file counts as off");
+    }
 
     #[test]
     fn template_parses_and_hotkeys() {

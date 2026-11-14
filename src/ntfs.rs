@@ -104,6 +104,11 @@ const UPSERT: u8 = 0;
 const DELETE: u8 = 1;
 /// A drive's snapshot is complete; live changes follow.
 const READY: u8 = 2;
+/// First record of every connection: the helper's protocol version, in the record field.
+/// Helpers from before it never send one.
+const HELLO: u8 = 3;
+/// 2: flags byte with the hidden bit, removable drives on request.
+const HELPER_VERSION: u64 = 2;
 const W_DIR: u8 = 1;
 const W_HIDDEN: u8 = 2;
 // GetDriveTypeW results.
@@ -198,10 +203,22 @@ pub fn serve() {
             continue;
         }
         let pipe = Arc::new(Pipe { h, lock: Mutex::new(()) });
-        for drive in ntfs_drives() {
+        let mut hello = vec![];
+        put(&mut hello, HELLO, 0, HELPER_VERSION, 0, 0, "");
+        if pipe.write(&hello).is_none() {
+            continue;
+        }
+        // The pipe only flows outward, so the user's setting is read here, per connection. An
+        // unreadable or invalid config means no removable drives.
+        // ponytail: a stick plugged in while the setting is on stays open (blocking "Safely remove")
+        // until the helper's next rescan (reconnect); toggling the setting off reconnects.
+        let removable = crate::config::removable_wanted(&std::fs::read_to_string(crate::config::path()).unwrap_or_default());
+        for (drive, usb) in ntfs_drives(removable) {
             let pipe = pipe.clone();
             std::thread::spawn(move || {
-                if stream_drive(drive, &pipe).is_none() {
+                // A fixed drive failing restarts the whole stream; a stick (write-protected,
+                // ejected) only ends its own thread.
+                if stream_drive(drive, &pipe).is_none() && !usb {
                     pipe.kill();
                 }
             });
@@ -209,16 +226,21 @@ pub fn serve() {
     }
 }
 
-/// Fixed and removable drives formatted NTFS, as letters; procast drops the removable
-/// ones unless asked.
-fn ntfs_drives() -> Vec<u8> {
-    (b'A'..=b'Z')
-        .filter(|d| unsafe {
+/// The drives to stream, from (letter, GetDriveTypeW result): fixed ones, and removable
+/// ones only when wanted. Each comes with whether it is removable.
+fn pick_drives(types: &[(u8, u32)], removable: bool) -> Vec<(u8, bool)> {
+    types.iter().filter(|(_, t)| *t == DRIVE_FIXED || (removable && *t == DRIVE_REMOVABLE)).map(|&(d, t)| (d, t == DRIVE_REMOVABLE)).collect()
+}
+
+/// Fixed (and, when asked, removable) drives formatted NTFS, as letters.
+fn ntfs_drives(removable: bool) -> Vec<(u8, bool)> {
+    let types: Vec<(u8, u32)> = (b'A'..=b'Z').map(|d| (d, unsafe { GetDriveTypeW(&HSTRING::from(format!("{}:\\", d as char))) })).collect();
+    pick_drives(&types, removable)
+        .into_iter()
+        .filter(|(d, _)| unsafe {
             let root = HSTRING::from(format!("{}:\\", *d as char));
             let mut fs = [0u16; 16];
-            matches!(GetDriveTypeW(&root), DRIVE_FIXED | DRIVE_REMOVABLE)
-                && GetVolumeInformationW(&root, None, None, None, None, Some(&mut fs)).is_ok()
-                && String::from_utf16_lossy(&fs).trim_end_matches('\0') == "NTFS"
+            GetVolumeInformationW(&root, None, None, None, None, Some(&mut fs)).is_ok() && String::from_utf16_lossy(&fs).trim_end_matches('\0') == "NTFS"
         })
         .collect()
 }
@@ -486,6 +508,8 @@ pub struct Index {
     /// Drive letters left out: the removable ones, unless wanted.
     removable: Vec<u8>,
     hidden: bool,
+    /// The helper's protocol version (its HELLO record); 0 until one arrives.
+    helper: u64,
     live: usize,
     /// Exclusion flags need a full pass: before the first one, or after a folder moved.
     dirty: bool,
@@ -511,6 +535,11 @@ impl Index {
 
     pub fn len(&self) -> usize {
         self.live
+    }
+
+    /// The helper predates this build's protocol: it ignores the hidden and removable settings.
+    fn helper_outdated(&self) -> bool {
+        self.helper < HELPER_VERSION
     }
 
     fn slot(&self, drive: u8, rec: u64) -> Option<usize> {
@@ -613,6 +642,7 @@ impl Index {
                     self.dirty = true;
                     ready.push(drive);
                 }
+                HELLO => self.helper = rec,
                 _ => {}
             }
             at += HEADER + len;
@@ -818,6 +848,7 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
             let mut buf = vec![0u8; 4 << 20];
             let mut have = 0;
             let mut last_note = Instant::now();
+            let mut warned = false;
             while let Ok(n) = pipe.read(&mut buf[have..]) {
                 if n == 0 {
                     break;
@@ -831,7 +862,14 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
                     ix.refresh_excluded();
                 }
                 count.store(ix.len(), Ordering::SeqCst);
+                // The first bytes decide: an old helper sends no HELLO and ignores these settings.
+                let outdated = !warned && used > 0 && ix.helper_outdated() && (!filter.hidden || filter.removable);
                 drop(ix);
+                if outdated {
+                    warned = true;
+                    let note = "The whole-drive helper is out of date, so the hidden-file and removable-drive settings are ignored. Run \"Enable Fast File Search\" again to update it.";
+                    let _ = tx.unbounded_send(Msg::Notice(note.into()));
+                }
                 if !done.is_empty() {
                     let n = index.read().unwrap().len();
                     crate::ext_log("file index", &format!("drive {} ready: {n} entries kept after {:.1?}", done.iter().map(|d| *d as char).collect::<String>(), started.elapsed()));
@@ -1010,6 +1048,38 @@ mod tests {
         let mut ix = Index::new(&Filter { hidden: true, removable: true, ..Filter::default() });
         ix.apply(&wire);
         assert_eq!(ix.len(), 2, "wanted: nothing is left out");
+    }
+
+    #[test]
+    fn drives_are_picked_by_type_and_the_removable_setting() {
+        // A: floppy (2), C: fixed, D: fixed, E: removable, F: CD-ROM (5), G: network (4), H: unknown (0).
+        let types = [(b'A', 2), (b'C', 3), (b'D', 3), (b'E', 2), (b'F', 5), (b'G', 4), (b'H', 0)];
+        let letters = |removable| pick_drives(&types, removable).into_iter().map(|(d, usb)| format!("{}{}", d as char, if usb { "*" } else { "" })).collect::<Vec<_>>();
+        assert_eq!(letters(false), ["C", "D"], "removable drives are never opened by default");
+        assert_eq!(letters(true), ["A*", "C", "D", "E*"], "removable ones are flagged so a failure can't take the pipe down");
+    }
+
+    #[test]
+    fn an_old_helper_is_detected_by_its_missing_hello() {
+        let mut old = vec![];
+        put(&mut old, UPSERT, b'C', 20, ROOT, 0, "Docs");
+        let mut ix = Index::new(&Filter { removable: true, ..Filter::default() });
+        ix.apply(&old);
+        assert!(ix.helper_outdated(), "no HELLO: an older helper");
+
+        let mut new = vec![];
+        put(&mut new, HELLO, 0, HELPER_VERSION, 0, 0, "");
+        put(&mut new, UPSERT, b'C', 20, ROOT, 0, "Docs");
+        let mut ix = Index::new(&Filter { removable: true, ..Filter::default() });
+        ix.apply(&new);
+        assert!(!ix.helper_outdated());
+        assert_eq!(ix.len(), 1, "HELLO adds no entry");
+
+        let mut older = vec![];
+        put(&mut older, HELLO, 0, HELPER_VERSION - 1, 0, 0, "");
+        let mut ix = Index::new(&Filter::default());
+        ix.apply(&older);
+        assert!(ix.helper_outdated(), "an earlier version number counts too");
     }
 
     #[test]
