@@ -89,7 +89,7 @@ fn call_within<T: Send + 'static>(what: &str, wait: Duration, f: impl FnOnce() -
         },
         _ => format!("{what}: the desktop thread is not running"),
     };
-    eprintln!("procast: {failure}");
+    crate::ext_log("virtual desktops", &failure);
     Err(failure)
 }
 
@@ -259,7 +259,7 @@ impl Listener {
             return None;
         }
         let (tx, rx) = channel();
-        let events = winvd::listen_desktop_events::<winvd::DesktopEvent, _>(tx).inspect_err(|e| eprintln!("procast: Auto close desktops: {e:?}")).ok()?;
+        let events = winvd::listen_desktop_events::<winvd::DesktopEvent, _>(tx).inspect_err(|e| crate::ext_log("virtual desktops", &format!("Auto close desktops: {e:?}"))).ok()?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         std::thread::Builder::new().name("desktops-auto-close".into()).spawn(move || watch(rx, flag)).ok()?;

@@ -210,15 +210,15 @@ pub fn serve() {
         }
         // The pipe only flows outward, so the user's setting is read here, per connection. An
         // unreadable or invalid config means no removable drives.
-        // ponytail: a stick plugged in while the setting is on stays open (blocking "Safely remove")
-        // until the helper's next rescan (reconnect); toggling the setting off reconnects.
+        // ponytail: removable drives are a snapshot: no journal is followed, so no handle stays open
+        // to veto "Safely remove". Changes on a stick show at the next helper connection (rescan).
         let removable = crate::config::removable_wanted(&std::fs::read_to_string(crate::config::path()).unwrap_or_default());
         for (drive, usb) in ntfs_drives(removable) {
             let pipe = pipe.clone();
             std::thread::spawn(move || {
                 // A fixed drive failing restarts the whole stream; a stick (write-protected,
                 // ejected) only ends its own thread.
-                if stream_drive(drive, &pipe).is_none() && !usb {
+                if stream_drive(drive, usb, &pipe).is_none() && !usb {
                     pipe.kill();
                 }
             });
@@ -245,8 +245,9 @@ fn ntfs_drives(removable: bool) -> Vec<(u8, bool)> {
         .collect()
 }
 
-/// Enumerates one drive's MFT, then follows its USN journal until the client goes away.
-fn stream_drive(drive: u8, pipe: &Pipe) -> Option<()> {
+/// Enumerates one drive's MFT, then follows its USN journal until the client goes away. A
+/// removable drive (`snapshot_only`) stops after the snapshot and closes its volume handle.
+fn stream_drive(drive: u8, snapshot_only: bool, pipe: &Pipe) -> Option<()> {
     let h = unsafe {
         CreateFileW(
             &HSTRING::from(format!(r"\\.\{}:", drive as char)),
@@ -286,6 +287,9 @@ fn stream_drive(drive: u8, pipe: &Pipe) -> Option<()> {
     }
     put(&mut out, READY, drive, 0, 0, 0, "");
     pipe.write(&out)?;
+    if snapshot_only {
+        return Some(());
+    }
 
     // ponytail: the reason mask has no attribute changes, so hiding or unhiding an existing file
     // is seen only at the next full pass (reconnect). Add USN_REASON_BASIC_INFO_CHANGE if that bites.
@@ -893,6 +897,8 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
     let client = Client { index: index.clone(), ready: ready.clone(), stop: stop.clone() };
     std::thread::spawn(move || {
         let mut fails = 0u32;
+        // Once per client, not per connection: a reconnect loop must not reopen the launcher.
+        let mut warned = false;
         while !stop.stopped() {
             let Some(mut pipe) = open_pipe() else {
                 fails += 1;
@@ -916,7 +922,6 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
             let mut buf = vec![0u8; 4 << 20];
             let mut have = 0;
             let mut last_note = Instant::now();
-            let mut warned = false;
             let _registered = stop.register(&pipe);
             while let Ok(n) = pipe.read(&mut buf[have..]) {
                 if n == 0 || stop.stopped() {

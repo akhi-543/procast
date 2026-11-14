@@ -150,8 +150,9 @@ impl Files {
             std::thread::spawn(move || {
                 crate::win::watch_dir(Path::new(&root), true, |changes| {
                     let Some(index) = index.upgrade() else { return false };
-                    if changes.is_empty() {
-                        // Changes were lost: the next File Search re-crawls.
+                    if changes.is_empty() || root_ignore_changed(&rules, &changes) {
+                        // Changes were lost, or an ignore file at the root changed (a re-walk of the whole
+                        // root, which must not run under the index lock): the next File Search re-crawls.
                         *built.write().unwrap() = None;
                         return true;
                     }
@@ -368,6 +369,15 @@ fn ignore_state(root: &Path, rel: &Path, dir: bool, cache: &mut Cache) -> (Chain
     (chain, false)
 }
 
+fn is_ignore_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".gitignore") || n.eq_ignore_ascii_case(".ignore"))
+}
+
+/// Whether the batch (paths relative to the root) touches an ignore file directly in the root.
+fn root_ignore_changed(rules: &Rules, changes: &[PathBuf]) -> bool {
+    rules.gitignore && changes.iter().any(|c| is_ignore_file(c) && c.components().count() == 1)
+}
+
 /// Applies one batch of watcher changes (paths relative to `root`). Returns whether the
 /// index changed. Each changed path is dropped with everything under it, then added back
 /// (a folder with its contents) if it exists now, so renames, moves and repeats come out right.
@@ -378,7 +388,7 @@ pub fn apply(index: &mut Vec<Entry>, root: &str, rules: &Rules, changes: Vec<Pat
     let mut added = vec![];
     let mut cache = Cache::new();
     for mut c in changes {
-        if rules.gitignore && c.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".gitignore") || n.eq_ignore_ascii_case(".ignore")) {
+        if rules.gitignore && is_ignore_file(&c) {
             c.pop();
         }
         if c.components().any(|p| excluded(&rules.exclude, &p.as_os_str().to_string_lossy())) {
@@ -556,14 +566,27 @@ pub struct FileInfo {
 /// Pictures larger than this show their icon instead of being decoded.
 const MAX_PICTURE: u64 = 50 * 1024 * 1024;
 
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+
+/// Whether reading this file or listing this folder would download it (OneDrive and other cloud
+/// placeholders): the detail pane shows the icon and never opens those.
+fn is_cloud_only(attributes: u32) -> bool {
+    attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
+}
+
 /// What the detail pane needs for one path; None when it is gone.
 pub fn file_info(path: &str, home: &str) -> Option<FileInfo> {
+    use std::os::windows::fs::MetadataExt;
     let p = Path::new(path);
     let meta = std::fs::metadata(p).ok()?;
     let dir = meta.is_dir();
     let kind = classify(p, dir).1;
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let preview = if dir {
+    let preview = if is_cloud_only(meta.file_attributes()) {
+        Preview::Icon
+    } else if dir {
         Preview::Folder(std::fs::read_dir(p).map_or(0, |d| d.take(10_000).count()))
     } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") && meta.len() <= MAX_PICTURE {
         Preview::Image(p.to_path_buf())
@@ -651,6 +674,14 @@ mod tests {
         assert_eq!(size_text(512), "512 bytes");
         assert_eq!(size_text(3482), "3.4 KB");
         assert_eq!(size_text(5 * 1_048_576), "5.0 MB");
+    }
+
+    #[test]
+    fn cloud_placeholders_are_not_opened() {
+        assert!(is_cloud_only(0x20 | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS), "cloud-only file");
+        assert!(is_cloud_only(0x10 | FILE_ATTRIBUTE_RECALL_ON_OPEN), "cloud-only folder");
+        assert!(is_cloud_only(FILE_ATTRIBUTE_OFFLINE));
+        assert!(!is_cloud_only(0x20 | 0x2 | 0x10), "archive, hidden, directory: local");
     }
 
     #[test]
@@ -866,6 +897,17 @@ mod tests {
         assert!(apply(&mut index, &r, &rules, vec![ch("plain.txt")]));
         assert_eq!(names(&index, &r), ["plain.txt"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_root_ignore_file_change_means_a_recrawl() {
+        let ch = |p: &str| vec![PathBuf::from("x.txt"), PathBuf::from(p)];
+        let on = Rules { gitignore: true, ..Rules::default() };
+        assert!(root_ignore_changed(&on, &ch(".gitignore")));
+        assert!(root_ignore_changed(&on, &ch(".IGNORE")));
+        assert!(!root_ignore_changed(&on, &ch("a\\.gitignore")), "a folder's own ignore file re-walks only that folder");
+        assert!(!root_ignore_changed(&on, &ch(".gitignore~")));
+        assert!(!root_ignore_changed(&Rules { gitignore: false, ..Rules::default() }, &ch(".gitignore")));
     }
 
     #[test]

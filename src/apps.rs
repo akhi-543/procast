@@ -98,6 +98,8 @@ pub fn app_windows() -> Vec<(HWND, u32)> {
 /// so cloak bits other than "shell" are tolerated, an unreadable cloak state or an empty title
 /// does not drop a window (a desktop is only removed when sure it is empty). Tool windows stay
 /// out: they are palettes and helpers of another window, not something a desktop is kept for.
+/// The desktop (Progman) and taskbar windows are skipped in both lists: they exist on every
+/// desktop and are not something to close, minimize or count.
 pub fn app_windows_everywhere() -> Vec<(HWND, u32, u32)> {
     windows(true)
 }
@@ -128,7 +130,8 @@ fn windows(other_desktops: bool) -> Vec<(HWND, u32, u32)> {
                 && GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize == 0
                 && (*other_desktops || GetWindowTextLengthW(h) > 0)
                 && cloak_ok(*other_desktops, read.then_some(cloaked))
-                && GetAncestor(h, GA_ROOTOWNER) == h;
+                && GetAncestor(h, GA_ROOTOWNER) == h
+                && !crate::commands::is_shell(h);
             if shown {
                 out.push((h, pid_of(h), if read { cloaked } else { 0 }));
             }
@@ -163,7 +166,7 @@ pub fn running() -> Vec<Running> {
     let mut out: Vec<Running> = vec![];
     for (h, pid) in app_windows() {
         let (pid, exe) = window_exe(h, pid);
-        if pid == me || exe.is_empty() || exe.to_lowercase().ends_with("\\explorer.exe") && title(h) == "Program Manager" {
+        if pid == me || exe.is_empty() {
             continue;
         }
         match out.iter_mut().find(|r| r.pid == pid) {
@@ -349,6 +352,13 @@ mod tests {
         for r in running() {
             assert!(r.exe.contains('\\') && !r.windows.is_empty(), "{r:?}");
         }
+    }
+
+    #[test]
+    fn the_desktop_and_taskbar_are_never_listed() {
+        // Close Others, Minimize Others and auto-close would act on Progman otherwise.
+        assert!(app_windows().into_iter().all(|(h, _)| !crate::commands::is_shell(h)));
+        assert!(app_windows_everywhere().into_iter().all(|(h, ..)| !crate::commands::is_shell(h)));
     }
 
     #[test]

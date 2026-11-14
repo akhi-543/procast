@@ -270,9 +270,9 @@ pub struct Window {
     pub gap: u32,
     /// Pixels between snapped windows and the screen edges.
     pub screen_gap: u32,
-    /// Repeating a half or third command cycles through sizes.
+    /// Repeating Left, Right, Top or Bottom Half cycles through sizes (1/2, 2/3, 1/3).
     pub cycle: bool,
-    /// Close a virtual desktop when its last window leaves it.
+    /// Remove a virtual desktop with no windows when you switch away from it.
     pub auto_close_empty_desktops: bool,
     /// Named window arrangements, each a root-search command "Layout: <name>".
     pub layouts: Vec<Layout>,
@@ -565,13 +565,13 @@ hotkey = ""
 ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
 drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = every NTFS drive
 skip = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData']  # left out of whole-drive search (and memory)
-removable = false             # whole-drive search: include removable (USB) NTFS drives
+removable = false             # whole-drive search: include removable (USB) NTFS drives (the Fast File Search helper reads this from the config of the account it runs as)
 
 [window]
 gap = 0                       # pixels between snapped windows
 screen_gap = 0                # pixels between snapped windows and the screen edges
-cycle = true                  # repeating Left Half, Right Half, thirds... cycles through sizes
-auto_close_empty_desktops = false  # close a virtual desktop when its last window leaves it
+cycle = true                  # repeating Left, Right, Top or Bottom Half cycles through sizes (1/2, 2/3, 1/3)
+auto_close_empty_desktops = false  # remove a desktop with no windows when you switch away from it
 # Layout presets: each becomes a command "Layout: <name>" that finds (or starts) each app and snaps it.
 # app = the program's exe name (or a full path); a Start-menu app is launched from there, else Windows searches PATH.
 # Packaged Store apps (other than Windows Terminal, which is built in) can be snapped when already running, but a layout can't start them.

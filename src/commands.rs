@@ -427,7 +427,7 @@ pub fn cycle_target(s: Snap, wa: RECT, vis: RECT, g: Gaps, cycle: bool) -> RECT 
 }
 
 /// The desktop and taskbar: opening procast from them leaves no window to move.
-fn is_shell(hwnd: HWND) -> bool {
+pub fn is_shell(hwnd: HWND) -> bool {
     let mut buf = [0u16; 32];
     let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
     matches!(String::from_utf16_lossy(&buf[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
