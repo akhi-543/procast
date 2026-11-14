@@ -205,12 +205,12 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s, w),
-            Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() => return Err("No window to act on".into()),
+            Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
             Cmd::Minimize => _ = ShowWindow(target, SW_MINIMIZE),
             Cmd::ToggleMaximize => _ = ShowWindow(target, if IsZoomed(target).as_bool() { SW_RESTORE } else { SW_MAXIMIZE }),
-            Cmd::MinimizeOthers => others(target).for_each(|h| _ = ShowWindow(h, SW_MINIMIZE)),
+            Cmd::MinimizeOthers => others(target).into_iter().for_each(|h| _ = ShowWindow(h, SW_MINIMIZE)),
             // The windows get to ask about unsaved work, so some may stay open.
-            Cmd::CloseOthers => others(target).for_each(|h| drop(PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)))),
+            Cmd::CloseOthers => others(target).into_iter().for_each(|h| drop(PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)))),
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
@@ -220,9 +220,13 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
     Ok(())
 }
 
-/// Every Alt+Tab window except `target`. procast's own launcher is hidden by now, so it is not among them.
-fn others(target: HWND) -> impl Iterator<Item = HWND> {
-    crate::apps::app_windows().into_iter().map(|(h, _)| h).filter(move |&h| h != target)
+/// Every Alt+Tab window except `target` and procast's own windows (Settings and the like).
+fn others(target: HWND) -> Vec<HWND> {
+    others_of(&crate::apps::app_windows(), target, std::process::id())
+}
+
+fn others_of(windows: &[(HWND, u32)], target: HWND, me: u32) -> Vec<HWND> {
+    windows.iter().filter(|&&(h, pid)| h != target && pid != me).map(|&(h, _)| h).collect()
 }
 
 fn shutdown(flag: &str) {
@@ -506,6 +510,13 @@ mod tests {
             let t = with_gaps(layout(s, wa, cur), wa, 0);
             assert!(t.left >= 8 && t.top >= 8 && t.right <= 1192 && t.bottom <= 892, "{s:?} {t:?}");
         }
+    }
+
+    #[test]
+    fn others_drop_the_target_and_our_own_windows() {
+        let h = |n: usize| HWND(n as _);
+        let list = [(h(1), 10), (h(2), 20), (h(3), 99), (h(4), 30)];
+        assert_eq!(others_of(&list, h(2), 99), vec![h(1), h(4)]);
     }
 
     #[test]
