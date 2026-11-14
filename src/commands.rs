@@ -392,15 +392,25 @@ pub fn snap_by_name(name: &str) -> Option<Snap> {
     })
 }
 
+/// Programs whose windows belong to a different exe than the one that starts them:
+/// (window exe, launch alias on PATH).
+const LAUNCH_ALIASES: &[(&str, &str)] = &[("WindowsTerminal.exe", "wt.exe")];
+
+/// Whether two exe file names are the same program: equal, or a window exe and its launch alias.
+fn same_program(a: &str, b: &str) -> bool {
+    let is = |x: &str, y: &str| x.eq_ignore_ascii_case(y);
+    is(a, b) || LAUNCH_ALIASES.iter().any(|&(win, alias)| is(a, win) && is(b, alias) || is(a, alias) && is(b, win))
+}
+
 /// A visible window of the program named `app` (a file name, any case), procast's own excluded.
 fn window_of(app: &str) -> Option<HWND> {
-    let want = std::path::Path::new(app).file_name()?;
+    let want = std::path::Path::new(app).file_name()?.to_string_lossy().into_owned();
     let me = std::process::id();
     crate::apps::app_windows()
         .into_iter()
         .find(|&(h, pid)| {
             let (pid, exe) = crate::apps::window_exe(h, pid);
-            pid != me && std::path::Path::new(&exe).file_name().is_some_and(|n| n.eq_ignore_ascii_case(want))
+            pid != me && std::path::Path::new(&exe).file_name().is_some_and(|n| same_program(&n.to_string_lossy(), &want))
         })
         .map(|(h, _)| h)
 }
@@ -415,7 +425,8 @@ enum Launch {
 }
 
 /// A full path opens as is; a bare exe name goes through the first launcher app (from `ids`)
-/// whose shortcut targets that program; anything else is left to ShellExecute's own search.
+/// whose shortcut targets that program, else its launch alias (Windows Terminal's `wt.exe`);
+/// anything else is left to ShellExecute's own search.
 fn pick_launch(app: &str, ids: &[String], target_of: impl Fn(&str) -> Option<String>) -> Launch {
     let path = std::path::Path::new(app);
     if let Some(name) = path.file_name().filter(|_| !path.is_absolute()) {
@@ -424,7 +435,8 @@ fn pick_launch(app: &str, ids: &[String], target_of: impl Fn(&str) -> Option<Str
             return Launch::App(id.clone());
         }
     }
-    Launch::Open(app.to_string())
+    let alias = LAUNCH_ALIASES.iter().find(|(win, _)| app.eq_ignore_ascii_case(win)).map_or(app, |&(_, alias)| alias);
+    Launch::Open(alias.to_string())
 }
 
 /// Runs a layout preset: each slot's program gets a window (started if none is open,
@@ -642,8 +654,17 @@ mod tests {
         };
         assert_eq!(pick_launch("code.exe", &ids, target), Launch::App(ids[0].clone()), "case-insensitive exe name");
         assert_eq!(pick_launch("Tool.exe", &ids, target), Launch::App(ids[2].clone()));
-        assert_eq!(pick_launch("WindowsTerminal.exe", &ids, target), Launch::Open("WindowsTerminal.exe".into()), "an AUMID has no exe to match");
+        assert_eq!(pick_launch("WindowsTerminal.exe", &ids, target), Launch::Open("wt.exe".into()), "an AUMID has no exe to match: its alias starts it");
+        assert_eq!(pick_launch("wt.exe", &ids, target), Launch::Open("wt.exe".into()));
+        assert_eq!(pick_launch("Unknown.exe", &ids, target), Launch::Open("Unknown.exe".into()));
         assert_eq!(pick_launch(r"C:\Tools\Code.exe", &ids, target), Launch::Open(r"C:\Tools\Code.exe".into()), "a full path opens as is");
+    }
+
+    #[test]
+    fn terminal_and_its_alias_are_one_program() {
+        assert!(same_program("WindowsTerminal.exe", "wt.exe") && same_program("WT.EXE", "windowsterminal.exe"));
+        assert!(same_program("Code.exe", "code.exe"));
+        assert!(!same_program("Code.exe", "wt.exe") && !same_program("WindowsTerminal.exe", "Code.exe"));
     }
 
     #[test]
