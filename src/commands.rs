@@ -2,7 +2,7 @@
 //! `run` is called off the UI thread: several of these broadcast or send window messages
 //! that would re-enter GPUI if issued from inside an update.
 
-use crate::design::Tint;
+use crate::{config, design::Tint};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
@@ -16,6 +16,7 @@ use windows::{
             Shutdown::{EWX_LOGOFF, ExitWindowsEx, LockWorkStation, SHTDN_REASON_NONE},
         },
         UI::{
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Shell::{SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW},
             WindowsAndMessaging::{
                 GetClassNameW, GetWindowRect, HWND_BROADCAST, IsIconic, IsWindow, IsZoomed, SMTO_ABORTIFHUNG, SW_MAXIMIZE, SW_RESTORE,
@@ -182,7 +183,7 @@ impl Cmd {
 }
 
 /// Runs a system or window command. `target` is the window that was active before procast.
-pub fn run(cmd: Cmd, target: HWND) {
+pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
     unsafe {
         match cmd {
             Cmd::Lock => drop(LockWorkStation()),
@@ -192,13 +193,14 @@ pub fn run(cmd: Cmd, target: HWND) {
             Cmd::SignOut => drop(ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_NONE)),
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
-            Cmd::Snap(s) => snap(target, s),
+            Cmd::Snap(s) => snap(target, s, w),
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
             Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi => {}
         }
     }
+    Ok(())
 }
 
 fn shutdown(flag: &str) {
@@ -271,6 +273,37 @@ pub fn layout(s: Snap, wa: RECT, cur: RECT) -> RECT {
     }
 }
 
+/// Window and screen gaps in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gaps {
+    pub gap: i32,
+    pub screen: i32,
+}
+
+impl Gaps {
+    pub fn for_dpi(w: &config::Window, dpi: u32) -> Gaps {
+        let px = |v: u32| (v * dpi / 96) as i32;
+        Gaps { gap: px(w.gap), screen: px(w.screen_gap) }
+    }
+}
+
+/// `wa` shrunk by `by` on every side: the screen gap.
+pub fn inset(wa: RECT, by: i32) -> RECT {
+    RECT { left: wa.left + by, top: wa.top + by, right: wa.right - by, bottom: wa.bottom - by }
+}
+
+/// Moves every edge of `target` that is not on `wa`'s edge inward by half the gap,
+/// so two neighbours end up `gap` apart. `wa` is the work area after the screen gap.
+pub fn with_gaps(target: RECT, wa: RECT, gap: i32) -> RECT {
+    let h = gap / 2;
+    RECT {
+        left: target.left + if target.left != wa.left { h } else { 0 },
+        top: target.top + if target.top != wa.top { h } else { 0 },
+        right: target.right - if target.right != wa.right { h } else { 0 },
+        bottom: target.bottom - if target.bottom != wa.bottom { h } else { 0 },
+    }
+}
+
 /// The desktop and taskbar: opening procast from them leaves no window to move.
 fn is_shell(hwnd: HWND) -> bool {
     let mut buf = [0u16; 32];
@@ -278,7 +311,7 @@ fn is_shell(hwnd: HWND) -> bool {
     matches!(String::from_utf16_lossy(&buf[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
 }
 
-fn snap(hwnd: HWND, s: Snap) {
+fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
     unsafe {
         if hwnd.is_invalid() || !IsWindow(Some(hwnd)).as_bool() || is_shell(hwnd) {
             return;
@@ -314,12 +347,52 @@ fn snap(hwnd: HWND, s: Snap) {
                 bottom: map(vis.bottom, a.top, b.top, sy),
             }
         } else {
-            layout(s, work_area(here), vis)
+            let (mut dx, mut dy) = (96, 96);
+            let _ = GetDpiForMonitor(here, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+            let g = Gaps::for_dpi(w, dx);
+            let wa = inset(work_area(here), g.screen);
+            with_gaps(layout(s, wa, vis), wa, g.gap)
         };
         t.left -= vis.left - cur.left;
         t.top -= vis.top - cur.top;
         t.right += cur.right - vis.right;
         t.bottom += cur.bottom - vis.bottom;
         let _ = SetWindowPos(hwnd, None, t.left, t.top, t.right - t.left, t.bottom - t.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT { left: l, top: t, right: r, bottom: b }
+    }
+    fn same(a: RECT, b: RECT) -> bool {
+        (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+    }
+    const WA: RECT = RECT { left: 0, top: 0, right: 1200, bottom: 900 };
+
+    #[test]
+    fn gaps_scale_with_dpi() {
+        let w = config::Window { gap: 10, screen_gap: 4, ..Default::default() };
+        assert_eq!(Gaps::for_dpi(&w, 144), Gaps { gap: 15, screen: 6 });
+    }
+
+    #[test]
+    fn gaps_separate_neighbours() {
+        let cur = rc(100, 100, 500, 400);
+        assert!(same(with_gaps(layout(Snap::LeftHalf, WA, cur), WA, 10), rc(0, 0, 595, 900)));
+        assert!(same(with_gaps(layout(Snap::RightHalf, WA, cur), WA, 10), rc(605, 0, 1200, 900)));
+    }
+
+    #[test]
+    fn screen_gap_insets_the_work_area() {
+        let wa = inset(WA, 8);
+        let cur = rc(100, 100, 500, 400);
+        for s in [Snap::AlmostMaximize, Snap::LeftHalf] {
+            let t = with_gaps(layout(s, wa, cur), wa, 0);
+            assert!(t.left >= 8 && t.top >= 8 && t.right <= 1192 && t.bottom <= 892, "{s:?} {t:?}");
+        }
     }
 }

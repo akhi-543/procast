@@ -1681,7 +1681,10 @@ impl Launcher {
                 // Hide first so window commands act on the window you came from.
                 self.hide(true, cx);
                 let target = self.prev.0 as isize;
-                std::thread::spawn(move || commands::run(cmd, HWND(target as _)));
+                let w = self.cfg.window.clone();
+                std::thread::spawn(move || {
+                    let _ = commands::run(cmd, HWND(target as _), &w);
+                });
                 return;
             }
         }

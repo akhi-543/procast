@@ -26,6 +26,7 @@ pub struct Config {
     pub clipboard: Clipboard,
     pub emoji: Emoji,
     pub files: Files,
+    pub window: Window,
     pub scripts: Scripts,
     pub extensions: Extensions,
     pub theme: Theme,
@@ -252,6 +253,26 @@ impl Files {
     }
 }
 
+/// Window management (the Snap commands and desktop switching).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Window {
+    /// Pixels between snapped windows.
+    pub gap: u32,
+    /// Pixels between snapped windows and the screen edges.
+    pub screen_gap: u32,
+    /// Repeating a half or third command cycles through sizes.
+    pub cycle: bool,
+    /// Close a virtual desktop when its last window leaves it.
+    pub auto_close_empty_desktops: bool,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Self { gap: 0, screen_gap: 0, cycle: true, auto_close_empty_desktops: false }
+    }
+}
+
 /// `mode` picks the base palette; any colour can be overridden with "#rrggbb" or "#rrggbbaa".
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
@@ -403,6 +424,7 @@ impl Default for Config {
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
             files: Files::default(),
+            window: Window::default(),
             scripts: Scripts::default(),
             extensions: Extensions::default(),
             theme: Theme::default(),
@@ -511,6 +533,12 @@ hotkey = ""
 ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
 drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = every NTFS drive
 skip = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData']  # left out of whole-drive search (and memory)
+
+[window]
+gap = 0                       # pixels between snapped windows
+screen_gap = 0                # pixels between snapped windows and the screen edges
+cycle = true                  # repeating Left Half, Right Half, thirds... cycles through sizes
+auto_close_empty_desktops = false  # close a virtual desktop when its last window leaves it
 
 [scripts]
 # Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\procast\scripts

@@ -106,9 +106,9 @@ struct Row {
     group: String,
 }
 
-const SECTIONS: [&str; 12] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 13] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Window", "Theme", "Extensions", "Advanced"];
 /// The sidebar icon of each section, in `SECTIONS` order.
-const SECTION_ICONS: [&str; 12] = [
+const SECTION_ICONS: [&str; 13] = [
     design::g::SETTING,
     design::g::SEARCH,
     design::g::KEYBOARD,
@@ -118,6 +118,7 @@ const SECTION_ICONS: [&str; 12] = [
     design::g::LINK,
     design::g::EMOJI,
     design::g::FOLDER,
+    design::g::DOCK_LEFT,
     design::g::PERSONALIZE,
     design::g::PUZZLE,
     design::g::CODE,
@@ -318,6 +319,13 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Enter", "emoji.action", Kind::Choice(&["paste", "copy"]), "Paste into the app you came from, or only copy."),
                 row("Skin tone", "emoji.skin_tone", Kind::Choice(config::SKIN_TONES), "Used for every emoji that comes in skin tones."),
                 row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
+            ],
+        )]),
+        "Window" => groups(vec![(
+            "Snapping",
+            vec![
+                row("Window gap", "window.gap", Kind::Number, "Space between snapped windows, in pixels."),
+                row("Screen gap", "window.screen_gap", Kind::Number, "Space between windows and the screen edges, in pixels."),
             ],
         )]),
         "Files" => groups(vec![
