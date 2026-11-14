@@ -9,7 +9,7 @@ use std::{
         OnceLock,
         mpsc::{Sender, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     Wdk::System::SystemServices::RtlGetVersion,
@@ -63,10 +63,21 @@ fn thread() -> Option<&'static Sender<Job>> {
 /// Runs `f` on the desktop thread and waits for it. A winvd error or panic comes back as
 /// "<what>: <reason>" (and is logged); no answer in `WAIT` is "<what>: no answer from Explorer".
 pub fn call<T: Send + 'static>(what: &str, f: impl FnOnce() -> Result<T, winvd::Error> + Send + 'static) -> Result<T, String> {
+    call_within(what, WAIT, f)
+}
+
+/// `call` with its own wait. A job still queued after its caller gave up is dropped unrun, so
+/// a hung Explorer that recovers cannot replay old work (a switch, a confirmed close).
+fn call_within<T: Send + 'static>(what: &str, wait: Duration, f: impl FnOnce() -> Result<T, winvd::Error> + Send + 'static) -> Result<T, String> {
     let (reply, answer) = channel();
-    let job: Job = Box::new(move || _ = reply.send(catch_unwind(AssertUnwindSafe(f))));
+    let deadline = Instant::now() + wait;
+    let job: Job = Box::new(move || {
+        if Instant::now() <= deadline {
+            _ = reply.send(catch_unwind(AssertUnwindSafe(f)));
+        }
+    });
     let failure = match thread().map(|t| t.send(job)) {
-        Some(Ok(())) => match answer.recv_timeout(WAIT) {
+        Some(Ok(())) => match answer.recv_timeout(wait) {
             Ok(Ok(Ok(v))) => return Ok(v),
             Ok(Ok(Err(e))) => format!("{what}: {e:?}"),
             Ok(Err(p)) => {
@@ -179,6 +190,31 @@ mod tests {
         assert!(e.contains("Switch") && e.contains("boom"), "{e}");
         // The desktop thread survives a panic.
         assert_eq!(call("Again", || Ok(7)), Ok(7));
+    }
+
+    #[test]
+    fn a_job_that_timed_out_never_runs() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering::SeqCst},
+        };
+        let wait = Duration::from_millis(100);
+        // The first job holds the desktop thread past `wait`, like a hung Explorer.
+        let slow = call_within("Slow", wait, || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        });
+        assert!(slow.unwrap_err().contains("no answer from Explorer"));
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let late = call_within("Late", wait, move || {
+            flag.store(true, SeqCst);
+            Ok(())
+        });
+        assert!(late.unwrap_err().contains("no answer from Explorer"));
+        // Let the thread get past the slow job and reach the queued one.
+        assert_eq!(call("Drain", || Ok(1)), Ok(1));
+        assert!(!ran.load(SeqCst), "the late job ran after its caller gave up");
     }
 
     #[test]
