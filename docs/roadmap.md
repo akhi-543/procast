@@ -19,7 +19,7 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | [x] | A3 | **Live file index.** `ReadDirectoryChangesW` on each folder applies creates, deletes, renames and moves as they happen. Safety re-crawl at most hourly | ✅ | M | |
 | [x] | A4 | **File index saved to disk** (`files.bin`). 138,617 entries load in 54 ms vs a 1.3 s crawl; one background crawl at start catches changes made while procast was off | ✅ | S | |
 | [ ] | A5 | **Use Everything if it's installed.** Ask voidtools Everything over IPC: whole drives, instant, no index of our own | ✗ | M | install Everything (free) |
-| [x] | A6 | **NTFS MFT scanner + USN journal** (what Raycast's "NTFS Scanner" service does). Indexes whole drives in seconds and stays live. Needs an elevated helper service | ✅ enabled: C:, D:, E:: 2.7 M entries in ~10 s at logon, 20–44 ms per search, changes show in ~60 ms | L | OK to install an admin service |
+| [x] | A6 | **NTFS MFT scanner + USN journal** (what Raycast's "NTFS Scanner" service does). Indexes whole drives in seconds and stays live. Needs an elevated helper service | ✅ enabled: C:, D:, E:: 2.7 M entries in ~10 s at logon, 20–44 ms per search, changes show in ~60 ms. The debug build is optimised too (it's the one that runs at login): 18–36 ms per search on C: (`cargo test bench_real_index -- --ignored --nocapture`) | L | OK to install an admin service |
 | [ ] | A7 | **File content search** via the Windows Search index (Raycast does the same) | ✗ | M | turn on Windows Search indexing for your folders |
 | [x] | A8 | Faster matching over large file indexes (prefilter before fuzzy match). Only worth it if A5/A6 make the index millions of files | ✅ parallel prefilter in the NTFS search | S | |
 
@@ -81,29 +81,30 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Text history, ignored apps, encrypted at rest | ✅ | | |
-| [ ] | G1 | Keep history for a duration (day / week / month) instead of an entry count | ◐ count only | S | |
-| [ ] | G2 | **Images and files in history**, with preview | ✗ | M | |
-| [ ] | G3 | OCR: search text inside copied images (Windows built-in OCR, offline) | ✗ | M | needs G2 |
-| [ ] | G4 | Pin entries | ✗ | S | |
-| [ ] | G5 | Detail pane with full text, source app, size | ✗ | S | |
+| [x] | G1 | Keep history for a duration (day / week / month) instead of an entry count | ✅ by count, or 1 hour … 1 year, or forever | S | |
+| [x] | G2 | **Images and files in history**, with preview | ✅ images stored as encrypted PNGs, thumbnails in the list; copied files listed, Ctrl+K → Show in Explorer | M | |
+| [x] | G3 | OCR: search text inside copied images (Windows built-in OCR, offline) | ✅ `Windows.Media.Ocr`, on by default, toggle in Settings → Clipboard | M | |
+| [x] | G4 | Pin entries | ✅ pinned entries sit on top and outlast every limit | S | |
+| [x] | G5 | Detail pane with full text, source app, size | ✅ text, image or file list, then app, size, copied time | S | |
 
 ## H. Snippets
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Search and paste snippets, `{clipboard}` placeholder | ✅ | | |
-| [ ] | H1 | **Auto-expand while typing anywhere** (`;sig` turns into the text) | ✗ | M | |
-| [ ] | H2 | Expansion options: expand within words, delay, completion sound, disabled apps | ✗ | S | needs H1 |
-| [ ] | H3 | More placeholders: `{date}`, `{time}`, `{cursor}`, `{selection}`, `{argument}` | ◐ | S | |
-| [ ] | H4 | Manage snippets and quicklinks from a UI (today: edit config.toml) | ✗ | M | |
+| | — | Known limits: only text goes back on the clipboard after an expansion; a mouse click doesn't reset the typed keyword | | | |
+| [x] | H1 | **Auto-expand while typing anywhere** (`;sig` turns into the text) | ✅ keyboard hook; pastes, then puts your clipboard text back | M | |
+| [x] | H2 | Expansion options: expand within words, delay, completion sound, disabled apps | ✅ plus trigger: now / after a space (kept or dropped) | S | |
+| [x] | H3 | More placeholders: `{date}`, `{time}`, `{cursor}`, `{selection}`, `{argument}` | ✅ arguments are asked for in the launcher | S | |
+| [ ] | H4 | Manage snippets and quicklinks from a UI (today: edit config.toml) | ◐ Settings → Snippets / Quicklinks: add, edit, duplicate, delete; no disable or copy link yet | M | |
 
 ## I. Emoji
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | I1 | Grid layout with column count | ✗ list | S | |
-| [ ] | I2 | Primary action: paste or copy · skin tone | ✗ | S | |
-| [ ] | I3 | Inline `:` emoji picker in any text field | ✗ | M | needs the same keyboard hook as H1 |
+| [x] | I1 | Grid layout with column count | ✅ 4–16 columns, sections, only on-screen rows drawn | S | |
+| [x] | I2 | Primary action: paste or copy · skin tone | ✅ | S | |
+| [ ] | I3 | Inline `:` emoji picker in any text field | ◐ typing `:thumbsup:` anywhere turns into 👍; no popup picker yet | M | |
 
 ## J. File search
 

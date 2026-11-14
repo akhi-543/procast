@@ -1,40 +1,42 @@
 # procast TODO: what Raycast still has that procast doesn't
 
 Source: the Raycast **2.12.0** settings window (labels and options read from its installed settings pages,
-`frontend/*-settings-view-*.js`), compared with procast's code on `design-system` (2026-11-13).
+`frontend/*-settings-view-*.js`), compared with procast's code on `design-system` (2026-11-13); ticks updated for the clipboard, snippets and emoji work (2026-11-14).
 Extensions (runtime, store, updates, OAuth, `AI.ask`, dev mode, per-extension settings) are left out on purpose.
 IDs in brackets point at [docs/roadmap.md](docs/roadmap.md) where the item already has a row; **new** means it appeared since the 2.10.1 audit.
 
 Size: **S** under a day · **M** a few days · **L** a week or more.
 
 ## Clipboard history
-- [ ] Keep history by time instead of count: 5 min / 1 h / 1 day / 1 week / 1 month / 3 months / 6 months / 1 year / unlimited (warn that unlimited grows on disk) [G1] — S
-- [ ] Images and files in history, with preview [G2] — M
-- [ ] Text recognition (OCR) in copied images, searchable; toggle in settings [G3] — M
-- [ ] Pin entries [G4] — S
-- [ ] Detail pane: full text, source app, size, copied time [G5] — S
+- [x] Keep history by time instead of count: 5 min / 1 h / 1 day / 1 week / 1 month / 3 months / 6 months / 1 year / unlimited (warn that unlimited grows on disk) [G1] — S (no 5 min option)
+- [x] Images and files in history, with preview [G2] — M
+- [x] Text recognition (OCR) in copied images, searchable; toggle in settings [G3] — M
+- [x] Pin entries [G4] — S
+- [x] Detail pane: full text, source app, size, copied time [G5] — S
 - [ ] "Never record from" picker that lists installed apps instead of typing exe names — S
 
 ## Snippets
-- [ ] Auto-expand while typing anywhere [H1] — M
-- [ ] Expansion trigger: immediately / after delimiter (keep it) / after delimiter (discard it) — S
-- [ ] Expansion speed: instant / quick / default / delayed / extended — S
-- [ ] Completion sound: none or a Windows system sound (Ding, Notify, …) — S
-- [ ] Expand within words, apps where expansion is off [H2] — S
-- [ ] Placeholders `{cursor}`, `{selection}`, `{argument}` (date/time/clipboard exist) [H3] — S
-- [ ] Manage snippets in Settings (add, edit, duplicate, disable, delete) instead of config.toml [H4] — M
+- [x] Auto-expand while typing anywhere [H1] — M
+- [x] Expansion trigger: immediately / after delimiter (keep it) / after delimiter (discard it) — S
+- [x] Expansion speed: instant / quick / default / delayed / extended — S
+- [x] Completion sound: none or a Windows system sound (Ding, Notify, …) — S
+- [x] Expand within words, apps where expansion is off [H2] — S
+- [x] Placeholders `{cursor}`, `{selection}`, `{argument}` (date/time/clipboard exist) [H3] — S
+- [ ] Manage snippets in Settings (add, edit, duplicate, disable, delete) instead of config.toml [H4] — M (all but disable)
+- [ ] Restore images and files to the clipboard after an expansion (today only text comes back) — S
+- [ ] A mouse click resets the typed keyword (today only keys and window switches do) — S
 
 ## Quicklinks
-- [ ] Quicklinks page in Settings: add, edit, duplicate, disable, delete, copy link [H4] — M
+- [ ] Quicklinks page in Settings: add, edit, duplicate, disable, delete, copy link [H4] — M (all but disable and copy link)
 - [ ] Quicklink library with featured presets to add in one click — S
 - [ ] Favicons on quicklinks [M1] — S
 - [ ] Selected text as the quicklink argument [M2] — M
 
 ## Emoji
-- [ ] Grid layout with column count [I1] — S
-- [ ] Primary action: paste to active app or copy [I2] — S
-- [ ] Skin tone: none / light / medium light / medium / medium dark / dark [I2] — S
-- [ ] Inline `:` picker in any text field [I3] — M
+- [x] Grid layout with column count [I1] — S
+- [x] Primary action: paste to active app or copy [I2] — S
+- [x] Skin tone: none / light / medium light / medium / medium dark / dark [I2] — S
+- [ ] Inline `:` picker in any text field [I3] — M (`:name:` already turns into the emoji; the popup is left)
 
 ## File search
 - [ ] Use Everything when it's installed [A5] — M
