@@ -304,6 +304,10 @@ struct Launcher {
     pending: Option<Pending>,
     /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
     clip_images: HashMap<String, Option<Arc<RenderImage>>>,
+    /// File Search detail pane: the selected file's information (read when the selection
+    /// changes), and its decoded pictures (`p:`) and shell icons (`i:`) by path.
+    file_info: Option<(String, Option<files::FileInfo>)>,
+    file_images: HashMap<String, Option<Arc<RenderImage>>>,
     /// Emoji picker: the grid's scroll position, by grid row.
     /// The emoji grid's rows; only the ones on screen are laid out.
     grid_list: gpui::ListState,
@@ -392,6 +396,8 @@ impl Launcher {
             armed: None,
             pending: None,
             clip_images: HashMap::new(),
+            file_info: None,
+            file_images: HashMap::new(),
             grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
             ai: None,
@@ -932,6 +938,25 @@ impl Launcher {
     fn clip_preview(&mut self, id: &str) -> Option<Arc<RenderImage>> {
         let history = &self.history;
         self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
+    }
+
+    /// A file's picture (`p:`, fitted) or shell icon (`i:`), made on a worker thread: None
+    /// until it arrives as Msg::FilePreview.
+    fn file_preview(&mut self, key: String) -> Option<Arc<RenderImage>> {
+        if self.file_images.len() > 300 {
+            self.file_images.clear();
+        }
+        if let Some(img) = self.file_images.get(&key) {
+            return img.clone();
+        }
+        self.file_images.insert(key.clone(), None);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let path = &key[2..];
+            let img = if key.starts_with("p:") { std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)) } else { win::file_icon(path) };
+            let _ = tx.unbounded_send(Msg::FilePreview(key, img));
+        });
+        None
     }
 
     /// A snippet chosen in the launcher (`erase` 0) or typed in an app: asks for its
@@ -2071,6 +2096,12 @@ impl Launcher {
                     self.refresh(cx);
                 }
             }
+            Msg::FilePreview(key, img) => {
+                self.file_images.insert(key, img);
+                if self.visible && self.mode == Mode::Files {
+                    cx.notify();
+                }
+            }
             Msg::Running(list) => {
                 for (r, icon) in &list {
                     self.exe_icons.insert(r.exe.clone(), icon.clone());
@@ -2346,15 +2377,7 @@ impl Launcher {
             _ => return div().flex_1().into_any_element(),
         };
         let Some(e) = self.history.get(&key).cloned() else { return div().flex_1().into_any_element() };
-        let lines = |text: &str, mono: bool| {
-            div()
-                .flex()
-                .flex_col()
-                .when(mono, |d| d.font_family(design::FONT_MONO))
-                .text_size(px(design::ts::BODY_SM))
-                .line_height(px(20.))
-                .children(text.lines().take(300).map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.chars().take(2000).collect() })))
-        };
+        let lines = detail_lines;
         let mut meta: Vec<(String, String)> = vec![];
         let top = match &e.kind {
             clipboard::Kind::Text => {
@@ -2370,19 +2393,7 @@ impl Launcher {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .h(px(200.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(design::r::MD))
-                            .bg(t.surface)
-                            .border_1()
-                            .border_color(t.hairline)
-                            .overflow_hidden()
-                            .children(preview.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain))),
-                    )
+                    .child(image_box(t).children(preview.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain))))
                     .when(!e.text.is_empty(), |d| d.child(div().text_color(t.text_muted).child(lines(&e.text, false))))
                     .into_any_element()
             }
@@ -2408,6 +2419,46 @@ impl Launcher {
             .child(top)
             .children(info_rows(&meta, t))
             .into_any_element()
+    }
+
+    /// File Search's right-hand pane: a preview, then the file's information.
+    fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
+        let path = match self.items.get(self.selected).map(|it| &it.act) {
+            Some(Act::File(p)) => p.clone(),
+            _ => return div().flex_1().into_any_element(),
+        };
+        if self.file_info.as_ref().is_none_or(|f| f.0 != path) {
+            let info = files::file_info(&path, &std::env::var("USERPROFILE").unwrap_or_default());
+            self.file_info = Some((path.clone(), info));
+        }
+        let pane = div().id("file-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col();
+        let Some(info) = self.file_info.as_ref().and_then(|f| f.1.as_ref()) else {
+            return pane.child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child("Not found")).into_any_element();
+        };
+        let (kind, size, modified, created, folder) = (info.kind, info.size, info.modified, info.created, info.folder.clone());
+        let (text, count, image) = match &info.preview {
+            files::Preview::Text(s) => (Some(s.clone()), None, false),
+            files::Preview::Folder(n) => (None, Some(*n), false),
+            files::Preview::Image(_) => (None, None, true),
+            files::Preview::Icon => (None, None, false),
+        };
+        let picture = if image { self.file_preview(format!("p:{path}")) } else { None };
+        let top = if let Some(s) = text {
+            detail_lines(&s, true).into_any_element()
+        } else if let Some(n) = count {
+            detail_lines(&if n >= 10_000 { "10000+ items".to_string() } else if n == 1 { "1 item".to_string() } else { format!("{n} items") }, false).into_any_element()
+        } else {
+            let icon = if picture.is_none() { self.file_preview(format!("i:{path}")) } else { None };
+            let shown = picture.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain)).or_else(|| icon.map(|i| gpui::img(i).size(px(design::ic::XL))));
+            image_box(t).children(shown).into_any_element()
+        };
+        let when = |t: Option<SystemTime>| t.map(|t| win::local_time_of(t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()));
+        let mut meta: Vec<(String, String)> = vec![("Kind".into(), kind.into())];
+        meta.extend(size.map(|s| ("Size".to_string(), files::size_text(s))));
+        meta.extend(when(modified).map(|w| ("Modified".to_string(), w)));
+        meta.extend(when(created).map(|w| ("Created".to_string(), w)));
+        meta.push(("Where".into(), folder));
+        pane.child(top).children(info_rows(&meta, t)).into_any_element()
     }
 
     /// Emoji picker: moves the selection by `dx` cells or `dy` grid rows.
@@ -2511,6 +2562,22 @@ fn grid_rows(items: &[Item], cols: usize) -> Vec<GridRow> {
     out
 }
 
+/// A detail pane's text, line by line; mono for code.
+fn detail_lines(text: &str, mono: bool) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .when(mono, |d| d.font_family(design::FONT_MONO))
+        .text_size(px(design::ts::BODY_SM))
+        .line_height(px(20.))
+        .children(text.lines().take(300).map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.chars().take(2000).collect() })))
+}
+
+/// The framed box a detail pane's picture sits in.
+fn image_box(t: &Tokens) -> gpui::Div {
+    div().h(px(200.)).flex().items_center().justify_center().rounded(px(design::r::MD)).bg(t.surface).border_1().border_color(t.hairline).overflow_hidden()
+}
+
 /// "Information" and key / value rows under a detail view.
 fn info_rows(metadata: &[(String, String)], t: &Tokens) -> Vec<gpui::AnyElement> {
     let head = div().mt(px(12.)).pt(px(12.)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information");
@@ -2585,9 +2652,13 @@ impl Render for Launcher {
         let t = Tokens::from_theme(&self.cfg.theme, window);
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
-        // Views with their own body: the emoji grid, and clipboard history's detail pane.
+        // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.
         let grid = self.grid().then(|| self.grid_view(&t, cx));
-        let side = (self.mode == Mode::Clipboard && empty.is_none()).then(|| self.clip_detail(&t));
+        let side = match self.mode {
+            Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
+            Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
+            _ => None,
+        };
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
         let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());

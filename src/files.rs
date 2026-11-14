@@ -504,11 +504,21 @@ pub fn search(index: &[Entry], query: &str, max: usize, matcher: &mut Matcher) -
 pub fn item(path: &str, dir: bool, home: &str) -> Item {
     let p = Path::new(path);
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+    let (glyph, kind) = classify(p, dir);
+    Item::new(name, folder_of(p, home), Icon::Vector(glyph), Act::File(path.to_string())).acc(kind).tinted(crate::design::Tint::File)
+}
+
+/// A path's folder, with ~ for your user folder.
+fn folder_of(p: &Path, home: &str) -> String {
     let parent = p.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let parent = if !home.is_empty() && parent.starts_with(home) { format!("~{}", &parent[home.len()..]) } else { parent };
+    if !home.is_empty() && parent.starts_with(home) { format!("~{}", &parent[home.len()..]) } else { parent }
+}
+
+/// A path's icon glyph and kind name.
+fn classify(p: &Path, dir: bool) -> (&'static str, &'static str) {
     use crate::design::g;
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let (glyph, kind) = match ext.as_str() {
+    match ext.as_str() {
         _ if dir => (g::FOLDER, "Folder"),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "heic" => (g::PICTURE, "Image"),
         "mp4" | "mkv" | "mov" | "avi" | "webm" => (g::VIDEO, "Video"),
@@ -518,8 +528,62 @@ pub fn item(path: &str, dir: bool, home: &str) -> Item {
         "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "json" | "toml" | "yaml" | "yml" | "html" | "css" | "c" | "cpp" | "h" | "cs" | "go" | "java" | "sh" | "ps1" => (g::CODE, "Code"),
         "exe" | "msi" | "lnk" => (g::APP, "Program"),
         _ => (g::DOCUMENT, "File"),
+    }
+}
+
+/// What the detail pane shows above a file's information.
+#[derive(Debug, PartialEq)]
+pub enum Preview {
+    /// A picture the `image` crate decodes; the pane decodes it off the UI thread.
+    Image(PathBuf),
+    /// The first lines of a small text file.
+    Text(String),
+    /// A folder's item count (counting stops at 10,000).
+    Folder(usize),
+    /// Anything else: its shell icon.
+    Icon,
+}
+
+pub struct FileInfo {
+    pub kind: &'static str,
+    pub size: Option<u64>,
+    pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
+    pub folder: String,
+    pub preview: Preview,
+}
+
+/// What the detail pane needs for one path; None when it is gone.
+pub fn file_info(path: &str, home: &str) -> Option<FileInfo> {
+    let p = Path::new(path);
+    let meta = std::fs::metadata(p).ok()?;
+    let dir = meta.is_dir();
+    let kind = classify(p, dir).1;
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let preview = if dir {
+        Preview::Folder(std::fs::read_dir(p).map_or(0, |d| d.take(10_000).count()))
+    } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico") {
+        Preview::Image(p.to_path_buf())
+    } else if (kind == "Code" || matches!(ext.as_str(), "txt" | "md" | "log" | "csv" | "ini" | "xml")) && meta.len() < 256 * 1024 {
+        match std::fs::read(p) {
+            Ok(bytes) => Preview::Text(String::from_utf8_lossy(&bytes).lines().take(40).collect::<Vec<_>>().join("\n")),
+            Err(_) => Preview::Icon,
+        }
+    } else {
+        Preview::Icon
     };
-    Item::new(name, parent, Icon::Vector(glyph), Act::File(path.to_string())).acc(kind).tinted(crate::design::Tint::File)
+    Some(FileInfo { kind, size: (!dir).then_some(meta.len()), modified: meta.modified().ok(), created: meta.created().ok(), folder: folder_of(p, home), preview })
+}
+
+/// "512 bytes", "3.4 KB", "1.2 MB".
+pub fn size_text(bytes: u64) -> String {
+    let b = bytes as f64;
+    match bytes {
+        0..1024 => format!("{bytes} bytes"),
+        1024..1_048_576 => format!("{:.1} KB", b / 1024.),
+        1_048_576..1_073_741_824 => format!("{:.1} MB", b / 1_048_576.),
+        _ => format!("{:.1} GB", b / 1_073_741_824.),
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +614,38 @@ mod tests {
         assert_eq!(status_line(&busy, now), "Indexing…");
         let none = IndexStatus { indexing: false, updated: None, entries: 0, ..busy };
         assert_eq!(status_line(&none, now), "Not indexed yet");
+    }
+
+    #[test]
+    fn file_info_describes_files() {
+        let root = std::env::temp_dir().join(format!("procast-info-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let text = (1..=50).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(root.join("a.txt"), &text).unwrap();
+        std::fs::write(root.join("big.txt"), "x".repeat(300 * 1024)).unwrap();
+        image::RgbaImage::new(2, 2).save(root.join("pic.png")).unwrap();
+        for n in ["1", "2", "3"] {
+            std::fs::write(root.join("sub").join(n), "").unwrap();
+        }
+        let at = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let home = root.to_string_lossy().into_owned();
+
+        let a = file_info(&at("a.txt"), &home).unwrap();
+        assert_eq!((a.kind, a.size, a.folder.as_str()), ("File", Some(text.len() as u64), "~"));
+        assert!(a.modified.is_some());
+        assert!(matches!(&a.preview, Preview::Text(t) if t.lines().count() == 40 && t.starts_with("line 1\n") && t.ends_with("line 40")));
+        assert_eq!(file_info(&at("big.txt"), &home).unwrap().preview, Preview::Icon);
+        assert_eq!(file_info(&at("pic.png"), &home).unwrap().preview, Preview::Image(root.join("pic.png")));
+        let sub = file_info(&at("sub"), &home).unwrap();
+        assert_eq!((sub.kind, sub.size, sub.preview), ("Folder", None, Preview::Folder(3)));
+        assert!(file_info(&at("nope.txt"), &home).is_none());
+        assert_eq!(file_info(&at("a.txt"), "").unwrap().folder, home);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(size_text(512), "512 bytes");
+        assert_eq!(size_text(3482), "3.4 KB");
+        assert_eq!(size_text(5 * 1_048_576), "5.0 MB");
     }
 
     #[test]

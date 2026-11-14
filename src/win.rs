@@ -62,6 +62,8 @@ pub enum Msg {
     /// File search results for one query generation.
     Files(u64, Vec<crate::search::Item>),
     FilesIndexed,
+    /// A File Search detail picture (`p:path`) or shell icon (`i:path`) is ready.
+    FilePreview(String, Option<Arc<gpui::RenderImage>>),
     /// Settings → Files → Rebuild: start the file index over.
     RebuildIndex,
     /// The window's content height changed (compact mode); resize between updates.
