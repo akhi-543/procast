@@ -111,22 +111,22 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Folders to search, names to skip | ✅ | | |
-| [ ] | J1 | Respect `.gitignore` / `.ignore`, glob ignore patterns | ◐ names only | S | |
-| [ ] | J2 | Include hidden files toggle · network and removable drives toggle | ✗ | S | |
-| [ ] | J3 | Detail pane: preview, size, modified date | ✗ | M | |
-| [ ] | J4 | Index status: entries, last crawl time, "Rebuild index" | ✗ | S | |
+| [x] | J1 | Respect `.gitignore` / `.ignore`, glob ignore patterns | ✅ globs everywhere; .gitignore in folder search only | S | |
+| [x] | J2 | Include hidden files toggle · network and removable drives toggle | ✅ removable NTFS drives; no network | S | |
+| [x] | J3 | Detail pane: preview, size, modified date | ✅ detail pane in File Search only | M | |
+| [x] | J4 | Index status: entries, last crawl time, "Rebuild index" | ✅ status line and Rebuild in Settings → Files | S | |
 
 ## K. Window management
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Halves, thirds, two-thirds, maximize, almost maximize, center, restore, next display | ✅ | | |
-| [ ] | K1 | More layouts: quarters, sixths, top/bottom thirds, reasonable size | ✗ | S | |
-| [ ] | K2 | Window gap and screen gap | ✗ | S | |
-| [ ] | K3 | Cycling (pressing Left Half again cycles ½ → ⅔ → ⅓) | ✗ | S | |
-| [ ] | K4 | Minimize, minimize others, close others, toggle full screen | ✗ | S | |
-| [ ] | K5 | Virtual desktops: move window to next desktop, auto-close empty desktops | ✗ | M | |
-| [ ] | K6 | Layout presets: one command arranges several apps | ✗ | M | your layouts |
+| [x] | K1 | More layouts: quarters, sixths, top/bottom thirds, reasonable size | ✅ | S | |
+| [x] | K2 | Window gap and screen gap | ✅ | S | |
+| [x] | K3 | Cycling (pressing Left Half again cycles ½ → ⅔ → ⅓) | ✅ | S | |
+| [x] | K4 | Minimize, minimize others, close others, toggle full screen | ✅ toggle maximize, not full screen | S | |
+| [x] | K5 | Virtual desktops: move window to next desktop, auto-close empty desktops | ✅ Windows 11 23H2+, via winvd | M | |
+| [x] | K6 | Layout presets: one command arranges several apps | ✅ config only (`[[window.layouts]]`) | M | your layouts |
 
 ## L. System commands
 
