@@ -82,6 +82,8 @@ pub enum Msg {
     Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
+    /// A built-in command failed; shown as a notice.
+    Notice(String),
 }
 
 pub enum TrayCmd {

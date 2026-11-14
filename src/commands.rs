@@ -19,9 +19,9 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Shell::{SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW},
             WindowsAndMessaging::{
-                GetClassNameW, GetWindowRect, HWND_BROADCAST, IsIconic, IsWindow, IsZoomed, SMTO_ABORTIFHUNG, SW_MAXIMIZE, SW_RESTORE,
-                SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageTimeoutW, SetWindowPos, ShowWindow,
-                WM_SETTINGCHANGE,
+                GetClassNameW, GetWindowRect, HWND_BROADCAST, IsIconic, IsWindow, IsZoomed, PostMessageW, SMTO_ABORTIFHUNG, SW_MAXIMIZE,
+                SW_MINIMIZE, SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageTimeoutW, SetWindowPos,
+                ShowWindow, WM_CLOSE, WM_SETTINGCHANGE,
             },
         },
     },
@@ -43,6 +43,12 @@ pub enum Cmd {
     EmptyBin,
     ToggleDarkMode,
     Snap(Snap),
+    Minimize,
+    /// Minimize every window except the one you came from.
+    MinimizeOthers,
+    /// Ask every window except the one you came from to close.
+    CloseOthers,
+    ToggleMaximize,
     Settings,
     EditConfig,
     ReloadApps,
@@ -135,6 +141,10 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Snap(Snap::Center), "Center Window", "window middle", g::TILES),
     (Cmd::Snap(Snap::Restore), "Restore Window", "window", g::RESTORE),
     (Cmd::Snap(Snap::NextDisplay), "Move to Next Display", "window monitor screen", g::SWITCH_APPS),
+    (Cmd::Minimize, "Minimize Window", "window hide", g::DOWN),
+    (Cmd::MinimizeOthers, "Minimize Other Windows", "window hide", g::DOWN),
+    (Cmd::CloseOthers, "Close Other Windows", "window quit", g::CANCEL),
+    (Cmd::ToggleMaximize, "Toggle Maximize", "window full restore", g::FULL_SCREEN),
     (Cmd::Settings, "procast Settings", "preferences options configure", g::SETTING),
     (Cmd::EditConfig, "Edit config.toml", "config preferences toml settings file", g::EDIT),
     (Cmd::ReloadApps, "Reload Apps", "rescan refresh", g::REFRESH),
@@ -148,7 +158,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
 impl Cmd {
     /// Asks for a second Enter before running.
     pub fn destructive(self) -> bool {
-        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory)
+        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::CloseOthers)
     }
 
     pub fn key(self) -> String {
@@ -158,7 +168,7 @@ impl Cmd {
     /// The group a command belongs to, shown after its title.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Cmd::Snap(_) => "Window",
+            Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize => "Window",
             Cmd::SearchFiles => "Files",
             Cmd::ClipboardHistory | Cmd::ClearClipboardHistory => "Clipboard",
             Cmd::Emoji => "Emoji",
@@ -172,7 +182,8 @@ impl Cmd {
     /// The hue of the command's icon tile.
     pub fn tint(self) -> Tint {
         match self {
-            Cmd::Snap(_) => Tint::Window,
+            Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::ToggleMaximize => Tint::Window,
+            Cmd::CloseOthers => Tint::Danger,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::QuitApps => Tint::Danger,
@@ -194,6 +205,12 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s, w),
+            Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() => return Err("No window to act on".into()),
+            Cmd::Minimize => _ = ShowWindow(target, SW_MINIMIZE),
+            Cmd::ToggleMaximize => _ = ShowWindow(target, if IsZoomed(target).as_bool() { SW_RESTORE } else { SW_MAXIMIZE }),
+            Cmd::MinimizeOthers => others(target).for_each(|h| _ = ShowWindow(h, SW_MINIMIZE)),
+            // The windows get to ask about unsaved work, so some may stay open.
+            Cmd::CloseOthers => others(target).for_each(|h| drop(PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)))),
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
@@ -201,6 +218,11 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Every Alt+Tab window except `target`. procast's own launcher is hidden by now, so it is not among them.
+fn others(target: HWND) -> impl Iterator<Item = HWND> {
+    crate::apps::app_windows().into_iter().map(|(h, _)| h).filter(move |&h| h != target)
 }
 
 fn shutdown(flag: &str) {
@@ -484,5 +506,11 @@ mod tests {
             let t = with_gaps(layout(s, wa, cur), wa, 0);
             assert!(t.left >= 8 && t.top >= 8 && t.right <= 1192 && t.bottom <= 892, "{s:?} {t:?}");
         }
+    }
+
+    #[test]
+    fn close_others_asks_twice() {
+        assert!(Cmd::CloseOthers.destructive());
+        assert!(!Cmd::MinimizeOthers.destructive());
     }
 }

@@ -1682,8 +1682,11 @@ impl Launcher {
                 self.hide(true, cx);
                 let target = self.prev.0 as isize;
                 let w = self.cfg.window.clone();
+                let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    let _ = commands::run(cmd, HWND(target as _), &w);
+                    if let Err(e) = commands::run(cmd, HWND(target as _), &w) {
+                        let _ = tx.unbounded_send(Msg::Notice(e));
+                    }
                 });
                 return;
             }
@@ -2011,6 +2014,10 @@ impl Launcher {
                     }
                     Output::Silent => {}
                 }
+            }
+            Msg::Notice(e) => {
+                self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
+                self.show(Mode::Root, window, cx);
             }
             Msg::Ext(v) => self.on_ext(v, window, cx),
             Msg::Install(message, done) => {
@@ -3143,7 +3150,7 @@ fn main() {
                 let opens = match msg {
                     Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
                     Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
-                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..)),
+                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
                 };
                 let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
                 let geometry = handle.update(cx, |this, _, cx| {

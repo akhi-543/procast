@@ -89,7 +89,7 @@ fn real_pid(hwnd: HWND, pid: u32) -> u32 {
 }
 
 /// Windows that show in Alt+Tab: visible, unowned, not tool windows, not cloaked, titled.
-fn app_windows() -> Vec<(HWND, u32)> {
+pub fn app_windows() -> Vec<(HWND, u32)> {
     unsafe extern "system" fn each(h: HWND, l: LPARAM) -> BOOL {
         let out = unsafe { &mut *(l.0 as *mut Vec<(HWND, u32)>) };
         unsafe {
@@ -304,6 +304,12 @@ mod tests {
         for r in running() {
             assert!(r.exe.contains('\\') && !r.windows.is_empty(), "{r:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "depends on what is open on this machine"]
+    fn app_windows_lists_this_machine() {
+        println!("{} app windows", app_windows().len());
     }
 }
 
