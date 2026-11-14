@@ -276,6 +276,8 @@ struct Launcher {
     frec: Frecency,
     history: clipboard::History,
     files: Option<files::Files>,
+    /// Removes a desktop you leave once it is empty; present while the setting is on.
+    desktop_watch: Option<desktops::Listener>,
     /// The index line Settings → Files shows, kept current as the index changes.
     index_status: Arc<RwLock<String>>,
     file_gen: u64,
@@ -371,6 +373,7 @@ impl Launcher {
             },
             history: clipboard::History::load(config::dir().join("clipboard.bin"), cfg.clipboard.history, &cfg.clipboard.keep),
             files: start_files(&cfg, &tx),
+            desktop_watch: cfg.window.auto_close_empty_desktops.then(desktops::Listener::start).flatten(),
             index_status: Arc::default(),
             scripts: scripts::scan(&cfg.scripts.dirs()),
             exts: vec![],
@@ -2019,6 +2022,9 @@ impl Launcher {
                     self.tray_icon = if cfg.tray { tray(self.tx.clone()) } else { None };
                 }
                 design::set_size(&cfg.size);
+                if cfg.window.auto_close_empty_desktops != self.cfg.window.auto_close_empty_desktops {
+                    self.desktop_watch = cfg.window.auto_close_empty_desktops.then(desktops::Listener::start).flatten();
+                }
                 let same_files = cfg.files.enabled == self.files.is_some()
                     && self.files.as_ref().is_none_or(|f| f.same_settings(&cfg.files));
                 if !same_files {

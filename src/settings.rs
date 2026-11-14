@@ -331,14 +331,20 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
             ],
         )]),
-        "Window" => groups(vec![(
-            "Snapping",
-            vec![
-                row("Cycle halves", "window.cycle", Kind::Bool, "Pressing Left Half again makes the window ⅔, then ⅓."),
-                row("Window gap", "window.gap", Kind::Number, "Space between snapped windows, in pixels."),
-                row("Screen gap", "window.screen_gap", Kind::Number, "Space between windows and the screen edges, in pixels."),
-            ],
-        )]),
+        "Window" => groups(vec![
+            (
+                "Snapping",
+                vec![
+                    row("Cycle halves", "window.cycle", Kind::Bool, "Pressing Left Half again makes the window ⅔, then ⅓."),
+                    row("Window gap", "window.gap", Kind::Number, "Space between snapped windows, in pixels."),
+                    row("Screen gap", "window.screen_gap", Kind::Number, "Space between windows and the screen edges, in pixels."),
+                ],
+            ),
+            (
+                "Desktops",
+                vec![row("Close empty desktops", "window.auto_close_empty_desktops", Kind::Bool, "Remove a desktop with no windows when you switch away from it.")],
+            ),
+        ]),
         "Files" => groups(vec![
             (
                 "File search",

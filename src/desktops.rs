@@ -6,8 +6,9 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        OnceLock,
-        mpsc::{Sender, channel},
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering::Relaxed},
+        mpsc::{Receiver, Sender, channel},
     },
     time::{Duration, Instant},
 };
@@ -174,6 +175,78 @@ pub fn close() -> Result<(), String> {
     if closed { Ok(()) } else { Err("There is only one desktop".into()) }
 }
 
+/// How long a desktop must stay left alone before it counts as abandoned (a quick pass through
+/// it, or a window still moving out, should not remove it).
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// Whether to remove desktop `left` (0-based, among `count`) now that `current` is shown: only
+/// an empty one that is not the current one, and never the last.
+fn should_remove(left: u32, current: u32, count: u32, windows_on_left: usize) -> bool {
+    count > 1 && left != current && windows_on_left == 0
+}
+
+/// Removes desktop `old` (by id: indexes shift) if it still exists, is not current and holds no
+/// app windows. Windows that are pinned (shown on every desktop) belong to no desktop, so they
+/// are not counted; one whose desktop cannot be read is counted, to err on the side of keeping.
+fn close_if_empty(old: windows058::core::GUID) -> Result<(), winvd::Error> {
+    let ids = winvd::get_desktops()?.iter().map(|d| d.get_id()).collect::<Result<Vec<_>, _>>()?;
+    let Some(left) = ids.iter().position(|&i| i == old) else { return Ok(()) };
+    let current = winvd::get_current_desktop()?;
+    let me = std::process::id();
+    let on_left = crate::apps::app_windows_everywhere()
+        .into_iter()
+        .filter(|&(h, pid)| pid != me && !(winvd::is_pinned_window(winvd_hwnd(handle(h))).unwrap_or(false) || winvd::is_pinned_app(winvd_hwnd(handle(h))).unwrap_or(false)))
+        .filter(|&(h, _)| winvd::get_desktop_by_window(winvd_hwnd(handle(h))).and_then(|d| d.get_id()).map_or(true, |i| i == old))
+        .count();
+    if should_remove(left as u32, current.get_index()?, ids.len() as u32, on_left) { winvd::remove_desktop(winvd::get_desktop(old), current) } else { Ok(()) }
+}
+
+/// Watches desktop changes and removes the desktop you left once it is empty. Dropping it stops
+/// the watching.
+pub struct Listener {
+    events: Option<winvd::DesktopEventThread>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Listener {
+    /// None when this Windows is not supported or the listener could not start (logged).
+    pub fn start() -> Option<Listener> {
+        if !supported() {
+            return None;
+        }
+        let (tx, rx) = channel();
+        let events = winvd::listen_desktop_events::<winvd::DesktopEvent, _>(tx).inspect_err(|e| eprintln!("procast: Auto close desktops: {e:?}")).ok()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        std::thread::Builder::new().name("desktops-auto-close".into()).spawn(move || watch(rx, flag)).ok()?;
+        Some(Listener { events: Some(events), stop })
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        // Stopping joins winvd's thread, which can wait on Explorer: not on the caller's thread.
+        // The watcher ends by itself once that thread drops the event sender.
+        if let Some(events) = self.events.take() {
+            _ = std::thread::Builder::new().name("desktops-stop".into()).spawn(move || drop(events));
+        }
+    }
+}
+
+fn watch(rx: Receiver<winvd::DesktopEvent>, stop: Arc<AtomicBool>) {
+    for event in rx {
+        let winvd::DesktopEvent::DesktopChanged { old, .. } = event else { continue };
+        // Failures are logged by `call`; background work shows no notice.
+        let Ok(id) = call("Auto close: identify desktop", move || old.get_id()) else { continue };
+        std::thread::sleep(SETTLE);
+        if stop.load(Relaxed) {
+            return;
+        }
+        _ = call("Auto close: remove empty desktop", move || close_if_empty(id));
+    }
+}
+
 /// Names the current desktop.
 pub fn rename(name: &str) -> Result<(), String> {
     let name = name.to_string();
@@ -243,9 +316,27 @@ mod tests {
     }
 
     #[test]
+    fn only_empty_left_desktops_go() {
+        assert!(should_remove(1, 2, 3, 0));
+        assert!(!should_remove(1, 2, 3, 2), "a desktop with windows stays");
+        assert!(!should_remove(2, 2, 3, 0), "the current desktop stays");
+        assert!(!should_remove(0, 0, 1, 0), "the last desktop is never removed");
+        assert!(!should_remove(1, 0, 1, 0));
+    }
+
+    #[test]
     fn the_gate_is_a_build_number() {
         assert!(build().is_some_and(|b| b > 0));
         assert!(meets(22631) && meets(26200) && !meets(22630) && !meets(19045));
+    }
+
+    /// Registers and removes an event listener with Explorer; creates, switches and removes nothing.
+    #[test]
+    #[ignore]
+    fn listener_starts_and_stops() {
+        let l = Listener::start();
+        println!("listener: {}", l.is_some());
+        drop(l);
     }
 
     /// Read-only: `cargo test desktops_on_this_machine -- --ignored --nocapture`.

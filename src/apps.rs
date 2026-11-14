@@ -90,8 +90,20 @@ fn real_pid(hwnd: HWND, pid: u32) -> u32 {
 
 /// Windows that show in Alt+Tab: visible, unowned, not tool windows, not cloaked, titled.
 pub fn app_windows() -> Vec<(HWND, u32)> {
+    windows(false)
+}
+
+/// `app_windows` plus the windows of other virtual desktops (the shell cloaks those).
+pub fn app_windows_everywhere() -> Vec<(HWND, u32)> {
+    windows(true)
+}
+
+fn windows(other_desktops: bool) -> Vec<(HWND, u32)> {
+    /// DWM_CLOAKED_SHELL: hidden by the shell, as a window of another desktop is.
+    const SHELL: u32 = 2;
+    struct Scan(bool, Vec<(HWND, u32)>);
     unsafe extern "system" fn each(h: HWND, l: LPARAM) -> BOOL {
-        let out = unsafe { &mut *(l.0 as *mut Vec<(HWND, u32)>) };
+        let Scan(other_desktops, out) = unsafe { &mut *(l.0 as *mut Scan) };
         unsafe {
             let mut cloaked = 0u32;
             let shown = IsWindowVisible(h).as_bool()
@@ -99,7 +111,7 @@ pub fn app_windows() -> Vec<(HWND, u32)> {
                 && GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize == 0
                 && GetWindowTextLengthW(h) > 0
                 && DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4).is_ok()
-                && cloaked == 0
+                && (cloaked == 0 || *other_desktops && cloaked == SHELL)
                 && GetAncestor(h, GA_ROOTOWNER) == h;
             if shown {
                 out.push((h, pid_of(h)));
@@ -107,9 +119,9 @@ pub fn app_windows() -> Vec<(HWND, u32)> {
         }
         true.into()
     }
-    let mut out = vec![];
-    unsafe { _ = EnumWindows(Some(each), LPARAM(&mut out as *mut _ as isize)) };
-    out
+    let mut scan = Scan(other_desktops, vec![]);
+    unsafe { _ = EnumWindows(Some(each), LPARAM(&mut scan as *mut _ as isize)) };
+    scan.1
 }
 
 fn title(h: HWND) -> String {
