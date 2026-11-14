@@ -1743,8 +1743,10 @@ impl Launcher {
                 return;
             }
             Act::Cmd(cmd) => {
-                // Hide first so window commands act on the window you came from.
-                self.hide(true, cx);
+                // Hide first so window commands act on the window you came from. Open Desktop
+                // must not hand focus back: Windows would follow that window to its desktop
+                // after the switch, undoing it.
+                self.hide(!matches!(cmd, Cmd::Desktop(Desk::Open(_))), cx);
                 let target = self.prev.0 as isize;
                 let w = self.cfg.window.clone();
                 let tx = self.tx.clone();

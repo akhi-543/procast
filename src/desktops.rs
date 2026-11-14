@@ -20,6 +20,7 @@ use windows::{
             Com::{COINIT_MULTITHREADED, CoInitializeEx},
             SystemInformation::OSVERSIONINFOW,
         },
+        UI::WindowsAndMessaging::{GetShellWindow, IsIconic, SetForegroundWindow},
     },
 };
 
@@ -126,9 +127,21 @@ fn winvd_hwnd(h: isize) -> windows058::Win32::Foundation::HWND {
     windows058::Win32::Foundation::HWND(h as *mut std::ffi::c_void)
 }
 
+/// Switches to desktop `n`. The launcher hid without handing focus back (that window lives on
+/// the old desktop and Windows would follow it back), and as a tool window it shows on every
+/// desktop, so it would keep the keyboard: focus goes to the new desktop's top window instead,
+/// or to the desktop itself when it has none.
 pub fn open(n: u8) -> Result<(), String> {
     let i = index(n)?;
-    call("Open Desktop", move || winvd::switch_desktop(i))
+    let windows: Vec<isize> = crate::apps::app_windows_everywhere().into_iter().filter(|&(h, pid, _)| pid != std::process::id() && !unsafe { IsIconic(h) }.as_bool()).map(|(h, ..)| handle(h)).collect();
+    let top = call("Open Desktop", move || {
+        winvd::switch_desktop(i)?;
+        // Z-order, top first; membership by desktop, not cloak state, which lags the switch.
+        Ok(windows.into_iter().find(|&h| winvd::get_desktop_by_window(winvd_hwnd(h)).and_then(|d| d.get_index()).is_ok_and(|d| d == i)))
+    })?;
+    let to = top.map_or_else(|| unsafe { GetShellWindow() }, |h| HWND(h as _));
+    unsafe { _ = SetForegroundWindow(to) };
+    Ok(())
 }
 
 /// Moves the window without switching to its new desktop.

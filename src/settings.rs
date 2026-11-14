@@ -1265,6 +1265,8 @@ fn title_bar(t: &design::Tokens, maximized: bool) -> impl IntoElement {
             .hover(move |s| s.bg(bg))
             .child(design::icon(glyph, design::ic::MD, muted).group_hover(id, move |s| s.text_color(on)))
     };
+    // Drag goes on the title only: gpui takes the first control area under the mouse, so a
+    // Drag on the whole bar would swallow the buttons.
     div()
         .h(px(design::CONTROL))
         .flex_none()
@@ -1272,8 +1274,7 @@ fn title_bar(t: &design::Tokens, maximized: bool) -> impl IntoElement {
         .items_center()
         .border_b_1()
         .border_color(t.hairline)
-        .window_control_area(Drag)
-        .child(div().flex_1().min_w_0().px(px(12.)).truncate().text_size(px(design::ts::SMALL)).text_color(muted).child("procast Settings"))
+        .child(div().id("drag").window_control_area(Drag).flex_1().min_w_0().h_full().flex().items_center().px(px(12.)).child(div().truncate().text_size(px(design::ts::SMALL)).text_color(muted).child("procast Settings")))
         .child(button("minimise", Min, design::g::MINUS))
         // Two overlapping squares: the restore glyph.
         .child(button("maximise", Max, if maximized { design::g::COPY } else { design::g::SQUARE }))
