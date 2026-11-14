@@ -222,6 +222,8 @@ pub struct Files {
     pub roots: Vec<String>,
     /// File or folder names skipped anywhere in the tree.
     pub exclude: Vec<String>,
+    /// Folder search skips what `.gitignore` and `.ignore` files list.
+    pub gitignore: bool,
     pub hotkey: String,
     /// Search every NTFS drive through the admin helper, when it's installed.
     pub ntfs: bool,
@@ -239,6 +241,7 @@ impl Default for Files {
             exclude: ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
                 .map(String::from)
                 .to_vec(),
+            gitignore: true,
             hotkey: String::new(),
             ntfs: true,
             drives: vec![],
@@ -529,6 +532,7 @@ shortcodes = true             # typing :name: in any app (e.g. :thumbsup:) turns
 enabled = true
 roots = []                    # empty = your user folder; e.g. ["C:\\Users\\you", "D:\\Projects"]
 exclude = ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
+gitignore = true              # folder search skips what .gitignore and .ignore files list
 hotkey = ""
 ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
 drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = every NTFS drive

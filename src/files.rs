@@ -6,7 +6,7 @@
 // ponytail: changes made while a crawl runs can be lost until the next crawl (hourly at most).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -17,6 +17,7 @@ use std::{
 };
 
 use futures::channel::mpsc::UnboundedSender;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use nucleo_matcher::{
     Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -52,7 +53,7 @@ pub struct Files {
     pub indexing: Arc<AtomicBool>,
     built: Arc<RwLock<Option<Instant>>>,
     roots: Vec<String>,
-    exclude: Vec<String>,
+    rules: Rules,
     tx: UnboundedSender<Msg>,
     /// Whole-drive index from the admin helper; used instead of the folder index once ready.
     ntfs: Option<crate::ntfs::Client>,
@@ -62,8 +63,8 @@ pub struct Files {
 
 impl Files {
     pub fn start(cfg: &crate::config::Files, tx: UnboundedSender<Msg>) -> Self {
-        let (roots, exclude) = (cfg.roots(), cfg.exclude.clone());
-        let filter = crate::ntfs::Filter { exclude: exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
+        let (roots, rules) = (cfg.roots(), Rules::new(&cfg.exclude, cfg.gitignore));
+        let filter = crate::ntfs::Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
         let index = Arc::new(RwLock::new(Vec::new()));
         let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
         let (count, indexing) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -96,7 +97,7 @@ impl Files {
             indexing,
             built: Arc::new(RwLock::new(None)),
             roots,
-            exclude,
+            rules,
             tx,
             ntfs,
             cfg: cfg.clone(),
@@ -105,7 +106,7 @@ impl Files {
         // only built if the helper doesn't answer (on the next File Search).
         if !(files.ntfs.is_some() && crate::ntfs::installed()) {
             // Searchable at once from the saved index; the crawl below refreshes it.
-            let saved = load(&cache_path(), &cache_key(&files.roots, &files.exclude)).unwrap_or_default();
+            let saved = load(&cache_path(), &cache_key(&files.roots, &files.rules)).unwrap_or_default();
             files.count.store(saved.len(), Ordering::SeqCst);
             *files.index.write().unwrap() = saved;
             files.refresh_if_stale(Duration::ZERO);
@@ -129,10 +130,10 @@ impl Files {
             return;
         }
         let (index, count, indexing, built) = (self.index.clone(), self.count.clone(), self.indexing.clone(), self.built.clone());
-        let (roots, exclude, tx) = (self.roots.clone(), self.exclude.clone(), self.tx.clone());
+        let (roots, rules, tx) = (self.roots.clone(), self.rules.clone(), self.tx.clone());
         std::thread::spawn(move || {
-            let entries = crawl(&roots, &exclude);
-            let _ = save(&cache_path(), &cache_key(&roots, &exclude), &entries);
+            let entries = crawl(&roots, &rules);
+            let _ = save(&cache_path(), &cache_key(&roots, &rules), &entries);
             count.store(entries.len(), Ordering::SeqCst);
             *index.write().unwrap() = entries;
             *built.write().unwrap() = Some(Instant::now());
@@ -144,7 +145,7 @@ impl Files {
     /// One watcher thread per root. Each ends at the first change after `Files` is dropped.
     fn watch(&self) {
         for root in &self.roots {
-            let (root, exclude, tx) = (root.clone(), self.exclude.clone(), self.tx.clone());
+            let (root, rules, tx) = (root.clone(), self.rules.clone(), self.tx.clone());
             let (index, count, built) = (Arc::downgrade(&self.index), self.count.clone(), self.built.clone());
             std::thread::spawn(move || {
                 crate::win::watch_dir(Path::new(&root), true, |changes| {
@@ -155,7 +156,7 @@ impl Files {
                         return true;
                     }
                     let mut index = index.write().unwrap();
-                    if !apply(&mut index, &root, &exclude, changes) {
+                    if !apply(&mut index, &root, &rules, changes) {
                         return true;
                     }
                     count.store(index.len(), Ordering::SeqCst);
@@ -211,42 +212,129 @@ pub fn excluded(exclude: &[String], name: &str) -> bool {
     exclude.iter().any(|e| name.eq_ignore_ascii_case(e) || (e.contains(['*', '?']) && glob_match(e, name)))
 }
 
-pub fn crawl(roots: &[String], exclude: &[String]) -> Vec<Entry> {
-    let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
-    let mut out = Vec::new();
-    for root in roots {
-        let skip = exclude.clone();
-        let walk = jwalk::WalkDir::new(root).skip_hidden(false).follow_links(false).process_read_dir(move |_, _, _, children| {
-            children.retain(|c| c.as_ref().is_ok_and(|e| !excluded(&skip, &e.file_name.to_string_lossy())));
-        });
-        for entry in walk.into_iter().flatten().skip(1) {
-            out.push(Entry::new(entry.path().to_string_lossy().into(), entry.file_type.is_dir()));
-        }
+/// What the folder index leaves out.
+#[derive(Clone)]
+pub struct Rules {
+    /// `files.exclude`, ASCII-lowercased (see `excluded`); build with `Rules::new`.
+    pub exclude: Vec<String>,
+    /// Honour `.gitignore` and `.ignore` files found under the roots.
+    pub gitignore: bool,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self { exclude: vec![], gitignore: true }
     }
+}
+
+impl Rules {
+    pub fn new(exclude: &[String], gitignore: bool) -> Self {
+        Self { exclude: exclude.iter().map(|e| e.to_ascii_lowercase()).collect(), gitignore }
+    }
+}
+
+/// The ignore files from the root down to a folder, shallowest first.
+type Chain = Vec<Arc<Gitignore>>;
+type Cache = HashMap<PathBuf, Option<Arc<Gitignore>>>;
+
+/// The `.gitignore` and/or `.ignore` in `dir` as one matcher (`.ignore` wins, as in git tools).
+/// Windows file names ignore case, so patterns do too.
+fn ignore_file(dir: &Path, git: bool, dot: bool) -> Option<Arc<Gitignore>> {
+    let mut b = GitignoreBuilder::new(dir);
+    b.case_insensitive(true).ok()?;
+    if git {
+        let _ = b.add(dir.join(".gitignore"));
+    }
+    if dot {
+        let _ = b.add(dir.join(".ignore"));
+    }
+    b.build().ok().filter(|g| !g.is_empty()).map(Arc::new)
+}
+
+/// Whether a path is ignored: the deepest ignore file with an opinion decides, so `!keep` can undo a parent's rule.
+fn hit(chain: &[Arc<Gitignore>], path: &Path, dir: bool) -> bool {
+    chain.iter().rev().map(|g| g.matched(path, dir)).find(|m| !m.is_none()).is_some_and(|m| m.is_ignore())
+}
+
+/// One walk below `root`, starting with the ignore files of the folders above it.
+fn walk(root: &str, rules: &Rules, chain: Chain) -> Vec<Entry> {
+    let (skip, gitignore) = (rules.exclude.clone(), rules.gitignore);
+    let walk = jwalk::WalkDirGeneric::<(Chain, ())>::new(root).skip_hidden(false).follow_links(false).root_read_dir_state(chain).process_read_dir(
+        move |depth, dir, chain, children| {
+            if depth.is_none() {
+                return;
+            }
+            if gitignore {
+                let has = |name: &str| children.iter().any(|c| c.as_ref().is_ok_and(|e| e.file_name.eq_ignore_ascii_case(name)));
+                let (git, dot) = (has(".gitignore"), has(".ignore"));
+                if git || dot {
+                    chain.extend(ignore_file(dir, git, dot));
+                }
+            }
+            children.retain(|c| {
+                c.as_ref().is_ok_and(|e| !excluded(&skip, &e.file_name.to_string_lossy()) && (chain.is_empty() || !hit(chain, &e.path(), e.file_type.is_dir())))
+            });
+        },
+    );
+    walk.into_iter().flatten().skip(1).map(|e| Entry::new(e.path().to_string_lossy().into(), e.file_type.is_dir())).collect()
+}
+
+pub fn crawl(roots: &[String], rules: &Rules) -> Vec<Entry> {
+    let mut out: Vec<Entry> = roots.iter().flat_map(|root| walk(root, rules, vec![])).collect();
     out.shrink_to_fit();
     out
+}
+
+/// The ignore files of `root` and the folders down to `rel`'s parent, and whether `rel`
+/// (or a folder above it) is ignored by them.
+fn ignore_state(root: &Path, rel: &Path, dir: bool, cache: &mut Cache) -> (Chain, bool) {
+    let (mut at, mut chain) = (root.to_path_buf(), Chain::new());
+    let last = rel.components().count();
+    for (i, c) in rel.components().enumerate() {
+        chain.extend(cache.entry(at.clone()).or_insert_with(|| ignore_file(&at, true, true)).clone());
+        at.push(c);
+        if hit(&chain, &at, i + 1 < last || dir) {
+            return (chain, true);
+        }
+    }
+    (chain, false)
 }
 
 /// Applies one batch of watcher changes (paths relative to `root`). Returns whether the
 /// index changed. Each changed path is dropped with everything under it, then added back
 /// (a folder with its contents) if it exists now, so renames, moves and repeats come out right.
-pub fn apply(index: &mut Vec<Entry>, root: &str, exclude: &[String], changes: Vec<PathBuf>) -> bool {
-    let exclude: Vec<String> = exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
+/// A changed ignore file re-reads its whole folder; other paths are checked against the
+/// ignore files above them.
+pub fn apply(index: &mut Vec<Entry>, root: &str, rules: &Rules, changes: Vec<PathBuf>) -> bool {
     let mut dropped: HashSet<String> = HashSet::new();
     let mut added = vec![];
-    for c in changes {
-        if c.components().any(|p| excluded(&exclude, &p.as_os_str().to_string_lossy())) {
+    let mut cache = Cache::new();
+    for mut c in changes {
+        if rules.gitignore && c.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".gitignore") || n.eq_ignore_ascii_case(".ignore")) {
+            c.pop();
+        }
+        if c.components().any(|p| excluded(&rules.exclude, &p.as_os_str().to_string_lossy())) {
             continue;
         }
-        let full = Path::new(root).join(&c).to_string_lossy().into_owned();
-        if !dropped.insert(full.clone()) {
+        let at_root = c.as_os_str().is_empty();
+        let full = if at_root { root.to_string() } else { Path::new(root).join(&c).to_string_lossy().into_owned() };
+        if dropped.contains(&full) {
             continue;
         }
-        if let Ok(meta) = std::fs::symlink_metadata(&full) {
-            if meta.is_dir() {
-                added.extend(crawl(std::slice::from_ref(&full), &exclude));
+        let meta = std::fs::symlink_metadata(&full).ok();
+        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+        let (chain, hidden) = if rules.gitignore { ignore_state(Path::new(root), &c, is_dir, &mut cache) } else { Default::default() };
+        if hidden {
+            continue;
+        }
+        dropped.insert(full.clone());
+        if meta.is_some() {
+            if is_dir {
+                added.extend(walk(&full, rules, chain));
             }
-            added.push(Entry::new(full.into(), meta.is_dir()));
+            if !at_root {
+                added.push(Entry::new(full.into(), is_dir));
+            }
         }
     }
     if dropped.is_empty() {
@@ -274,9 +362,9 @@ fn cache_path() -> PathBuf {
     crate::config::dir().join("files.bin")
 }
 
-/// The cache is only used for the same roots and exclusions.
-fn cache_key(roots: &[String], exclude: &[String]) -> String {
-    format!("procast-files-1\n{}\n{}", roots.join("|"), exclude.join("|"))
+/// The cache is only used for the same roots and rules.
+fn cache_key(roots: &[String], rules: &Rules) -> String {
+    format!("procast-files-2\n{}\n{}\n{}", roots.join("|"), rules.exclude.join("|"), rules.gitignore)
 }
 
 /// Layout: the key, then per entry a dir flag and the path, strings as u32 length + UTF-8.
@@ -408,7 +496,7 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, "").unwrap();
         }
-        let index = crawl(&[root.to_string_lossy().into_owned()], &["node_modules".into(), "*.JS".into()]);
+        let index = crawl(&[root.to_string_lossy().into_owned()], &Rules::new(&["node_modules".into(), "*.JS".into()], true));
         let _ = std::fs::remove_dir_all(&root);
         assert!(index.iter().all(|e| !e.path.contains("node_modules")), "excluded folders are not walked");
         assert!(index.iter().all(|e| !e.path.ends_with(".js")), "wildcard names are not indexed");
@@ -432,7 +520,7 @@ mod tests {
             std::fs::write(&p, "").unwrap();
         }
         let r = root.to_string_lossy().into_owned();
-        let ex = vec!["skip".to_string()];
+        let ex = Rules::new(&["skip".to_string()], true);
         let mut index = crawl(std::slice::from_ref(&r), &ex);
         let names = |ix: &[Entry]| {
             let mut v: Vec<String> = ix.iter().map(|e| e.path[r.len() + 1..].replace('\\', "/")).collect();
@@ -457,6 +545,84 @@ mod tests {
         assert!(!apply(&mut index, &r, &ex, vec![ch("skip\\y.txt")]), "excluded folders are ignored");
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(names(&index), ["c", "c/one.txt", "c/sub", "c/sub/two.txt", "new.txt"]);
+    }
+
+    /// A temp tree of files with the given contents; returns it and its path as a string.
+    fn tree(name: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("procast-{name}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (p, text) in files {
+            let p = root.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+        let r = root.to_string_lossy().into_owned();
+        (root, r)
+    }
+
+    /// Sorted paths relative to `root`, with `/` separators.
+    fn names(ix: &[Entry], root: &str) -> Vec<String> {
+        let mut v: Vec<String> = ix.iter().map(|e| e.path[root.len() + 1..].replace('\\', "/")).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn gitignore_hides_ignored_files() {
+        let (root, r) = tree(
+            "gitignore",
+            &[(".gitignore", "dist/\n*.bak"), ("dist/app.js", ""), ("notes.bak", ""), ("src/main.rs", ""), ("sub/.ignore", "secret.txt"), ("sub/secret.txt", "")],
+        );
+        let on = names(&crawl(std::slice::from_ref(&r), &Rules { gitignore: true, ..Rules::default() }), &r);
+        let off = names(&crawl(std::slice::from_ref(&r), &Rules { gitignore: false, ..Rules::default() }), &r);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(on, [".gitignore", "src", "src/main.rs", "sub", "sub/.ignore"]);
+        assert_eq!(off.len(), 9, "{off:?}");
+    }
+
+    #[test]
+    fn deeper_ignore_files_win_and_apply_respects_ancestors() {
+        let (root, r) = tree(
+            "ignore-apply",
+            &[(".gitignore", "*.log\ndist/"), ("a/.gitignore", "!keep.log\nown.txt"), ("a/keep.log", ""), ("a/other.log", ""), ("a/own.txt", ""), ("a/b/x.txt", "")],
+        );
+        let rules = Rules::default();
+        let mut index = crawl(std::slice::from_ref(&r), &rules);
+        assert_eq!(names(&index, &r), [".gitignore", "a", "a/.gitignore", "a/b", "a/b/x.txt", "a/keep.log"]);
+
+        // New files under ignored folders, or matching an ancestor's rule, stay out.
+        std::fs::create_dir_all(root.join("dist/deep")).unwrap();
+        std::fs::write(root.join("dist/deep/x.js"), "").unwrap();
+        std::fs::write(root.join("a/b/new.log"), "").unwrap();
+        std::fs::write(root.join("a/b/new.txt"), "").unwrap();
+        let ch = PathBuf::from;
+        assert!(apply(&mut index, &r, &rules, vec![ch("dist"), ch("dist\\deep\\x.js"), ch("a\\b\\new.log"), ch("a\\b\\new.txt")]));
+        assert_eq!(names(&index, &r), [".gitignore", "a", "a/.gitignore", "a/b", "a/b/new.txt", "a/b/x.txt", "a/keep.log"]);
+
+        // A folder created in is crawled under the ancestors' rules.
+        std::fs::create_dir_all(root.join("a/moved")).unwrap();
+        std::fs::write(root.join("a/moved/y.log"), "").unwrap();
+        std::fs::write(root.join("a/moved/y.txt"), "").unwrap();
+        assert!(apply(&mut index, &r, &rules, vec![ch("a\\moved")]));
+        let moved = names(&index, &r);
+        assert!(moved.contains(&"a/moved/y.txt".to_string()) && !moved.contains(&"a/moved/y.log".to_string()), "{moved:?}");
+
+        // Editing an ignore file re-reads its folder: own.txt shows, b/x.txt goes, root rules still apply.
+        std::fs::write(root.join("a/.gitignore"), "x.txt\n").unwrap();
+        assert!(apply(&mut index, &r, &rules, vec![ch("a\\.gitignore")]));
+        let after = names(&index, &r);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(after.contains(&"a/own.txt".to_string()), "{after:?}");
+        assert!(!after.contains(&"a/b/x.txt".to_string()), "{after:?}");
+        assert!(!after.contains(&"a/keep.log".to_string()) && !after.contains(&"a/other.log".to_string()), "{after:?}");
+        assert!(after.contains(&"a/b/new.txt".to_string()), "{after:?}");
+    }
+
+    #[test]
+    fn cache_key_changes_with_the_rules() {
+        let roots = vec!["C:\\r".to_string()];
+        let key = |gitignore| cache_key(&roots, &Rules { gitignore, ..Rules::default() });
+        assert_ne!(key(true), key(false));
     }
 
     #[test]
