@@ -340,6 +340,9 @@ pub fn apply(index: &mut Vec<Entry>, root: &str, rules: &Rules, changes: Vec<Pat
     if dropped.is_empty() {
         return false;
     }
+    // A re-walked folder already holds its changed children; the index's old copies of all of them go below.
+    let mut seen = HashSet::new();
+    added.retain(|e| seen.insert(e.path.clone()));
     dropped.extend(added.iter().map(|e| e.path.to_string()));
     let under_dropped = |path: &str| {
         let mut p = path;
@@ -616,6 +619,20 @@ mod tests {
         assert!(!after.contains(&"a/b/x.txt".to_string()), "{after:?}");
         assert!(!after.contains(&"a/keep.log".to_string()) && !after.contains(&"a/other.log".to_string()), "{after:?}");
         assert!(after.contains(&"a/b/new.txt".to_string()), "{after:?}");
+    }
+
+    #[test]
+    fn a_batch_that_rewalks_a_folder_adds_nothing_twice() {
+        let (root, r) = tree("rewalk", &[("a/.gitignore", "*.tmp"), ("a/x.txt", ""), ("a/keep.txt", "")]);
+        let rules = Rules::default();
+        let mut index = crawl(std::slice::from_ref(&r), &rules);
+        std::fs::write(root.join("a/y.txt"), "").unwrap();
+        std::fs::write(root.join("a/.gitignore~"), "").unwrap();
+        let ch = PathBuf::from;
+        assert!(apply(&mut index, &r, &rules, vec![ch("a\\.gitignore"), ch("a\\x.txt"), ch("a\\y.txt"), ch("a\\.gitignore~"), ch("a")]));
+        let got = names(&index, &r);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, ["a", "a/.gitignore", "a/.gitignore~", "a/keep.txt", "a/x.txt", "a/y.txt"]);
     }
 
     #[test]
