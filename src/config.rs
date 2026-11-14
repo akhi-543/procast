@@ -274,12 +274,33 @@ pub struct Window {
     pub cycle: bool,
     /// Close a virtual desktop when its last window leaves it.
     pub auto_close_empty_desktops: bool,
+    /// Named window arrangements, each a root-search command "Layout: <name>".
+    pub layouts: Vec<Layout>,
 }
 
 impl Default for Window {
     fn default() -> Self {
-        Self { gap: 0, screen_gap: 0, cycle: true, auto_close_empty_desktops: false }
+        Self { gap: 0, screen_gap: 0, cycle: true, auto_close_empty_desktops: false, layouts: vec![] }
     }
+}
+
+/// A window layout preset: every slot finds (or starts) a program and snaps its window.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Layout {
+    pub name: String,
+    pub slots: Vec<Slot>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Slot {
+    /// Program file name, e.g. "Code.exe".
+    pub app: String,
+    /// A `Snap` variant name, e.g. "FirstTwoThirds".
+    pub snap: String,
+    /// 1-based monitor; None keeps the window's own.
+    pub display: Option<usize>,
 }
 
 /// `mode` picks the base palette; any colour can be overridden with "#rrggbb" or "#rrggbbaa".
@@ -551,6 +572,14 @@ gap = 0                       # pixels between snapped windows
 screen_gap = 0                # pixels between snapped windows and the screen edges
 cycle = true                  # repeating Left Half, Right Half, thirds... cycles through sizes
 auto_close_empty_desktops = false  # close a virtual desktop when its last window leaves it
+# Layout presets: each becomes a command "Layout: <name>" that finds (or starts) each app and snaps it.
+# snap = a Snap name (LeftHalf, RightHalf, FirstTwoThirds, LastThird ...); display = 2 puts it on that monitor.
+# [[window.layouts]]
+# name = "Coding"
+# slots = [
+#   { app = "Code.exe", snap = "FirstTwoThirds" },
+#   { app = "WindowsTerminal.exe", snap = "LastThird" },
+# ]
 
 [scripts]
 # Raycast-format script commands (.ps1 .py .js .bat .cmd). Empty = %APPDATA%\procast\scripts
@@ -865,6 +894,22 @@ mod tests {
         assert!(!removable_wanted(""), "unset is off, as is a missing file's empty text");
         assert!(!removable_wanted(TEMPLATE));
         assert!(!removable_wanted("[files]\nremovable = true\nroots = 3\n"), "an invalid file counts as off");
+    }
+
+    #[test]
+    fn layouts_parse() {
+        let c = parse(
+            "[[window.layouts]]\nname = \"Coding\"\nslots = [\n  { app = \"Code.exe\", snap = \"FirstTwoThirds\" },\n  { app = \"WindowsTerminal.exe\", snap = \"LastThird\" },\n]\n",
+        )
+        .unwrap();
+        assert_eq!(c.window.layouts.len(), 1);
+        let l = &c.window.layouts[0];
+        assert_eq!(l.name, "Coding");
+        assert_eq!(l.slots.len(), 2);
+        assert_eq!((l.slots[0].app.as_str(), l.slots[0].snap.as_str(), l.slots[0].display), ("Code.exe", "FirstTwoThirds", None));
+        let d = parse("[[window.layouts]]\nname = \"X\"\nslots = [{ app = \"a.exe\", snap = \"LeftHalf\", display = 2 }]\n").unwrap();
+        assert_eq!(d.window.layouts[0].slots[0].display, Some(2));
+        assert!(parse(TEMPLATE).unwrap().window.layouts.is_empty(), "the template's example is commented out");
     }
 
     #[test]

@@ -378,7 +378,73 @@ fn is_shell(hwnd: HWND) -> bool {
     matches!(String::from_utf16_lossy(&buf[..n]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
 }
 
+/// A `Snap` by its variant name ("FirstTwoThirds"), as layouts name them. "FirstThird" and
+/// "LastThird" are accepted for `LeftThird` and `RightThird` (the titles those two show).
+pub fn snap_by_name(name: &str) -> Option<Snap> {
+    let name = match name {
+        "FirstThird" => "LeftThird",
+        "LastThird" => "RightThird",
+        n => n,
+    };
+    ALL.iter().find_map(|&(c, ..)| match c {
+        Cmd::Snap(s) if format!("{s:?}") == name => Some(s),
+        _ => None,
+    })
+}
+
+/// A visible window of the program named `app` (a file name, any case), procast's own excluded.
+fn window_of(app: &str) -> Option<HWND> {
+    let want = std::path::Path::new(app).file_name()?;
+    let me = std::process::id();
+    crate::apps::app_windows().into_iter().find(|&(_, pid)| {
+        pid != me && crate::apps::exe_path(pid).is_some_and(|e| std::path::Path::new(&e).file_name().is_some_and(|n| n.eq_ignore_ascii_case(want)))
+    }).map(|(h, _)| h)
+}
+
+/// Runs a layout preset: each slot's program gets a window (started if none is open,
+/// waiting up to 5 s) and is snapped, never cycled. A failing slot doesn't stop the
+/// rest; the first error is returned.
+pub fn run_layout(l: &config::Layout, w: &config::Window) -> Result<(), String> {
+    let mut first = None;
+    for slot in &l.slots {
+        if let Err(e) = run_slot(slot, w) {
+            first.get_or_insert(format!("Layout {}: {e}", l.name));
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+fn run_slot(slot: &config::Slot, w: &config::Window) -> Result<(), String> {
+    let s = snap_by_name(&slot.snap).ok_or_else(|| format!("unknown snap {}", slot.snap))?;
+    let mon = match slot.display {
+        Some(n) => Some(n.checked_sub(1).and_then(|i| monitors().get(i).copied()).ok_or_else(|| format!("no display {n}"))?),
+        None => None,
+    };
+    let hwnd = match window_of(&slot.app) {
+        Some(h) => h,
+        None => {
+            crate::win::open(&slot.app);
+            let h = (0..50).find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                window_of(&slot.app)
+            });
+            let h = h.ok_or_else(|| format!("{} didn't open a window", slot.app))?;
+            // Let a fresh window finish sizing itself before moving it.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            h
+        }
+    };
+    snap_with(hwnd, s, w, false, mon);
+    Ok(())
+}
+
 fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
+    snap_with(hwnd, s, w, w.cycle, None)
+}
+
+/// `snap`, with cycling chosen by the caller and optionally a monitor to snap on
+/// instead of the window's own.
+fn snap_with(hwnd: HWND, s: Snap, w: &config::Window, cycle: bool, on: Option<HMONITOR>) {
     unsafe {
         if hwnd.is_invalid() || !IsWindow(Some(hwnd)).as_bool() || is_shell(hwnd) {
             return;
@@ -400,8 +466,8 @@ fn snap(hwnd: HWND, s: Snap, w: &config::Window) {
         let mut vis = cur;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut vis as *mut _ as _, size_of::<RECT>() as u32);
         // A just-restored window is not part of a cycle: its first press gives the plain half.
-        let cycle = w.cycle && !was_big;
-        let here = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let cycle = cycle && !was_big;
+        let here = on.unwrap_or_else(|| MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
         let mut t = if s == Snap::NextDisplay {
             let all = monitors();
             let Some(i) = all.iter().position(|m| *m == here) else { return };
@@ -517,6 +583,25 @@ mod tests {
         let h = |n: usize| HWND(n as _);
         let list = [(h(1), 10), (h(2), 20), (h(3), 99), (h(4), 30)];
         assert_eq!(others_of(&list, h(2), 99), vec![h(1), h(4)]);
+    }
+
+    #[test]
+    fn snap_names_round_trip() {
+        assert_eq!(snap_by_name("FirstTwoThirds"), Some(Snap::FirstTwoThirds));
+        assert_eq!(snap_by_name("LastThird"), Some(Snap::RightThird), "the spec's name for the last third");
+        assert_eq!(snap_by_name("Nope"), None);
+        assert_eq!(snap_by_name("lefthalf"), None, "case-sensitive like the variant names");
+        let snaps: Vec<Snap> = ALL.iter().filter_map(|&(c, ..)| if let Cmd::Snap(s) = c { Some(s) } else { None }).collect();
+        assert_eq!(snaps.len(), 28, "every Snap variant is in the command table");
+        for s in snaps {
+            assert_eq!(snap_by_name(&format!("{s:?}")), Some(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn layout_errors_name_the_layout() {
+        let l = config::Layout { name: "Coding".into(), slots: vec![config::Slot { app: "x.exe".into(), snap: "Nope".into(), display: None }] };
+        assert_eq!(run_layout(&l, &config::Window::default()), Err("Layout Coding: unknown snap Nope".into()));
     }
 
     #[test]

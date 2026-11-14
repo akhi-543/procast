@@ -88,7 +88,7 @@ fn table_rows(list: &'static str, text: &str) -> Vec<Row> {
     out
 }
 
-const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts"];
+const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts", "Layouts"];
 
 /// The Shortcuts category an item belongs to, from its key prefix.
 fn category(it: &Item) -> &'static str {
@@ -98,6 +98,7 @@ fn category(it: &Item) -> &'static str {
         Some("ql") => "Quicklinks",
         Some("sn") => "Snippets",
         Some("sc") => "Scripts",
+        Some("wl") => "Layouts",
         _ => "Applications",
     }
 }

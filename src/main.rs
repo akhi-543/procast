@@ -1718,6 +1718,18 @@ impl Launcher {
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true, true),
             Act::Cmd(Cmd::Quit) => return cx.quit(),
+            Act::Layout(name) => {
+                self.hide(true, cx);
+                let Some(layout) = self.cfg.window.layouts.iter().find(|l| l.name == name).cloned() else { return };
+                let w = self.cfg.window.clone();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = commands::run_layout(&layout, &w) {
+                        let _ = tx.unbounded_send(Msg::Notice(e));
+                    }
+                });
+                return;
+            }
             Act::Cmd(cmd) => {
                 // Hide first so window commands act on the window you came from.
                 self.hide(true, cx);
@@ -2633,7 +2645,7 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::RunAsAdmin(_) => g::SHIELD,
         Act::DeleteClip(_) | Act::UninstallExt(_) => g::DELETE,
         Act::Install(_) => g::DOWNLOAD,
-        Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::ExtRun(..) => g::PLAY,
+        Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::Layout(_) | Act::ExtRun(..) => g::PLAY,
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
         Act::Confirm(false) => g::CANCEL,

@@ -47,6 +47,8 @@ pub enum Act {
     /// Index into the launcher's script list.
     Script(usize),
     Cmd(Cmd),
+    /// Run a window layout preset, by name.
+    Layout(String),
     /// Ask Claude; the answer streams into its own view.
     Ask(String),
     /// Put text in the search box (quicklink waiting for its argument).
@@ -92,7 +94,7 @@ impl Act {
             Act::DeleteClip(_) => "Delete Entry",
             Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) => "Open",
             Act::Install(_) => "Install",
-            Act::Cmd(_) | Act::ExtRun(..) => "Run Command",
+            Act::Cmd(_) | Act::ExtRun(..) | Act::Layout(_) => "Run Command",
             Act::ExtFn(_) => "Run Action",
             Act::ExtSet(..) | Act::FormSet(..) => "Choose",
             Act::Confirm(true) => "Confirm",
@@ -294,6 +296,9 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
             continue;
         }
         items.push(Item::new(title, cmd.subtitle(), Icon::Vector(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
+    }
+    for l in &cfg.window.layouts {
+        items.push(Item::new(format!("Layout: {}", l.name), "Window", Icon::Vector(g::TILES), Act::Layout(l.name.clone())).acc("Command").keyed(format!("wl:{}", l.name)).words("window arrange preset").tinted(Tint::Window));
     }
     for q in &cfg.quicklink {
         let act = if q.url.contains("{query}") {
@@ -786,6 +791,14 @@ mod tests {
         let odd = rect(0, 0, 1201, 901);
         let (q, s, t) = (layout(Snap::BottomRightQuarter, odd, cur), layout(Snap::BottomRightSixth, odd, cur), layout(Snap::BottomThird, odd, cur));
         assert_eq!((q.right, q.bottom, s.right, s.bottom, t.right, t.bottom), (1201, 901, 1201, 901, 1201, 901), "right and bottom pieces end on the work area");
+    }
+
+    #[test]
+    fn layouts_become_root_commands() {
+        let cfg = crate::config::parse("[[window.layouts]]\nname = \"Coding\"\nslots = [{ app = \"Code.exe\", snap = \"LeftHalf\" }]").unwrap();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let it = cat.iter().find(|i| i.title == "Layout: Coding").unwrap();
+        assert_eq!((it.act.clone(), it.key.as_deref(), it.subtitle.as_str()), (Act::Layout("Coding".into()), Some("wl:Coding"), "Window"));
     }
 
     #[test]
