@@ -31,7 +31,7 @@ use windows::{
             GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
         },
         Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
+            CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
             FILE_SHARE_WRITE, GetDriveTypeW, GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, WriteFile,
         },
         System::{
@@ -96,20 +96,26 @@ fn remove_old_helper() {
 }
 
 // ---- wire format ----------------------------------------------------------------------
-// Per record: kind u8, drive letter u8, MFT record u64, parent record u64, dir u8,
-// name length u16, UTF-8 name.
+// Per record: kind u8, drive letter u8, MFT record u64, parent record u64, flags u8,
+// name length u16, UTF-8 name. Flags: bit 0 folder, bit 1 hidden. (Helpers from before
+// the hidden bit sent just 0 or 1, which still reads right.)
 
 const UPSERT: u8 = 0;
 const DELETE: u8 = 1;
 /// A drive's snapshot is complete; live changes follow.
 const READY: u8 = 2;
+const W_DIR: u8 = 1;
+const W_HIDDEN: u8 = 2;
+// GetDriveTypeW results.
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_FIXED: u32 = 3;
 const HEADER: usize = 1 + 1 + 8 + 8 + 1 + 2;
 
-fn put(out: &mut Vec<u8>, kind: u8, drive: u8, rec: u64, parent: u64, dir: bool, name: &str) {
+fn put(out: &mut Vec<u8>, kind: u8, drive: u8, rec: u64, parent: u64, flags: u8, name: &str) {
     out.extend([kind, drive]);
     out.extend(rec.to_le_bytes());
     out.extend(parent.to_le_bytes());
-    out.push(dir as u8);
+    out.push(flags);
     out.extend((name.len() as u16).to_le_bytes());
     out.extend(name.as_bytes());
 }
@@ -203,13 +209,14 @@ pub fn serve() {
     }
 }
 
-/// Fixed drives formatted NTFS, as letters.
+/// Fixed and removable drives formatted NTFS, as letters; procast drops the removable
+/// ones unless asked.
 fn ntfs_drives() -> Vec<u8> {
     (b'A'..=b'Z')
         .filter(|d| unsafe {
             let root = HSTRING::from(format!("{}:\\", *d as char));
             let mut fs = [0u16; 16];
-            GetDriveTypeW(&root) == 3 /* DRIVE_FIXED */
+            matches!(GetDriveTypeW(&root), DRIVE_FIXED | DRIVE_REMOVABLE)
                 && GetVolumeInformationW(&root, None, None, None, None, Some(&mut fs)).is_ok()
                 && String::from_utf16_lossy(&fs).trim_end_matches('\0') == "NTFS"
         })
@@ -248,16 +255,18 @@ fn stream_drive(drive: u8, pipe: &Pipe) -> Option<()> {
         }
         enum_data.StartFileReferenceNumber = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         each_record(&bytes[8..], |r, name| {
-            put(&mut out, UPSERT, drive, record(r.FileReferenceNumber), record(r.ParentFileReferenceNumber), is_dir(r), name)
+            put(&mut out, UPSERT, drive, record(r.FileReferenceNumber), record(r.ParentFileReferenceNumber), flags(r), name)
         });
         if out.len() > 1 << 20 {
             pipe.write(&out)?;
             out.clear();
         }
     }
-    put(&mut out, READY, drive, 0, 0, false, "");
+    put(&mut out, READY, drive, 0, 0, 0, "");
     pipe.write(&out)?;
 
+    // ponytail: the reason mask has no attribute changes, so hiding or unhiding an existing file
+    // is seen only at the next full pass (reconnect). Add USN_REASON_BASIC_INFO_CHANGE if that bites.
     let mut read = READ_USN_JOURNAL_DATA_V0 {
         StartUsn: journal.NextUsn,
         ReasonMask: USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME,
@@ -279,7 +288,7 @@ fn stream_drive(drive: u8, pipe: &Pipe) -> Option<()> {
             // Reasons accumulate until the file is closed; the latest state wins.
             let gone = r.Reason & USN_REASON_FILE_DELETE != 0
                 || (r.Reason & USN_REASON_RENAME_OLD_NAME != 0 && r.Reason & USN_REASON_RENAME_NEW_NAME == 0);
-            put(&mut out, if gone { DELETE } else { UPSERT }, drive, rec, parent, is_dir(r), name)
+            put(&mut out, if gone { DELETE } else { UPSERT }, drive, rec, parent, flags(r), name)
         });
         if !out.is_empty() {
             pipe.write(&out)?;
@@ -287,8 +296,14 @@ fn stream_drive(drive: u8, pipe: &Pipe) -> Option<()> {
     }
 }
 
-fn is_dir(r: &USN_RECORD_V2) -> bool {
-    r.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+fn flags(r: &USN_RECORD_V2) -> u8 {
+    let bit = |attr: u32, flag: u8| if r.FileAttributes & attr != 0 { flag } else { 0 };
+    bit(FILE_ATTRIBUTE_DIRECTORY.0, W_DIR) | bit(FILE_ATTRIBUTE_HIDDEN.0, W_HIDDEN)
+}
+
+/// Drive letters of removable drives (USB sticks and the like).
+fn removable_drives() -> Vec<u8> {
+    (b'A'..=b'Z').filter(|d| unsafe { GetDriveTypeW(&HSTRING::from(format!("{}:\\", *d as char))) } == DRIVE_REMOVABLE).collect()
 }
 
 fn query_journal(h: &Handle) -> Option<USN_JOURNAL_DATA_V0> {
@@ -433,6 +448,7 @@ struct Node {
 const DIR: u8 = 1;
 const DEAD: u8 = 2;
 const EXCLUDED: u8 = 4;
+const HIDDEN: u8 = 8;
 const NONE: u32 = u32::MAX;
 
 /// What whole-drive search leaves out (Settings → Files). Left-out entries aren't kept in
@@ -445,6 +461,10 @@ pub struct Filter {
     pub skip: Vec<String>,
     /// Drive letters to index; empty = every NTFS drive.
     pub drives: Vec<String>,
+    /// Keep files and folders with the hidden attribute.
+    pub hidden: bool,
+    /// Keep removable drives.
+    pub removable: bool,
 }
 
 /// Every kept file and folder on the NTFS drives. Names live in one arena; a node points
@@ -463,6 +483,9 @@ pub struct Index {
     skip_names: Vec<String>,
     /// Drive letters kept; empty = all.
     drives: Vec<u8>,
+    /// Drive letters left out: the removable ones, unless wanted.
+    removable: Vec<u8>,
+    hidden: bool,
     live: usize,
     /// Exclusion flags need a full pass: before the first one, or after a folder moved.
     dirty: bool,
@@ -480,6 +503,8 @@ impl Index {
             skip_names: skip.iter().filter_map(|p| p.rsplit('\\').next().map(str::to_string)).collect(),
             skip,
             drives: f.drives.iter().filter_map(|d| d.trim().bytes().next()).map(|b| b.to_ascii_uppercase()).collect(),
+            removable: if f.removable { vec![] } else { removable_drives() },
+            hidden: f.hidden,
             ..Self::default()
         }
     }
@@ -497,8 +522,10 @@ impl Index {
         &self.names[n.name_at as usize..n.name_at as usize + n.name_len as usize]
     }
 
-    fn upsert(&mut self, drive: u8, rec: u64, parent: u64, dir: bool, name: &str) {
-        let node = Node { name_at: self.names.len() as u32, name_len: name.len() as u16, flags: if dir { DIR } else { 0 }, drive, parent };
+    fn upsert(&mut self, drive: u8, rec: u64, parent: u64, wire: u8, name: &str) {
+        let dir = wire & W_DIR != 0;
+        let flags = (if dir { DIR } else { 0 }) | (if wire & W_HIDDEN != 0 { HIDDEN } else { 0 });
+        let node = Node { name_at: self.names.len() as u32, name_len: name.len() as u16, flags, drive, parent };
         // After the first pass, something filtered out (or under a dropped folder) isn't kept.
         if self.complete.contains(&drive) {
             let orphan = parent != ROOT && self.slot(drive, parent).is_none();
@@ -523,7 +550,7 @@ impl Index {
             i => {
                 let old = self.nodes[i as usize];
                 // Unchanged (a repeat record for the same file): nothing to do.
-                if old.parent == parent && self.name(&old) == name {
+                if old.parent == parent && old.flags == flags && self.name(&old) == name {
                     return;
                 }
                 // A folder that moved or was renamed changes what's under it.
@@ -537,9 +564,9 @@ impl Index {
         }
     }
 
-    /// Filtered out by name (AppData, NTFS's own `$` files) or by full path (C:\Windows).
+    /// Filtered out by name (AppData, NTFS's own `$` files), by the hidden attribute, or by full path (C:\Windows).
     fn left_out(&self, n: &Node, name: &str) -> bool {
-        if crate::files::excluded(&self.exclude, name) || (n.parent == ROOT && name.starts_with('$')) {
+        if (n.flags & HIDDEN != 0 && !self.hidden) || crate::files::excluded(&self.exclude, name) || (n.parent == ROOT && name.starts_with('$')) {
             return true;
         }
         let lower = name.to_lowercase();
@@ -576,10 +603,10 @@ impl Index {
             let rec = u64::from_le_bytes(b[2..10].try_into().unwrap());
             let parent = u64::from_le_bytes(b[10..18].try_into().unwrap());
             let name = std::str::from_utf8(&b[HEADER..HEADER + len]).unwrap_or("");
-            let wanted = self.drives.is_empty() || self.drives.contains(&drive);
+            let wanted = (self.drives.is_empty() || self.drives.contains(&drive)) && !self.removable.contains(&drive);
             match kind {
                 UPSERT | DELETE if !wanted => {}
-                UPSERT => self.upsert(drive, rec, parent, b[18] == 1, name),
+                UPSERT => self.upsert(drive, rec, parent, b[18], name),
                 DELETE => self.delete(drive, rec),
                 READY => {
                     self.complete.push(drive);
@@ -850,7 +877,7 @@ mod tests {
     #[ignore = "cargo test bench_real_index -- --ignored --nocapture"]
     fn bench_real_index() {
         let cfg = crate::config::load().unwrap().files;
-        let filter = Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
+        let filter = Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone(), hidden: cfg.hidden, removable: cfg.removable };
         let (tx, _rx) = futures::channel::mpsc::unbounded();
         let t = Instant::now();
         let client = connect(filter, Arc::default(), Arc::default(), tx);
@@ -883,21 +910,21 @@ mod tests {
     fn index_builds_paths_applies_changes_and_searches() {
         let mut wire = vec![];
         // Children before parents, as the MFT may order them.
-        put(&mut wire, UPSERT, b'C', 40, 30, false, "Quarterly Report.docx");
-        put(&mut wire, UPSERT, b'C', 30, 20, true, "Docs");
-        put(&mut wire, UPSERT, b'C', 20, ROOT, true, "Users");
-        put(&mut wire, UPSERT, b'C', 50, 20, true, "AppData");
-        put(&mut wire, UPSERT, b'C', 51, 50, false, "report-cache.tmp");
-        put(&mut wire, UPSERT, b'C', 55, 20, false, "report-scratch.TMP");
-        put(&mut wire, UPSERT, b'C', 60, ROOT, false, "$Secure");
-        put(&mut wire, UPSERT, b'C', 70, ROOT, true, "Windows");
-        put(&mut wire, UPSERT, b'C', 71, 70, false, "report-system.log");
-        put(&mut wire, UPSERT, b'C', 80, 999, false, "report-orphan.txt");
-        put(&mut wire, UPSERT, b'E', 40, ROOT, false, "report-on-e.txt");
+        put(&mut wire, UPSERT, b'C', 40, 30, 0, "Quarterly Report.docx");
+        put(&mut wire, UPSERT, b'C', 30, 20, W_DIR, "Docs");
+        put(&mut wire, UPSERT, b'C', 20, ROOT, W_DIR, "Users");
+        put(&mut wire, UPSERT, b'C', 50, 20, W_DIR, "AppData");
+        put(&mut wire, UPSERT, b'C', 51, 50, 0, "report-cache.tmp");
+        put(&mut wire, UPSERT, b'C', 55, 20, 0, "report-scratch.TMP");
+        put(&mut wire, UPSERT, b'C', 60, ROOT, 0, "$Secure");
+        put(&mut wire, UPSERT, b'C', 70, ROOT, W_DIR, "Windows");
+        put(&mut wire, UPSERT, b'C', 71, 70, 0, "report-system.log");
+        put(&mut wire, UPSERT, b'C', 80, 999, 0, "report-orphan.txt");
+        put(&mut wire, UPSERT, b'E', 40, ROOT, 0, "report-on-e.txt");
         // D: is still loading when C: finishes; its child arrives before its parent.
-        put(&mut wire, UPSERT, b'D', 91, 90, false, "report-on-d.txt");
-        put(&mut wire, READY, b'C', 0, 0, false, "");
-        let filter = Filter { exclude: vec!["AppData".into(), "*.tmp".into()], skip: vec![r"C:\Windows\".into()], drives: vec!["c".into(), "D".into()] };
+        put(&mut wire, UPSERT, b'D', 91, 90, 0, "report-on-d.txt");
+        put(&mut wire, READY, b'C', 0, 0, 0, "");
+        let filter = Filter { exclude: vec!["AppData".into(), "*.tmp".into()], skip: vec![r"C:\Windows\".into()], drives: vec!["c".into(), "D".into()], hidden: true, removable: true };
         let mut ix = Index::new(&filter);
         // Split mid-record: the tail is kept for the next read.
         let (used, ready) = ix.apply(&wire[..wire.len() - 3]);
@@ -907,8 +934,8 @@ mod tests {
         ix.refresh_excluded();
         // D: finishes later; its records survived C:'s pass and its parent now arrives.
         let mut d = vec![];
-        put(&mut d, UPSERT, b'D', 90, ROOT, true, "Notes");
-        put(&mut d, READY, b'D', 0, 0, false, "");
+        put(&mut d, UPSERT, b'D', 90, ROOT, W_DIR, "Notes");
+        put(&mut d, READY, b'D', 0, 0, 0, "");
         ix.apply(&d);
         ix.refresh_excluded();
         assert_eq!(ix.path(ix.slot(b'D', 91).unwrap()), r"D:\Notes\report-on-d.txt");
@@ -926,9 +953,9 @@ mod tests {
 
         // Rename the folder, delete the file, add one.
         let mut live = vec![];
-        put(&mut live, UPSERT, b'C', 30, 20, true, "Papers");
-        put(&mut live, DELETE, b'C', 40, 30, false, "Quarterly Report.docx");
-        put(&mut live, UPSERT, b'C', 41, 30, false, "report v2.txt");
+        put(&mut live, UPSERT, b'C', 30, 20, W_DIR, "Papers");
+        put(&mut live, DELETE, b'C', 40, 30, 0, "Quarterly Report.docx");
+        put(&mut live, UPSERT, b'C', 41, 30, 0, "report v2.txt");
         ix.apply(&live);
         ix.refresh_excluded();
         assert_eq!(titles(&ix, "report"), ["report v2.txt", "report-on-d.txt"]);
@@ -937,10 +964,64 @@ mod tests {
 
         // After the drive is complete, a new file is judged on its own (no full pass needed).
         let mut more = vec![];
-        put(&mut more, UPSERT, b'C', 52, 50, false, "report-new.tmp");
+        put(&mut more, UPSERT, b'C', 52, 50, 0, "report-new.tmp");
         ix.apply(&more);
         assert!(!ix.dirty, "a new file doesn't trigger a full pass");
         assert_eq!(titles(&ix, "report"), ["report v2.txt", "report-on-d.txt"], "still excluded under AppData");
+    }
+
+    #[test]
+    fn hidden_files_follow_the_filter() {
+        let mut wire = vec![];
+        put(&mut wire, UPSERT, b'C', 20, ROOT, W_DIR | W_HIDDEN, "Vault");
+        put(&mut wire, UPSERT, b'C', 21, 20, 0, "inner.txt");
+        put(&mut wire, UPSERT, b'C', 22, ROOT, W_HIDDEN, "secret.txt");
+        put(&mut wire, UPSERT, b'C', 23, ROOT, 0, "plain.txt");
+        put(&mut wire, READY, b'C', 0, 0, 0, "");
+        let kept = |hidden| {
+            let mut ix = Index::new(&Filter { hidden, removable: true, ..Filter::default() });
+            ix.apply(&wire);
+            ix.refresh_excluded();
+            // A hidden file that shows up after the snapshot is judged on its own.
+            let mut live = vec![];
+            put(&mut live, UPSERT, b'C', 24, ROOT, W_HIDDEN, "later.txt");
+            put(&mut live, UPSERT, b'C', 25, 20, 0, "later-inner.txt");
+            ix.apply(&live);
+            let mut t: Vec<String> = ["txt", "vault"].iter().flat_map(|q| ix.search(q, 10)).map(|i| i.title).collect();
+            t.sort();
+            t.dedup();
+            t
+        };
+        assert_eq!(kept(true), ["Vault", "inner.txt", "later-inner.txt", "later.txt", "plain.txt", "secret.txt"]);
+        assert_eq!(kept(false), ["plain.txt"], "hidden files go, and so does everything inside a hidden folder");
+    }
+
+    #[test]
+    fn removable_drives_follow_the_filter() {
+        let mut wire = vec![];
+        put(&mut wire, UPSERT, b'C', 30, ROOT, 0, "on-fixed.txt");
+        put(&mut wire, UPSERT, b'E', 30, ROOT, 0, "on-usb.txt");
+        put(&mut wire, READY, b'E', 0, 0, 0, "");
+        let mut ix = Index::new(&Filter { hidden: true, removable: false, ..Filter::default() });
+        ix.removable = vec![b'E'];
+        ix.apply(&wire);
+        ix.refresh_excluded();
+        assert_eq!(ix.len(), 1, "the USB drive's records are dropped");
+        let mut ix = Index::new(&Filter { hidden: true, removable: true, ..Filter::default() });
+        ix.apply(&wire);
+        assert_eq!(ix.len(), 2, "wanted: nothing is left out");
+    }
+
+    #[test]
+    fn an_old_helper_flag_still_decodes() {
+        // An older helper sent 0 or 1 in the flags byte; 1 is a plain folder.
+        let mut wire = vec![];
+        put(&mut wire, UPSERT, b'C', 20, ROOT, 0, "Docs");
+        wire[18] = 1;
+        let mut ix = Index::new(&Filter { hidden: false, removable: true, ..Filter::default() });
+        ix.apply(&wire);
+        let n = ix.nodes[ix.slot(b'C', 20).unwrap()];
+        assert_eq!(n.flags, DIR);
     }
 
     #[test]

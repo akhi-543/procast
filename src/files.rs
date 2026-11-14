@@ -63,8 +63,8 @@ pub struct Files {
 
 impl Files {
     pub fn start(cfg: &crate::config::Files, tx: UnboundedSender<Msg>) -> Self {
-        let (roots, rules) = (cfg.roots(), Rules::new(&cfg.exclude, cfg.gitignore));
-        let filter = crate::ntfs::Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone() };
+        let (roots, rules) = (cfg.roots(), Rules { hidden: cfg.hidden, ..Rules::new(&cfg.exclude, cfg.gitignore) });
+        let filter = crate::ntfs::Filter { exclude: cfg.exclude.clone(), skip: cfg.skip.clone(), drives: cfg.drives.clone(), hidden: cfg.hidden, removable: cfg.removable };
         let index = Arc::new(RwLock::new(Vec::new()));
         let (queries, rx) = mpsc::channel::<(u64, String, usize)>();
         let (count, indexing) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
@@ -219,18 +219,27 @@ pub struct Rules {
     pub exclude: Vec<String>,
     /// Honour `.gitignore` and `.ignore` files found under the roots.
     pub gitignore: bool,
+    /// Keep files and folders with the hidden attribute (and what's inside hidden folders).
+    pub hidden: bool,
 }
 
 impl Default for Rules {
     fn default() -> Self {
-        Self { exclude: vec![], gitignore: true }
+        Self { exclude: vec![], gitignore: true, hidden: true }
     }
 }
 
 impl Rules {
     pub fn new(exclude: &[String], gitignore: bool) -> Self {
-        Self { exclude: exclude.iter().map(|e| e.to_ascii_lowercase()).collect(), gitignore }
+        Self { exclude: exclude.iter().map(|e| e.to_ascii_lowercase()).collect(), gitignore, hidden: true }
     }
+}
+
+/// Whether the file or folder has the hidden attribute.
+fn is_hidden(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 2;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
 }
 
 /// The ignore files from the root down to a folder, shallowest first.
@@ -258,7 +267,7 @@ fn hit(chain: &[Arc<Gitignore>], path: &Path, dir: bool) -> bool {
 
 /// One walk below `root`, starting with the ignore files of the folders above it.
 fn walk(root: &str, rules: &Rules, chain: Chain) -> Vec<Entry> {
-    let (skip, gitignore) = (rules.exclude.clone(), rules.gitignore);
+    let (skip, gitignore, hidden) = (rules.exclude.clone(), rules.gitignore, rules.hidden);
     let walk = jwalk::WalkDirGeneric::<(Chain, ())>::new(root).skip_hidden(false).follow_links(false).root_read_dir_state(chain).process_read_dir(
         move |depth, dir, chain, children| {
             if depth.is_none() {
@@ -271,8 +280,13 @@ fn walk(root: &str, rules: &Rules, chain: Chain) -> Vec<Entry> {
                     chain.extend(ignore_file(dir, git, dot));
                 }
             }
+            // jwalk doesn't expose attributes, so hiding costs one lookup per entry (none when hidden files are kept).
             children.retain(|c| {
-                c.as_ref().is_ok_and(|e| !excluded(&skip, &e.file_name.to_string_lossy()) && (chain.is_empty() || !hit(chain, &e.path(), e.file_type.is_dir())))
+                c.as_ref().is_ok_and(|e| {
+                    !excluded(&skip, &e.file_name.to_string_lossy())
+                        && (chain.is_empty() || !hit(chain, &e.path(), e.file_type.is_dir()))
+                        && (hidden || !is_hidden(&e.path()))
+                })
             });
         },
     );
@@ -321,6 +335,11 @@ pub fn apply(index: &mut Vec<Entry>, root: &str, rules: &Rules, changes: Vec<Pat
         if dropped.contains(&full) {
             continue;
         }
+        // Hidden, or inside a hidden folder: dropped from the index, never added.
+        if !rules.hidden && !at_root && c.ancestors().any(|a| !a.as_os_str().is_empty() && is_hidden(&Path::new(root).join(a))) {
+            dropped.insert(full);
+            continue;
+        }
         let meta = std::fs::symlink_metadata(&full).ok();
         let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
         let (chain, hidden) = if rules.gitignore { ignore_state(Path::new(root), &c, is_dir, &mut cache) } else { Default::default() };
@@ -367,7 +386,7 @@ fn cache_path() -> PathBuf {
 
 /// The cache is only used for the same roots and rules.
 fn cache_key(roots: &[String], rules: &Rules) -> String {
-    format!("procast-files-2\n{}\n{}\n{}", roots.join("|"), rules.exclude.join("|"), rules.gitignore)
+    format!("procast-files-2\n{}\n{}\n{}\n{}", roots.join("|"), rules.exclude.join("|"), rules.gitignore, rules.hidden)
 }
 
 /// Layout: the key, then per entry a dir flag and the path, strings as u32 length + UTF-8.
@@ -635,11 +654,43 @@ mod tests {
         assert_eq!(got, ["a", "a/.gitignore", "a/.gitignore~", "a/keep.txt", "a/x.txt", "a/y.txt"]);
     }
 
+    fn hide(path: &Path) {
+        use windows::{Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW}, core::HSTRING};
+        unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_HIDDEN) }.unwrap();
+    }
+
+    #[test]
+    fn hidden_files_follow_the_toggle() {
+        let (root, r) = tree("hidden", &[("seen.txt", ""), ("secret.txt", ""), ("vault/inner.txt", "")]);
+        hide(&root.join("secret.txt"));
+        hide(&root.join("vault"));
+        let all = names(&crawl(std::slice::from_ref(&r), &Rules { hidden: true, ..Rules::default() }), &r);
+        let some = names(&crawl(std::slice::from_ref(&r), &Rules { hidden: false, ..Rules::default() }), &r);
+        assert_eq!(all, ["secret.txt", "seen.txt", "vault", "vault/inner.txt"]);
+        assert_eq!(some, ["seen.txt"], "hidden files and everything in hidden folders are skipped");
+
+        // The watcher: a new file in a hidden folder, and a file that just became hidden.
+        let ch = PathBuf::from;
+        let rules = Rules { hidden: false, ..Rules::default() };
+        let mut index = crawl(std::slice::from_ref(&r), &rules);
+        std::fs::write(root.join("vault/new.txt"), "").unwrap();
+        apply(&mut index, &r, &rules, vec![ch("vault\\new.txt")]);
+        assert_eq!(names(&index, &r), ["seen.txt"], "nothing under a hidden folder slips in");
+        hide(&root.join("seen.txt"));
+        assert!(apply(&mut index, &r, &rules, vec![ch("seen.txt")]));
+        assert!(names(&index, &r).is_empty(), "a file hidden later drops out");
+        std::fs::write(root.join("plain.txt"), "").unwrap();
+        assert!(apply(&mut index, &r, &rules, vec![ch("plain.txt")]));
+        assert_eq!(names(&index, &r), ["plain.txt"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn cache_key_changes_with_the_rules() {
         let roots = vec!["C:\\r".to_string()];
-        let key = |gitignore| cache_key(&roots, &Rules { gitignore, ..Rules::default() });
-        assert_ne!(key(true), key(false));
+        let key = |gitignore, hidden| cache_key(&roots, &Rules { gitignore, hidden, ..Rules::default() });
+        assert_ne!(key(true, true), key(false, true));
+        assert_ne!(key(true, true), key(true, false));
     }
 
     #[test]

@@ -343,6 +343,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                     row("Folders to search", "files.roots", Kind::List, "Full paths, e.g. D:\\Projects. With none, your user folder is searched."),
                     row("Skip names", "files.exclude", Kind::List, "File or folder names skipped wherever they appear, e.g. node_modules or *.log."),
                     row("Respect .gitignore", "files.gitignore", Kind::Bool, "Skip what .gitignore and .ignore files list. Folders only, not whole-drive search."),
+                    row("Include hidden files", "files.hidden", Kind::Bool, "Also find files and folders marked hidden."),
                 ],
             ),
             (
@@ -351,6 +352,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                     row("Search whole drives", "files.ntfs", Kind::Bool, "Every NTFS drive, kept up to date live. Run \"Enable Fast File Search\" once first (asks for admin)."),
                     row("Drives", "files.drives", Kind::List, "Letters to index, e.g. C and D. With none, every NTFS drive."),
                     row("Skip folders", "files.skip", Kind::List, "Full paths left out with everything under them; also saves memory."),
+                    row("Include removable drives", "files.removable", Kind::Bool, "NTFS drives only; network drives aren't searched."),
                 ],
             ),
         ]),

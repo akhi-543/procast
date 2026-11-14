@@ -224,6 +224,8 @@ pub struct Files {
     pub exclude: Vec<String>,
     /// Folder search skips what `.gitignore` and `.ignore` files list.
     pub gitignore: bool,
+    /// Include files and folders marked hidden.
+    pub hidden: bool,
     pub hotkey: String,
     /// Search every NTFS drive through the admin helper, when it's installed.
     pub ntfs: bool,
@@ -231,6 +233,8 @@ pub struct Files {
     pub drives: Vec<String>,
     /// Whole-drive search: full paths left out, with everything under them.
     pub skip: Vec<String>,
+    /// Whole-drive search: include removable (USB) NTFS drives.
+    pub removable: bool,
 }
 
 impl Default for Files {
@@ -242,10 +246,12 @@ impl Default for Files {
                 .map(String::from)
                 .to_vec(),
             gitignore: true,
+            hidden: true,
             hotkey: String::new(),
             ntfs: true,
             drives: vec![],
             skip: [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\ProgramData"].map(String::from).to_vec(),
+            removable: false,
         }
     }
 }
@@ -533,10 +539,12 @@ enabled = true
 roots = []                    # empty = your user folder; e.g. ["C:\\Users\\you", "D:\\Projects"]
 exclude = ["AppData", "node_modules", ".git", "target", ".cargo", ".rustup", "$RECYCLE.BIN", "__pycache__", ".venv", ".gradle", ".npm"]
 gitignore = true              # folder search skips what .gitignore and .ignore files list
+hidden = true                 # include files and folders marked hidden
 hotkey = ""
 ntfs = true                   # after "Enable Fast File Search" (admin, once): search every NTFS drive, live
 drives = []                   # whole-drive search: e.g. ["C", "D"]; empty = every NTFS drive
 skip = ['C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData']  # left out of whole-drive search (and memory)
+removable = false             # whole-drive search: include removable (USB) NTFS drives
 
 [window]
 gap = 0                       # pixels between snapped windows
