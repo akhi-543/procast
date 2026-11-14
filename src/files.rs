@@ -223,11 +223,12 @@ pub fn status_line(s: &IndexStatus, now: SystemTime) -> String {
         out.push(c);
         out
     });
+    let noun = if s.entries == 1 { "entry" } else { "entries" };
     if s.whole_drives {
         let drives = s.drives.iter().map(|d| format!("{d}:")).collect::<Vec<_>>().join(", ");
-        format!("{entries} entries · whole drives {drives} · updated {when}")
+        format!("{entries} {noun} · whole drives {drives} · updated {when}")
     } else {
-        format!("{entries} entries · folders · crawled {when}")
+        format!("{entries} {noun} · folders · crawled {when}")
     }
 }
 
@@ -542,6 +543,9 @@ mod tests {
         let old = now - Duration::from_secs(3 * 86_400);
         let then = IndexStatus { updated: Some(old), ..folders };
         assert_eq!(status_line(&then, now), format!("138,617 entries · folders · crawled {}", crate::win::local_time_of(secs(old))));
+        let one = IndexStatus { entries: 1, ..then };
+        assert_eq!(status_line(&one, now), format!("1 entry · folders · crawled {}", crate::win::local_time_of(secs(old))));
+        let then = IndexStatus { entries: 138_617, ..one };
         let busy = IndexStatus { indexing: true, ..then };
         assert_eq!(status_line(&busy, now), "Indexing…");
         let none = IndexStatus { indexing: false, updated: None, entries: 0, ..busy };

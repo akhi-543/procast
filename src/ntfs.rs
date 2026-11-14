@@ -9,7 +9,7 @@
 
 use std::{
     io::Read,
-    os::windows::io::FromRawHandle,
+    os::windows::io::{AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -35,7 +35,7 @@ use windows::{
             FILE_SHARE_WRITE, GetDriveTypeW, GetVolumeInformationW, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, WriteFile,
         },
         System::{
-            IO::DeviceIoControl,
+            IO::{CancelIoEx, DeviceIoControl},
             Ioctl::{
                 CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
                 MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
@@ -830,6 +830,47 @@ fn subsequence(needle: &[u8], hay: &[u8]) -> bool {
 pub struct Client {
     pub index: Arc<RwLock<Index>>,
     pub ready: Arc<AtomicBool>,
+    stop: Arc<Stop>,
+}
+
+/// Dropping the client ends its connection: the thread sees `stopped` and a read blocked on
+/// the pipe is cancelled, so the pipe closes (the helper's next write to it fails and its drive
+/// thread ends) and the thread's copy of the index is freed.
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
+/// Tells the connect thread its owner is gone, and wakes it if it is blocked reading.
+#[derive(Default)]
+struct Stop {
+    stopped: AtomicBool,
+    /// The pipe being read (raw handle), while there is one.
+    pipe: Mutex<Option<isize>>,
+}
+
+impl Stop {
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Records the pipe the thread is about to read, or `None` once it is done with it.
+    fn set_pipe(&self, pipe: Option<isize>) {
+        *self.pipe.lock().unwrap() = pipe;
+    }
+
+    // ponytail: a stop landing between the thread's `stopped()` check and its ReadFile cancels
+    // nothing; that read then returns with the helper's next write (live changes, or at once
+    // while a snapshot streams). Make the read overlapped if that window ever matters.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(h) = *self.pipe.lock().unwrap() {
+            unsafe {
+                let _ = CancelIoEx(HANDLE(h as *mut _), None);
+            }
+        }
+    }
 }
 
 /// Keeps a connection to the helper for as long as procast runs, reconnecting (and
@@ -837,10 +878,11 @@ pub struct Client {
 pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool>, tx: UnboundedSender<Msg>) -> Client {
     let index = Arc::new(RwLock::new(Index::new(&filter)));
     let ready = Arc::new(AtomicBool::new(false));
-    let client = Client { index: index.clone(), ready: ready.clone() };
+    let stop = Arc::new(Stop::default());
+    let client = Client { index: index.clone(), ready: ready.clone(), stop: stop.clone() };
     std::thread::spawn(move || {
         let mut fails = 0u32;
-        loop {
+        while !stop.stopped() {
             let Some(mut pipe) = open_pipe() else {
                 fails += 1;
                 // The helper should start at logon; nudge it if it isn't there.
@@ -860,8 +902,9 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
             let mut have = 0;
             let mut last_note = Instant::now();
             let mut warned = false;
+            stop.set_pipe(Some(pipe.as_raw_handle() as isize));
             while let Ok(n) = pipe.read(&mut buf[have..]) {
-                if n == 0 {
+                if n == 0 || stop.stopped() {
                     break;
                 }
                 have += n;
@@ -894,8 +937,12 @@ pub fn connect(filter: Filter, count: Arc<AtomicUsize>, indexing: Arc<AtomicBool
                     }
                 }
             }
+            // Before the pipe closes, so `Stop` never cancels a handle that is gone.
+            stop.set_pipe(None);
             ready.store(false, Ordering::SeqCst);
-            crate::ext_log("file index", "helper disconnected; reconnecting");
+            if !stop.stopped() {
+                crate::ext_log("file index", "helper disconnected; reconnecting");
+            }
         }
     });
     client
@@ -920,6 +967,26 @@ fn open_pipe() -> Option<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_wakes_a_blocked_read() {
+        use windows::Win32::System::Pipes::CreatePipe;
+        let (mut r, mut w) = (HANDLE::default(), HANDLE::default());
+        unsafe { CreatePipe(&mut r, &mut w, None, 0) }.unwrap();
+        let mut pipe = unsafe { std::fs::File::from_raw_handle(r.0) };
+        let stop = Arc::new(Stop::default());
+        stop.set_pipe(Some(pipe.as_raw_handle() as isize));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Nothing is ever written: only a cancel can end this read.
+            let _ = done_tx.send(pipe.read(&mut [0u8; 8]).is_err());
+        });
+        assert!(done.recv_timeout(Duration::from_millis(300)).is_err(), "the read should be blocked");
+        stop.stop();
+        assert_eq!(done.recv_timeout(Duration::from_secs(5)), Ok(true), "stop cancels the read");
+        assert!(stop.stopped());
+        unsafe { CloseHandle(w).unwrap() };
+    }
 
     /// Times searches over this machine's real index (needs the helper running).
     #[test]
