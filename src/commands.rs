@@ -88,6 +88,8 @@ pub enum Cmd {
     Translate,
     /// Ask for a word in the search bar (`define dog`).
     Define,
+    /// Today's and tomorrow's events from the calendar feeds.
+    MySchedule,
     /// Search the screenshot folders by the text in each picture.
     SearchScreenshots,
     /// Put the newest screenshot on the clipboard and paste it into the app you came from.
@@ -194,6 +196,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
     (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
+    (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR),
     (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::PICTURE),
     (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::PICTURE),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
@@ -305,6 +308,7 @@ impl Cmd {
             Cmd::Focus(_) => "Focus",
             Cmd::Translate => "Translator",
             Cmd::Define => "Dictionary",
+            Cmd::MySchedule => "Calendar",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
@@ -358,7 +362,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define | Cmd::MySchedule | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
         }
     }
     Ok(None)

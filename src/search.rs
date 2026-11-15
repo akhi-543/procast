@@ -83,6 +83,8 @@ pub enum Act {
     StopTimer(u64),
     /// Start a Focus session with a category's lists (by name), blocking them or allowing only them.
     FocusStart(String, crate::focus::Mode),
+    /// Open a meeting link: event title, address. Asks "Join <title>?" first when `[calendar] confirm_join`.
+    Join(String, String),
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
@@ -127,6 +129,7 @@ impl Act {
             Act::ForceQuit(_) => "Force Quit",
             Act::StartTimer(..) => "Start Timer",
             Act::StopTimer(_) => "Stop",
+            Act::Join(..) => "Join Meeting",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::Translate(_) => "Translate",
@@ -227,7 +230,7 @@ impl Item {
         match &self.act {
             Act::App(id) => acts.extend([Act::RunAsAdmin(id.clone()), Act::Copy(self.title.clone())]),
             Act::File(path) => acts.extend([Act::Reveal(path.clone()), Act::Copy(path.clone())]),
-            Act::Open(url) | Act::Run(url) => acts.push(Act::Copy(url.clone())),
+            Act::Open(url) | Act::Run(url) | Act::Join(_, url) => acts.push(Act::Copy(url.clone())),
             Act::Copy(text) => acts.push(Act::Paste(text.clone())),
             Act::Paste(text) => acts.push(Act::Copy(text.clone())),
             Act::QuitApp(pid) => acts.push(Act::ForceQuit(*pid)),

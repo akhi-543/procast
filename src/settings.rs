@@ -262,6 +262,16 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 ],
             ),
             (
+                "Calendar",
+                vec![
+                    row("Calendar feeds", "calendar.ics", Kind::List, "ICS addresses (https:// or webcal://) of the calendars My Schedule shows, checked every 10 minutes."),
+                    row("Show events within", "calendar.tolerance_secs", Kind::Number, "Seconds around now within which an event shows in an empty search."),
+                    row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask \"Join <title>?\" before opening a meeting link."),
+                    row("Remind before", "calendar.remind_minutes", Kind::Number, "Minutes before an event to show a reminder. 0 turns reminders off."),
+                    row("Ignore events", "calendar.ignore", Kind::List, "Events whose title contains one of these words are left out."),
+                ],
+            ),
+            (
                 "Root search items",
                 vec![
                     row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in procast with Ctrl+K → Add to Favorites."),

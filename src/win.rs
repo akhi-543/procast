@@ -86,6 +86,8 @@ pub enum Msg {
     /// A translation came back (or failed): the request number (older ones are dropped), what
     /// was asked, whether the launcher was hidden meanwhile, and DeepL's answer.
     Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<crate::translate::Translation, String> },
+    /// A calendar fetch finished: each feed's address and its events, or why it failed.
+    Calendar(Vec<(String, Result<Vec<crate::calendar::Event>, String>)>),
     /// A word was looked up (or the dictionary could not be fetched): the request number, the word, the answer.
     Defined { seq: u64, word: String, result: Result<crate::dict::Answer, String> },
     /// Screenshot search: the scan's number and the index so far, or None when the scan is over.

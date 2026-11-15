@@ -2,6 +2,7 @@
 
 mod apps;
 mod browser;
+mod calendar;
 mod clipboard;
 mod commands;
 mod config;
@@ -137,6 +138,8 @@ enum Mode {
     Define,
     /// Screenshot search (see `Launcher::shots`).
     Shots,
+    /// My Schedule: today's and tomorrow's events.
+    Schedule,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -330,6 +333,8 @@ struct Launcher {
     timer_tick: Option<Arc<AtomicBool>>,
     /// The Focus session; its countdown rides on the same tick.
     focus: focus::Focus,
+    /// Calendar feeds' events; fetched and reminded of on the 10 s `Msg::Tick`.
+    calendar: calendar::Calendar,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -439,6 +444,7 @@ impl Launcher {
             timers: timers::Timers::load(config::dir().join("timers.json")),
             timer_tick: None,
             focus: focus::Focus::load(config::dir().join("focus.json")),
+            calendar: calendar::Calendar::default(),
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -740,6 +746,9 @@ impl Launcher {
                 }
                 let mut rows = self.timer_rows(&query);
                 rows.extend(self.focus_rows(&query));
+                if query.trim().is_empty() {
+                    rows.extend(self.schedule_now());
+                }
                 rows.extend(search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher));
                 rows
             }
@@ -753,6 +762,10 @@ impl Launcher {
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
             Mode::Shots => shots::rows(&self.shots, &query, &self.cfg.screenshots.primary, 200),
+            Mode::Schedule => {
+                let rows = self.schedule_rows();
+                search::filter(&query, rows, &mut self.matcher)
+            }
             Mode::Files => {
                 // Results arrive later as Msg::Files; keep showing the previous ones meanwhile.
                 self.file_gen += 1;
@@ -976,6 +989,60 @@ impl Launcher {
                 }
             }
             cx.notify();
+        }
+    }
+
+    // ---- My Schedule (the decisions are in calendar.rs) ------------------------------
+
+    fn calendar_events(&self) -> Vec<calendar::Event> {
+        self.calendar.events(&self.cfg.calendar.ics, &self.cfg.calendar.ignore)
+    }
+
+    /// Events on now or about to start, for an empty root search.
+    fn schedule_now(&self) -> Vec<Item> {
+        let now = search::now() as i64;
+        let tolerance = i64::from(self.cfg.calendar.tolerance_secs);
+        let events = self.calendar_events();
+        events.iter().filter(|e| calendar::near(e, now, tolerance)).map(|e| calendar::row(e, now, Act::Cmd(Cmd::MySchedule)).sec("My Schedule")).collect()
+    }
+
+    /// Today's and tomorrow's events, or why there are none.
+    fn schedule_rows(&self) -> Vec<Item> {
+        let now = search::now() as i64;
+        if self.cfg.calendar.ics.is_empty() {
+            let edit = vec![("Edit Config".to_string(), Act::Cmd(Cmd::EditConfig))];
+            return vec![empty_row(g::CALENDAR, "No calendar connected".into(), "Add your calendar's ICS address as ics = [\"…\"] under [calendar] in config.toml".into(), edit)];
+        }
+        let (from, to) = calendar::today_and_tomorrow(now);
+        let events = calendar::within(&self.calendar_events(), from, to);
+        if events.is_empty() {
+            let text = if self.calendar.pending() { "Fetching your calendar…" } else { "Nothing on today or tomorrow" };
+            return vec![empty_row(g::CALENDAR, text.into(), String::new(), vec![])];
+        }
+        events.iter().map(|e| calendar::row(e, now, Act::None).sec(calendar::day_label(e.start, now))).collect()
+    }
+
+    /// Every 10 s: fetches the feeds when due (off the UI thread), and reminds of events about to start.
+    fn calendar_tick(&mut self) {
+        let urls = self.cfg.calendar.ics.clone();
+        if self.calendar.wants_fetch(urls.len(), Instant::now()) {
+            self.calendar.fetching(Instant::now());
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                // The result is always sent, so a crash cannot leave "fetching" on.
+                let results = urls
+                    .into_iter()
+                    .map(|u| {
+                        let r = std::panic::catch_unwind(|| calendar::fetch(&u)).unwrap_or_else(|_| Err("the fetch failed".into()));
+                        (u, r)
+                    })
+                    .collect();
+                let _ = tx.unbounded_send(Msg::Calendar(results));
+            });
+        }
+        let events = self.calendar_events();
+        for text in self.calendar.due(&events, search::now() as i64, self.cfg.calendar.remind_minutes) {
+            self.say(true, text);
         }
     }
 
@@ -2141,6 +2208,7 @@ impl Launcher {
         let needs_confirm = match item.act {
             Act::Cmd(cmd) => cmd.destructive(),
             Act::Script(i) => self.scripts[i].confirm,
+            Act::Join(..) => self.cfg.calendar.confirm_join,
             _ => false,
         };
         if needs_confirm && self.armed != Some(self.selected) {
@@ -2294,6 +2362,8 @@ impl Launcher {
             Act::None => return,
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
             Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
+            Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
+            Act::Join(_, url) => win::open(&url),
             Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
             Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
@@ -2702,6 +2772,9 @@ impl Launcher {
                     self.files = start_files(&cfg, &self.tx);
                     self.refresh_index_status(cx);
                 }
+                if cfg.calendar.ics != self.cfg.calendar.ics {
+                    self.calendar.reset(&cfg.calendar.ics);
+                }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
                 self.notice = None;
@@ -2823,7 +2896,16 @@ impl Launcher {
                 self.history.prune(search::now());
                 let idle = Duration::from_secs(self.cfg.apps.auto_quit_minutes.max(1) * 60);
                 self.autoquit.tick(&self.cfg.apps.auto_quit, idle, win::foreground());
+                self.calendar_tick();
                 self.tick(cx);
+            }
+            Msg::Calendar(results) => {
+                for text in self.calendar.done(results) {
+                    self.say(false, text);
+                }
+                if self.visible && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
+                    self.refresh(cx);
+                }
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
@@ -2920,6 +3002,7 @@ impl Launcher {
             Mode::Translate => Some("Translator".into()),
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
             Mode::Shots => Some("Screenshots".into()),
+            Mode::Schedule => Some("My Schedule".into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -2959,6 +3042,7 @@ impl Launcher {
             Mode::Output => "Enter copies the output".into(),
             Mode::Define => "Enter copies the definition".into(),
             Mode::Shots => "Search screenshots by text or name…".into(),
+            Mode::Schedule => "Search events…".into(),
             Mode::Translate => if self.cfg.translator.primary == "paste" { "Enter pastes the translation" } else { "Enter copies the translation" }.into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
@@ -3015,6 +3099,7 @@ impl Launcher {
             Mode::Translate => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
             Mode::Shots => Icon::Vector(g::PICTURE),
+            Mode::Schedule => Icon::Vector(g::CALENDAR),
         }
     }
 
@@ -3446,7 +3531,10 @@ impl Render for Launcher {
         let footer_action = match (&self.panel, selected_item) {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
-            (None, Some(it)) if self.armed == Some(self.selected) => format!("Press ↵ again to {}", it.title),
+            (None, Some(it)) if self.armed == Some(self.selected) => match &it.act {
+                Act::Join(title, _) => format!("Join {title}? Press ↵ again"),
+                _ => format!("Press ↵ again to {}", it.title),
+            },
             (None, Some(_)) => match &primary {
                 Some(p) if actions.len() > 1 => format!("{p}  ↵    Actions  Ctrl+K"),
                 Some(p) => format!("{p}  ↵"),
