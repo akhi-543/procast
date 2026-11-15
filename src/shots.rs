@@ -59,6 +59,8 @@ pub struct Opts {
     pub all_media: bool,
     pub keep: Option<Duration>,
     pub batch: usize,
+    /// Read the pictures for their text. Off: they are listed with no text and never read.
+    pub ocr: bool,
 }
 
 fn ext(path: &Path) -> Option<String> {
@@ -114,9 +116,12 @@ impl ShotIndex {
         }
     }
 
-    /// Brings the index in line with `folders`: drops what is gone or too old, then reads the
-    /// text of up to `opts.batch` new or changed files, newest first (a failed read is
-    /// remembered, not retried). Returns how many were read.
+    /// Brings the index in line with `folders`: drops what is gone or too old, then indexes up
+    /// to `opts.batch` new or changed files, newest first. With `opts.ocr` each is read and
+    /// its text recognised: a picture that can't be recognised is remembered as `failed` and
+    /// not tried again until it changes, but one that can't be read right now (locked by
+    /// OneDrive or an antivirus) is left out so the next scan retries it. Without `opts.ocr`
+    /// nothing is read. Returns how many were indexed.
     pub fn update(&mut self, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> usize {
         self.prune(opts.keep);
         let mut found = scan(folders, opts.all_media);
@@ -127,24 +132,30 @@ impl ShotIndex {
         let known: HashMap<&PathBuf, u64> = self.entries.iter().map(|e| (&e.path, e.mtime)).collect();
         let mut todo: Vec<(PathBuf, u64)> = found.iter().filter(|(p, m)| known.get(p) != Some(m)).map(|(p, m)| (p.clone(), *m)).collect();
         todo.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        todo.truncate(opts.batch);
-        let redo: HashSet<&PathBuf> = todo.iter().map(|t| &t.0).collect();
-        self.entries.retain(|e| found.contains_key(&e.path) && !redo.contains(&e.path));
-        let read = todo.len();
+        let mut fresh = Vec::new();
         for (path, mtime) in todo {
-            let (text, failed) = if video(&path) {
+            if fresh.len() == opts.batch {
+                break;
+            }
+            let (text, failed) = if video(&path) || !opts.ocr {
                 (String::new(), false)
             } else {
-                let bytes = fs::metadata(&path).ok().filter(|m| m.len() <= MAX_BYTES).and_then(|_| fs::read(&path).ok());
-                match bytes.and_then(|b| ocr(&b)) {
-                    Some(text) => (text, false),
-                    None => (String::new(), true),
+                let Ok(meta) = fs::metadata(&path) else { continue };
+                if meta.len() > MAX_BYTES {
+                    (String::new(), true)
+                } else {
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    ocr(&bytes).map_or((String::new(), true), |t| (t, false))
                 }
             };
-            self.entries.push(Shot { path, mtime, text, failed });
+            fresh.push(Shot { path, mtime, text, failed });
         }
+        let redo: HashSet<&PathBuf> = fresh.iter().map(|s| &s.path).collect();
+        self.entries.retain(|e| found.contains_key(&e.path) && !redo.contains(&e.path));
+        let indexed = fresh.len();
+        self.entries.extend(fresh);
         self.entries.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-        read
+        indexed
     }
 
     /// Entries matching `q` (every word in the file name or the text): name matches first,
@@ -235,22 +246,31 @@ pub fn put_image(owner: HWND, path: Option<PathBuf>, folders: &[PathBuf]) -> Res
 }
 
 /// Brings the saved index up to date, reading new screenshots' text a batch at a time;
-/// `show` gets the index after each step. Run on a worker thread. Without OCR nothing is read
-/// or saved: the folders are just listed.
-pub fn rescan(folders: &[PathBuf], keep: Option<Duration>, all_media: bool, ocr: bool, mut show: impl FnMut(&ShotIndex)) {
+/// `show` gets the index after each step. Run on a worker thread. Without OCR (switched off,
+/// or Windows has no OCR language installed) nothing is read or saved and no picture is
+/// marked failed: the folders are just listed.
+pub fn rescan(folders: &[PathBuf], keep: Option<Duration>, all_media: bool, ocr: bool, show: impl FnMut(&ShotIndex)) {
     // Text recognition is a WinRT API.
     unsafe { _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED) };
+    let ocr = ocr && clipboard::ocr_ready();
     let mut index = if ocr { ShotIndex::load() } else { ShotIndex::default() };
-    show(&index);
-    let opts = Opts { all_media, keep, batch: if ocr { 20 } else { usize::MAX } };
+    // Listing costs a stat per file, so its batches are bigger than reading ones.
+    let opts = Opts { all_media, keep, batch: if ocr { 20 } else { 500 }, ocr };
+    scan_loop(&mut index, folders, opts, clipboard::recognise, show, ShotIndex::save);
+}
+
+/// Updates `index` batch by batch until nothing is left, showing it after each batch and,
+/// when reading text, saving it whenever it changed.
+fn scan_loop(index: &mut ShotIndex, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>, mut show: impl FnMut(&ShotIndex), mut save: impl FnMut(&ShotIndex)) {
+    show(index);
     loop {
         let before = index.entries.len();
-        let read = index.update(folders, opts, |png| if ocr { clipboard::recognise(png) } else { Some(String::new()) });
-        if ocr && (read > 0 || index.entries.len() != before) {
-            index.save();
+        let indexed = index.update(folders, opts, &ocr);
+        if opts.ocr && (indexed > 0 || index.entries.len() != before) {
+            save(index);
         }
-        show(&index);
-        if read < opts.batch {
+        show(index);
+        if indexed < opts.batch {
             break;
         }
     }
@@ -299,7 +319,7 @@ mod tests {
         fs::File::options().write(true).open(path).unwrap().set_modified(at).unwrap();
     }
 
-    const OPTS: Opts = Opts { all_media: false, keep: None, batch: 100 };
+    const OPTS: Opts = Opts { all_media: false, keep: None, batch: 100, ocr: true };
 
     #[test]
     fn new_files_are_read_once() {
@@ -377,7 +397,7 @@ mod tests {
         assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr), 0, "older than keep, and videos, are not listed");
         assert_eq!(idx.entries.len(), 2);
 
-        let all = Opts { all_media: true, keep: None, batch: 100 };
+        let all = Opts { all_media: true, ..OPTS };
         assert_eq!(idx.update(std::slice::from_ref(&d), all, ocr), 2, "the week-old picture and the video");
         let video = idx.entries.iter().find(|s| s.path.ends_with("clip.mp4")).unwrap();
         assert!(!video.failed && video.text.is_empty());
@@ -403,6 +423,59 @@ mod tests {
         assert_eq!(label(&super::rows(&idx, "a.png", "open", 10)[0]), "Open,Copy Image,Paste Image,Show in Explorer");
         assert_eq!(label(&super::rows(&idx, "a.png", "copy", 10)[0]), "Copy Image,Paste Image,Open,Show in Explorer");
         assert_eq!(super::rows(&idx, "", "copy", 1).len(), 1);
+    }
+
+    #[test]
+    fn unreadable_files_are_left_for_the_next_scan() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = dir("locked");
+        touch(&d.join("a.png"), 10);
+        touch(&d.join("b.png"), 20);
+        let (calls, mut idx) = (Cell::new(0), ShotIndex::default());
+        let ocr = |_: &[u8]| {
+            calls.set(calls.get() + 1);
+            Some("text".to_string())
+        };
+        // Held without sharing, like a file OneDrive or an antivirus has open.
+        let lock = fs::File::options().read(true).share_mode(0).open(d.join("a.png")).unwrap();
+        assert_eq!(idx.update(std::slice::from_ref(&d), Opts { batch: 1, ..OPTS }, ocr), 1, "the batch is filled from the files that can be read");
+        assert_eq!(idx.entries.len(), 1);
+        assert!(idx.entries.iter().all(|s| !s.failed && s.path.ends_with("b.png")), "the locked one is not recorded as failed");
+        drop(lock);
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 1, "and is read once it is free");
+        assert_eq!(idx.entries.len(), 2);
+    }
+
+    #[test]
+    fn without_ocr_nothing_is_read_or_saved() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = dir("nocr");
+        touch(&d.join("a.png"), 10);
+        touch(&d.join("b.png"), 20);
+        let _lock = fs::File::options().read(true).share_mode(0).open(d.join("a.png")).unwrap();
+        let (calls, saves, shown) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let mut idx = ShotIndex::default();
+        let ocr = |_: &[u8]| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        // Also what happens when Windows has no OCR language: no text, no `failed`, no file.
+        scan_loop(&mut idx, std::slice::from_ref(&d), Opts { batch: 1, ocr: false, ..OPTS }, ocr, |_| shown.set(shown.get() + 1), |_| saves.set(saves.get() + 1));
+        assert_eq!((calls.get(), saves.get()), (0, 0));
+        assert!(shown.get() >= 2, "the list fills in batch by batch");
+        assert_eq!(idx.entries.len(), 2, "a file that can't be opened is still listed");
+        assert!(idx.entries.iter().all(|s| !s.failed && s.text.is_empty()));
+    }
+
+    #[test]
+    fn with_ocr_batches_are_saved() {
+        let d = dir("save");
+        for (i, n) in ["a", "b", "c"].iter().enumerate() {
+            touch(&d.join(format!("{n}.png")), 10 * (i as u64 + 1));
+        }
+        let (saves, mut idx) = (Cell::new(0), ShotIndex::default());
+        scan_loop(&mut idx, std::slice::from_ref(&d), Opts { batch: 2, ..OPTS }, |_| Some("x".into()), |_| {}, |_| saves.set(saves.get() + 1));
+        assert_eq!((idx.entries.len(), saves.get()), (3, 2), "two batches, one save each");
     }
 
     #[test]

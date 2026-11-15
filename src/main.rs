@@ -1319,6 +1319,11 @@ impl Launcher {
     /// Brings the screenshot index up to date on a worker thread; the view fills in as
     /// each batch of pictures has been read.
     fn scan_shots(&mut self) {
+        // One scan at a time: a second would read the same pictures again and race on the saved file.
+        // ponytail: reopening during a scan shows its results; pictures added meanwhile wait for the next open.
+        if self.shots_busy {
+            return;
+        }
         self.shots_seq += 1;
         self.shots_busy = true;
         let (seq, tx, s) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone());

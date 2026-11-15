@@ -300,6 +300,12 @@ pub fn watch(tx: UnboundedSender<Msg>) {
     });
 }
 
+/// Whether Windows can read text at all (an OCR language is installed). Call on a thread
+/// that has initialised WinRT.
+pub(crate) fn ocr_ready() -> bool {
+    windows::Media::Ocr::OcrEngine::TryCreateFromUserProfileLanguages().is_ok()
+}
+
 /// The text Windows' own OCR finds in an image (offline, in your Windows display languages).
 pub(crate) fn recognise(png: &[u8]) -> Option<String> {
     use windows::{
