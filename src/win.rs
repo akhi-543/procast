@@ -102,8 +102,9 @@ pub enum Msg {
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
-    /// The foreground window changed: its handle and whether it is a game (see foreground.rs).
-    Foreground { hwnd: isize, game: bool },
+    /// The foreground window changed: its handle, whether it is a game, and its program's file
+    /// name in lower case, empty if Windows won't say (see foreground.rs).
+    Foreground { hwnd: isize, game: bool, exe: String },
     /// A command's result (true) or why it failed (false): shown as a toast that fades away.
     Toast(bool, String),
 }

@@ -79,7 +79,8 @@ unsafe extern "system" fn changed(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: 
     let path = crate::apps::exe_path(pid).unwrap_or_default();
     let game = is_game(&path, d3d_full(), covers_monitor(hwnd), &games());
     let Some(tx) = TX.get() else { return };
-    let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, game });
+    let exe = file_name(&path);
+    let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, game, exe: exe.clone() });
     let at = hwnd.0 as isize;
     // A failed spawn must not unwind out of this extern fn: the re-check is just skipped.
     let _ = std::thread::Builder::new().spawn(move || {
@@ -87,7 +88,7 @@ unsafe extern "system" fn changed(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: 
         let hwnd = HWND(at as *mut _);
         let now = is_game(&path, d3d_full(), covers_monitor(hwnd), &games());
         if resend(unsafe { GetForegroundWindow() } == hwnd, game, now) {
-            let _ = tx.unbounded_send(Msg::Foreground { hwnd: at, game: now });
+            let _ = tx.unbounded_send(Msg::Foreground { hwnd: at, game: now, exe });
         }
     });
 }

@@ -37,6 +37,9 @@ const HOST: &str = "com.procast.browser";
 pub const EXTENSION_ID: &str = "mdbobfibhbhbeeogppclpodmbkjkbkal";
 const MANIFEST: &str = include_str!("../browser/manifest.json");
 const SCRIPT: &str = include_str!("../browser/background.js");
+/// Where Focus sends a blocked site's tab.
+const BLOCKED_PAGE: &str = include_str!("../browser/blocked.html");
+const BLOCKED_SCRIPT: &str = include_str!("../browser/blocked.js");
 /// Chrome's own cap on a message to the browser; anything bigger is a broken stream.
 const MAX_FRAME: u32 = 64 << 20;
 
@@ -214,6 +217,8 @@ pub fn register() -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.json"), MANIFEST)?;
     std::fs::write(dir.join("background.js"), SCRIPT)?;
+    std::fs::write(dir.join("blocked.html"), BLOCKED_PAGE)?;
+    std::fs::write(dir.join("blocked.js"), BLOCKED_SCRIPT)?;
     let exe = std::env::current_exe()?;
     let manifest = json!({
         "name": HOST,
@@ -255,6 +260,13 @@ mod tests {
         }
         assert!(matches!(parse_reply(br#"{"t":"open","ok":true}"#), Reply::Done(Ok(()))));
         assert!(matches!(parse_reply(br#"{"t":"activate","error":"No tab with id: 9."}"#), Reply::Done(Err(_))));
+    }
+
+    #[test]
+    fn the_blocked_page_is_plain_text_from_its_own_script() {
+        assert!(BLOCKED_PAGE.contains(r#"src="blocked.js""#) && !BLOCKED_PAGE.contains("<style"), "no inline script (manifest v3), no styling");
+        assert!(BLOCKED_SCRIPT.contains("is blocked by procast Focus"));
+        assert!(SCRIPT.contains("blocked.html") && SCRIPT.contains(r#"case "focusSites""#));
     }
 
     #[test]

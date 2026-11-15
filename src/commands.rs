@@ -80,6 +80,7 @@ pub enum Cmd {
     /// Show the browser extension's folder, to load it in the browser.
     BrowserSetup,
     Desktop(Desk),
+    Focus(FocusCmd),
     /// Ask for a duration and label in the search bar (`timer 5m tea`).
     StartTimer,
     StartStopwatch,
@@ -107,6 +108,29 @@ pub enum Desk {
     Close,
     /// Needs a name: the launcher asks for it, then calls `desktops::rename`.
     Rename,
+}
+
+/// A Focus session command (see focus.rs); all of them run on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FocusCmd {
+    /// Asks for a title, minutes and category.
+    Start,
+    /// Completes the session, or asks for a new one when none runs.
+    Toggle,
+    Pause,
+    Resume,
+    Complete,
+    Cancel,
+    Restart,
+    /// Asks again, starting from the session's answers.
+    Edit,
+    /// Lets the app Focus just closed run for `[focus] snooze_minutes`.
+    Snooze,
+    /// Lists categories in the search bar (`focus work`).
+    SearchCategories,
+    CreateCategory,
+    /// Reads a Raycast focus categories export.
+    ImportCategories,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -154,6 +178,18 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::SPARKLES),
     (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::PANELS_TOP_LEFT),
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
+    (Cmd::Focus(FocusCmd::Start), "Start Focus Session", "block distractions apps websites concentrate pomodoro", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Toggle), "Toggle Focus Session", "start stop block distractions concentrate", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Pause), "Pause Focus Session", "break block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Resume), "Resume Focus Session", "continue block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Complete), "Complete Focus Session", "finish end done block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Cancel), "Cancel Focus Session", "stop end abort block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Restart), "Restart Focus Session", "again reset block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Edit), "Edit Focus Session", "change title minutes category block distractions", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Snooze), "Snooze Focus Session", "allow blocked app temporarily unblock", g::SHIELD),
+    (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::SHIELD),
+    (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::SHIELD),
+    (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::SHIELD),
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
@@ -266,6 +302,7 @@ impl Cmd {
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
+            Cmd::Focus(_) => "Focus",
             Cmd::Translate => "Translator",
             Cmd::Define => "Dictionary",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
@@ -321,7 +358,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
         }
     }
     Ok(None)

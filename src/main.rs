@@ -10,6 +10,7 @@ mod dict;
 mod desktops;
 mod ext;
 mod files;
+mod focus;
 mod foreground;
 mod hdr;
 mod keys;
@@ -60,7 +61,7 @@ use tray_icon::{
 };
 use windows::Win32::Foundation::HWND;
 
-use commands::{Cmd, Desk};
+use commands::{Cmd, Desk, FocusCmd};
 use config::Config;
 use design::{Tokens, g, px};
 use ext::FieldKind;
@@ -237,6 +238,8 @@ enum Pending {
     Snippet { name: String, template: String, args: Vec<snippets::Arg>, got: Vec<String>, erase: usize, then: String },
     /// The name for the current virtual desktop.
     RenameDesktop,
+    /// A Focus question sequence and the answers so far.
+    Focus(focus::Ask, Vec<String>),
 }
 
 /// Hook settings: Hyper, double tap, and the snippet keywords and emoji shortcodes typed anywhere.
@@ -325,6 +328,8 @@ struct Launcher {
     /// only while something runs).
     timers: timers::Timers,
     timer_tick: Option<Arc<AtomicBool>>,
+    /// The Focus session; its countdown rides on the same tick.
+    focus: focus::Focus,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -433,6 +438,7 @@ impl Launcher {
             autoquit: apps::AutoQuit::default(),
             timers: timers::Timers::load(config::dir().join("timers.json")),
             timer_tick: None,
+            focus: focus::Focus::load(config::dir().join("focus.json")),
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -733,6 +739,7 @@ impl Launcher {
                     f.search(self.file_gen, &query, 5);
                 }
                 let mut rows = self.timer_rows(&query);
+                rows.extend(self.focus_rows(&query));
                 rows.extend(search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher));
                 rows
             }
@@ -769,6 +776,7 @@ impl Launcher {
                     vec![Item::new(format!("Paste {name}"), sub, Icon::Vector(g::EDIT), Act::Snippet(template.clone()))]
                 }
                 Some(Pending::RenameDesktop) => vec![Item::new("Rename Desktop", "Name for the current desktop", Icon::Vector(g::EDIT), Act::Cmd(Cmd::Desktop(Desk::Rename)))],
+                Some(Pending::Focus(ask, got)) => vec![Item::new(ask.title(), format!("question {} of {}", got.len() + 1, ask.count()), Icon::Vector(g::SHIELD), Act::Cmd(Cmd::Focus(FocusCmd::Start)))],
                 None => vec![],
             },
             // Typed text is the next question; with an empty bar, Enter copies the answer.
@@ -923,7 +931,7 @@ impl Launcher {
 
     /// Starts the 1 s tick while a timer runs; the thread ends when its flag is set.
     fn watch_timers(&mut self) {
-        if self.timer_tick.is_some() || !self.timers.any() {
+        if self.timer_tick.is_some() || (!self.timers.any() && !self.focus.ticking()) {
             return;
         }
         let (stop, tx) = (Arc::new(AtomicBool::new(false)), self.tx.clone());
@@ -942,11 +950,13 @@ impl Launcher {
     /// when nothing is left.
     fn on_timer_tick(&mut self, cx: &mut Context<Self>) {
         let now = SystemTime::now();
+        self.on_focus_tick(cx);
         for (_, label) in self.timers.due(now) {
             let _ = self.tx.unbounded_send(Msg::Toast(true, if label.is_empty() { "Timer done".into() } else { format!("Timer done: {label}") }));
             timers::beep();
         }
         if !self.timers.any()
+            && !self.focus.ticking()
             && let Some(stop) = self.timer_tick.take()
         {
             stop.store(true, Ordering::Relaxed);
@@ -967,6 +977,210 @@ impl Launcher {
             }
             cx.notify();
         }
+    }
+
+    // ---- Focus sessions (the decisions are in focus.rs) -----------------------------
+
+    fn say(&self, ok: bool, text: String) {
+        let _ = self.tx.unbounded_send(Msg::Toast(ok, text));
+    }
+
+    /// Gives the browser companion the site filter (or switches it off).
+    fn focus_push(&self) {
+        self.browsers.ask_all(focus::sites_message(self.focus.session.as_ref(), SystemTime::now()));
+    }
+
+    /// The session as a root row with its actions, and the categories in a `focus …` search.
+    fn focus_rows(&self, query: &str) -> Vec<Item> {
+        let q = query.trim().to_lowercase();
+        let mut rows = vec![];
+        if let Some(s) = &self.focus.session
+            && (q.is_empty() || s.title.to_lowercase().contains(&q))
+        {
+            let (title, left) = s.row(SystemTime::now());
+            let (flip, label) = if s.until.is_some() { (FocusCmd::Pause, "Pause Session") } else { (FocusCmd::Resume, "Resume Session") };
+            let mut row = Item::new(title, "", Icon::Vector(g::SHIELD), Act::Cmd(Cmd::Focus(flip))).acc(left).sec("Focus");
+            row.extra = [(label, flip), ("Edit Session", FocusCmd::Edit), ("Restart Session", FocusCmd::Restart), ("Complete Session", FocusCmd::Complete), ("Cancel Session", FocusCmd::Cancel)]
+                .map(|(l, c)| (l.to_string(), Act::Cmd(Cmd::Focus(c))))
+                .to_vec();
+            rows.push(row);
+        }
+        if let Some(rest) = q.strip_prefix("focus ") {
+            for c in self.cfg.focus_category.iter().filter(|c| c.name.to_lowercase().contains(rest.trim())) {
+                let start = |m| Act::FocusStart(c.name.clone(), m);
+                let sub = format!("{} apps · {} websites", c.apps.len(), c.sites.len());
+                let mut row = Item::new(c.name.clone(), sub, Icon::Vector(g::SHIELD), start(focus::Mode::Block)).acc("Focus category").sec("Focus Categories");
+                row.extra = [focus::Mode::Block, focus::Mode::Allow].map(|m| (start(m).label().to_string(), start(m))).to_vec();
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    /// Starts (or, editing, replaces) the session; returns what to tell the user.
+    fn focus_begin(&mut self, start: focus::Start, edit: bool) -> String {
+        let focus::Start { title, minutes, filter } = start;
+        let old = self.focus.session.take();
+        let (mode, apps, sites) = match (filter, &old) {
+            (Some(f), _) => f,
+            (None, Some(o)) if edit => (o.mode, o.apps.clone(), o.sites.clone()),
+            (None, _) => (focus::Mode::Block, vec![], vec![]),
+        };
+        let mut session = focus::Session::new(&title, mode, &apps, &sites, minutes, self.cfg.focus.allow_all_on_empty_sites, SystemTime::now());
+        // The apps already closed still come back at the end.
+        session.closed = old.map(|o| o.closed).unwrap_or_default();
+        let text = format!("Focus started: {} for {minutes} min", session.title);
+        self.focus.set(Some(session));
+        self.watch_timers();
+        self.focus_push();
+        text
+    }
+
+    fn ask_focus(&mut self, ask: focus::Ask, cx: &mut Context<Self>) {
+        self.pending = Some(Pending::Focus(ask, vec![]));
+        self.set_mode(Mode::Args, cx);
+        let fill = ask.prefill(0, self.focus.session.as_ref());
+        if !fill.is_empty() {
+            self.input.update(cx, |s, cx| s.emplace(&fill, cx));
+        }
+    }
+
+    /// Adds categories to config.toml (the config reload applies them within a couple of seconds).
+    fn focus_save_categories(&self, cats: &[config::FocusCategory]) -> Result<String, String> {
+        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
+        let (text, n) = focus::add_categories(&text, cats)?;
+        if n == 0 {
+            return Err("Those categories are already in config.toml".into());
+        }
+        config::parse(&text)?;
+        std::fs::write(config::path(), text).map_err(|e| e.to_string())?;
+        Ok(format!("Added {n} focus categor{}", if n == 1 { "y" } else { "ies" }))
+    }
+
+    /// All the answers are in: start the session or save the categories. A refusal keeps the
+    /// last question open.
+    fn finish_focus_ask(&mut self, ask: focus::Ask, mut got: Vec<String>, cx: &mut Context<Self>) {
+        let done = match ask {
+            focus::Ask::Start | focus::Ask::Edit => focus::parse_start(&got, &self.cfg.focus_category, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, ask == focus::Ask::Edit)),
+            focus::Ask::Category => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
+            focus::Ask::Import => std::fs::read_to_string(got[0].trim().trim_matches('"'))
+                .map_err(|e| format!("Could not read the file: {e}"))
+                .and_then(|t| focus::import(&t))
+                .and_then(|c| self.focus_save_categories(&c)),
+        };
+        match done {
+            Ok(text) => {
+                self.say(true, text);
+                self.hide(true, cx);
+            }
+            Err(e) => {
+                got.pop();
+                self.pending = Some(Pending::Focus(ask, got));
+                self.status = Some((Tone::Error, e));
+                cx.notify();
+            }
+        }
+    }
+
+    fn focus_cmd(&mut self, f: FocusCmd, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let needs_session = matches!(f, FocusCmd::Pause | FocusCmd::Resume | FocusCmd::Complete | FocusCmd::Cancel | FocusCmd::Restart | FocusCmd::Edit | FocusCmd::Snooze);
+        if needs_session && self.focus.session.is_none() {
+            return self.say(false, "No Focus session is running".into());
+        }
+        match f {
+            FocusCmd::Start => return self.ask_focus(focus::Ask::Start, cx),
+            FocusCmd::Toggle if self.focus.session.is_none() => return self.ask_focus(focus::Ask::Start, cx),
+            FocusCmd::Toggle | FocusCmd::Complete => return self.focus_end(true, cx),
+            FocusCmd::Cancel => return self.focus_end(false, cx),
+            FocusCmd::Edit => return self.ask_focus(focus::Ask::Edit, cx),
+            FocusCmd::CreateCategory => return self.ask_focus(focus::Ask::Category, cx),
+            FocusCmd::ImportCategories => return self.ask_focus(focus::Ask::Import, cx),
+            FocusCmd::SearchCategories => return self.input.update(cx, |s, cx| s.emplace("focus ", cx)),
+            FocusCmd::Pause => self.focus.update(|s| s.pause(now)),
+            FocusCmd::Resume => {
+                self.focus.update(|s| s.resume(now));
+                self.watch_timers();
+            }
+            FocusCmd::Restart => {
+                self.focus.update(|s| s.restart(now));
+                self.watch_timers();
+            }
+            FocusCmd::Snooze => {
+                let Some((exe, path)) = self.focus.last_closed() else { return self.say(false, "Focus has not closed an app yet".into()) };
+                let mins = self.cfg.focus.snooze_minutes.max(1);
+                self.focus.update(|s| {
+                    s.snooze(&exe, mins);
+                    s.closed.retain(|p| *p != path);
+                });
+                if !path.is_empty() {
+                    win::launch_app(&path);
+                }
+                return self.say(true, format!("Focus: {} allowed for {mins} min", focus::app_label(&exe)));
+            }
+        }
+        self.focus_push();
+        let said = match f {
+            FocusCmd::Pause => "Focus paused",
+            FocusCmd::Resume => "Focus resumed",
+            _ => "Focus restarted",
+        };
+        self.say(true, said.into());
+        if self.visible && self.mode == Mode::Root {
+            self.refresh(cx);
+        }
+    }
+
+    /// Ends the session: done (completed, or the time ran out) or cancelled.
+    fn focus_end(&mut self, done: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.focus.session.clone() else { return };
+        self.focus.set(None);
+        for path in &s.closed {
+            win::launch_app(path);
+        }
+        if done && self.cfg.focus.sound {
+            focus::beep();
+        }
+        self.say(true, format!("Focus {}: {}", if done { "done" } else { "cancelled" }, s.title));
+        self.focus_push();
+        if self.visible && self.mode == Mode::Root {
+            self.refresh(cx);
+        }
+    }
+
+    /// Once a second while a session counts down: ends it on time, repeats the site filter now
+    /// and then (the browser forgets it when its extension restarts), keeps the row's time current.
+    fn on_focus_tick(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let Some(s) = &self.focus.session else { return };
+        if s.expired(now) {
+            return self.focus_end(true, cx);
+        }
+        let (left, repeat) = (s.row(now).1, s.left(now).as_secs() % 15 == 0);
+        if repeat {
+            self.focus_push();
+        }
+        if self.visible && self.mode == Mode::Root {
+            for it in &mut self.items {
+                if it.section.as_deref() == Some("Focus") && matches!(it.act, Act::Cmd(Cmd::Focus(FocusCmd::Pause | FocusCmd::Resume))) {
+                    it.accessory = left.clone();
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// A window took focus: the window of a blocked app is asked to close.
+    fn focus_front(&mut self, hwnd: isize, exe: &str) {
+        let now = SystemTime::now();
+        let Some(s) = &self.focus.session else { return };
+        if !s.blocked_app(exe, now) || !self.focus.fresh(exe, Instant::now()) {
+            return;
+        }
+        let left = focus::minutes_left(s.left(now));
+        let path = focus::close_window(hwnd);
+        self.focus.closed_app(exe, path, self.cfg.focus.restore_apps, Instant::now());
+        self.say(true, format!("Focus: {} blocked for {left} min", focus::app_label(exe)));
     }
 
     /// Scrolls the selected row into view (section headers take list slots too).
@@ -1956,6 +2170,17 @@ impl Launcher {
             Act::App(id) => win::launch_app(&id),
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
             // A quicklink switches to a tab already showing it, when a browser is connected.
+            // The browser companion can't see a link procast opens itself, so check it here.
+            Act::Open(url) if self.focus.blocked_url(&url, SystemTime::now()).is_some() => {
+                self.say(false, format!("Focus: {} is blocked", focus::host_of(&url).unwrap_or_default()));
+            }
+            Act::FocusStart(name, mode) => {
+                let Some(c) = focus::category(&self.cfg.focus_category, &name).cloned() else { return };
+                let start = focus::Start { title: name, minutes: self.cfg.focus.default_minutes, filter: Some((mode, c.apps, c.sites)) };
+                let text = self.focus_begin(start, false);
+                self.say(true, text);
+            }
+            Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, cx),
             Act::Open(url) if self.cfg.search.existing_tab && key.as_deref().is_some_and(|k| k.starts_with("ql:")) && url.starts_with("http") && self.browsers.any() => {
                 win::allow_foreground();
                 if !self.browsers.ask(None, json!({"t": "open", "url": url})) {
@@ -2204,6 +2429,8 @@ impl Launcher {
     fn needs_window(&self, act: &Act) -> bool {
         match act {
             Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
+            Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none(),
+            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
             Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
@@ -2374,6 +2601,17 @@ impl Launcher {
                 self.mode = Mode::Root;
                 self.insert_snippet(template, got, erase, then, cx);
             }
+            Some(Pending::Focus(ask, mut got)) => {
+                got.push(value);
+                if got.len() < ask.count() {
+                    let fill = ask.prefill(got.len(), self.focus.session.as_ref());
+                    self.pending = Some(Pending::Focus(ask, got));
+                    self.status = None;
+                    self.input.update(cx, |s, cx| s.emplace(&fill, cx));
+                    return self.refresh(cx);
+                }
+                self.finish_focus_ask(ask, got, cx);
+            }
             Some(Pending::RenameDesktop) => {
                 if value.is_empty() {
                     self.status = Some((Tone::Error, "Name is required".into()));
@@ -2539,7 +2777,10 @@ impl Launcher {
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
-            Msg::Foreground { hwnd, game } => self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd),
+            Msg::Foreground { hwnd, game, exe } => {
+                self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd);
+                self.focus_front(hwnd, &exe);
+            }
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2656,6 +2897,7 @@ impl Launcher {
                 Pending::Script(i, _) => self.scripts[*i].title.clone(),
                 Pending::Snippet { name, .. } => name.clone(),
                 Pending::RenameDesktop => "Rename Desktop".into(),
+                Pending::Focus(ask, _) => ask.title().into(),
             }),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate => Some("Translator".into()),
@@ -2693,6 +2935,7 @@ impl Launcher {
                         if a.default.is_empty() { format!("{}…", a.name) } else { format!("{} (empty: {})", a.name, a.default) }
                     }
                     Pending::RenameDesktop => "Desktop name…".into(),
+                    Pending::Focus(ask, got) => ask.placeholder(got.len(), self.cfg.focus.default_minutes),
                 })
                 .unwrap_or_default()
                 .into(),

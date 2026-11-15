@@ -81,6 +81,8 @@ pub enum Act {
     StartTimer(u64, String),
     /// Cancel a timer, or stop a stopwatch and copy its time, by id.
     StopTimer(u64),
+    /// Start a Focus session with a category's lists (by name), blocking them or allowing only them.
+    FocusStart(String, crate::focus::Mode),
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
@@ -125,6 +127,8 @@ impl Act {
             Act::ForceQuit(_) => "Force Quit",
             Act::StartTimer(..) => "Start Timer",
             Act::StopTimer(_) => "Stop",
+            Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
+            Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::Translate(_) => "Translate",
             Act::Define(_) => "Define",
             Act::None => "",

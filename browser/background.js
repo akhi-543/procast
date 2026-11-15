@@ -3,6 +3,8 @@
 //   {t: "tabs"}                      -> {t: "tabs", browser, tabs: [{id, window, title, url, icon}]}
 //   {t: "activate", id, window}      -> {t: "activate", ok}
 //   {t: "open", url}                 -> {t: "open", ok, existing}: the tab already showing url, else a new one
+//   {t: "focusSites", mode, sites}   -> {t: "focusSites", ok}: Focus. mode "block" sends tabs on those domains (and
+//                                       their subdomains) to blocked.html, "allow" sends every other tab there, "off" stops
 
 const HOST = "com.procast.browser";
 let port = null;
@@ -26,6 +28,33 @@ async function focus(tab) {
   await chrome.tabs.update(tab.id, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true });
 }
+
+// Focus: the host a tab is on if the filter keeps it out, else null. Only web pages count.
+let focusRule = { mode: "off", sites: [] };
+
+function blockedHost(url) {
+  if (focusRule.mode === "off") return null;
+  let host;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    host = u.hostname.toLowerCase().replace(/^www\./, "");
+  } catch (e) {
+    return null;
+  }
+  const listed = focusRule.sites.some((s) => host === s || host.endsWith("." + s));
+  return (focusRule.mode === "block") === listed ? host : null;
+}
+
+function redirect(tab, url) {
+  const host = blockedHost(url);
+  if (host) chrome.tabs.update(tab, { url: chrome.runtime.getURL("blocked.html") + "?site=" + encodeURIComponent(host) });
+}
+
+// A tab that navigates while Focus runs.
+chrome.tabs.onUpdated.addListener((id, change) => {
+  if (change.url) redirect(id, change.url);
+});
 
 async function handle(req) {
   switch (req.t) {
@@ -51,6 +80,11 @@ async function handle(req) {
         await chrome.windows.update(tab.windowId, { focused: true });
       }
       return { t: "open", ok: true, existing: !!same };
+    }
+    case "focusSites": {
+      focusRule = { mode: req.mode, sites: req.sites || [] };
+      for (const t of await chrome.tabs.query({})) redirect(t.id, t.url);
+      return { t: "focusSites", ok: true };
     }
     default:
       return { t: req.t, error: "unknown request" };

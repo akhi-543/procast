@@ -252,6 +252,16 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 ],
             ),
             (
+                "Focus",
+                vec![
+                    row("Default length", "focus.default_minutes", Kind::Number, "Minutes offered when you start a Focus session."),
+                    row("Snooze", "focus.snooze_minutes", Kind::Number, "Minutes Snooze Focus Session lets you use the app Focus just closed."),
+                    row("Sound", "focus.sound", Kind::Bool, "Play a sound when a session ends."),
+                    row("Reopen closed apps", "focus.restore_apps", Kind::Bool, "When a session ends, start again the apps Focus closed."),
+                    row("Allow all sites when none listed", "focus.allow_all_on_empty_sites", Kind::Bool, "Allow mode with no websites listed: let every site through. Off blocks every site."),
+                ],
+            ),
+            (
                 "Root search items",
                 vec![
                     row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in procast with Ctrl+K → Add to Favorites."),

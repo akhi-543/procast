@@ -45,6 +45,41 @@ pub struct Config {
     pub snippet: Vec<Snippet>,
     pub snippets: Snippets,
     pub games: Games,
+    pub focus: Focus,
+    /// `[[focus_category]]`: named app and website lists a Focus session can use.
+    pub focus_category: Vec<FocusCategory>,
+}
+
+/// Focus sessions: what they offer and do.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Focus {
+    /// Length offered when a session starts, in minutes.
+    pub default_minutes: u32,
+    /// How long Snooze lets you use the app Focus just closed.
+    pub snooze_minutes: u8,
+    /// A sound when a session ends.
+    pub sound: bool,
+    /// Reopen the apps Focus closed when the session ends.
+    pub restore_apps: bool,
+    /// Allow mode with no websites listed: allow every site (false: block every site).
+    pub allow_all_on_empty_sites: bool,
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        Self { default_minutes: 25, snooze_minutes: 3, sound: true, restore_apps: false, allow_all_on_empty_sites: false }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FocusCategory {
+    pub name: String,
+    /// Program file names, e.g. "discord.exe".
+    pub apps: Vec<String>,
+    /// Domains; subdomains match too.
+    pub sites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -492,6 +527,8 @@ impl Default for Config {
             snippet: vec![],
             snippets: Snippets::default(),
             games: Games::default(),
+            focus: Focus::default(),
+            focus_category: vec![],
         }
     }
 }
@@ -688,6 +725,18 @@ ignore_apps = []              # program names where typing never expands, e.g. [
 [games]
 auto_hdr = false              # turn HDR on while a game has focus, off again after
 list = []                     # program names that always count as games, e.g. ["eldenring.exe"]; full-screen D3D apps and borderless Steam/Epic/Xbox/Riot games are found by themselves
+
+[focus]
+default_minutes = 25          # length offered when you start a Focus session
+snooze_minutes = 3            # how long Snooze Focus Session lets you use the app Focus just closed
+sound = true                  # a sound when a session ends
+restore_apps = false          # reopen the apps Focus closed when the session ends
+allow_all_on_empty_sites = false  # allow mode with no websites listed: allow every site (false: block every site)
+# Categories: lists to block (or to allow only) in a session. Apps are program file names; sites match their subdomains too.
+# [[focus_category]]
+# name = "Social"
+# apps = ["discord.exe", "slack.exe"]
+# sites = ["reddit.com", "x.com"]
 
 [emoji]
 hotkey = ""                   # e.g. "Ctrl+Alt+E"
