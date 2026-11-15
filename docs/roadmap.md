@@ -133,18 +133,18 @@ Status: ✅ have · ◐ partial · ✗ missing. Size: **S** under a day · **M**
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
 | | — | Lock, sleep, restart, shut down, sign out, empty bin, toggle dark mode | ✅ | | |
-| [ ] | L1 | Volume up/down/mute, toggle Wi-Fi / Bluetooth | ✗ | S | |
-| [ ] | L2 | Toggle hidden files, restart Explorer, eject drive, empty temp | ✗ | S | |
-| [ ] | L3 | **Windows Settings commands** (`ms-settings:` pages: Display, Bluetooth, Sound, …) | ✗ | S | |
-| [ ] | L4 | Windows Run: choose shell (cmd / PowerShell / pwsh), run in terminal | ◐ `>` prefix | S | |
+| [x] | L1 | Volume up/down/mute, toggle Wi-Fi / Bluetooth | ✅ media keys; radios via Windows.Devices.Radios | S | |
+| [x] | L2 | Toggle hidden files, restart Explorer, eject drive, empty temp | ✅ Eject USB Drives ejects every USB stick and disk at once | S | |
+| [x] | L3 | **Windows Settings commands** (`ms-settings:` pages: Display, Bluetooth, Sound, …) | ✅ 55 pages, own Shortcuts category | S | |
+| [x] | L4 | Windows Run: choose shell (cmd / PowerShell / pwsh), run in terminal | ✅ Settings → Launcher → Windows Run | S | |
 
 ## M. Quicklinks and browser
 
 | | ID | Feature | Status | Size | You |
 |---|---|---|---|---|---|
-| [ ] | M1 | Favicons on quicklinks | ✗ | S | |
-| [ ] | M2 | Pass selected text as the quicklink argument | ✗ | M | |
-| [ ] | M3 | Browser companion extension: search open tabs, prefer existing tab | ✗ | L | install a browser extension |
+| [x] | M1 | Favicons on quicklinks | ✅ `/favicon.ico` from the link's own host, cached | S | |
+| [x] | M2 | Pass selected text as the quicklink argument | ✅ `{selection}` / `{clipboard}` in URLs; Ctrl+K → Open with Selected Text | M | |
+| [x] | M3 | Browser companion extension: search open tabs, prefer existing tab | ✅ Chrome / Edge / Brave via native messaging; no history or bookmarks yet | L | run Set Up Browser Extension, then Load unpacked |
 
 ## N. Extensions
 

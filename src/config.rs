@@ -440,6 +440,8 @@ pub struct Search {
     pub shell: String,
     /// Open that shell in Windows Terminal instead of its own console window.
     pub terminal: bool,
+    /// A quicklink switches to a browser tab already showing its page (needs the procast extension).
+    pub existing_tab: bool,
 }
 
 impl Default for Config {
@@ -488,7 +490,7 @@ impl Default for Ai {
 
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec(), shell: "run".into(), terminal: false }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec(), shell: "run".into(), terminal: false, existing_tab: true }
     }
 }
 
@@ -535,6 +537,7 @@ fallback = "https://www.google.com/search?q={query}"
 fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", or a quicklink name with {query}
 shell = "run"                 # what runs "> command": run (like Win+R) | cmd | powershell | pwsh
 terminal = false              # open that shell in Windows Terminal
+existing_tab = true           # quicklinks switch to a tab already showing the page (with the procast browser extension)
 
 [ai]
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus

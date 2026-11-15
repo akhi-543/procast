@@ -75,6 +75,8 @@ pub enum Act {
     QuitApp(u32),
     /// End a running app's process.
     ForceQuit(u32),
+    /// Switch to a browser tab: (browser connection, tab id).
+    Tab(u32, i64),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -106,6 +108,7 @@ impl Act {
             Act::Favorite(_, false) => "Remove from Favorites",
             Act::Hide(_) => "Hide from Root Search",
             Act::QuitApp(_) => "Quit",
+            Act::Tab(..) => "Switch to Tab",
             Act::ForceQuit(_) => "Force Quit",
             Act::None => "",
         }

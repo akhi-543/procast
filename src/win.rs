@@ -87,6 +87,8 @@ pub enum Msg {
     Store(Vec<crate::ext::StoreEntry>),
     /// Quit Applications: running apps with their icons.
     Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
+    /// A connected browser's answer (see browser.rs), by connection id.
+    Browser(u32, crate::browser::Reply),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
@@ -670,6 +672,11 @@ fn app_open_target(id: &str) -> String {
 /// (see `shell`).
 pub fn launch_app_wait(id: &str) -> Result<(), String> {
     open_wait(&app_open_target(id))
+}
+
+/// Lets whatever procast asks next (a browser) bring its window to the front.
+pub fn allow_foreground() {
+    unsafe { _ = AllowSetForegroundWindow(ASFW_ANY) };
 }
 
 /// `open`, but waits for ShellExecute and reports its failure (a bare name it can't find, say).

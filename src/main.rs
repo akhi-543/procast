@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod apps;
+mod browser;
 mod clipboard;
 mod commands;
 mod config;
@@ -119,6 +120,8 @@ enum Mode {
     Store,
     /// Running apps, to quit.
     Running,
+    /// Tabs open in connected browsers.
+    Tabs,
     /// A Quick AI answer (see `Launcher::ai`).
     Ai,
 }
@@ -297,6 +300,10 @@ struct Launcher {
     favicons: HashSet<String>,
     /// Store index (None until loaded) and whether a load is running.
     store: Option<Vec<ext::StoreEntry>>,
+    /// Browsers connected through the procast extension.
+    browsers: browser::Browsers,
+    /// Search Browser Tabs: (connection, browser name, tab) as they answer.
+    tabs: Vec<(u32, String, browser::Tab)>,
     /// Quit Applications: the running apps, once listed (None while loading).
     running: Option<Vec<(apps::Running, Option<Arc<RenderImage>>)>>,
     /// Program icons by path, so the running list fills in at once next time.
@@ -369,6 +376,8 @@ impl Launcher {
             let tx = tx.clone();
             std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
         }
+        std::thread::spawn(|| _ = browser::register());
+        let browsers = browser::serve(tx.clone());
         let mut this = Self {
             input,
             hotkeys: {
@@ -387,6 +396,8 @@ impl Launcher {
             apps: vec![],
             scanned: None,
             running: None,
+            browsers,
+            tabs: vec![],
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
             frec: Frecency::load(config::dir().join("frecency.json")),
@@ -554,19 +565,26 @@ impl Launcher {
     }
 
     /// An extension icon value: "icon:Name", an emoji, an asset file or a URL.
+    /// A web image (http only): drawn from the cache once downloaded, `glyph` until then.
+    fn web_icon(&mut self, url: &str, glyph: &'static str) -> Icon {
+        if !url.starts_with("http") {
+            return Icon::Vector(glyph);
+        }
+        let cached = net::image_path(url);
+        if cached.exists() {
+            return self.image(cached).map(Icon::Image).unwrap_or(Icon::Vector(glyph));
+        }
+        net::fetch_image(url, &self.tx);
+        Icon::Vector(glyph)
+    }
+
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
         let Some(icon) = icon else { return Icon::Vector(g::BULLETS) };
         if let Some(name) = icon.strip_prefix("icon:") {
             return Icon::Vector(ext::icon_glyph(name));
         }
         if icon.starts_with("http") {
-            // Web images: drawn from the cache once downloaded; a globe until then.
-            let cached = net::image_path(icon);
-            if cached.exists() {
-                return self.image(cached).map(Icon::Image).unwrap_or(Icon::Vector(g::GLOBE));
-            }
-            net::fetch_image(icon, &self.tx);
-            return Icon::Vector(g::GLOBE);
+            return self.web_icon(icon, g::GLOBE);
         }
         if icon.starts_with("data:") {
             return Icon::Vector(g::DOCUMENT);
@@ -772,6 +790,26 @@ impl Launcher {
                     search::filter(&query, rows, &mut self.matcher)
                 }
             },
+            Mode::Tabs => {
+                if !self.browsers.any() {
+                    vec![empty_row(g::GLOBE, "No browser connected".into(), "Run Set Up Browser Extension, then load the extension in Chrome, Edge or Brave".into(), vec![])]
+                } else if self.tabs.is_empty() {
+                    vec![empty_row(g::CLOCK, "Asking your browsers…".into(), String::new(), vec![])]
+                } else {
+                    let rows: Vec<Item> = self
+                        .tabs
+                        .clone()
+                        .into_iter()
+                        .map(|(conn, browser, tab)| {
+                            let host = tab.url.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or(&tab.url).to_string();
+                            let icon = self.web_icon(&tab.icon, g::GLOBE);
+                            let title = if tab.title.is_empty() { tab.url.clone() } else { tab.title.clone() };
+                            Item::new(&title, &host, icon, Act::Tab(conn, tab.id)).acc(browser).with_hay(format!("{title} {}", tab.url))
+                        })
+                        .collect();
+                    search::filter(&query, rows, &mut self.matcher)
+                }
+            }
             Mode::Install => {
                 let what = query.trim();
                 let title = if what.is_empty() { "Install an extension".to_string() } else { format!("Install {what}") };
@@ -882,6 +920,10 @@ impl Launcher {
         if mode == Mode::Running {
             self.load_running();
         }
+        if mode == Mode::Tabs {
+            self.tabs.clear();
+            self.browsers.ask_all(json!({"t": "tabs"}));
+        }
         self.input.update(cx, |s, cx| s.emplace("", cx));
         self.selected = 0;
         self.refresh(cx);
@@ -914,6 +956,7 @@ impl Launcher {
                 "emoji" => Mode::Emoji,
                 "files" => Mode::Files,
                 "running" => Mode::Running,
+                "tabs" => Mode::Tabs,
                 _ => Mode::Root,
             };
             self.set_mode(mode, cx);
@@ -1639,6 +1682,15 @@ impl Launcher {
             }
             Act::App(id) => win::launch_app(&id),
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
+            // A quicklink switches to a tab already showing it, when a browser is connected.
+            Act::Open(url) if self.cfg.search.existing_tab && key.as_deref().is_some_and(|k| k.starts_with("ql:")) && url.starts_with("http") && self.browsers.any() => {
+                win::allow_foreground();
+                if !self.browsers.ask(None, json!({"t": "open", "url": url})) {
+                    win::open(&url);
+                }
+                self.hide(false, cx);
+                return;
+            }
             Act::Open(url) if snippets::link_needs_fill(&url) => {
                 self.hide(true, cx);
                 return snippets::open_link(self.hwnd, url, self.tx.clone());
@@ -1732,6 +1784,26 @@ impl Launcher {
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
+            Act::Cmd(Cmd::SearchTabs) => return self.set_mode(Mode::Tabs, cx),
+            Act::Cmd(Cmd::BrowserSetup) => {
+                if let Err(e) = browser::register() {
+                    self.status = Some((Tone::Error, format!("Could not set up the extension: {e}")));
+                    return cx.notify();
+                }
+                win::open(&browser::extension_dir().to_string_lossy());
+                let _ = self.tx.unbounded_send(Msg::Toast(true, "In chrome://extensions or edge://extensions: Developer mode, Load unpacked, this folder".into()));
+            }
+            Act::Tab(conn, id) => {
+                let window = self.tabs.iter().find(|(c, _, t)| *c == conn && t.id == id).map_or(0, |t| t.2.window);
+                // The browser brings its own window forward.
+                win::allow_foreground();
+                if !self.browsers.ask(Some(conn), json!({"t": "activate", "id": id, "window": window})) {
+                    self.status = Some((Tone::Error, "That browser has gone".into()));
+                    return cx.notify();
+                }
+                self.hide(false, cx);
+                return;
+            }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
                 self.pending = Some(Pending::RenameDesktop);
@@ -2184,7 +2256,7 @@ impl Launcher {
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
-                if self.visible && self.mode == Mode::Ext {
+                if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs) {
                     self.refresh(cx);
                 }
             }
@@ -2201,6 +2273,19 @@ impl Launcher {
                     cx.notify();
                 }
             }
+            Msg::Browser(conn, reply) => match reply {
+                browser::Reply::Tabs(name, tabs) => {
+                    self.tabs.retain(|(c, ..)| *c != conn);
+                    self.tabs.extend(tabs.into_iter().map(|t| (conn, name.clone(), t)));
+                    if self.mode == Mode::Tabs {
+                        self.refresh(cx);
+                    }
+                }
+                browser::Reply::Done(Err(e)) => {
+                    let _ = self.tx.unbounded_send(Msg::Toast(false, e));
+                }
+                browser::Reply::Done(Ok(())) => {}
+            },
             Msg::Running(list) => {
                 for (r, icon) in &list {
                     self.exe_icons.insert(r.exe.clone(), icon.clone());
@@ -2249,6 +2334,7 @@ impl Launcher {
             Mode::Install => Some("Install Extension".into()),
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
+            Mode::Tabs => Some("Browser Tabs".into()),
             Mode::Args => self.pending.as_ref().map(|p| match p {
                 Pending::Script(i, _) => self.scripts[*i].title.clone(),
                 Pending::Snippet { name, .. } => name.clone(),
@@ -2272,6 +2358,7 @@ impl Launcher {
             Mode::Install => "Extension name or folder…".into(),
             Mode::Store => "Search the extension store…".into(),
             Mode::Running => "Search running apps…".into(),
+            Mode::Tabs => "Search open tabs…".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self
                 .pending
@@ -2336,6 +2423,7 @@ impl Launcher {
             Mode::Store => Icon::Vector(g::SHOP),
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
+            Mode::Tabs => Icon::Vector(g::GLOBE),
             Mode::Args | Mode::Output => Icon::Vector(g::COMMAND),
             Mode::Ai => Icon::Vector(g::LIGHTBULB),
         }
@@ -3227,6 +3315,8 @@ fn main() {
     // The whole-drive file index helper (see ntfs.rs).
     match std::env::args().nth(1).as_deref() {
         Some("--indexer") => return ntfs::serve(),
+        // A browser starting its native messaging host (browser.rs).
+        Some(origin) if origin.starts_with("chrome-extension://") => return browser::host(),
         Some(flag @ ("--install-indexer" | "--uninstall-indexer")) => {
             let done = if flag == "--install-indexer" { ntfs::install() } else { ntfs::uninstall() };
             if let Err(e) = done {

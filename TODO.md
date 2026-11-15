@@ -29,8 +29,8 @@ Size: **S** under a day · **M** a few days · **L** a week or more.
 ## Quicklinks
 - [ ] Quicklinks page in Settings: add, edit, duplicate, disable, delete, copy link [H4] — M (all but disable and copy link)
 - [ ] Quicklink library with featured presets to add in one click — S
-- [ ] Favicons on quicklinks [M1] — S
-- [ ] Selected text as the quicklink argument [M2] — M
+- [x] Favicons on quicklinks [M1] — S
+- [x] Selected text as the quicklink argument [M2] — M
 
 ## Emoji
 - [x] Grid layout with column count [I1] — S
@@ -71,10 +71,10 @@ Size: **S** under a day · **M** a few days · **L** a week or more.
 - [ ] Hyper key diagnostics: status, conflicting apps, copy log — S
 
 ## System commands
-- [ ] Volume up / down / mute, toggle Wi-Fi / Bluetooth [L1] — S
-- [ ] Toggle hidden files, restart Explorer, eject drive, empty temp [L2] — S
-- [ ] Windows Settings commands (`ms-settings:` pages), as their own category in Shortcuts [L3] — S
-- [ ] Windows Run: default shell (cmd / PowerShell / pwsh), run in terminal [L4] — S
+- [x] Volume up / down / mute, toggle Wi-Fi / Bluetooth [L1] — S
+- [x] Toggle hidden files, restart Explorer, eject drive, empty temp [L2] — S
+- [x] Windows Settings commands (`ms-settings:` pages), as their own category in Shortcuts [L3] — S
+- [x] Windows Run: default shell (cmd / PowerShell / pwsh), run in terminal [L4] — S
 
 ## Script commands
 - [ ] Several script folders, managed in Settings (add, remove, reveal) [N5] — S
@@ -99,7 +99,7 @@ Size: **S** under a day · **M** a few days · **L** a week or more.
 - [ ] Screenshot search: several folders, retention 1 day … unlimited, OCR [O2] — M
 - [ ] Timer / stopwatch [O7] — S
 - [ ] **new** Taskbar widget: performance monitor and calendar, docked top / bottom / left / right, flyout — M
-- [ ] **new** Browser companion: search open tabs, history, bookmarks; paired-browser list and diagnostics [M3] — L
+- [ ] **new** Browser companion: search open tabs, history, bookmarks; paired-browser list and diagnostics [M3] — L (open tabs and prefer-existing-tab done; history, bookmarks, diagnostics left)
 - [ ] Auto HDR while a game is in front [O8] — S
 
 ## AI (beyond the Quick AI / Ask AI that exist)

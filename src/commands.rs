@@ -71,6 +71,10 @@ pub enum Cmd {
     QuitApps,
     /// Open the Quick AI view to type a question.
     AskAi,
+    /// List the tabs open in browsers with the procast extension.
+    SearchTabs,
+    /// Show the browser extension's folder, to load it in the browser.
+    BrowserSetup,
     Desktop(Desk),
     Quit,
 }
@@ -133,6 +137,8 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Emoji, "Search Emoji", "emoji symbols", g::EMOJI),
     (Cmd::QuitApps, "Quit Applications", "close kill force end task running processes", g::CANCEL),
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::LIGHTBULB),
+    (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::GLOBE),
+    (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::DOWNLOAD),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::REFRESH),
@@ -234,6 +240,7 @@ impl Cmd {
             Cmd::Emoji => "Emoji",
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
+            Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -247,6 +254,7 @@ impl Cmd {
             Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
+            Cmd::SearchTabs | Cmd::BrowserSetup => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::QuitApps => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => Tint::Accent,
             _ => Tint::System,
@@ -284,7 +292,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup => {}
         }
     }
     Ok(None)

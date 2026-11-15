@@ -328,7 +328,19 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             r.extend(table_rows("snippet", text));
             r
         }
-        "Quicklinks" => table_rows("quicklink", text),
+        "Quicklinks" => {
+            let mut r = groups(vec![(
+                "Browser",
+                vec![row(
+                    "Switch to open tab",
+                    "search.existing_tab",
+                    Kind::Bool,
+                    "A quicklink whose page is already open goes to that tab instead of opening another. Needs the procast browser extension (Set Up Browser Extension).",
+                )],
+            )]);
+            r.extend(table_rows("quicklink", text));
+            r
+        }
         "Emoji" => groups(vec![(
             "Emoji picker",
             vec![
