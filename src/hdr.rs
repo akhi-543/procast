@@ -125,60 +125,100 @@ fn owned(done: Option<bool>, ours: bool, hdr_on: bool) -> bool {
     done.unwrap_or(ours && hdr_on)
 }
 
-/// Present while procast owns the on-state, so a crash or restart can still switch it off.
+/// Holds the name of the display procast turned HDR on for, while it owns the on-state, so a
+/// crash or restart can still switch off that display (and only that one).
 fn flag() -> std::path::PathBuf {
     crate::config::dir().join("hdr-on")
 }
 
-fn set_flag(on: bool) {
-    let _ = if on { std::fs::write(flag(), b"") } else { std::fs::remove_file(flag()) };
+fn set_flag(owned: Option<&str>) {
+    let _ = match owned {
+        Some(gdi) => std::fs::write(flag(), gdi),
+        None => std::fs::remove_file(flag()),
+    };
+}
+
+/// What to do at start-up about a flag left by the last run.
+#[derive(Debug, PartialEq)]
+enum Recovery {
+    /// Nothing to undo: forget the flag.
+    Clear,
+    /// A game still has focus on that display: procast keeps owning HDR.
+    Keep,
+    /// Turn that display off, then forget the flag.
+    Release,
+}
+
+/// `flag` is the display named in the flag file, `game_on` the display of the game in front, if any.
+fn recovery(flag: &str, all: &[HdrDisplay], game_on: Option<&str>) -> Recovery {
+    match all.iter().find(|d| d.gdi == flag) {
+        None => Recovery::Clear,
+        Some(_) if game_on == Some(flag) => Recovery::Keep,
+        Some(d) if d.enabled => Recovery::Release,
+        Some(_) => Recovery::Clear,
+    }
+}
+
+/// The switch one focus change asks for, on the display procast may own (`mine`). With Auto
+/// HDR off, an owned display is let go as if the game had left.
+fn decide(auto: bool, game: bool, mine: bool, hdr_on: bool) -> Option<bool> {
+    next(auto || mine, game && auto, mine, hdr_on)
 }
 
 /// Auto HDR runs on its own thread, one focus change at a time (display calls take a moment).
 pub struct Auto(Sender<(bool, bool, isize)>);
 
 impl Auto {
-    /// Starts the thread. If the last run left HDR on and no game has focus, switches it off.
+    /// Starts the thread, first undoing what a previous run left on (see `recovery`).
     pub fn start() -> Self {
         let (tx, rx) = channel::<(bool, bool, isize)>();
         let _ = thread::Builder::new().spawn(move || {
             // The display procast turned HDR on for.
             let mut ours: Option<String> = None;
-            if flag().exists() {
+            if let Ok(saved) = std::fs::read_to_string(flag()) {
                 let all = displays();
-                if crate::foreground::game_in_front() {
-                    ours = display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone());
-                } else {
-                    // ponytail: which display was ours isn't stored, so every HDR display goes off.
-                    all.iter().filter(|d| d.enabled).for_each(|d| _ = set(d, false));
-                    set_flag(false);
+                let game_on = crate::foreground::game_in_front().then(|| display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone())).flatten();
+                match recovery(saved.trim(), &all, game_on.as_deref()) {
+                    Recovery::Keep => ours = Some(saved.trim().to_string()),
+                    Recovery::Release => {
+                        all.iter().filter(|d| d.gdi == saved.trim()).for_each(|d| _ = set(d, false));
+                        set_flag(None);
+                    }
+                    Recovery::Clear => set_flag(None),
                 }
+            } else if flag().exists() {
+                set_flag(None); // unreadable: nothing safe to undo
             }
             // ponytail: one owned display; a game moved to another HDR display leaves the first on.
             for (auto, game, hwnd) in rx {
                 if !auto && ours.is_none() {
                     continue;
                 }
+                let game = game && auto;
+                let before = ours.clone();
                 let all = displays();
                 let target = if game { display_of(&all, HWND(hwnd as *mut _)) } else { ours.as_ref().and_then(|g| all.iter().find(|d| &d.gdi == g)) };
-                let Some(t) = target.filter(|t| t.supported) else {
-                    if !game && ours.take().is_some() {
-                        set_flag(false);
+                match target.filter(|t| t.supported) {
+                    // The owned display is gone, or there is no HDR display to act on.
+                    None if !game => ours = None,
+                    None => {}
+                    Some(t) => {
+                        let mine = ours.as_ref() == Some(&t.gdi);
+                        let want = decide(auto, game, mine, t.enabled);
+                        let done = want.filter(|&on| set(t, on).is_ok());
+                        // Windows refused: ownership stays as it was, try again at the next change.
+                        if want.is_none() || done.is_some() {
+                            if owned(done, mine, t.enabled) {
+                                ours = Some(t.gdi.clone());
+                            } else if mine {
+                                ours = None;
+                            }
+                        }
                     }
-                    continue;
-                };
-                let mine = ours.as_ref() == Some(&t.gdi);
-                let want = next(auto, game, mine, t.enabled);
-                let done = want.filter(|&on| set(t, on).is_ok());
-                if want.is_some() && done.is_none() {
-                    continue; // Windows refused: try again at the next change.
                 }
-                if owned(done, mine, t.enabled) {
-                    ours = Some(t.gdi.clone());
-                } else if mine {
-                    ours = None;
+                if ours != before {
+                    set_flag(ours.as_deref());
                 }
-                set_flag(ours.is_some());
             }
         });
         Self(tx)
@@ -237,5 +277,34 @@ mod tests {
         let fg = display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone());
         println!("foreground window is on {fg:?}");
         assert!(!all.is_empty());
+    }
+
+    fn display(gdi: &str, enabled: bool) -> HdrDisplay {
+        HdrDisplay { adapter: LUID::default(), id: 0, gdi: gdi.into(), supported: true, enabled }
+    }
+
+    #[test]
+    fn recovery_only_undoes_what_the_flag_names() {
+        let (a, b) = (r"\\.\DISPLAY1", r"\\.\DISPLAY2");
+        // Flag names A (on), the user has B on: only A is released.
+        let all = [display(a, true), display(b, true)];
+        assert_eq!(recovery(a, &all, None), Recovery::Release);
+        // The flagged display is gone, or already off: nothing to switch off, flag cleared.
+        assert_eq!(recovery(r"\\.\DISPLAY9", &all, None), Recovery::Clear);
+        assert_eq!(recovery("", &all, None), Recovery::Clear);
+        assert_eq!(recovery(a, &[display(a, false), display(b, true)], None), Recovery::Clear);
+        // A game still in front on that display: keep owning. On another display: release.
+        assert_eq!(recovery(a, &all, Some(a)), Recovery::Keep);
+        assert_eq!(recovery(a, &all, Some(b)), Recovery::Release);
+    }
+
+    #[test]
+    fn turning_auto_off_releases_what_procast_owns() {
+        assert_eq!(decide(false, true, true, true), Some(false)); // owned, auto off, game in front: release
+        assert_eq!(decide(false, false, true, true), Some(false));
+        assert_eq!(decide(false, true, false, true), None); // the user's HDR stays
+        assert_eq!(decide(false, false, true, false), None); // already off
+        assert_eq!(decide(true, true, false, false), Some(true)); // auto on behaves as `next`
+        assert_eq!(decide(true, false, true, true), Some(false));
     }
 }
