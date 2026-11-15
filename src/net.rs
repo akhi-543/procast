@@ -82,6 +82,17 @@ pub fn image_path(url: &str) -> PathBuf {
     config::dir().join("image-cache").join(format!("{:016x}", h.finish()))
 }
 
+/// Where a link's site keeps its icon: `/favicon.ico` on the same host. Only for web links
+/// whose host is fixed (not a `{query}` placeholder).
+pub fn favicon_url(link: &str) -> Option<String> {
+    let (scheme, rest) = link.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    (!host.is_empty() && !host.contains(['{', '}'])).then(|| format!("{}://{host}/favicon.ico", scheme.to_ascii_lowercase()))
+}
+
 /// Downloads a web image once into the cache, then reports `Msg::ImageReady`.
 pub fn fetch_image(url: &str, tx: &UnboundedSender<Msg>) {
     static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -117,5 +128,14 @@ mod tests {
         assert_eq!(rate_of("usd").unwrap(), 1.1216);
         assert!(rate_of("XYZ").is_err());
         assert_ne!(image_path("https://a/1.png"), image_path("https://a/2.png"));
+    }
+
+    #[test]
+    fn favicons_come_from_the_links_host() {
+        assert_eq!(favicon_url("https://github.com/search?q={query}").as_deref(), Some("https://github.com/favicon.ico"));
+        assert_eq!(favicon_url("HTTP://user@example.com#top").as_deref(), Some("http://example.com/favicon.ico"));
+        assert_eq!(favicon_url("https://{query}.example.com"), None);
+        assert_eq!(favicon_url("obsidian://open?vault=x"), None);
+        assert_eq!(favicon_url(r"C:\notes"), None);
     }
 }

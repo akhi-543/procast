@@ -61,7 +61,7 @@ fn table_fields(list: &str) -> &'static [(&'static str, &'static str, &'static s
         _ => &[
             ("name", "Name", "What you search for in procast."),
             ("keyword", "Keyword", "Type it, a space, then your search, e.g. gh rust."),
-            ("url", "Link", "{query} becomes what you type, e.g. https://github.com/search?q={query}"),
+            ("url", "Link", "{query} becomes what you type, e.g. https://github.com/search?q={query}. {selection} takes the text selected in the app you came from; {clipboard} what you copied last."),
         ],
     }
 }

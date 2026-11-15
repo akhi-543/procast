@@ -395,7 +395,8 @@ pub struct Quicklink {
     pub name: String,
     #[serde(default)]
     pub keyword: String,
-    /// May contain `{query}`.
+    /// May contain `{query}` (typed after the keyword), `{selection}` (selected in the app you
+    /// came from) and `{clipboard}`.
     pub url: String,
 }
 
@@ -613,6 +614,7 @@ mode = "system"               # system (follow Windows) | dark | light
 # notePath = "D:\\Notes"
 
 # Quicklinks: search by name, or type the keyword, a space, then your query.
+# {query} is what you type; {selection} the text selected in the app you came from; {clipboard} your last copy.
 [[quicklink]]
 name = "GitHub Search"
 keyword = "gh"

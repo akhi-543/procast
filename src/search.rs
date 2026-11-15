@@ -307,12 +307,17 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         items.push(Item::new(format!("Layout: {}", l.name), "Window", Icon::Vector(g::TILES), Act::Layout(l.name.clone())).acc("Command").keyed(format!("wl:{}", l.name)).words("window arrange preset").tinted(Tint::Window));
     }
     for q in &cfg.quicklink {
-        let act = if q.url.contains("{query}") {
-            Act::Fill(format!("{} ", if q.keyword.is_empty() { q.title() } else { &q.keyword }))
+        let mut it = if q.url.contains("{query}") {
+            let mut it = Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), Act::Fill(format!("{} ", if q.keyword.is_empty() { q.title() } else { &q.keyword })));
+            // The text selected in the app you came from, as the argument.
+            let with_selection = Act::Open(q.url.replace("{query}", "{selection}"));
+            it.extra = [(it.act.clone(), it.act.label()), (with_selection, "Open with Selected Text"), (Act::Copy(q.url.clone()), "Copy")].map(|(a, l)| (l.to_string(), a)).to_vec();
+            it
         } else {
-            Act::Open(q.url.clone())
+            Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), Act::Open(q.url.clone()))
         };
-        items.push(Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), act).acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web));
+        it = it.acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web);
+        items.push(it);
     }
     for s in &cfg.snippet {
         items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
@@ -380,6 +385,12 @@ fn tier(title: &str, q: &str) -> f64 {
     }
 }
 
+/// A quicklink's icon as the catalog has it: its favicon once downloaded, else the link glyph.
+fn quicklink_icon(catalog: &[Item], title: &str) -> Icon {
+    let key = format!("ql:{title}");
+    catalog.iter().find(|it| it.key.as_deref() == Some(key.as_str())).map_or(Icon::Vector(g::LINK), |it| it.icon.clone())
+}
+
 /// The calculator's answer as shown: no "approx.", at most four decimals.
 pub fn tidy_number(answer: &str) -> String {
     let a = answer.trim_start_matches("approx. ").trim();
@@ -426,7 +437,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         && !rest.trim().is_empty()
     {
         let url = link.url.replace("{query}", &url_encode(rest.trim()));
-        top.push(Item::new(rest.trim(), link.title(), Icon::Vector(g::LINK), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
+        top.push(Item::new(rest.trim(), link.title(), quicklink_icon(catalog, link.title()), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
@@ -444,15 +455,15 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
             if name.eq_ignore_ascii_case("ai") {
                 return Some(Item::new("Ask AI", "", Icon::Vector(g::LIGHTBULB), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
             }
-            let (title, url, glyph, kind) = if name.eq_ignore_ascii_case("web") {
-                (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), g::GLOBE, "Web"))?
+            let (title, url, icon, kind) = if name.eq_ignore_ascii_case("web") {
+                (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), Icon::Vector(g::GLOBE), "Web"))?
             } else if name.eq_ignore_ascii_case("chatgpt") {
-                ("Search with ChatGPT".to_string(), "https://chatgpt.com/?q={query}".to_string(), g::SEARCH, "Web")
+                ("Search with ChatGPT".to_string(), "https://chatgpt.com/?q={query}".to_string(), Icon::Vector(g::SEARCH), "Web")
             } else {
                 let l = cfg.quicklink.iter().find(|l| l.title().eq_ignore_ascii_case(name) && l.url.contains("{query}"))?;
-                (l.title().to_string(), l.url.clone(), g::LINK, "Quicklink")
+                (l.title().to_string(), l.url.clone(), quicklink_icon(catalog, l.title()), "Quicklink")
             };
-            Some(Item::new(title, "", Icon::Vector(glyph), Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).tinted(Tint::Web).sec(format!("Use \"{q}\" with")))
+            Some(Item::new(title, "", icon, Act::Open(url.replace("{query}", &url_encode(q)))).acc(kind).tinted(Tint::Web).sec(format!("Use \"{q}\" with")))
         })
         .collect();
     // An alias typed exactly puts its item first, hidden or not.
@@ -646,7 +657,7 @@ fn calculate(q: &str) -> Option<String> {
     (!main.is_empty() && main != q).then_some(main)
 }
 
-fn url_encode(s: &str) -> String {
+pub fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

@@ -20,7 +20,7 @@ mod toast;
 mod win;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::PathBuf,
     rc::Rc,
@@ -293,6 +293,8 @@ struct Launcher {
     trays: HashMap<String, (u64, TrayIcon)>,
     confirm: Option<Confirm>,
     images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
+    /// Favicon URLs already asked for this session: a site without one isn't asked again.
+    favicons: HashSet<String>,
     /// Store index (None until loaded) and whether a load is running.
     store: Option<Vec<ext::StoreEntry>>,
     /// Quit Applications: the running apps, once listed (None while loading).
@@ -397,6 +399,7 @@ impl Launcher {
             trays: HashMap::new(),
             confirm: None,
             images: HashMap::new(),
+            favicons: HashSet::new(),
             store: None,
             store_loading: false,
             settings_window: None,
@@ -800,8 +803,26 @@ impl Launcher {
 
     fn rebuild_catalog(&mut self, cx: &mut Context<Self>) {
         self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
+        self.add_favicons();
         if self.mode == Mode::Root {
             self.refresh(cx);
+        }
+    }
+
+    /// Web quicklinks show their site's icon once it's downloaded; the link glyph until then.
+    fn add_favicons(&mut self) {
+        for i in 0..self.catalog.len() {
+            let Some(name) = self.catalog[i].key.as_deref().and_then(|k| k.strip_prefix("ql:")) else { continue };
+            let Some(url) = self.cfg.quicklink.iter().find(|q| q.title() == name).and_then(|q| net::favicon_url(&q.url)) else { continue };
+            let path = net::image_path(&url);
+            if path.exists() {
+                // ponytail: a site that answers /favicon.ico with a page leaves an undecodable file and the glyph for good.
+                if let Some(img) = self.image(path) {
+                    self.catalog[i].icon = Icon::Image(img);
+                }
+            } else if self.favicons.insert(url.clone()) {
+                net::fetch_image(&url, &self.tx);
+            }
         }
     }
 
@@ -1618,6 +1639,10 @@ impl Launcher {
             }
             Act::App(id) => win::launch_app(&id),
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
+            Act::Open(url) if snippets::link_needs_fill(&url) => {
+                self.hide(true, cx);
+                return snippets::open_link(self.hwnd, url, self.tx.clone());
+            }
             Act::Open(target) | Act::File(target) => win::open(&target),
             Act::Reveal(path) => win::reveal(&path),
             Act::Run(cmdline) => win::run(&cmdline, &self.cfg.search),
@@ -2156,6 +2181,9 @@ impl Launcher {
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
+                if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
+                    self.rebuild_catalog(cx);
+                }
                 if self.visible && self.mode == Mode::Ext {
                     self.refresh(cx);
                 }

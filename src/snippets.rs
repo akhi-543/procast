@@ -289,15 +289,7 @@ pub fn insert(job: Job) {
         let mut fill = Fill { clipboard: old.clone().unwrap_or_default(), args: job.args, ..Default::default() };
         (fill.date, fill.time) = crate::win::local_date_time();
         if needs_selection(&job.template) {
-            let seq = unsafe { GetClipboardSequenceNumber() };
-            copy();
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(20));
-                if unsafe { GetClipboardSequenceNumber() } != seq {
-                    fill.selection = clipboard::text().unwrap_or_default();
-                    break;
-                }
-            }
+            fill.selection = selection().unwrap_or_default();
         }
         let (mut text, back) = expand(&job.template, &fill);
         text.push_str(&job.then);
@@ -319,6 +311,56 @@ pub fn insert(job: Job) {
             clipboard::set(owner, clipboard::Put::Text(&old), true);
         }
     });
+}
+
+/// The focused app's selected text, through Ctrl+C: None when nothing was copied within
+/// ~400 ms. The clipboard keeps the copy; callers put the old contents back.
+fn selection() -> Option<String> {
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    copy();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(20));
+        if unsafe { GetClipboardSequenceNumber() } != seq {
+            return clipboard::text();
+        }
+    }
+    None
+}
+
+/// Whether a link needs filling in from the app you came from.
+pub fn link_needs_fill(url: &str) -> bool {
+    url.contains("{selection}") || url.contains("{clipboard}")
+}
+
+/// Off the UI thread: fills a quicklink's `{selection}` (the text selected in the app you
+/// came from) and `{clipboard}`, URL-encoded, then opens it. Says why in a toast if there was
+/// nothing selected.
+pub fn open_link(owner: HWND, url: String, tx: futures::channel::mpsc::UnboundedSender<crate::win::Msg>) {
+    let owner = owner.0 as isize;
+    std::thread::spawn(move || {
+        let owner = HWND(owner as _);
+        // Focus is on its way back to the app.
+        std::thread::sleep(Duration::from_millis(80));
+        let old = clipboard::text();
+        let sel = if url.contains("{selection}") {
+            let Some(sel) = selection().filter(|s| !s.trim().is_empty()) else {
+                let _ = tx.unbounded_send(crate::win::Msg::Toast(false, "No text selected".into()));
+                return;
+            };
+            // ponytail: only text comes back, as with snippets.
+            if let Some(old) = &old {
+                clipboard::set(owner, clipboard::Put::Text(old), true);
+            }
+            sel
+        } else {
+            String::new()
+        };
+        crate::win::open(&fill_link(&url, sel.trim(), old.as_deref().unwrap_or("").trim()));
+    });
+}
+
+fn fill_link(url: &str, selection: &str, clip: &str) -> String {
+    url.replace("{selection}", &crate::search::url_encode(selection)).replace("{clipboard}", &crate::search::url_encode(clip))
 }
 
 /// Ctrl+C into the focused app (for `{selection}`).
@@ -346,6 +388,12 @@ mod tests {
         let fill = Fill { args: vec!["".into(), "A".into(), "B".into()], ..Default::default() };
         assert_eq!(expand(t, &fill).0, "Hi there, A and B. Bye there", "empty takes the default; a name repeats its value");
         assert!(needs_selection("Re: {selection}") && !needs_selection("{clipboard}"));
+    }
+
+    #[test]
+    fn links_fill_from_selection_and_clipboard() {
+        assert_eq!(fill_link("https://x.com/?q={selection}&c={clipboard}", "a b", "c&d"), "https://x.com/?q=a%20b&c=c%26d");
+        assert!(link_needs_fill("https://x/{clipboard}") && !link_needs_fill("https://x/{query}"));
     }
 
     #[test]
