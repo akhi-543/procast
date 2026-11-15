@@ -21,8 +21,22 @@ use crate::config::FocusCategory;
 
 /// Never closed or redirected, whatever the lists say: procast itself and the Windows shell.
 /// ApplicationFrameHost draws every Store app, so it can't tell them apart.
-const NEVER: &[&str] =
-    &["procast.exe", "explorer.exe", "shellexperiencehost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "lockapp.exe", "applicationframehost.exe"];
+const NEVER: &[&str] = &[
+    "procast.exe",
+    "explorer.exe",
+    "shellexperiencehost.exe",
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "lockapp.exe",
+    "applicationframehost.exe",
+    "textinputhost.exe",
+    "shellhost.exe",
+    "credentialuibroker.exe",
+];
+
+/// While a session runs, the browser is given the site filter again this often: it forgets it
+/// when its extension restarts.
+const RESEND: Duration = Duration::from_secs(15);
 
 /// A blocked app that comes back within this long is left alone: it is most likely the "save
 /// changes?" box of the window just closed.
@@ -45,11 +59,15 @@ pub struct Session {
     pub apps: Vec<String>,
     /// Lower-case domains.
     pub sites: Vec<String>,
-    /// Length in minutes (Restart starts over with it).
+    /// Length in minutes (Restart starts over with it); 0 = no limit.
     pub minutes: u32,
-    /// Wall-clock end while running; None while paused.
+    /// Wall-clock end while a timed session runs; None while paused (and with no limit).
     pub until: Option<SystemTime>,
+    /// Paused: what was left (timed) or how long it had run (no limit).
     pub paused_left: Option<Duration>,
+    /// Wall-clock start while a no-limit session runs (moved forward by pauses); None otherwise.
+    #[serde(default)]
+    pub since: Option<SystemTime>,
     /// Apps allowed until the time, by file name.
     #[serde(default)]
     pub snoozed: HashMap<String, SystemTime>,
@@ -74,45 +92,81 @@ impl Session {
             apps: clean(apps, norm_app),
             sites: clean(sites, norm_site),
             minutes,
-            until: Some(after(now, Duration::from_secs(minutes as u64 * 60))),
+            until: (minutes > 0).then(|| after(now, Duration::from_secs(minutes as u64 * 60))),
             paused_left: None,
+            since: (minutes == 0).then_some(now),
             snoozed: HashMap::new(),
             allow_empty_sites,
             closed: vec![],
         }
     }
 
+    pub fn unlimited(&self) -> bool {
+        self.minutes == 0
+    }
+
+    /// Counting (not paused). A timed session may be over; see `expired`.
+    pub fn running(&self) -> bool {
+        self.until.is_some() || self.since.is_some()
+    }
+
     /// Running: not paused and not over.
     pub fn active(&self, now: SystemTime) -> bool {
-        self.until.is_some_and(|u| now < u)
+        self.since.is_some() || self.until.is_some_and(|u| now < u)
     }
 
     pub fn expired(&self, now: SystemTime) -> bool {
         self.until.is_some_and(|u| now >= u)
     }
 
+    /// Time left in a timed session (zero with no limit).
     pub fn left(&self, now: SystemTime) -> Duration {
+        if self.unlimited() {
+            return Duration::ZERO;
+        }
         self.paused_left.or_else(|| self.until.map(|u| u.duration_since(now).unwrap_or_default())).unwrap_or_default()
     }
 
+    /// How long a no-limit session has run (zero for a timed one).
+    pub fn elapsed(&self, now: SystemTime) -> Duration {
+        if !self.unlimited() {
+            return Duration::ZERO;
+        }
+        self.paused_left.or_else(|| self.since.map(|s| now.duration_since(s).unwrap_or_default())).unwrap_or_default()
+    }
+
     pub fn pause(&mut self, now: SystemTime) {
-        if self.until.is_some() {
-            self.paused_left = Some(self.left(now));
-            self.until = None;
+        if let Some(u) = self.until.take() {
+            self.paused_left = Some(u.duration_since(now).unwrap_or_default());
+        } else if let Some(s) = self.since.take() {
+            self.paused_left = Some(now.duration_since(s).unwrap_or_default());
         }
     }
 
     pub fn resume(&mut self, now: SystemTime) {
         if let Some(d) = self.paused_left.take() {
-            self.until = Some(after(now, d));
+            if self.unlimited() {
+                self.since = Some(now.checked_sub(d).unwrap_or(now));
+            } else {
+                self.until = Some(after(now, d));
+            }
         }
     }
 
     /// Starts over with the full length.
     pub fn restart(&mut self, now: SystemTime) {
-        self.until = Some(after(now, Duration::from_secs(self.minutes as u64 * 60)));
+        if self.unlimited() {
+            self.since = Some(now);
+        } else {
+            self.until = Some(after(now, Duration::from_secs(self.minutes as u64 * 60)));
+        }
         self.paused_left = None;
         self.snoozed.clear();
+    }
+
+    /// What Toggle starts again.
+    pub fn preset(&self) -> Preset {
+        Preset { title: self.title.clone(), mode: self.mode, apps: self.apps.clone(), sites: self.sites.clone(), minutes: self.minutes }
     }
 
     /// Lets `key` (an app's file name) through for `mins` minutes. The overlay's choices are 1, 3, 5, 10.
@@ -150,11 +204,56 @@ impl Session {
         (mode == Mode::Block) == sites.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
     }
 
-    /// The root row: title and time left.
+    /// The root row: title and time left (or, with no limit, time run).
     pub fn row(&self, now: SystemTime) -> (String, String) {
-        let left = crate::timers::fmt_duration(self.left(now));
-        (self.title.clone(), if self.until.is_none() { format!("Paused · {left} left") } else { format!("{left} left") })
+        let time = if self.unlimited() { format!("{} elapsed", crate::timers::fmt_duration(self.elapsed(now))) } else { format!("{} left", crate::timers::fmt_duration(self.left(now))) };
+        (self.title.clone(), if self.paused_left.is_some() { format!("Paused · {time}") } else { time })
     }
+}
+
+/// A session's settings, kept for the next Toggle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub title: String,
+    pub mode: Mode,
+    pub apps: Vec<String>,
+    pub sites: Vec<String>,
+    pub minutes: u32,
+}
+
+impl Preset {
+    pub fn start(self) -> Start {
+        Start { title: self.title, minutes: self.minutes, filter: Some((self.mode, self.apps, self.sites)) }
+    }
+}
+
+/// The minutes Snooze allows: 0 in `[focus] snooze_minutes` turns it off.
+pub fn snooze_for(configured: u8) -> Option<u8> {
+    (configured > 0).then_some(configured)
+}
+
+/// Whether the browser is due the site filter again: a session counts down and the last push
+/// (None: never) is `RESEND` old.
+pub fn resend_due(running: bool, last: Option<Instant>, now: Instant) -> bool {
+    running && last.is_none_or(|l| now.duration_since(l) >= RESEND)
+}
+
+/// A file's text, where a missing file is just empty. Any other failure (a UTF-16 file, a
+/// sharing violation) is an error, so nothing is ever written over text that could not be read.
+pub fn text_or_empty(read: std::io::Result<String>) -> Result<String, String> {
+    match read {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("Could not read config.toml: {e}")),
+    }
+}
+
+/// Writes to `<file>.tmp` first, then renames over the file, so a crash never leaves half a file.
+pub fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, path))
 }
 
 /// The message that gives the browser companion the site filter (or switches it off).
@@ -218,34 +317,46 @@ pub fn close_window(hwnd: isize) -> String {
 
 // ---- the running state ---------------------------------------------------------------
 
+/// What `focus.json` holds.
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    session: Option<Session>,
+    preset: Option<Preset>,
+}
+
 /// The session and where it is saved.
 #[derive(Default)]
 pub struct Focus {
     pub session: Option<Session>,
+    /// The settings of the latest session started, for Toggle.
+    pub preset: Option<Preset>,
     path: Option<PathBuf>,
+    /// When the browser last got the site filter.
+    pushed: Option<Instant>,
     /// The last app Focus closed: file name, full path, when.
     last: Option<(String, String, Instant)>,
 }
 
 impl Focus {
     pub fn load(path: PathBuf) -> Self {
-        let session = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
-        Self { session, path: Some(path), last: None }
+        let saved: Saved = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        Self { session: saved.session, preset: saved.preset, path: Some(path), ..Default::default() }
     }
 
-    /// Written to a temporary file first, so a crash never leaves half a session.
     fn save(&self) {
         let Some(path) = &self.path else { return };
-        match &self.session {
-            Some(s) => {
-                let tmp = path.with_extension("json.tmp");
-                let _ = fs::write(&tmp, serde_json::to_string(s).unwrap_or_default()).and_then(|_| fs::rename(&tmp, path));
-            }
-            None => _ = fs::remove_file(path),
+        if self.session.is_none() && self.preset.is_none() {
+            return drop(fs::remove_file(path));
         }
+        let saved = Saved { session: self.session.clone(), preset: self.preset.clone() };
+        let _ = write_atomic(path, &serde_json::to_string(&saved).unwrap_or_default());
     }
 
+    /// Starts, replaces or (None) ends the session; a new one is also kept as the preset.
     pub fn set(&mut self, session: Option<Session>) {
+        if let Some(s) = &session {
+            self.preset = Some(s.preset());
+        }
         self.session = session;
         self.save();
     }
@@ -258,9 +369,18 @@ impl Focus {
         }
     }
 
-    /// The tick is needed while a session counts down.
+    /// The tick is needed while a session counts (a paused one does not).
     pub fn ticking(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.until.is_some())
+        self.session.as_ref().is_some_and(Session::running)
+    }
+
+    pub fn push_due(&self, now: Instant) -> bool {
+        resend_due(self.ticking(), self.pushed, now)
+    }
+
+    /// Notes that the browser just got the site filter.
+    pub fn pushed(&mut self, now: Instant) {
+        self.pushed = Some(now);
     }
 
     /// False for an app just closed (see `SAVE_PROMPT`).
@@ -324,7 +444,7 @@ impl Ask {
     pub fn placeholder(self, i: usize, default_minutes: u32) -> String {
         match (self, i) {
             (Ask::Start | Ask::Edit, 0) => "What are you focusing on? (empty: Focus)".into(),
-            (Ask::Start | Ask::Edit, 1) => format!("Minutes (empty: {default_minutes})"),
+            (Ask::Start | Ask::Edit, 1) => format!("Minutes, 0 for no limit (empty: {default_minutes})"),
             (Ask::Start, _) => "Category, then allow or block (empty: block nothing)".into(),
             (Ask::Edit, _) => "Category, then allow or block (empty: keep)".into(),
             (Ask::Category, 0) => "Category name".into(),
@@ -364,12 +484,9 @@ pub fn parse_start(got: &[String], cats: &[FocusCategory], default_minutes: u32)
         "" => default_minutes,
         t => match t.parse::<u32>() {
             Ok(n) => n,
-            Err(_) => crate::timers::parse_duration(t).ok_or("Minutes: a number like 25, or 1h30m")?.as_secs().div_ceil(60) as u32,
+            Err(_) => crate::timers::parse_duration(t).ok_or("Minutes: a number like 25 (0 for no limit), or 1h30m")?.as_secs().div_ceil(60) as u32,
         },
     };
-    if minutes == 0 {
-        return Err("Minutes must be at least 1".into());
-    }
     let mut words: Vec<&str> = answer(2).split_whitespace().collect();
     let mode = match words.last().map(|w| w.to_lowercase()).as_deref() {
         Some("allow") => Some(Mode::Allow),
@@ -486,7 +603,18 @@ mod tests {
         let s = session(Mode::Allow, &["code.exe"], &[], now);
         assert!(s.blocked_app("discord.exe", now));
         assert!(!s.blocked_app("code.exe", now));
-        for shell in ["procast.exe", "explorer.exe", "ShellExperienceHost.exe", "searchhost.exe", "startmenuexperiencehost.exe", "lockapp.exe", "applicationframehost.exe"] {
+        for shell in [
+            "procast.exe",
+            "explorer.exe",
+            "ShellExperienceHost.exe",
+            "searchhost.exe",
+            "startmenuexperiencehost.exe",
+            "lockapp.exe",
+            "applicationframehost.exe",
+            "textinputhost.exe",
+            "shellhost.exe",
+            "credentialuibroker.exe",
+        ] {
             assert!(!s.blocked_app(shell, now), "{shell}");
         }
         assert!(!s.blocked_app("", now), "an unnamed process is unknown, not blocked");
@@ -594,7 +722,8 @@ mod tests {
         assert!(matches!(ask(["", "", "Deep Work allow"]).unwrap().filter, Some((Mode::Allow, ..))));
         assert_eq!(ask(["", "", "allow"]).unwrap().filter, Some((Mode::Allow, vec![], vec![])));
         assert!(ask(["", "", "nope"]).unwrap_err().contains("No category named nope"));
-        assert!(ask(["", "0", ""]).is_err() && ask(["", "soon", ""]).is_err());
+        assert_eq!(ask(["", "0", ""]).unwrap().minutes, 0, "0 is no limit");
+        assert!(ask(["", "soon", ""]).is_err());
     }
 
     #[test]
@@ -637,9 +766,103 @@ mod tests {
         let back = Focus::load(path.clone());
         assert_eq!(back.session, f.session);
         assert_eq!(back.session.as_ref().unwrap().closed, [r"C:\Windows\notepad.exe"], "once");
-        assert!(!path.with_extension("json.tmp").exists());
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         f.set(None);
-        assert!(!path.exists() && Focus::load(path).session.is_none());
+        let back = Focus::load(path.clone());
+        assert!(back.session.is_none() && back.preset.is_some(), "the settings stay for Toggle");
+        let mut fresh = Focus { path: Some(path.clone()), ..Default::default() };
+        fresh.set(None);
+        assert!(!path.exists(), "nothing to keep, no file");
+    }
+
+    #[test]
+    fn a_paused_session_survives_a_restart_still_paused() {
+        let path = std::env::temp_dir().join(format!("procast-focus-paused-test-{}.json", std::process::id()));
+        let now = SystemTime::now();
+        for minutes in [25, 0] {
+            let mut f = Focus::load(path.clone());
+            let mut s = Session::new("Write", Mode::Block, &["notepad.exe".into()], &[], minutes, false, now);
+            s.pause(now + mins(5));
+            f.set(Some(s));
+            let back = Focus::load(path.clone());
+            let s = back.session.as_ref().unwrap();
+            assert_eq!(Some(s), f.session.as_ref());
+            assert!(!back.ticking() && s.paused_left == Some(if minutes == 0 { mins(5) } else { mins(20) }));
+            assert!(!s.blocked_app("notepad.exe", now + mins(60)), "paused stays paused across the restart");
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn toggle_starts_again_with_the_last_settings() {
+        let path = std::env::temp_dir().join(format!("procast-focus-preset-test-{}.json", std::process::id()));
+        let now = SystemTime::now();
+        let mut f = Focus::load(path.clone());
+        assert!(f.preset.is_none());
+        f.set(Some(Session::new("Essay", Mode::Allow, &["Code.exe".into()], &["docs.rs".into()], 50, false, now)));
+        f.set(None);
+        let start = Focus::load(path.clone()).preset.unwrap().start();
+        assert_eq!(start, Start { title: "Essay".into(), minutes: 50, filter: Some((Mode::Allow, vec!["code.exe".into()], vec!["docs.rs".into()])) });
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_session_with_no_limit_never_ends_but_can_pause() {
+        let now = SystemTime::now();
+        let mut s = session(Mode::Block, &["notepad.exe"], &[], now);
+        s = Session::new("Open", s.mode, &s.apps, &s.sites, 0, false, now);
+        assert!(s.unlimited() && s.running() && s.until.is_none());
+        let later = now + mins(60 * 24);
+        assert!(s.active(later) && !s.expired(later) && s.blocked_app("notepad.exe", later));
+        assert_eq!(s.row(now + mins(3)), ("Open".into(), "3:00 elapsed".into()));
+        s.pause(now + mins(5));
+        assert!(!s.running() && !s.blocked_app("notepad.exe", later), "paused: not blocking");
+        assert_eq!(s.row(later).1, "Paused · 5:00 elapsed", "a pause stops the clock");
+        s.resume(now + mins(10));
+        assert_eq!(s.elapsed(now + mins(12)), mins(7));
+        assert!(s.blocked_app("notepad.exe", now + mins(12)));
+        s.restart(now + mins(20));
+        assert_eq!(s.elapsed(now + mins(21)), mins(1));
+        assert_eq!(sites_message(Some(&s), now + mins(21))["mode"], "off", "nothing listed, nothing to filter");
+    }
+
+    #[test]
+    fn snooze_can_be_turned_off() {
+        assert_eq!((snooze_for(0), snooze_for(1), snooze_for(3), snooze_for(10)), (None, Some(1), Some(3), Some(10)));
+    }
+
+    #[test]
+    fn the_site_filter_is_repeated_only_while_counting_down_and_every_15_seconds() {
+        let t = Instant::now();
+        let s15 = Duration::from_secs(15);
+        assert!(!resend_due(false, None, t), "paused or no session: never");
+        assert!(!resend_due(false, Some(t), t + s15 * 4));
+        assert!(resend_due(true, None, t), "never pushed: now");
+        assert!(!resend_due(true, Some(t), t + Duration::from_secs(14)));
+        assert!(resend_due(true, Some(t), t + s15));
+        assert!(resend_due(true, Some(t), t + Duration::from_secs(31)), "a late tick still catches up");
+        let mut f = Focus { session: Some(session(Mode::Block, &[], &["x.com"], SystemTime::now())), ..Default::default() };
+        assert!(f.push_due(t));
+        f.pushed(t);
+        assert!(!f.push_due(t + Duration::from_secs(1)) && f.push_due(t + s15));
+        f.update(|s| s.pause(SystemTime::now()));
+        assert!(!f.push_due(t + s15 * 9), "a paused session is not ticking");
+    }
+
+    #[test]
+    fn only_a_missing_config_counts_as_empty() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(text_or_empty(Ok("a = 1".into())), Ok("a = 1".into()));
+        assert_eq!(text_or_empty(Err(Error::from(ErrorKind::NotFound))), Ok(String::new()));
+        for kind in [ErrorKind::InvalidData, ErrorKind::PermissionDenied, ErrorKind::Other] {
+            assert!(text_or_empty(Err(Error::from(kind))).is_err(), "{kind:?}");
+        }
+        let path = std::env::temp_dir().join(format!("procast-atomic-test-{}.toml", std::process::id()));
+        write_atomic(&path, "one").unwrap();
+        write_atomic(&path, "two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

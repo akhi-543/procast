@@ -38,7 +38,7 @@ function blockedHost(url) {
   try {
     const u = new URL(url);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    host = u.hostname.toLowerCase().replace(/^www\./, "");
+    host = u.hostname.toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
   } catch (e) {
     return null;
   }

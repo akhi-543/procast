@@ -54,9 +54,9 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Focus {
-    /// Length offered when a session starts, in minutes.
+    /// Length offered when a session starts, in minutes; 0 = no limit.
     pub default_minutes: u32,
-    /// How long Snooze lets you use the app Focus just closed.
+    /// How long Snooze lets you use the app Focus just closed; 0 turns Snooze off.
     pub snooze_minutes: u8,
     /// A sound when a session ends.
     pub sound: bool,
@@ -727,8 +727,8 @@ auto_hdr = false              # turn HDR on while a game has focus, off again af
 list = []                     # program names that always count as games, e.g. ["eldenring.exe"]; full-screen D3D apps and borderless Steam/Epic/Xbox/Riot games are found by themselves
 
 [focus]
-default_minutes = 25          # length offered when you start a Focus session
-snooze_minutes = 3            # how long Snooze Focus Session lets you use the app Focus just closed
+default_minutes = 25          # length offered when you start a Focus session; 0 = no limit
+snooze_minutes = 3            # how long Snooze Focus Session lets you use the app Focus just closed; 0 = no snooze
 sound = true                  # a sound when a session ends
 restore_apps = false          # reopen the apps Focus closed when the session ends
 allow_all_on_empty_sites = false  # allow mode with no websites listed: allow every site (false: block every site)

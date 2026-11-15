@@ -96,6 +96,8 @@ pub enum Msg {
     Store(Vec<crate::ext::StoreEntry>),
     /// Quit Applications: running apps with their icons.
     Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
+    /// A browser just connected (see browser.rs): it knows nothing of procast's state yet.
+    BrowserUp,
     /// A connected browser's answer (see browser.rs), by connection id.
     Browser(u32, crate::browser::Reply),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).

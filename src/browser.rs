@@ -171,6 +171,7 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
             let mut pipe = unsafe { File::from_raw_handle(h.0) };
             let (q, requests) = channel::<Value>();
             list.0.lock().unwrap().push((id, q));
+            let _ = tx.unbounded_send(Msg::BrowserUp);
             let (tx, list) = (tx.clone(), list.clone());
             std::thread::spawn(move || {
                 for req in requests {

@@ -986,7 +986,8 @@ impl Launcher {
     }
 
     /// Gives the browser companion the site filter (or switches it off).
-    fn focus_push(&self) {
+    fn focus_push(&mut self) {
+        self.focus.pushed(Instant::now());
         self.browsers.ask_all(focus::sites_message(self.focus.session.as_ref(), SystemTime::now()));
     }
 
@@ -998,7 +999,7 @@ impl Launcher {
             && (q.is_empty() || s.title.to_lowercase().contains(&q))
         {
             let (title, left) = s.row(SystemTime::now());
-            let (flip, label) = if s.until.is_some() { (FocusCmd::Pause, "Pause Session") } else { (FocusCmd::Resume, "Resume Session") };
+            let (flip, label) = if s.running() { (FocusCmd::Pause, "Pause Session") } else { (FocusCmd::Resume, "Resume Session") };
             let mut row = Item::new(title, "", Icon::Vector(g::SHIELD), Act::Cmd(Cmd::Focus(flip))).acc(left).sec("Focus");
             row.extra = [(label, flip), ("Edit Session", FocusCmd::Edit), ("Restart Session", FocusCmd::Restart), ("Complete Session", FocusCmd::Complete), ("Cancel Session", FocusCmd::Cancel)]
                 .map(|(l, c)| (l.to_string(), Act::Cmd(Cmd::Focus(c))))
@@ -1029,7 +1030,7 @@ impl Launcher {
         let mut session = focus::Session::new(&title, mode, &apps, &sites, minutes, self.cfg.focus.allow_all_on_empty_sites, SystemTime::now());
         // The apps already closed still come back at the end.
         session.closed = old.map(|o| o.closed).unwrap_or_default();
-        let text = format!("Focus started: {} for {minutes} min", session.title);
+        let text = if minutes == 0 { format!("Focus started: {} (no limit)", session.title) } else { format!("Focus started: {} for {minutes} min", session.title) };
         self.focus.set(Some(session));
         self.watch_timers();
         self.focus_push();
@@ -1047,13 +1048,13 @@ impl Launcher {
 
     /// Adds categories to config.toml (the config reload applies them within a couple of seconds).
     fn focus_save_categories(&self, cats: &[config::FocusCategory]) -> Result<String, String> {
-        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
+        let text = focus::text_or_empty(std::fs::read_to_string(config::path()))?;
         let (text, n) = focus::add_categories(&text, cats)?;
         if n == 0 {
             return Err("Those categories are already in config.toml".into());
         }
         config::parse(&text)?;
-        std::fs::write(config::path(), text).map_err(|e| e.to_string())?;
+        focus::write_atomic(&config::path(), &text).map_err(|e| e.to_string())?;
         Ok(format!("Added {n} focus categor{}", if n == 1 { "y" } else { "ies" }))
     }
 
@@ -1090,7 +1091,15 @@ impl Launcher {
         }
         match f {
             FocusCmd::Start => return self.ask_focus(focus::Ask::Start, cx),
-            FocusCmd::Toggle if self.focus.session.is_none() => return self.ask_focus(focus::Ask::Start, cx),
+            FocusCmd::Toggle if self.focus.session.is_none() => {
+                let Some(last) = self.focus.preset.clone() else { return self.ask_focus(focus::Ask::Start, cx) };
+                let text = self.focus_begin(last.start(), false);
+                self.say(true, text);
+                if self.visible {
+                    self.hide(true, cx);
+                }
+                return;
+            }
             FocusCmd::Toggle | FocusCmd::Complete => return self.focus_end(true, cx),
             FocusCmd::Cancel => return self.focus_end(false, cx),
             FocusCmd::Edit => return self.ask_focus(focus::Ask::Edit, cx),
@@ -1107,8 +1116,10 @@ impl Launcher {
                 self.watch_timers();
             }
             FocusCmd::Snooze => {
+                let Some(mins) = focus::snooze_for(self.cfg.focus.snooze_minutes) else {
+                    return self.say(false, "Snooze is off (snooze_minutes = 0 in config.toml)".into());
+                };
                 let Some((exe, path)) = self.focus.last_closed() else { return self.say(false, "Focus has not closed an app yet".into()) };
-                let mins = self.cfg.focus.snooze_minutes.max(1);
                 self.focus.update(|s| {
                     s.snooze(&exe, mins);
                     s.closed.retain(|p| *p != path);
@@ -1153,11 +1164,15 @@ impl Launcher {
     fn on_focus_tick(&mut self, cx: &mut Context<Self>) {
         let now = SystemTime::now();
         let Some(s) = &self.focus.session else { return };
+        // A paused session has nothing to count, repeat or redraw (a timer may keep the tick alive).
+        if !s.running() {
+            return;
+        }
         if s.expired(now) {
             return self.focus_end(true, cx);
         }
-        let (left, repeat) = (s.row(now).1, s.left(now).as_secs() % 15 == 0);
-        if repeat {
+        let left = s.row(now).1;
+        if self.focus.push_due(Instant::now()) {
             self.focus_push();
         }
         if self.visible && self.mode == Mode::Root {
@@ -1177,10 +1192,11 @@ impl Launcher {
         if !s.blocked_app(exe, now) || !self.focus.fresh(exe, Instant::now()) {
             return;
         }
-        let left = focus::minutes_left(s.left(now));
+        let left = (!s.unlimited()).then(|| focus::minutes_left(s.left(now)));
         let path = focus::close_window(hwnd);
         self.focus.closed_app(exe, path, self.cfg.focus.restore_apps, Instant::now());
-        self.say(true, format!("Focus: {} blocked for {left} min", focus::app_label(exe)));
+        let app = focus::app_label(exe);
+        self.say(true, left.map_or_else(|| format!("Focus: {app} blocked"), |m| format!("Focus: {app} blocked for {m} min")));
     }
 
     /// Scrolls the selected row into view (section headers take list slots too).
@@ -2429,7 +2445,7 @@ impl Launcher {
     fn needs_window(&self, act: &Act) -> bool {
         match act {
             Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
-            Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none(),
+            Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
             Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
@@ -2831,6 +2847,7 @@ impl Launcher {
                     cx.notify();
                 }
             }
+            Msg::BrowserUp => self.focus_push(),
             Msg::Browser(conn, reply) => match reply {
                 browser::Reply::Tabs(name, tabs) => {
                     self.tabs.retain(|(c, ..)| *c != conn);
