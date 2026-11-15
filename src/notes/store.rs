@@ -94,31 +94,38 @@ impl Store {
         v
     }
 
-    pub fn text(&self, id: &str) -> String {
-        fs::read_to_string(self.path(id)).unwrap_or_default()
+    /// The note's text. A missing file is an empty note; any other read error is passed on, so a
+    /// transient lock can never look like an empty note (and get saved over the real one).
+    pub fn text(&self, id: &str) -> io::Result<String> {
+        match fs::read_to_string(self.path(id)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            r => r,
+        }
     }
 
     /// A new empty note, unless one exists already (then its id comes back as `Exists`).
     pub fn create(&mut self, now: i64) -> io::Result<Result<Id, Exists>> {
-        let empty = self.list().into_iter().find(|m| self.text(&m.id).trim().is_empty());
-        if let Some(m) = empty {
-            return Ok(Err(Exists(m.id)));
+        for m in self.list() {
+            if self.text(&m.id)?.trim().is_empty() {
+                return Ok(Err(Exists(m.id)));
+            }
         }
         self.add("", now).map(Ok)
     }
 
     pub fn duplicate(&mut self, id: &str, now: i64) -> io::Result<Id> {
         self.index(id)?;
-        let text = self.text(id);
+        let text = self.text(id)?;
         self.add(&text, now)
     }
 
     pub fn save(&mut self, id: &str, text: &str, now: i64) -> io::Result<()> {
         let i = self.index(id)?;
+        let old = self.text(id)?;
+        self.snapshot(id, &old, self.metas[i].modified, text, now)?;
         write_atomic(&self.path(id), text)?;
         self.metas[i].modified = now;
         self.metas[i].title = title_of(text);
-        self.snapshot(id, text, now)?;
         self.persist()
     }
 
@@ -169,7 +176,7 @@ impl Store {
         let q = q.trim().to_lowercase();
         self.list()
             .into_iter()
-            .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q) || self.text(&m.id).to_lowercase().contains(&q))
+            .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q) || self.text(&m.id).unwrap_or_default().to_lowercase().contains(&q))
             .collect()
     }
 
@@ -215,15 +222,17 @@ impl Store {
         v
     }
 
-    /// Writes a snapshot of `text` unless the last one is under five minutes old; keeps the newest 50.
-    fn snapshot(&self, id: &str, text: &str, now: i64) -> io::Result<()> {
+    /// Before a save replaces `old` (last modified at `stamp`) with `new` at `now`: keeps `old` as a
+    /// snapshot, so the version being overwritten can always be recovered. At most one per five
+    /// minutes, never a blank or unchanged one; keeps the newest 50.
+    fn snapshot(&self, id: &str, old: &str, stamp: i64, new: &str, now: i64) -> io::Result<()> {
         let times = self.snapshots(id);
-        if times.last().is_some_and(|t| now - t < SNAPSHOT_EVERY) || text.trim().is_empty() {
+        if times.last().is_some_and(|t| now - t < SNAPSHOT_EVERY) || old.trim().is_empty() || old == new {
             return Ok(());
         }
         let dir = self.history_dir(id);
         fs::create_dir_all(&dir)?;
-        write_atomic(&dir.join(format!("{now}.md")), text)?;
+        write_atomic(&dir.join(format!("{stamp}.md")), old)?;
         let total = times.len() + 1;
         for t in times.iter().take(total.saturating_sub(SNAPSHOT_KEEP)) {
             let _ = fs::remove_file(dir.join(format!("{t}.md")));
@@ -363,7 +372,7 @@ mod tests {
         s.save(&a, "# Hi", 2).unwrap();
         s.pin(&a, true).unwrap();
         let b = s.duplicate(&a, 3).unwrap();
-        assert_eq!(s.text(&b), "# Hi");
+        assert_eq!(s.text(&b).unwrap(), "# Hi");
         let m = s.list().into_iter().find(|m| m.id == b).unwrap();
         assert!(!m.pinned);
         assert_eq!(m.title, "Hi");
@@ -388,16 +397,61 @@ mod tests {
     }
 
     #[test]
-    fn history_throttles_to_one_per_five_minutes() {
+    fn history_recovers_the_version_a_save_overwrites() {
         let mut s = open("history");
         let a = made(s.create(1000));
+        s.save(&a, "a", 1000).unwrap();
+        assert!(s.history(&a).is_empty());
+        s.save(&a, "ab", 1100).unwrap();
+        s.save(&a, "abcdef", 1200).unwrap();
+        // throttled: only the first overwritten version, stamped when it was written
+        assert_eq!(s.history(&a), [(1000, "a".to_string())]);
+        s.save(&a, "x", 5000).unwrap();
+        assert_eq!(s.history(&a), [(1200, "abcdef".to_string()), (1000, "a".to_string())]);
+        assert_eq!(s.text(&a).unwrap(), "x");
+    }
+
+    #[test]
+    fn history_throttle_edge_is_exactly_five_minutes() {
+        let mut s = open("edge");
+        let a = made(s.create(1000));
         s.save(&a, "v1", 1000).unwrap();
-        s.save(&a, "v2", 1100).unwrap();
-        s.save(&a, "v3", 1299).unwrap();
-        assert_eq!(s.history(&a), [(1000, "v1".to_string())]);
-        s.save(&a, "v4", 1300).unwrap();
-        assert_eq!(s.history(&a), [(1300, "v4".to_string()), (1000, "v1".to_string())]);
-        assert_eq!(s.text(&a), "v4");
+        s.save(&a, "v2", 1100).unwrap(); // snapshot v1 @1000
+        s.save(&a, "v3", 1299).unwrap(); // 299 s since 1000: none
+        assert_eq!(s.history(&a).len(), 1);
+        s.save(&a, "v4", 1300).unwrap(); // 300 s: snapshot v3 @1299
+        assert_eq!(s.history(&a), [(1299, "v3".to_string()), (1000, "v1".to_string())]);
+    }
+
+    #[test]
+    fn wiping_a_note_keeps_its_last_text_and_blank_or_same_text_is_never_snapshotted() {
+        let mut s = open("wipe");
+        let a = made(s.create(1000));
+        s.save(&a, "keep me", 1000).unwrap();
+        s.save(&a, "keep me", 2000).unwrap(); // unchanged: nothing
+        assert!(s.history(&a).is_empty());
+        s.save(&a, "", 3000).unwrap(); // wipe: the old text is recoverable
+        assert_eq!(s.history(&a), [(2000, "keep me".to_string())]);
+        s.save(&a, "new", 9000).unwrap(); // old text is blank: nothing
+        assert_eq!(s.history(&a).len(), 1);
+    }
+
+    #[test]
+    fn read_errors_are_not_an_empty_note() {
+        let mut s = open("readerr");
+        let a = made(s.create(1));
+        s.save(&a, "real", 2).unwrap();
+        // a directory where the file should be: reading fails with something other than NotFound
+        fs::remove_file(s.path(&a)).unwrap();
+        fs::create_dir(s.path(&a)).unwrap();
+        assert!(s.text(&a).is_err());
+        assert!(s.save(&a, "overwrite", 3).is_err());
+        assert!(s.duplicate(&a, 4).is_err());
+        assert!(s.create(5).is_err());
+        assert_eq!(s.list().len(), 1);
+        // a plainly missing file is an empty note
+        fs::remove_dir(s.path(&a)).unwrap();
+        assert_eq!(s.text(&a).unwrap(), "");
     }
 
     #[test]
@@ -409,8 +463,8 @@ mod tests {
         }
         let h = s.history(&a);
         assert_eq!(h.len(), 50);
-        assert_eq!(h[0].1, "v59");
-        assert_eq!(h[49].1, "v10");
+        assert_eq!(h[0].1, "v58");
+        assert_eq!(h[49].1, "v9");
     }
 
     #[test]
@@ -418,6 +472,7 @@ mod tests {
         let mut s = open("purgehist");
         let a = made(s.create(0));
         s.save(&a, "x", 10).unwrap();
+        s.save(&a, "y", 20).unwrap();
         assert_eq!(s.history(&a).len(), 1);
         s.purge(&a).unwrap();
         assert!(s.history(&a).is_empty());
@@ -510,7 +565,7 @@ mod tests {
         assert!(s.pin("zz", true).is_err());
         assert!(s.delete("zz", 1).is_err());
         assert!(s.restore("zz").is_err());
-        assert_eq!(s.text("zz"), "");
+        assert_eq!(s.text("zz").unwrap(), "");
     }
 
     #[test]
