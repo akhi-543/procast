@@ -143,6 +143,12 @@ impl Timers {
         done.into_iter().map(|e| (e.id, e.label)).collect()
     }
 
+    /// The `rows` whose title contains `query` (case aside): what root search shows.
+    pub fn matching(&self, now: SystemTime, query: &str) -> Vec<(u64, String, String)> {
+        let q = query.trim().to_lowercase();
+        self.rows(now).into_iter().filter(|r| r.1.to_lowercase().contains(&q)).collect()
+    }
+
     /// (id, title, time) of everything running: the time left, or a stopwatch's elapsed time.
     pub fn rows(&self, now: SystemTime) -> Vec<(u64, String, String)> {
         let now = millis(now);
@@ -160,6 +166,12 @@ impl Timers {
             })
             .collect()
     }
+}
+
+/// Whether the timer rows on screen (their ids, in order) are no longer the `rows` that should
+/// show: the list needs rebuilding, not just the times.
+pub fn rows_changed(shown: &[u64], rows: &[(u64, String, String)]) -> bool {
+    shown.len() != rows.len() || shown.iter().zip(rows).any(|(id, r)| *id != r.0)
 }
 
 #[cfg(test)]
@@ -230,6 +242,25 @@ mod tests {
         assert_eq!(t.rows(at(28_500)), vec![(1, "tea".into(), "4:32".into()), (2, "Stopwatch".into(), "0:28".into())]);
         t.cancel(1);
         assert_eq!(t.rows(at(0)).len(), 1);
+    }
+
+    #[test]
+    fn a_query_filters_rows_and_only_a_changed_set_needs_a_rebuild() {
+        let items = vec![Entry { id: 1, label: "Tea".into(), start: 0, length: Some(300_000) }, Entry { id: 2, label: String::new(), start: 0, length: None }];
+        let mut t = Timers { items, ..Default::default() };
+        let at = |s| UNIX_EPOCH + Duration::from_millis(s);
+        let ids = |q: &str| t.matching(at(1_000), q).iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!((ids(""), ids("tea"), ids(" STOP "), ids("x")), (vec![1, 2], vec![1], vec![2], vec![]));
+        // Query "tea" with both running: one row shown, one expected, so a tick only updates times.
+        let rows = t.matching(at(2_000), "tea");
+        assert!(!rows_changed(&[1], &rows));
+        assert!(!rows_changed(&[], &t.matching(at(2_000), "x")));
+        // A row that finished, appeared or swapped does need it.
+        t.cancel(1);
+        assert!(rows_changed(&[1], &t.matching(at(3_000), "tea")));
+        assert!(rows_changed(&[], &t.matching(at(3_000), "")));
+        assert!(rows_changed(&[1, 2], &t.matching(at(3_000), "")));
+        assert!(rows_changed(&[1], &t.matching(at(3_000), "")));
     }
 
     #[test]

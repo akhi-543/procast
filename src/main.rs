@@ -846,9 +846,8 @@ impl Launcher {
     /// Running timers and stopwatches as root rows: all of them in an empty search, else the
     /// ones whose title contains the query.
     fn timer_rows(&self, query: &str) -> Vec<Item> {
-        let q = query.trim().to_lowercase();
         let row = |(id, title, left): (u64, String, String)| Item::new(title, "", Icon::Vector(g::TIMER), Act::StopTimer(id)).acc(left).sec("Timers");
-        self.timers.rows(SystemTime::now()).into_iter().filter(|r| r.1.to_lowercase().contains(&q)).map(row).collect()
+        self.timers.matching(SystemTime::now(), query).into_iter().map(row).collect()
     }
 
     /// Starts the 1 s tick while a timer runs; the thread ends when its flag is set.
@@ -882,18 +881,17 @@ impl Launcher {
             stop.store(true, Ordering::Relaxed);
         }
         if self.visible && self.mode == Mode::Root {
-            if self.items.iter().any(|it| matches!(it.act, Act::StopTimer(_))) {
-                let rows = self.timers.rows(now);
-                // A finished timer's row goes away; the rest only change their time.
-                if self.items.iter().filter(|it| matches!(it.act, Act::StopTimer(_))).count() != rows.len() {
-                    return self.refresh(cx);
-                }
-                for it in &mut self.items {
-                    if let Act::StopTimer(id) = it.act
-                        && let Some(r) = rows.iter().find(|r| r.0 == id)
-                    {
-                        it.accessory = r.2.clone();
-                    }
+            let shown: Vec<u64> = self.items.iter().filter_map(|it| if let Act::StopTimer(id) = it.act { Some(id) } else { None }).collect();
+            let rows = self.timers.matching(now, &self.query(cx));
+            // A finished timer's row goes away; otherwise the rows only change their time.
+            if timers::rows_changed(&shown, &rows) {
+                return self.refresh(cx);
+            }
+            for it in &mut self.items {
+                if let Act::StopTimer(id) = it.act
+                    && let Some(r) = rows.iter().find(|r| r.0 == id)
+                {
+                    it.accessory = r.2.clone();
                 }
             }
             cx.notify();
