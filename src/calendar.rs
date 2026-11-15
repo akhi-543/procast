@@ -302,6 +302,24 @@ pub fn parse_ics(s: &str, from: i64, to: i64) -> Vec<Event> {
     out
 }
 
+/// An `https://` link's host (lower case) and the rest from its path on. The address ends at
+/// the first `/`, `?`, `#` or `\`; a link with a user name, or a port other than 443 or 80, is refused.
+fn split_link(link: &str) -> Option<(String, &str)> {
+    let rest = link.get(8..).filter(|_| link[..8].eq_ignore_ascii_case("https://"))?;
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len()));
+    let host = match authority.split_once(':') {
+        Some((h, "443" | "80")) => h,
+        Some(_) => return None,
+        None => authority,
+    };
+    (!host.is_empty() && !authority.contains('@')).then(|| (host.to_ascii_lowercase(), path))
+}
+
+/// Where a meeting link goes, for the "Join <title> on <host>?" question.
+pub fn link_host(link: &str) -> Option<String> {
+    split_link(link).map(|(host, _)| host)
+}
+
 /// The first Teams, Zoom, Meet or Webex meeting link in `text`.
 pub fn join_link(text: &str) -> Option<String> {
     // (host, path prefix): the host is the domain itself or a subdomain of it.
@@ -309,9 +327,7 @@ pub fn join_link(text: &str) -> Option<String> {
     text.split(|c: char| c.is_whitespace() || "<>\"'()[]".contains(c))
         .map(|w| w.trim_end_matches(['.', ',', ';']))
         .find(|w| {
-            let Some(rest) = w.strip_prefix("https://").or_else(|| w.strip_prefix("http://")) else { return false };
-            let (host, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
-            let host = host.to_ascii_lowercase();
+            let Some((host, path)) = split_link(w) else { return false };
             MEETINGS.iter().any(|(h, p)| (host == *h || host.ends_with(&format!(".{h}"))) && path.starts_with(p) && path.len() > 1)
         })
         .map(str::to_string)
@@ -366,9 +382,8 @@ impl Calendar {
                     self.feeds.insert(url, events);
                 }
                 Err(e) => {
-                    let host = crate::focus::host_of(&url_of(&url)).unwrap_or_default();
                     if self.failed.insert(url) {
-                        say.push(format!("Calendar {host}: {e}"));
+                        say.push(format!("Calendar: {e}"));
                     }
                 }
             }
@@ -460,13 +475,26 @@ fn url_of(url: &str) -> String {
         .map_or_else(|| u.to_string(), |p| format!("https://{}", &u[p.len()..]))
 }
 
+/// What a failed fetch says. Only the host goes in: ureq's own text can hold the whole address,
+/// and a feed address is a secret (its path is the key).
+fn fetch_error(e: &ureq::Error, host: &str) -> String {
+    match e {
+        ureq::Error::StatusCode(code) => format!("HTTP {code} from {host}"),
+        ureq::Error::Timeout(_) => format!("{host} timed out"),
+        ureq::Error::BadUri(_) => "that calendar address is not valid".into(),
+        _ => format!("could not reach {host}"),
+    }
+}
+
 /// Blocks on the network: call from a worker thread. Keeps the days around now.
 pub fn fetch(url: &str) -> Result<Vec<Event>, String> {
+    let url = url_of(url);
+    let Some(host) = crate::focus::host_of(&url) else { return Err("that calendar address is not valid".into()) };
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
-    let mut resp = agent.get(url_of(url)).call().map_err(|e| e.to_string())?;
-    let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let mut resp = agent.get(&url).call().map_err(|e| fetch_error(&e, &host))?;
+    let body = resp.body_mut().read_to_string().map_err(|e| fetch_error(&e, &host))?;
     if !body.contains("BEGIN:VCALENDAR") {
-        return Err("that is not an ICS calendar".into());
+        return Err(format!("{host} did not send an ICS calendar"));
     }
     let now = crate::search::now() as i64;
     Ok(parse_ics(&body, now - DAY, now + 3 * DAY))
@@ -575,6 +603,25 @@ mod tests {
         }
         assert_eq!(join_link("see https://example.com/?u=zoom.us/j/1"), None);
         assert_eq!(join_link("https://notzoom.us/j/1"), None);
+        // The address ends at / ? # or \, whatever comes after it.
+        for bad in [
+            "https://evil.com?.zoom.us/j/1",
+            "https://evil.com#.zoom.us/j/1",
+            "https://evil.com\\.zoom.us/j/1",
+            "https://evil.com?.teams.microsoft.com/l/meetup-join/x",
+            "https://zoom.us@evil.com/j/1",
+            "https://zoom.us:pw@evil.com/j/1",
+            "https://zoom.us:8443/j/1",
+            "https://zoom.us.evil.com/j/1",
+            "http://zoom.us/j/1",
+            "ftp://zoom.us/j/1",
+            "https://@zoom.us/j/1",
+        ] {
+            assert_eq!(join_link(bad), None, "{bad}");
+        }
+        assert_eq!(join_link("https://ZOOM.us/j/1").as_deref(), Some("https://ZOOM.us/j/1"));
+        assert_eq!(join_link("HTTPS://Acme.Zoom.US:443/j/1").as_deref(), Some("HTTPS://Acme.Zoom.US:443/j/1"));
+        assert_eq!(link_host("HTTPS://Acme.Zoom.US:443/j/1").as_deref(), Some("acme.zoom.us"));
         assert_eq!(join_link("https://meet.google.com/"), None);
         assert_eq!(join_link("no link"), None);
     }
@@ -635,12 +682,27 @@ mod tests {
         assert!(c.done(vec![(url.clone(), Ok(vec![ev(1, 2, "A")]))]).is_empty());
         assert!(!c.wants_fetch(1, t + REFRESH - Duration::from_secs(1)) && c.wants_fetch(1, t + REFRESH));
         let say = c.done(vec![(url.clone(), Err("http status: 500".into()))]);
-        assert_eq!(say, vec!["Calendar cal.example.com: http status: 500".to_string()]);
+        assert_eq!(say, vec!["Calendar: http status: 500".to_string()]);
         assert!(!say[0].contains("secret"));
         assert!(c.done(vec![(url.clone(), Err("again".into()))]).is_empty());
         assert_eq!(c.events(std::slice::from_ref(&url), &[]).len(), 1);
         c.done(vec![(url.clone(), Ok(vec![]))]);
         assert_eq!(c.done(vec![(url, Err("down".into()))]).len(), 1, "told again after a good fetch");
+    }
+
+    #[test]
+    fn fetch_errors_never_repeat_the_address() {
+        // ureq's own text for an address without a host holds the whole address.
+        let e = ureq::Agent::config_builder().build().new_agent().get("/private/token.ics").call().unwrap_err();
+        assert!(matches!(e, ureq::Error::BadUri(_)) && e.to_string().contains("token"), "{e}");
+        assert_eq!(fetch_error(&e, "cal.example.com"), "that calendar address is not valid");
+        assert_eq!(fetch_error(&ureq::Error::StatusCode(404), "cal.example.com"), "HTTP 404 from cal.example.com");
+        assert_eq!(fetch_error(&ureq::Error::HostNotFound, "cal.example.com"), "could not reach cal.example.com");
+        assert_eq!(fetch_error(&ureq::Error::Timeout(ureq::Timeout::Global), "cal.example.com"), "cal.example.com timed out");
+        // And the entries that never reach ureq.
+        for bad in ["/private/token.ics", "token.ics", "ftp://x.com/token.ics", ""] {
+            assert_eq!(fetch(bad), Err("that calendar address is not valid".to_string()), "{bad}");
+        }
     }
 
     #[test]

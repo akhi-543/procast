@@ -3532,7 +3532,7 @@ impl Render for Launcher {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
             (None, Some(it)) if self.armed == Some(self.selected) => match &it.act {
-                Act::Join(title, _) => format!("Join {title}? Press ↵ again"),
+                Act::Join(title, url) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(url).unwrap_or_default()),
                 _ => format!("Press ↵ again to {}", it.title),
             },
             (None, Some(_)) => match &primary {
