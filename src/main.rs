@@ -15,6 +15,7 @@ mod scripts;
 mod search;
 mod settings;
 mod snippets;
+mod system;
 mod toast;
 mod win;
 
@@ -1619,7 +1620,7 @@ impl Launcher {
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
             Act::Open(target) | Act::File(target) => win::open(&target),
             Act::Reveal(path) => win::reveal(&path),
-            Act::Run(cmdline) => win::run(&cmdline),
+            Act::Run(cmdline) => win::run(&cmdline, &self.cfg.search),
             Act::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             Act::Paste(text) => return self.paste(text, cx),
             Act::Clip(key) => {
@@ -1738,7 +1739,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = commands::run_layout(&layout, &w, &ids) {
-                        let _ = tx.unbounded_send(Msg::Toast(e));
+                        let _ = tx.unbounded_send(Msg::Toast(false, e));
                     }
                 });
                 return;
@@ -1752,8 +1753,12 @@ impl Launcher {
                 let w = self.cfg.window.clone();
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = commands::run(cmd, HWND(target as _), &w) {
-                        let _ = tx.unbounded_send(Msg::Toast(e));
+                    let said = match commands::run(cmd, HWND(target as _), &w) {
+                        Ok(done) => done.map(|d| (true, d)),
+                        Err(e) => Some((false, e)),
+                    };
+                    if let Some((ok, text)) = said {
+                        let _ = tx.unbounded_send(Msg::Toast(ok, text));
                     }
                 });
                 return;
@@ -1973,7 +1978,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = desktops::rename(&value) {
-                        let _ = tx.unbounded_send(Msg::Toast(e));
+                        let _ = tx.unbounded_send(Msg::Toast(false, e));
                     }
                 });
             }
@@ -2120,7 +2125,7 @@ impl Launcher {
                 }
             }
             // Handled by the message loop, between updates.
-            Msg::Toast(_) => {}
+            Msg::Toast(..) => {}
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -3308,10 +3313,10 @@ fn main() {
                     }
                     continue;
                 }
-                if let Msg::Toast(text) = msg {
+                if let Msg::Toast(ok, text) = msg {
                     let text: String = text.lines().next().unwrap_or_default().chars().take(200).collect();
                     let theme = handle.update(cx, |this, _, _| this.cfg.theme.clone()).unwrap_or_default();
-                    toast::show(cx, toast, text, theme);
+                    toast::show(cx, toast, ok, text, theme);
                     continue;
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window

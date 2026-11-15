@@ -299,6 +299,10 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         }
         items.push(Item::new(title, cmd.subtitle(), Icon::Vector(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
     }
+    for &(title, page, words) in crate::system::SETTINGS_PAGES {
+        let it = Item::new(title, "Windows Settings", Icon::Vector(g::SETTING), Act::Open(format!("ms-settings:{page}")));
+        items.push(it.acc("Windows Settings").keyed(format!("ms:{page}")).words(&format!("settings {words}")).tinted(Tint::System));
+    }
     for l in &cfg.window.layouts {
         items.push(Item::new(format!("Layout: {}", l.name), "Window", Icon::Vector(g::TILES), Act::Layout(l.name.clone())).acc("Command").keyed(format!("wl:{}", l.name)).words("window arrange preset").tinted(Tint::Window));
     }
@@ -354,14 +358,17 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
     hits
 }
 
-/// How a query meets a title, strongest first: the whole title, its start, the start of a
-/// word, the initials. Scattered letters ("sear*c*h fi*l*es" for "cl") get nothing extra.
+/// How a query meets a title, strongest first: the whole title, a whole word ("ai" in
+/// "Ask AI"), the title's start, the start of a word, the initials. Scattered letters
+/// ("sear*c*h fi*l*es" for "cl") get nothing extra.
 fn tier(title: &str, q: &str) -> f64 {
     let (t, q) = (title.to_lowercase(), q.to_lowercase());
     let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
     if t == q {
         1000.
+    } else if words.iter().any(|w| *w == q) {
+        700.
     } else if t.starts_with(&q) {
         600.
     } else if words.iter().any(|w| w.starts_with(&q)) {

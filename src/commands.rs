@@ -2,7 +2,12 @@
 //! `run` is called off the UI thread: several of these broadcast or send window messages
 //! that would re-enter GPUI if issued from inside an update.
 
-use crate::{config, design::Tint, desktops};
+use crate::{
+    config,
+    design::Tint,
+    desktops,
+    system::{self, RadioOf, Volume},
+};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM},
@@ -42,6 +47,12 @@ pub enum Cmd {
     SignOut,
     EmptyBin,
     ToggleDarkMode,
+    Volume(Volume),
+    Radio(RadioOf),
+    ToggleHiddenFiles,
+    RestartExplorer,
+    EjectDrives,
+    EmptyTemp,
     Snap(Snap),
     Minimize,
     /// Minimize every window except the one you came from.
@@ -129,6 +140,15 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::SignOut, "Sign Out", "log out logoff", g::SIGN_OUT),
     (Cmd::EmptyBin, "Empty Recycle Bin", "trash", g::DELETE),
     (Cmd::ToggleDarkMode, "Toggle Dark Mode", "theme appearance light", g::PERSONALIZE),
+    (Cmd::Volume(Volume::Up), "Volume Up", "sound louder audio", g::AUDIO),
+    (Cmd::Volume(Volume::Down), "Volume Down", "sound quieter audio", g::AUDIO),
+    (Cmd::Volume(Volume::Mute), "Toggle Mute", "sound volume silence audio unmute", g::AUDIO),
+    (Cmd::Radio(RadioOf::WiFi), "Toggle Wi-Fi", "wireless network wlan on off", g::NETWORK),
+    (Cmd::Radio(RadioOf::Bluetooth), "Toggle Bluetooth", "wireless bt on off", g::NETWORK),
+    (Cmd::ToggleHiddenFiles, "Toggle Hidden Files", "explorer show hide hidden files folders", g::FOLDER),
+    (Cmd::RestartExplorer, "Restart Explorer", "taskbar shell explorer.exe reload", g::REFRESH),
+    (Cmd::EjectDrives, "Eject USB Drives", "eject safely remove usb stick disk drive unmount", g::DOWNLOAD),
+    (Cmd::EmptyTemp, "Empty Temp Folder", "clean temporary files cleanup disk space", g::DELETE),
     (Cmd::Snap(Snap::LeftHalf), "Left Half", "window", g::DOCK_LEFT),
     (Cmd::Snap(Snap::RightHalf), "Right Half", "window", g::DOCK_RIGHT),
     (Cmd::Snap(Snap::TopHalf), "Top Half", "window", g::UP),
@@ -198,7 +218,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
 impl Cmd {
     /// Asks for a second Enter before running.
     pub fn destructive(self) -> bool {
-        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::CloseOthers | Cmd::Desktop(Desk::Close))
+        matches!(self, Cmd::Restart | Cmd::ShutDown | Cmd::SignOut | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::RestartExplorer | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::CloseOthers | Cmd::Desktop(Desk::Close))
     }
 
     pub fn key(self) -> String {
@@ -235,9 +255,16 @@ impl Cmd {
 }
 
 /// Runs a system or window command. `target` is the window that was active before procast.
-pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
+/// Some say how it went ("Wi-Fi off"), for a toast.
+pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>, String> {
     unsafe {
         match cmd {
+            Cmd::Volume(v) => system::volume(v),
+            Cmd::Radio(r) => return system::toggle_radio(r).map(Some),
+            Cmd::ToggleHiddenFiles => return Ok(Some(if system::toggle_hidden_files() { "Hidden files shown" } else { "Hidden files hidden" }.into())),
+            Cmd::RestartExplorer => return system::restart_explorer().map(|_| None),
+            Cmd::EjectDrives => return system::eject_drives().map(Some),
+            Cmd::EmptyTemp => return Ok(Some(system::empty_temp())),
             Cmd::Lock => drop(LockWorkStation()),
             Cmd::Sleep => drop(SetSuspendState(false, false, false)),
             Cmd::Restart => shutdown("/r"),
@@ -247,7 +274,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
             Cmd::ToggleDarkMode => toggle_dark_mode(),
             Cmd::Snap(s) => snap(target, s, w),
             Cmd::Desktop(Desk::MoveTo(_) | Desk::MoveNext | Desk::MovePrev) if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
-            Cmd::Desktop(d) => return desktop(d, target),
+            Cmd::Desktop(d) => return desktop(d, target).map(|_| None),
             Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
             Cmd::Minimize => _ = ShowWindow(target, SW_MINIMIZE),
             Cmd::ToggleMaximize => _ = ShowWindow(target, if IsZoomed(target).as_bool() { SW_RESTORE } else { SW_MAXIMIZE }),
@@ -260,7 +287,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
             Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn desktop(d: Desk, target: HWND) -> Result<(), String> {

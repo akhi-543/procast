@@ -26,6 +26,7 @@ winvd = { git = "https://github.com/Ciantic/VirtualDesktopAccessor", rev = "ef74
 # winvd takes its own HWND type from windows 0.58: this names it to convert at the boundary.
 windows058 = { package = "windows", version = "0.58", features = ["Win32_Foundation"] }
 windows = { version = "0.62", features = [
+    "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
     "Graphics_Imaging",

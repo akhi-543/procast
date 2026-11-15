@@ -91,8 +91,8 @@ pub enum Msg {
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
-    /// A command failed: shown as a toast that fades away.
-    Toast(String),
+    /// A command's result (true) or why it failed (false): shown as a toast that fades away.
+    Toast(bool, String),
 }
 
 pub enum TrayCmd {
@@ -590,10 +590,57 @@ pub fn local_time_of(unix: u64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute)
 }
 
-/// Windows Run: first token is the program, the rest its arguments.
-pub fn run(cmdline: &str) {
-    let (file, args) = cmdline.split_once(' ').unwrap_or((cmdline, ""));
+/// Windows Run: a `>` command line, run as `[search] shell` and `terminal` say.
+pub fn run(cmdline: &str, s: &crate::config::Search) {
+    let (file, args) = run_target(cmdline, &s.shell, s.terminal);
     shell("open", file.into(), args.into());
+}
+
+/// The program and arguments for a command line. `run` is Windows Run: the first word (or
+/// a "quoted path") is the program. A shell stays open on what the line printed.
+fn run_target(line: &str, shell: &str, terminal: bool) -> (String, String) {
+    let (file, args) = match shell {
+        "cmd" => ("cmd.exe".to_string(), format!("/k {line}")),
+        // Encoded, so quotes in the line reach PowerShell as typed.
+        "powershell" | "pwsh" => (format!("{shell}.exe"), format!("-NoExit -EncodedCommand {}", base64_utf16(line))),
+        _ => {
+            let (file, args) = match line.strip_prefix('"').and_then(|l| l.split_once('"')) {
+                Some((file, rest)) => (file, rest.trim_start()),
+                None => line.split_once(' ').unwrap_or((line, "")),
+            };
+            return (file.to_string(), args.to_string());
+        }
+    };
+    // Windows Terminal reads `;` as "new tab": escaped, it reaches the shell.
+    if terminal { ("wt.exe".into(), format!("{file} {}", args.replace(';', "\\;"))) } else { (file, args) }
+}
+
+/// UTF-16LE then base64: what `-EncodedCommand` takes.
+fn base64_utf16(s: &str) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[test]
+fn run_lines_reach_their_shell() {
+    let t = |l, s, wt| run_target(l, s, wt);
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(t("notepad a.txt", "run", false), pair("notepad", "a.txt"));
+    assert_eq!(t(r#""C:\Program Files\x.exe" -v"#, "run", false), pair(r"C:\Program Files\x.exe", "-v"));
+    assert_eq!(t("dir", "run", true), pair("dir", ""), "Windows Run has no terminal");
+    assert_eq!(t("dir & ver", "cmd", false), pair("cmd.exe", "/k dir & ver"));
+    assert_eq!(t("a; b", "cmd", true), pair("wt.exe", r"cmd.exe /k a\; b"));
+    assert_eq!(t("ls", "pwsh", false), pair("pwsh.exe", "-NoExit -EncodedCommand bABzAA=="));
+    assert_eq!(base64_utf16("Get-Date"), "RwBlAHQALQBEAGEAdABlAA==");
 }
 
 #[cfg(test)]

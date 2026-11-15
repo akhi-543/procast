@@ -88,7 +88,7 @@ fn table_rows(list: &'static str, text: &str) -> Vec<Row> {
     out
 }
 
-const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts", "Layouts"];
+const CATEGORIES: &[&str] = &["All", "Commands", "Applications", "Extensions", "Quicklinks", "Snippets", "Scripts", "Layouts", "Windows Settings"];
 
 /// The Shortcuts category an item belongs to, from its key prefix.
 fn category(it: &Item) -> &'static str {
@@ -99,6 +99,7 @@ fn category(it: &Item) -> &'static str {
         Some("sn") => "Snippets",
         Some("sc") => "Scripts",
         Some("wl") => "Layouts",
+        Some("ms") => "Windows Settings",
         _ => "Applications",
     }
 }
@@ -248,6 +249,13 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 vec![
                     row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in procast with Ctrl+K → Add to Favorites."),
                     row("Hidden", "launcher.hidden", Kind::Keys, "Left out of results; aliases and hotkeys still work. Hide with Ctrl+K → Hide from Root Search."),
+                ],
+            ),
+            (
+                "Windows Run",
+                vec![
+                    row("Run with", "search.shell", Kind::Choice(&["run", "cmd", "powershell", "pwsh"]), "What runs a line typed after >. Run works like Win+R; a shell stays open on what the command printed."),
+                    row("In Windows Terminal", "search.terminal", Kind::Bool, "Open that shell as a Windows Terminal tab instead of its own window."),
                 ],
             ),
             (

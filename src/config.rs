@@ -435,6 +435,10 @@ pub struct Search {
     pub fallback: String,
     /// Rows offered for any query, in order: "web" (the URL above), "chatgpt", "ai", or a quicklink's name.
     pub fallbacks: Vec<String>,
+    /// What runs a `>` command line: run (Windows Run) | cmd | powershell | pwsh.
+    pub shell: String,
+    /// Open that shell in Windows Terminal instead of its own console window.
+    pub terminal: bool,
 }
 
 impl Default for Config {
@@ -483,7 +487,7 @@ impl Default for Ai {
 
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec() }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec(), shell: "run".into(), terminal: false }
     }
 }
 
@@ -528,6 +532,8 @@ auto_quit_minutes = 60
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
 fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", or a quicklink name with {query}
+shell = "run"                 # what runs "> command": run (like Win+R) | cmd | powershell | pwsh
+terminal = false              # open that shell in Windows Terminal
 
 [ai]
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus

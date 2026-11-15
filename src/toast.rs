@@ -23,6 +23,7 @@ const OUT: Duration = Duration::from_millis(200);
 
 pub struct Toast {
     text: String,
+    ok: bool,
     theme: config::Theme,
     /// Bumped per toast: restarts the animation, and lets an older timer see it was replaced.
     id: u64,
@@ -33,7 +34,7 @@ pub struct Toast {
 impl Render for Toast {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let t = design::Tokens::from_theme(&self.theme, window);
-        let pill = design::toast(&self.text, &t);
+        let pill = design::toast(&self.text, self.ok, &t);
         // ponytail: gpui ignores the Windows "show animations" setting, so the rise always runs;
         // read SPI_GETCLIENTAREAANIMATION into cx.set_reduce_motion if that matters.
         let pill = if self.leaving {
@@ -47,13 +48,13 @@ impl Render for Toast {
 
 /// Shows `text` as a toast, replacing any that is showing. Call between updates (it moves a
 /// window, and Windows answers that synchronously through gpui's window proc).
-pub fn show(cx: &mut AsyncApp, slot: Option<WindowHandle<Toast>>, text: String, theme: config::Theme) {
+pub fn show(cx: &mut AsyncApp, slot: Option<WindowHandle<Toast>>, ok: bool, text: String, theme: config::Theme) {
     let Some(handle) = slot else { return };
     let Ok(hwnd) = handle.update(cx, |this, _, _| this.hwnd) else { return };
     win::place_toast(hwnd, &win::screen("active"), W, H);
     let Ok(id) = handle.update(cx, |this, _, cx| {
         this.id += 1;
-        (this.text, this.theme, this.leaving) = (text, theme, false);
+        (this.text, this.ok, this.theme, this.leaving) = (text, ok, theme, false);
         win::cloak(this.hwnd, false);
         cx.notify();
         this.id
@@ -91,7 +92,7 @@ pub fn open(cx: &mut AsyncApp) -> Option<WindowHandle<Toast>> {
         windows_window_background: gpui::WindowsWindowBackground::Transparent,
         ..Default::default()
     };
-    let handle = cx.open_window(options, |_, cx| cx.new(|_| Toast { text: String::new(), theme: config::Theme::default(), id: 0, leaving: false, hwnd: HWND::default() })).ok()?;
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| Toast { text: String::new(), ok: false, theme: config::Theme::default(), id: 0, leaving: false, hwnd: HWND::default() })).ok()?;
     handle
         .update(cx, |this, window, _| {
             this.hwnd = win::hwnd(window);
