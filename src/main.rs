@@ -16,6 +16,7 @@ mod ntfs;
 mod scripts;
 mod search;
 mod settings;
+mod shots;
 mod snippets;
 mod system;
 mod timers;
@@ -131,6 +132,8 @@ enum Mode {
     Translate,
     /// A dictionary answer (see `Launcher::define`).
     Define,
+    /// Screenshot search (see `Launcher::shots`).
+    Shots,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -353,6 +356,10 @@ struct Launcher {
     /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
     define: Option<(String, Option<Result<dict::Answer, String>>)>,
     define_seq: u64,
+    /// Screenshot search: the index as last scanned, the newest scan's number (older scans' answers are dropped) and whether it is still reading pictures.
+    shots: shots::ShotIndex,
+    shots_seq: u64,
+    shots_busy: bool,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -452,6 +459,9 @@ impl Launcher {
             translate_seq: 0,
             define: None,
             define_seq: 0,
+            shots: shots::ShotIndex::default(),
+            shots_seq: 0,
+            shots_busy: false,
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -728,6 +738,7 @@ impl Launcher {
                 search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
+            Mode::Shots => shots::rows(&self.shots, &query, &self.cfg.screenshots.primary, 200),
             Mode::Files => {
                 // Results arrive later as Msg::Files; keep showing the previous ones meanwhile.
                 self.file_gen += 1;
@@ -874,6 +885,14 @@ impl Launcher {
         if self.items.is_empty() && self.mode == Mode::Clipboard {
             let hint = if query.trim().is_empty() { "Text, images and files you copy show up here" } else { "Nothing copied matches" };
             self.items = vec![empty_row(g::PASTE, if query.trim().is_empty() { "Nothing copied yet" } else { "No matches" }.into(), hint.into(), vec![])];
+        }
+        if self.items.is_empty() && self.mode == Mode::Shots {
+            let (title, hint) = match (self.shots_busy, query.trim().is_empty()) {
+                (true, _) => ("Reading screenshots…", "Text in new pictures is found in the background".to_string()),
+                (_, false) => ("No matches", "Nothing in your screenshots matches".to_string()),
+                _ => ("No screenshots found", format!("Looked in {}", shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", "))),
+            };
+            self.items = vec![empty_row(g::PICTURE, title.into(), hint, vec![])];
         }
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
@@ -1024,6 +1043,9 @@ impl Launcher {
         {
             f.refresh_if_stale(Duration::from_secs(3600));
         }
+        if mode == Mode::Shots {
+            self.scan_shots();
+        }
         if mode == Mode::Store {
             self.load_store();
         }
@@ -1065,6 +1087,7 @@ impl Launcher {
                 "clipboard" => Mode::Clipboard,
                 "emoji" => Mode::Emoji,
                 "files" => Mode::Files,
+                "shots" => Mode::Shots,
                 "running" => Mode::Running,
                 "tabs" => Mode::Tabs,
                 _ => Mode::Root,
@@ -1289,6 +1312,54 @@ impl Launcher {
         if self.mode == Mode::Define {
             self.refresh(cx);
         }
+    }
+
+    // ---- screenshots -----------------------------------------------------------------
+
+    /// Brings the screenshot index up to date on a worker thread; the view fills in as
+    /// each batch of pictures has been read.
+    fn scan_shots(&mut self) {
+        self.shots_seq += 1;
+        self.shots_busy = true;
+        let (seq, tx, s) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone());
+        std::thread::spawn(move || {
+            let run = || shots::rescan(&shots::folders(&s.folders), shots::keep(&s.keep), s.all_media, s.ocr, |index| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone())))));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            let _ = tx.unbounded_send(Msg::Shots(seq, None));
+        });
+    }
+
+    fn on_shots(&mut self, seq: u64, index: Option<shots::ShotIndex>, cx: &mut Context<Self>) {
+        if seq != self.shots_seq {
+            return;
+        }
+        match index {
+            Some(index) => self.shots = index,
+            None => self.shots_busy = false,
+        }
+        if self.mode == Mode::Shots {
+            // New results arrive while you browse: keep the selection where it is.
+            let at = self.selected;
+            self.refresh(cx);
+            self.selected = at.min(self.items.len().saturating_sub(1));
+            self.scroll_to_selected();
+        }
+    }
+
+    /// Puts a screenshot (the newest when `path` is None) on the clipboard as an image, and
+    /// pastes it into the app you came from if `paste`. The work runs off the UI thread.
+    fn shot_to_clipboard(&mut self, path: Option<PathBuf>, paste: bool, cx: &mut Context<Self>) {
+        self.hide(true, cx);
+        let (owner, tx, folders) = (self.hwnd.0 as isize, self.tx.clone(), shots::folders(&self.cfg.screenshots.folders));
+        std::thread::spawn(move || {
+            let put = || shots::put_image(HWND(owner as _), path, &folders);
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(put)).unwrap_or_else(|_| Err("Could not read that screenshot".into()));
+            match done {
+                Ok(()) if paste => clipboard::paste_soon(),
+                Ok(()) => drop(tx.unbounded_send(Msg::Toast(true, "Screenshot copied".into()))),
+                Err(e) => drop(tx.unbounded_send(Msg::Toast(false, e))),
+            }
+        });
     }
 
     // ---- Quick AI -------------------------------------------------------------------
@@ -1969,6 +2040,10 @@ impl Launcher {
             }
             Act::None => return,
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
+            Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
+            Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
+            Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
+            Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
             Act::Cmd(Cmd::ClipboardHistory) => return self.set_mode(Mode::Clipboard, cx),
             Act::Cmd(Cmd::Emoji) => return self.set_mode(Mode::Emoji, cx),
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
@@ -2117,7 +2192,7 @@ impl Launcher {
     fn needs_window(&self, act: &Act) -> bool {
         match act {
             Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -2448,6 +2523,7 @@ impl Launcher {
             Msg::TimerTick => self.on_timer_tick(cx),
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
+            Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2487,14 +2563,14 @@ impl Launcher {
             }
             Msg::FilePreview(key, img) => {
                 self.file_images.insert(key, img);
-                if self.visible && self.mode == Mode::Files {
+                if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
                 }
             }
             Msg::FilePreviewDropped(key) => {
                 self.file_images.remove(&key);
                 // Re-selected meanwhile? The next render asks again.
-                if self.visible && self.mode == Mode::Files {
+                if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
                 }
             }
@@ -2568,6 +2644,7 @@ impl Launcher {
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate => Some("Translator".into()),
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
+            Mode::Shots => Some("Screenshots".into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -2605,6 +2682,7 @@ impl Launcher {
                 .into(),
             Mode::Output => "Enter copies the output".into(),
             Mode::Define => "Enter copies the definition".into(),
+            Mode::Shots => "Search screenshots by text or name…".into(),
             Mode::Translate => if self.cfg.translator.primary == "paste" { "Enter pastes the translation" } else { "Enter copies the translation" }.into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
@@ -2615,6 +2693,9 @@ impl Launcher {
     fn footer_left(&self) -> String {
         if let Some((_, s)) = &self.status {
             return s.clone();
+        }
+        if self.mode == Mode::Shots && self.shots_busy {
+            return "Reading screenshots…".into();
         }
         if self.mode == Mode::Files
             && let Some(f) = &self.files
@@ -2657,6 +2738,7 @@ impl Launcher {
             Mode::Ai => Icon::Vector(g::SPARKLES),
             Mode::Translate => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
+            Mode::Shots => Icon::Vector(g::PICTURE),
         }
     }
 
@@ -2844,7 +2926,7 @@ impl Launcher {
     /// File Search's right-hand pane: a preview, then the file's information.
     fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
         let path = match self.items.get(self.selected).map(|it| &it.act) {
-            Some(Act::File(p)) => p.clone(),
+            Some(Act::File(p) | Act::CopyShot(p) | Act::PasteShot(p)) => p.clone(),
             _ => return div().flex_1().into_any_element(),
         };
         if self.file_info.as_ref().is_none_or(|f| f.0 != path) {
@@ -3024,9 +3106,9 @@ fn act_glyph(act: &Act) -> &'static str {
     match act {
         Act::Favorite(..) => g::STAR,
         Act::Hide(_) => g::CANCEL,
-        Act::Copy(_) | Act::CopyClip(_) => g::COPY,
+        Act::Copy(_) | Act::CopyClip(_) | Act::CopyShot(_) => g::COPY,
         Act::PinClip(..) => g::PIN,
-        Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => g::PASTE,
+        Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) | Act::PasteShot(_) => g::PASTE,
         Act::Open(_) => g::GLOBE,
         Act::File(_) => g::DOCUMENT,
         Act::Reveal(_) => g::FOLDER,
@@ -3077,7 +3159,7 @@ impl Render for Launcher {
         let grid = self.grid().then(|| self.grid_view(&t, cx));
         let side = match self.mode {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
-            Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
+            Mode::Files | Mode::Shots if empty.is_none() => Some(self.file_detail(&t)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
@@ -3161,7 +3243,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || self.mode == Mode::Clipboard { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Shots) { 110. } else { design::ACCESSORY_MAX };
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {

@@ -83,6 +83,10 @@ pub enum Cmd {
     Translate,
     /// Ask for a word in the search bar (`define dog`).
     Define,
+    /// Search the screenshot folders by the text in each picture.
+    SearchScreenshots,
+    /// Put the newest screenshot on the clipboard and paste it into the app you came from.
+    PasteLatestScreenshot,
     Quit,
 }
 
@@ -150,6 +154,8 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
     (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
+    (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::PICTURE),
+    (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::PICTURE),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -255,6 +261,7 @@ impl Cmd {
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
             Cmd::Translate => "Translator",
             Cmd::Define => "Dictionary",
+            Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -264,8 +271,8 @@ impl Cmd {
     pub fn tint(self) -> Tint {
         match self {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
-            Cmd::SearchFiles => Tint::File,
-            Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
+            Cmd::SearchFiles | Cmd::SearchScreenshots => Tint::File,
+            Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot => Tint::Paste,
             Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
@@ -304,7 +311,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
         }
     }
     Ok(None)

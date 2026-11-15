@@ -88,6 +88,8 @@ pub enum Msg {
     Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<crate::translate::Translation, String> },
     /// A word was looked up (or the dictionary could not be fetched): the request number, the word, the answer.
     Defined { seq: u64, word: String, result: Result<crate::dict::Answer, String> },
+    /// Screenshot search: the scan's number and the index so far, or None when the scan is over.
+    Shots(u64, Option<crate::shots::ShotIndex>),
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.

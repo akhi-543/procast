@@ -81,6 +81,9 @@ pub enum Act {
     StartTimer(u64, String),
     /// Cancel a timer, or stop a stopwatch and copy its time, by id.
     StopTimer(u64),
+    /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
+    CopyShot(String),
+    PasteShot(String),
     /// Look a word up in the offline dictionary; the answer opens in its own view.
     Define(String),
     /// Translate with DeepL; the result opens in its own view or pastes over the selection.
@@ -99,11 +102,13 @@ impl Act {
             Act::Run(_) | Act::Script(_) => "Run",
             Act::Ask(_) => "Ask",
             Act::Copy(_) | Act::CopyClip(_) => "Copy",
+            Act::CopyShot(_) => "Copy Image",
+            Act::PasteShot(_) => "Paste Image",
             Act::PinClip(_, true) => "Pin Entry",
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots) => "Open",
             Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) | Act::Layout(_) => "Run Command",
             Act::ExtFn(_) => "Run Action",

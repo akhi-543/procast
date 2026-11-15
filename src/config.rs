@@ -25,6 +25,7 @@ pub struct Config {
     pub ai: Ai,
     pub translator: Translator,
     pub dictionary: Dictionary,
+    pub screenshots: Screenshots,
     /// `[[translate]]`: commands that translate the selected text into one language.
     pub translate: Vec<TranslateCmd>,
     pub clipboard: Clipboard,
@@ -464,6 +465,7 @@ impl Default for Config {
             ai: Ai::default(),
             translator: Translator::default(),
             dictionary: Dictionary::default(),
+            screenshots: Screenshots::default(),
             translate: vec![],
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
@@ -492,6 +494,28 @@ pub struct Ai {
 impl Default for Ai {
     fn default() -> Self {
         Self { model: "haiku".into() }
+    }
+}
+
+/// Screenshot search: the pictures in your screenshot folders, found by the text in them.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Screenshots {
+    /// Folders searched. Empty = Pictures\Screenshots.
+    pub folders: Vec<String>,
+    /// How long a screenshot stays listed: 1h | 1d | 7d | 30d | 90d | 180d | 365d | unlimited.
+    pub keep: String,
+    /// Find the text in screenshots (Windows' own OCR, offline) so search finds them.
+    pub ocr: bool,
+    /// Also list videos (their text is not read).
+    pub all_media: bool,
+    /// Enter: copy | paste (into the app you came from) | open.
+    pub primary: String,
+}
+
+impl Default for Screenshots {
+    fn default() -> Self {
+        Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into() }
     }
 }
 
@@ -625,6 +649,13 @@ prefill_selection = false     # "Translate" starts from the text selected in the
 
 [dictionary]
 enabled = true                # define dog: offline WordNet, downloaded once (16 MB) into %APPDATA%\procast\wordnet
+
+[screenshots]
+folders = []                  # searched for pictures; empty = Pictures\Screenshots, e.g. ["D:\\Shots"]
+keep = "unlimited"            # how long a screenshot stays listed: 1h | 1d | 7d | 30d | 90d | 180d | 365d | unlimited
+ocr = true                    # find text in screenshots (Windows' own OCR, offline); off lists them by name only
+all_media = false             # also list videos (their text is not read)
+primary = "copy"              # Enter: copy | paste (into the app you came from) | open
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account

@@ -301,7 +301,7 @@ pub fn watch(tx: UnboundedSender<Msg>) {
 }
 
 /// The text Windows' own OCR finds in an image (offline, in your Windows display languages).
-fn recognise(png: &[u8]) -> Option<String> {
+pub(crate) fn recognise(png: &[u8]) -> Option<String> {
     use windows::{
         Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},
         Media::Ocr::OcrEngine,
