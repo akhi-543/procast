@@ -120,19 +120,19 @@ struct Row {
 const SECTIONS: [&str; 13] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Window", "Theme", "Extensions", "Advanced"];
 /// The sidebar icon of each section, in `SECTIONS` order.
 const SECTION_ICONS: [&str; 13] = [
-    design::g::SETTING,
+    design::g::SLIDERS_HORIZONTAL,
     design::g::SEARCH,
     design::g::KEYBOARD,
     design::g::APP,
     design::g::PASTE,
-    design::g::EDIT,
+    design::g::TEXT_CURSOR_INPUT,
     design::g::LINK,
     design::g::EMOJI,
     design::g::FOLDER,
-    design::g::DOCK_LEFT,
+    design::g::WIN_LEFT_HALF,
     design::g::PERSONALIZE,
     design::g::PUZZLE,
-    design::g::CODE,
+    design::g::WRENCH,
 ];
 
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
@@ -1361,7 +1361,7 @@ fn preview(t: &design::Tokens) -> impl IntoElement {
     design::glass_window(t)
         .flex_none()
         .child(design::search_bar(design::search_mark(t), query, [], t))
-        .child(div().py(px(design::LIST_PAD)).child(row(g::FOLDER, "Search Files", "Files", Tint::File, false)).child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true)).child(row(g::DOCK_LEFT, "Left Half", "Window", Tint::Window, false)).child(section_header("Use \"42\" with", None, t)).child(row(g::GLOBE, "Search the web", "", Tint::Web, false)))
+        .child(div().py(px(design::LIST_PAD)).child(row(g::FOLDER, "Search Files", "Files", Tint::File, false)).child(row(g::PASTE, "Clipboard History", "Clipboard", Tint::Paste, true)).child(row(g::WIN_LEFT_HALF, "Left Half", "Window", Tint::Window, false)).child(section_header("Use \"42\" with", None, t)).child(row(g::GLOBE, "Search the web", "", Tint::Web, false)))
         .child(design::action_bar(icon(g::PASTE, ic::MD, Tint::Paste.hue(t)).into_any_element(), "Command", false, vec![keys("Open", &["↵"]), design::vdivider(t).into_any_element(), keys("Actions", &["Ctrl", "K"])], t))
 }
 

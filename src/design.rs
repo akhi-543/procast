@@ -198,12 +198,6 @@ names! {
     SIGN_OUT = "sign-out",
     DELETE = "delete",
     PERSONALIZE = "personalize",
-    DOCK_LEFT = "dock-left",
-    DOCK_RIGHT = "dock-right",
-    DOCK_BOTTOM = "dock-bottom",
-    FULL_SCREEN = "full-screen",
-    RESTORE = "restore",
-    SWITCH_APPS = "switch-apps",
     TILES = "tiles",
     DOCUMENT = "document",
     FOLDER = "folder",
@@ -211,10 +205,9 @@ names! {
     SHOP = "store",
     PUZZLE = "extension",
     DOWNLOAD = "download",
-    COMMAND = "command",
+    TERMINAL = "terminal",
     CALCULATOR = "calculator",
     GLOBE = "web",
-    LIGHTBULB = "idea",
     LINK = "link",
     EDIT = "edit",
     INFO = "info",
@@ -247,6 +240,77 @@ names! {
     MAIL = "mail",
     MINUS = "minus",
     SQUARE = "square",
+    BELL = "bell",
+    BLUETOOTH = "bluetooth",
+    BRUSH = "brush",
+    CLIPBOARD_X = "clipboard-x",
+    CPU = "cpu",
+    DESK_CLOSE = "desk-close",
+    DESK_MOVE_TO = "desk-move-to",
+    DESK_NEXT = "desk-next",
+    DESK_OPEN = "desk-open",
+    DESK_PREV = "desk-prev",
+    DESK_RENAME = "desk-rename",
+    ERASER = "eraser",
+    EYE_OFF = "eye-off",
+    FILE_COG = "file-cog",
+    FOLDER_SEARCH = "folder-search",
+    GAMEPAD_2 = "gamepad-2",
+    GAUGE = "gauge",
+    HARD_DRIVE = "hard-drive",
+    HASH = "hash",
+    MONITOR = "monitor",
+    OCTAGON_X = "octagon-x",
+    PACKAGE_PLUS = "package-plus",
+    PANELS_TOP_LEFT = "panels-top-left",
+    POWER_OFF = "power-off",
+    REFRESH_CCW = "refresh-ccw",
+    ROTATE_CW = "rotate-cw",
+    SLIDERS_HORIZONTAL = "sliders-horizontal",
+    SPARKLES = "sparkles",
+    SUN_MOON = "sun-moon",
+    TEXT_CURSOR_INPUT = "text-cursor-input",
+    TIMER = "timer",
+    USB = "usb",
+    VOLUME_1 = "volume-1",
+    VOLUME_2 = "volume-2",
+    VOLUME_X = "volume-x",
+    WIFI = "wifi",
+    WIN_ALMOST_MAXIMIZE = "win-almost-maximize",
+    WIN_BOTTOM_CENTER_SIXTH = "win-bottom-center-sixth",
+    WIN_BOTTOM_HALF = "win-bottom-half",
+    WIN_BOTTOM_LEFT_QUARTER = "win-bottom-left-quarter",
+    WIN_BOTTOM_LEFT_SIXTH = "win-bottom-left-sixth",
+    WIN_BOTTOM_RIGHT_QUARTER = "win-bottom-right-quarter",
+    WIN_BOTTOM_RIGHT_SIXTH = "win-bottom-right-sixth",
+    WIN_BOTTOM_THIRD = "win-bottom-third",
+    WIN_CENTER = "win-center",
+    WIN_CENTER_THIRD = "win-center-third",
+    WIN_CLOSE_OTHERS = "win-close-others",
+    WIN_FIRST_THIRD = "win-first-third",
+    WIN_FIRST_TWO_THIRDS = "win-first-two-thirds",
+    WIN_LAST_THIRD = "win-last-third",
+    WIN_LAST_TWO_THIRDS = "win-last-two-thirds",
+    WIN_LEFT_HALF = "win-left-half",
+    WIN_MAXIMIZE = "win-maximize",
+    WIN_MIDDLE_THIRD = "win-middle-third",
+    WIN_MINIMIZE = "win-minimize",
+    WIN_MINIMIZE_OTHERS = "win-minimize-others",
+    WIN_NEXT_DISPLAY = "win-next-display",
+    WIN_REASONABLE = "win-reasonable",
+    WIN_RESTORE = "win-restore",
+    WIN_RIGHT_HALF = "win-right-half",
+    WIN_TOGGLE_MAXIMIZE = "win-toggle-maximize",
+    WIN_TOP_CENTER_SIXTH = "win-top-center-sixth",
+    WIN_TOP_HALF = "win-top-half",
+    WIN_TOP_LEFT_QUARTER = "win-top-left-quarter",
+    WIN_TOP_LEFT_SIXTH = "win-top-left-sixth",
+    WIN_TOP_RIGHT_QUARTER = "win-top-right-quarter",
+    WIN_TOP_RIGHT_SIXTH = "win-top-right-sixth",
+    WIN_TOP_THIRD = "win-top-third",
+    WRENCH = "wrench",
+    ZAP = "zap",
+    ZAP_OFF = "zap-off",
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +548,9 @@ icon_files![
     "archive",
     "audio",
     "back",
+    "bell",
+    "bluetooth",
+    "brush",
     "calculator",
     "calendar",
     "cancel",
@@ -491,26 +558,36 @@ icon_files![
     "checkbox",
     "checkbox-on",
     "chevron-down",
+    "clipboard-x",
     "clock",
     "code",
-    "command",
     "copy",
+    "cpu",
     "delete",
-    "dock-bottom",
-    "dock-left",
-    "dock-right",
+    "desk-close",
+    "desk-move-to",
+    "desk-next",
+    "desk-open",
+    "desk-prev",
+    "desk-rename",
     "document",
     "down",
     "download",
     "edit",
     "emoji",
+    "eraser",
     "extension",
+    "eye-off",
     "file",
+    "file-cog",
     "filter",
     "folder",
+    "folder-search",
     "forward",
-    "full-screen",
-    "idea",
+    "gamepad-2",
+    "gauge",
+    "hard-drive",
+    "hash",
     "info",
     "keyboard",
     "link",
@@ -518,55 +595,134 @@ icon_files![
     "lock",
     "mail",
     "minus",
+    "monitor",
     "network",
+    "octagon-x",
+    "package-plus",
+    "panels-top-left",
     "paste",
     "personalize",
     "picture",
     "pin",
     "play",
     "power",
+    "power-off",
+    "refresh-ccw",
     "restart",
-    "restore",
     "return",
+    "rotate-cw",
     "search",
     "settings",
     "shield",
     "sign-out",
     "sleep",
+    "sliders-horizontal",
+    "sparkles",
     "square",
     "star",
     "store",
-    "switch-apps",
+    "sun-moon",
+    "terminal",
+    "text-cursor-input",
     "tiles",
+    "timer",
     "up",
+    "usb",
     "video",
+    "volume-1",
+    "volume-2",
+    "volume-x",
     "warning",
     "web",
+    "wifi",
+    "win-almost-maximize",
+    "win-bottom-center-sixth",
+    "win-bottom-half",
+    "win-bottom-left-quarter",
+    "win-bottom-left-sixth",
+    "win-bottom-right-quarter",
+    "win-bottom-right-sixth",
+    "win-bottom-third",
+    "win-center",
+    "win-center-third",
+    "win-close-others",
+    "win-first-third",
+    "win-first-two-thirds",
+    "win-last-third",
+    "win-last-two-thirds",
+    "win-left-half",
+    "win-maximize",
+    "win-middle-third",
+    "win-minimize",
+    "win-minimize-others",
+    "win-next-display",
+    "win-reasonable",
+    "win-restore",
+    "win-right-half",
+    "win-toggle-maximize",
+    "win-top-center-sixth",
+    "win-top-half",
+    "win-top-left-quarter",
+    "win-top-left-sixth",
+    "win-top-right-quarter",
+    "win-top-right-sixth",
+    "win-top-third",
+    "wrench",
+    "zap",
+    "zap-off",
 ];
 
-/// Serves the embedded icons: `icons/<stem>.svg` as stored (stroke 1.75), `icons/<stem>@xl.svg`
-/// (stroke 1.25, for 40 px) and `icons/<stem>@cap.svg` (stroke 2, for key caps).
+/// Serves the embedded icons: `icons/<stem>.svg` as stored (stroke 1.75), `icons/<stem>@pane.svg`
+/// (the same with its glass pane, for 16 px), `icons/<stem>@tile.svg` (stroke 2.25, pane at 40%,
+/// for sticker tiles), `icons/<stem>@xl.svg` (pane, stroke 1.25, for 40 px) and
+/// `icons/<stem>@cap.svg` (stroke 2, for key caps).
 pub struct Icons;
+
+const VARIANTS: [&str; 5] = ["", "@pane", "@tile", "@xl", "@cap"];
 
 impl Icons {
     fn names() -> impl Iterator<Item = String> {
-        ICONS.iter().flat_map(|(n, _)| [format!("icons/{n}.svg"), format!("icons/{n}@xl.svg"), format!("icons/{n}@cap.svg")])
+        ICONS.iter().flat_map(|(n, _)| VARIANTS.map(|v| format!("icons/{n}{v}.svg")))
     }
+}
+
+/// The icon with its pane: every closed shape (rect, circle, ellipse, polygon, a path ending in
+/// `z`) copied behind the outline, filled in the icon colour at `opacity` with no stroke. Shapes that
+/// already carry a fill (the solid region of a window icon) are left out.
+fn with_pane(src: &str, opacity: &str) -> String {
+    let Some(open) = src.find('>') else { return src.to_string() };
+    let shapes: String = src[open + 1..]
+        .split_inclusive('>')
+        .map(str::trim)
+        .filter(|el| {
+            let tag = el.trim_start_matches('<').split([' ', '/', '>']).next().unwrap_or("");
+            let closed = match tag {
+                "rect" | "circle" | "ellipse" | "polygon" => true,
+                "path" => el.split("d=\"").nth(1).and_then(|d| d.split('"').next()).is_some_and(|d| d.trim_end().ends_with(['z', 'Z'])),
+                _ => false,
+            };
+            closed && !el.contains(" fill=")
+        })
+        .collect();
+    if shapes.is_empty() {
+        return src.to_string();
+    }
+    format!("{}<g fill=\"currentColor\" fill-opacity=\"{opacity}\" stroke=\"none\">{shapes}</g>{}", &src[..=open], &src[open + 1..])
 }
 
 impl AssetSource for Icons {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         let Some(rest) = path.strip_prefix("icons/").and_then(|p| p.strip_suffix(".svg")) else { return Ok(None) };
-        let (stem, stroke) = match rest.split_once('@') {
-            None => (rest, None),
-            Some((stem, "xl")) => (stem, Some("1.25")),
-            Some((stem, "cap")) => (stem, Some("2")),
-            Some(_) => return Ok(None),
-        };
+        let (stem, variant) = rest.split_once('@').unwrap_or((rest, ""));
         let Some((_, src)) = ICONS.iter().find(|(n, _)| *n == stem) else { return Ok(None) };
-        Ok(Some(match stroke {
-            None => Cow::Borrowed(src.as_bytes()),
-            Some(w) => Cow::Owned(src.replace("stroke-width=\"1.75\"", &format!("stroke-width=\"{w}\"")).into_bytes()),
+        let stroke = |w: &str| src.replace("stroke-width=\"1.75\"", &format!("stroke-width=\"{w}\""));
+        Ok(Some(match variant {
+            "" => Cow::Borrowed(src.as_bytes()),
+            "pane" => Cow::Owned(with_pane(src, ".2").into_bytes()),
+            "tile" => Cow::Owned(with_pane(&stroke("2.25"), ".4").into_bytes()),
+            "xl" => Cow::Owned(with_pane(&stroke("1.25"), ".2").into_bytes()),
+            "cap" => Cow::Owned(stroke("2").into_bytes()),
+            _ => return Ok(None),
         }))
     }
 
@@ -575,10 +731,11 @@ impl AssetSource for Icons {
     }
 }
 
-/// A vector icon (a `g::` name) of `size` px in `color`; the 40 px size uses the thinner stroke.
+/// A vector icon (a `g::` name) of `size` px in `color`. From 16 px up it draws its glass pane;
+/// the 40 px size also takes the thinner stroke.
 pub fn icon(name: &'static str, size: f32, color: Hsla) -> Svg {
-    let path = if size >= ic::XL { format!("icons/{name}@xl.svg") } else { format!("icons/{name}.svg") };
-    svg().path(path).size(px(size)).flex_none().text_color(color)
+    let variant = if size >= ic::XL { "@xl" } else if size >= ic::LG { "@pane" } else { "" };
+    svg().path(format!("icons/{name}{variant}.svg")).size(px(size)).flex_none().text_color(color)
 }
 
 /// An icon inside a key cap: `ic::SM` with the heavier stroke.
@@ -591,9 +748,9 @@ pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
     icon_tile(icon, t, selected, None)
 }
 
-/// A kind tile's wash and rim strengths, as shares of the hue.
-const TILE_WASH: f32 = 0.14;
-const TILE_RIM: f32 = 0.24;
+/// A sticker's top and bottom: the hue mixed with this much white, and with this much black.
+const STICKER_LIGHT: f32 = 0.2;
+const STICKER_DEEP: f32 = 0.18;
 
 fn alpha(color: Hsla, a: f32) -> Hsla {
     Hsla { alpha: a, ..color }
@@ -605,26 +762,43 @@ fn inset_ring(color: Hsla) -> BoxShadow {
     BoxShadow::new(gpui::px(0.), gpui::px(0.), color).spread_radius(gpui::px(1.)).inset()
 }
 
-/// A glyph tile's (fill, rim, glyph) colours. Tinted: the hue on a 14% wash of itself with a
-/// 24% rim; selected, the wash stays and the glyph steps up to `text` (a hue on a deeper wash
-/// of itself falls under 3:1). Untinted: surface and hairline, `surface_strong` when selected.
-fn tile_colors(t: &Tokens, tint: Option<Tint>, selected: bool) -> (Hsla, Hsla, Hsla) {
-    match tint.map(|k| k.hue(t)) {
-        Some(h) => (alpha(h, TILE_WASH), alpha(h, TILE_RIM), if selected { t.text } else { h }),
-        None => (if selected { t.surface_strong } else { t.surface }, t.hairline, if selected { t.text } else { t.text_muted }),
-    }
+/// The pressable edge shared by sticker tiles, key caps and buttons: a 2 px shade inside the
+/// bottom edge.
+fn press(t: &Tokens) -> BoxShadow {
+    BoxShadow::new(gpui::px(0.), gpui::px(-2.), if t.dark { t.scrim_soft } else { t.scrim }).inset()
 }
 
-/// A list icon in the shared `TILE` box. Glyphs sit on a wash of the row's kind hue; images
-/// are 24 px in the box with no wash; emoji draw bare.
+/// A sticker tile's (top, bottom, glyph) colours: the hue lightened at the top and deepened at
+/// the bottom, the glyph `accent_text`. A selected row does not change it.
+fn sticker(t: &Tokens, tint: Tint) -> (Hsla, Hsla, Hsla) {
+    let h = tint.hue(t);
+    (over(alpha(c(0xffffffff), STICKER_LIGHT), h), over(alpha(c(0x000000ff), STICKER_DEEP), h), t.accent_text)
+}
+
+/// A list icon in the shared `TILE` box. With a kind, a glossy sticker in the kind's hue; with
+/// none, a surface wash. Images are 24 px in the box with no wash; emoji draw bare.
 pub fn icon_tile(kind: &Icon, t: &Tokens, selected: bool, tint: Option<Tint>) -> AnyElement {
     let frame = || div().size(px(TILE)).flex_none().flex().items_center().justify_center();
     match kind {
         Icon::Image(image) => frame().child(img(image.clone()).size(px(TILE - 4.))).into_any_element(),
-        Icon::Vector(name) => {
-            let (wash, rim, glyph) = tile_colors(t, tint, selected);
-            frame().rounded(px(r::MD)).bg(wash).shadow(vec![inset_ring(rim)]).child(icon(name, ic::LG, glyph)).into_any_element()
-        }
+        Icon::Vector(name) => match tint {
+            Some(k) => {
+                let (top, bottom, glyph) = sticker(t, k);
+                // ponytail: gpui gradients take two stops; the spec's pure hue at 55% falls between them.
+                frame()
+                    .rounded(px(r::MD))
+                    .bg(linear_gradient(180., linear_color_stop(top, 0.), linear_color_stop(bottom, 1.)))
+                    .shadow(vec![BoxShadow::new(gpui::px(0.), gpui::px(1.), t.edge).inset(), press(t)])
+                    .child(svg().path(format!("icons/{name}@tile.svg")).size(px(ic::LG)).flex_none().text_color(glyph))
+                    .into_any_element()
+            }
+            None => frame()
+                .rounded(px(r::MD))
+                .bg(if selected { t.surface_strong } else { t.surface })
+                .shadow(vec![inset_ring(t.hairline), BoxShadow::new(gpui::px(0.), gpui::px(-2.), t.hairline).inset()])
+                .child(icon(name, ic::LG, if selected { t.text } else { t.text_muted }))
+                .into_any_element(),
+        },
         Icon::Glyph(s) => frame().font_family(FONT_EMOJI).text_size(px(18.)).child(s.clone()).into_any_element(),
     }
 }
@@ -683,6 +857,7 @@ pub fn key_cap(label: &str, t: &Tokens) -> Div {
         .rounded(px(r::XS))
         .bg(t.surface)
         .border_1()
+        .border_b_2()
         .border_color(t.border)
         .font_family(FONT_SMALL)
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -792,7 +967,7 @@ pub fn button(label: &str, kind: Button, focused: bool, t: &Tokens) -> Div {
         .border_color(border)
         .text_size(px(ts::BODY_SM))
         .text_color(text)
-        .when(focused, |d| focus_ring(d, if kind == Button::Quiet { t.accent } else { border }))
+        .map(|d| if focused { focus_ring(d, if kind == Button::Quiet { t.accent } else { border }) } else { d.shadow(vec![press(t)]) })
         .child(label.to_string())
 }
 
@@ -1076,12 +1251,26 @@ mod tests {
     #[test]
     fn every_icon_name_is_served() {
         for name in g::ALL {
-            for (suffix, stroke) in [("", "1.75"), ("@xl", "1.25"), ("@cap", "2")] {
+            for (suffix, stroke) in [("", "1.75"), ("@pane", "1.75"), ("@tile", "2.25"), ("@xl", "1.25"), ("@cap", "2")] {
                 let svg = Icons.load(&format!("icons/{name}{suffix}.svg")).unwrap().unwrap_or_else(|| panic!("no icon {name}{suffix}"));
                 assert!(String::from_utf8_lossy(&svg).contains(&format!("stroke-width=\"{stroke}\"")), "{name}{suffix}");
             }
         }
         assert!(Icons.load("icons/nope.svg").unwrap().is_none());
+    }
+
+    #[test]
+    fn panes_fill_closed_shapes_only() {
+        let pane = |name: &str| String::from_utf8(Icons.load(&format!("icons/{name}@pane.svg")).unwrap().unwrap().into_owned()).unwrap();
+        // A circle is closed; the handle is not.
+        assert!(pane("search").contains(r#"stroke="none"><circle cx="11" cy="11" r="8" /></g>"#));
+        // An open path (a tick) has no pane.
+        assert!(!pane("check").contains("fill-opacity"));
+        // A closed path counts; a shape with its own fill (a window's solid region) does not.
+        assert!(pane("folder").contains(r#"stroke="none"><path d="M20 20"#));
+        let win = pane("win-left-half");
+        assert!(win.contains(r#"stroke="none"><rect x="3" y="4" width="18" height="16" rx="3"/></g>"#), "{win}");
+        assert_eq!(win.matches("width=\"6.11\"").count(), 1);
     }
 
     /// The family name the embedded font reports is the one `FONT_UI` asks for.
@@ -1116,11 +1305,6 @@ mod tests {
 
     /// The tint of every kind, `Accent` and `Danger` included.
     const TINTS: [Tint; 8] = [Tint::Accent, Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::File, Tint::Calc, Tint::Danger];
-
-    /// A hue's tile wash, as the tile draws it.
-    fn wash(h: Hsla) -> Hsla {
-        alpha(h, TILE_WASH)
-    }
 
     #[test]
     fn text_holds_4_5_on_the_solid_body() {
@@ -1168,26 +1352,18 @@ mod tests {
         hold(4.5, |t, _| vec![("text label on sel_top over bg_elevated".into(), lum_ratio(t.text, over(t.sel_top, over(t.bg_elevated, t.bg_solid))))]);
     }
 
-    /// A kind's icon is its hue on a 14% wash of itself.
+    /// A sticker's glyph holds 3:1 on its top, its pure hue and its bottom. The sticker is
+    /// opaque, so this covers glass, every backdrop and the selected row.
     #[test]
-    fn tint_icons_hold_3_on_their_wash() {
-        hold(3., |t, _| TINTS.map(|k| (format!("{k:?} on its wash over bg_solid"), lum_ratio(k.hue(t), over(wash(k.hue(t)), t.bg_solid)))).into())
-    }
-
-    /// Spec values kept: on Light glass over the #404040 stand-in four hues fall a hair under
-    /// 3:1 on their wash: System 2.86, File 2.95, Window 2.97, Danger 2.99 (all hold on `bg_solid`).
-    #[test]
-    #[ignore = "Light glass over #404040: System 2.86, File 2.95, Window 2.97, Danger 2.99 on their wash"]
-    fn tint_icons_hold_3_on_their_wash_over_glass() {
-        hold(3., |t, back| TINTS.map(|k| (format!("{k:?} on its wash over glass over the worst backdrop"), lum_ratio(k.hue(t), over(wash(k.hue(t)), over(t.bg, back))))).into())
-    }
-
-    /// In a selected row the icon steps up to `text`, on the tile wash over the selected fill.
-    #[test]
-    fn selected_tile_icons_hold_3_on_their_wash() {
+    fn sticker_glyphs_hold_3_on_their_tile() {
         hold(3., |t, _| {
-            let row = over(t.sel_top, t.bg_solid);
-            TINTS.map(|k| (format!("text on the {k:?} wash over the selected fill"), lum_ratio(t.text, over(wash(k.hue(t)), row)))).into()
+            TINTS
+                .into_iter()
+                .flat_map(|k| {
+                    let (top, bottom, glyph) = sticker(t, k);
+                    [("top", top), ("hue", k.hue(t)), ("bottom", bottom)].map(|(w, bg)| (format!("{k:?} glyph on its {w}"), lum_ratio(glyph, bg)))
+                })
+                .collect()
         })
     }
 
@@ -1201,18 +1377,15 @@ mod tests {
         }
     }
 
-    /// The tile recipe: tinted keeps its 14% wash and steps the glyph up to `text` when selected;
-    /// untinted raises to `surface_strong`.
+    /// The sticker recipe: lighter at the top, deeper at the bottom, the glyph `accent_text`.
     #[test]
-    fn tile_colours_follow_the_recipe() {
+    fn stickers_follow_the_recipe() {
         for (_, t, _) in modes() {
             for k in TINTS {
-                let h = k.hue(&t);
-                assert_eq!(tile_colors(&t, Some(k), false), (alpha(h, 0.14), alpha(h, 0.24), h));
-                assert_eq!(tile_colors(&t, Some(k), true), (alpha(h, 0.14), alpha(h, 0.24), t.text));
+                let (top, bottom, glyph) = sticker(&t, k);
+                assert!(luminance(top) >= luminance(k.hue(&t)) && luminance(bottom) < luminance(k.hue(&t)), "{k:?}");
+                assert_eq!(glyph, t.accent_text);
             }
-            assert_eq!(tile_colors(&t, None, false), (t.surface, t.hairline, t.text_muted));
-            assert_eq!(tile_colors(&t, None, true), (t.surface_strong, t.hairline, t.text));
         }
     }
 }

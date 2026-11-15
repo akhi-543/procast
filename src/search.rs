@@ -326,7 +326,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
     }
     for (i, s) in scripts.iter().enumerate() {
-        let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Vector(g::COMMAND));
+        let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Vector(g::TERMINAL));
         items.push(Item::new(&s.title, &s.package, icon, Act::Script(i)).acc("Script Command").keyed(format!("sc:{}", s.path)));
     }
     for (e, (ext, icon)) in exts.iter().enumerate() {
@@ -433,7 +433,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
 
     let mut top = Vec::new();
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
-        top.push(Item::new(cmdline, "", Icon::Vector(g::COMMAND), Act::Run(cmdline.to_string())).acc("Windows Run"));
+        top.push(Item::new(cmdline, "", Icon::Vector(g::TERMINAL), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
     if let Some((kw, rest)) = q.split_once(' ')
         && let Some(link) = cfg.quicklink.iter().find(|l| !l.keyword.is_empty() && l.keyword.eq_ignore_ascii_case(kw))
@@ -456,7 +456,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         .iter()
         .filter_map(|name| {
             if name.eq_ignore_ascii_case("ai") {
-                return Some(Item::new("Ask AI", "", Icon::Vector(g::LIGHTBULB), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
+                return Some(Item::new("Ask AI", "", Icon::Vector(g::SPARKLES), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
             }
             let (title, url, icon, kind) = if name.eq_ignore_ascii_case("web") {
                 (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), Icon::Vector(g::GLOBE), "Web"))?

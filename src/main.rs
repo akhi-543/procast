@@ -717,7 +717,7 @@ impl Launcher {
                 Some(Pending::Script(i, got)) => {
                     let s = &self.scripts[*i];
                     let n = s.args.len();
-                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::COMMAND), Act::Script(*i))]
+                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::TERMINAL), Act::Script(*i))]
                 }
                 Some(Pending::Snippet { name, template, args, got, .. }) => {
                     let sub = format!("{} · {} of {}", args[got.len()].name, got.len() + 1, args.len());
@@ -727,14 +727,14 @@ impl Launcher {
                 None => vec![],
             },
             // Typed text is the next question; with an empty bar, Enter copies the answer.
-            Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::LIGHTBULB), Act::Ask(query.trim().to_string()))],
+            Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
                     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                     let shown = if lines.is_empty() { vec!["(no output)"] } else { lines };
-                    shown.iter().map(|l| Item::new(*l, "", Icon::Vector(g::COMMAND), Act::Copy(text.clone())).sec("Output")).collect()
+                    shown.iter().map(|l| Item::new(*l, "", Icon::Vector(g::TERMINAL), Act::Copy(text.clone())).sec("Output")).collect()
                 }
                 None => vec![],
             },
@@ -2424,8 +2424,8 @@ impl Launcher {
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
             Mode::Tabs => Icon::Vector(g::GLOBE),
-            Mode::Args | Mode::Output => Icon::Vector(g::COMMAND),
-            Mode::Ai => Icon::Vector(g::LIGHTBULB),
+            Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
+            Mode::Ai => Icon::Vector(g::SPARKLES),
         }
     }
 
