@@ -2,7 +2,7 @@
 //! its own thread, shared by Auto HDR and Focus. The callback stays small; the UI thread
 //! decides what a change means.
 
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 
 use futures::channel::mpsc::UnboundedSender;
 use windows::Win32::{
@@ -12,7 +12,7 @@ use windows::Win32::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         Shell::{QUERY_USER_NOTIFICATION_STATE, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState},
         WindowsAndMessaging::{
-            EVENT_SYSTEM_FOREGROUND, GWL_STYLE, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, MSG, OBJID_WINDOW,
+            EVENT_SYSTEM_FOREGROUND, GWL_STYLE, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, MSG, OBJID_WINDOW,
             WINEVENT_OUTOFCONTEXT, WS_CAPTION,
         },
     },
@@ -21,8 +21,11 @@ use windows::Win32::{
 use crate::win::Msg;
 
 /// Game library folders, as consecutive path segments (compared lower case): Steam, Epic,
-/// Xbox (and Store packages), Riot.
-const LIBRARIES: &[&[&str]] = &[&["steamapps", "common"], &["epic games"], &["xboxgames"], &["windowsapps"], &["riot games"]];
+/// Xbox / Game Pass, Riot. Not WindowsApps: it holds every Store app, video players included.
+const LIBRARIES: &[&[&str]] = &[&["steamapps", "common"], &["epic games"], &["xboxgames"], &["riot games"]];
+/// D3D full-screen state lags the focus event (and outlives an alt-tab), so it is read again
+/// this long after each change.
+const RECHECK: Duration = Duration::from_secs(1);
 
 static TX: OnceLock<UnboundedSender<Msg>> = OnceLock::new();
 
@@ -51,9 +54,22 @@ unsafe extern "system" fn changed(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: 
     let path = crate::apps::exe_path(pid).unwrap_or_default();
     // ponytail: no user game list yet (the config key comes with the features that use it).
     let game = is_game(&path, d3d_full(), covers_monitor(hwnd), &[]);
-    if let Some(tx) = TX.get() {
-        let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, pid, exe: file_name(&path), game });
-    }
+    let Some(tx) = TX.get() else { return };
+    let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, pid, exe: file_name(&path), game });
+    let at = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(RECHECK);
+        let hwnd = HWND(at as *mut _);
+        let now = is_game(&path, d3d_full(), covers_monitor(hwnd), &[]);
+        if resend(unsafe { GetForegroundWindow() } == hwnd, game, now) {
+            let _ = tx.unbounded_send(Msg::Foreground { hwnd: at, pid, exe: file_name(&path), game: now });
+        }
+    });
+}
+
+/// A second report is due when the window still has focus and the re-check disagrees.
+fn resend(still_foreground: bool, sent: bool, now: bool) -> bool {
+    still_foreground && sent != now
 }
 
 /// "c:\\games\\foo.exe" -> "foo.exe", lower case.
@@ -126,6 +142,10 @@ mod tests {
         assert!(is_game(r"D:\SteamLibrary\steamapps\common\Foo\foo.exe", false, true, &[]));
         assert!(is_game(r"C:\Program Files\Epic Games\Fortnite\f.exe", false, true, &[]));
         assert!(is_game(r"C:\XboxGames\Halo\halo.exe", false, true, &[]));
+        assert!(is_game("c:/program files (x86)/STEAM/STEAMAPPS/Common/Foo/foo.exe", false, true, &[]));
+        assert!(is_game(r"D:\Games\EPIC GAMES\Fortnite.exe", false, true, &[]));
+        // Store apps (video players, Terminal) are not games when borderless.
+        assert!(!is_game(r"C:\Program Files\WindowsApps\Microsoft.Photos_1\Photos.exe", false, true, &[]));
         assert!(is_game(r"C:\Riot Games\VALORANT\v.exe", false, true, &[]));
         // Library folder, but not full-monitor; or full-monitor, wrong place.
         assert!(!is_game(r"D:\steamapps\common\Foo\foo.exe", false, false, &[]));
@@ -133,5 +153,13 @@ mod tests {
         // Neither.
         assert!(!is_game(chrome, false, false, &games));
         assert!(!is_game("", false, false, &[]));
+    }
+
+    #[test]
+    fn recheck_resends_only_changes_of_the_same_window() {
+        assert!(resend(true, true, false)); // alt-tabbed out of the game: no longer one
+        assert!(resend(true, false, true)); // the game's D3D state caught up
+        assert!(!resend(true, true, true));
+        assert!(!resend(false, true, false)); // focus moved on: the next event covers it
     }
 }
