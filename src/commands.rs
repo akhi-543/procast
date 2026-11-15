@@ -265,7 +265,9 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<(), String> {
 
 fn desktop(d: Desk, target: HWND) -> Result<(), String> {
     match d {
-        Desk::Open(n) => desktops::open(n),
+        // The launcher hid without handing focus back (see desktops::open); no switch, no new
+        // focus, so give it back here.
+        Desk::Open(n) => desktops::open(n).inspect_err(|_| crate::win::focus(target)),
         Desk::MoveTo(n) => desktops::move_window(target, n),
         Desk::MoveNext => desktops::move_next(target),
         Desk::MovePrev => desktops::move_prev(target),

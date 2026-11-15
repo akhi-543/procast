@@ -884,6 +884,31 @@ pub fn glass_window(t: &Tokens) -> Div {
     }
 }
 
+/// The Toast pill: an error's warning icon in `danger`, then one line of text. On `bg_elevated`,
+/// not the glass `bg`: its window has no OS blur behind it, and the thin pane alone would not
+/// hold 4.5:1 over a busy wallpaper. Unscaled: it lives on the desktop, not in the launcher.
+pub fn toast(text: &str, t: &Tokens) -> Div {
+    let p = gpui::px;
+    div()
+        .h(p(ROW))
+        .max_w(p(480.))
+        .pl(p(12.))
+        .pr(p(16.))
+        .flex()
+        .items_center()
+        .gap(p(8.))
+        .rounded_full()
+        .bg(t.bg_elevated)
+        .border_1()
+        .border_color(rim_border(t))
+        .shadow([rim(t), float(t)].concat())
+        .font_family(FONT_UI)
+        .text_size(p(ts::BODY_SM))
+        .text_color(t.text)
+        .child(svg().path(format!("icons/{}.svg", g::WARNING)).size(p(ic::MD)).flex_none().text_color(t.danger))
+        .child(div().min_w_0().truncate().child(text.to_string()))
+}
+
 /// An ActionPanel or Dialog surface: `bg_elevated`, `r::LG`, the rim border, `rim` and `float`
 /// shadows, no blur. The caller sets width and padding.
 pub fn elevated(t: &Tokens) -> Div {

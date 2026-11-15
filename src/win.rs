@@ -9,7 +9,7 @@ use futures::channel::mpsc::UnboundedSender;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
+        Foundation::{COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
         Graphics::{
             Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
@@ -39,7 +39,8 @@ use windows::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
                 GWL_STYLE, GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
                 SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_CAPTION,
-                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP,
+                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
             },
         },
     },
@@ -88,8 +89,10 @@ pub enum Msg {
     Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
-    /// A built-in command failed; shown as a notice.
+    /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
+    /// A command failed: shown as a toast that fades away.
+    Toast(String),
 }
 
 pub enum TrayCmd {
@@ -201,6 +204,16 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
+/// A toast's window: never activated, and clicks fall through to whatever is beneath
+/// (layered + transparent; fully opaque as a layer, gpui's own alpha does the see-through).
+pub fn make_overlay(hwnd: HWND) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOPMOST.0) as isize);
+        _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    }
+}
+
 /// Windows 11 rounded corners (no-op on Windows 10). DWM rounds to 8 px (`design::r::WINDOW`),
 /// anti-aliased, and clips the acrylic with it; a `SetWindowRgn` at any other radius is jagged.
 pub fn round_corners(hwnd: HWND) {
@@ -301,6 +314,14 @@ pub fn place(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
             let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+}
+
+/// Places a toast window horizontally centred with its bottom edge on the work area's (just
+/// above the taskbar), on top of everything, without activating it.
+pub fn place_toast(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
+    let (w, h) = ((width * screen.dpi) as i32, (height * screen.dpi) as i32);
+    let RECT { left, right, bottom, .. } = screen.work;
+    unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), left + (right - left - w) / 2, bottom - h, w, h, SWP_NOACTIVATE) };
 }
 
 /// Changes only the window's height (logical px), keeping its top-left corner.

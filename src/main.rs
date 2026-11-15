@@ -15,6 +15,7 @@ mod scripts;
 mod search;
 mod settings;
 mod snippets;
+mod toast;
 mod win;
 
 use std::{
@@ -1737,7 +1738,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = commands::run_layout(&layout, &w, &ids) {
-                        let _ = tx.unbounded_send(Msg::Notice(e));
+                        let _ = tx.unbounded_send(Msg::Toast(e));
                     }
                 });
                 return;
@@ -1752,7 +1753,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = commands::run(cmd, HWND(target as _), &w) {
-                        let _ = tx.unbounded_send(Msg::Notice(e));
+                        let _ = tx.unbounded_send(Msg::Toast(e));
                     }
                 });
                 return;
@@ -1972,7 +1973,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = desktops::rename(&value) {
-                        let _ = tx.unbounded_send(Msg::Notice(e));
+                        let _ = tx.unbounded_send(Msg::Toast(e));
                     }
                 });
             }
@@ -2118,6 +2119,8 @@ impl Launcher {
                     Output::Silent => {}
                 }
             }
+            // Handled by the message loop, between updates.
+            Msg::Toast(_) => {}
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -3297,11 +3300,18 @@ fn main() {
         }
 
         cx.spawn(async move |cx| {
+            let toast = toast::open(cx);
             while let Some(msg) = rx.next().await {
                 if let Msg::Resize = msg {
                     if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
                         win::resize(hwnd, h * design::launcher_scale());
                     }
+                    continue;
+                }
+                if let Msg::Toast(text) = msg {
+                    let text: String = text.lines().next().unwrap_or_default().chars().take(200).collect();
+                    let theme = handle.update(cx, |this, _, _| this.cfg.theme.clone()).unwrap_or_default();
+                    toast::show(cx, toast, text, theme);
                     continue;
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
