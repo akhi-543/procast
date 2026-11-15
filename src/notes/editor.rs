@@ -16,6 +16,8 @@ pub enum Mark {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Block {
+    /// No block: `set_block` with it strips any block prefix (`#` to `######`, quote, list, task).
+    Paragraph,
     H1,
     H2,
     H3,
@@ -106,6 +108,9 @@ fn parse_prefix(line: &str) -> Option<(usize, usize, Block)> {
         (2, Block::Bullet)
     } else if s.starts_with("### ") {
         (4, Block::H3)
+    } else if (4..=6).any(|n| s.starts_with(&format!("{} ", "#".repeat(n)))) {
+        // h4 to h6 have no block of their own: only `Paragraph` removes them
+        (s.find(' ').unwrap_or(0) + 1, Block::Paragraph)
     } else if s.starts_with("## ") {
         (3, Block::H2)
     } else if s.starts_with("# ") {
@@ -132,7 +137,7 @@ fn block_prefix(block: Block, n: usize) -> String {
         Block::Bullet => "- ".into(),
         Block::Numbered => format!("{n}. "),
         Block::Task => "- [ ] ".into(),
-        Block::Code => String::new(),
+        Block::Paragraph | Block::Code => String::new(),
     }
 }
 
@@ -497,7 +502,8 @@ impl Buffer {
             // fences are the first and last selected lines
             let (f, l) = (first.len(), last.len());
             self.edit(le - l - 1, le, "");
-            self.edit(ls, ls + f + 1, "");
+            // with just the two fence lines the first edit already took the newline
+            self.edit(ls, (ls + f + 1).min(self.text.len()), "");
             return;
         }
         let prev = (ls > 0).then(|| line_start(t, ls - 1)).filter(|&p| is_fence(&t[p..ls - 1]));
@@ -508,8 +514,15 @@ impl Buffer {
             self.edit(p, ls, "");
             return;
         }
-        // nothing sits above `le` that needs to move, so positions up to it stay put
-        self.text.insert_str(le, "\n```");
+        // a cursor at the end of the last line stays before the closing fence
+        let (c, a) = (self.cursor, self.anchor);
+        self.edit(le, le, "\n```");
+        if c == le {
+            self.cursor = le;
+        }
+        if a == le {
+            self.anchor = le;
+        }
         self.edit(ls, ls, "```\n");
     }
 
@@ -641,6 +654,9 @@ fn links(line: &str, mask: &[bool]) -> Vec<(usize, usize)> {
     out
 }
 
+/// Longest line `spans` styles, in bytes.
+const STYLE_MAX: usize = 2048;
+
 fn paint(st: &mut [Style], ranges: &[(usize, usize)], f: impl Fn(&mut Style)) {
     for &(s, e) in ranges {
         st[s..e].iter_mut().for_each(&f);
@@ -651,6 +667,11 @@ fn paint(st: &mut [Style], ranges: &[(usize, usize)], f: impl Fn(&mut Style)) {
 /// Nested marks give one span per stretch with all its styles. Code suppresses other marks
 /// inside it, and a marker without its partner is plain text.
 pub fn spans(line: &str) -> Vec<Span> {
+    // ponytail: marker matching rescans to the end of the line for each unmatched opener, so
+    // cost grows with the square of the line; longer lines (pasted blobs) go unstyled.
+    if line.len() > STYLE_MAX {
+        return Vec::new();
+    }
     let n = line.len();
     let mut st = vec![Style::default(); n];
     let none = vec![false; n];
@@ -1084,6 +1105,80 @@ mod tests {
         let mut b = Buffer::new("");
         b.set_block(Block::Code);
         assert_eq!(b.text(), "```\n\n```");
+    }
+
+    #[test]
+    fn code_fence_edge_cases() {
+        // an empty fenced block, fully selected, at the very start and end of the text
+        let mut b = sel("```\n```", 0, 7);
+        b.set_block(Block::Code);
+        assert_eq!((b.text(), b.selection()), ("", (0, 0)));
+        let mut b = sel("x\n```\n```", 2, 9);
+        b.set_block(Block::Code);
+        assert_eq!(b.text(), "x\n");
+        let mut b = sel("```\n```\ny", 0, 7);
+        b.set_block(Block::Code);
+        assert_eq!(b.text(), "y");
+        // fences just outside an empty line at the end of the text
+        let mut b = Buffer::new("```\n\n```");
+        b.set_cursor(4, false);
+        b.set_block(Block::Code);
+        assert_eq!((b.text(), b.cursor()), ("", 0));
+        // a selection ending at the next line start keeps that end after the fence
+        let mut b = sel("a\nb\n", 0, 2);
+        b.set_block(Block::Code);
+        assert_eq!((b.text(), b.selection()), ("```\na\n```\nb\n", (4, 10)));
+        // the cursor at the end of the last line stays inside the block
+        let mut b = Buffer::new("a\nb");
+        b.set_block(Block::Code);
+        assert_eq!(b.cursor(), 7);
+    }
+
+    #[test]
+    fn paragraph_strips_any_block_prefix() {
+        for (from, to) in [
+            ("# a", "a"),
+            ("## a", "a"),
+            ("### a", "a"),
+            ("#### a", "a"),
+            ("###### a", "a"),
+            ("> a", "a"),
+            ("- a", "a"),
+            ("* a", "a"),
+            ("12. a", "a"),
+            ("- [ ] a", "a"),
+            ("- [x] a", "a"),
+            ("  - a", "  a"),
+            ("plain", "plain"),
+            ("####### seven", "####### seven"),
+        ] {
+            let mut b = Buffer::new(from);
+            b.set_block(Block::Paragraph);
+            assert_eq!(b.text(), to, "{from}");
+        }
+        let mut b = sel("# a\n- b\nc", 0, 9);
+        b.set_block(Block::Paragraph);
+        assert_eq!(b.text(), "a\nb\nc");
+        b.undo();
+        assert_eq!(b.text(), "# a\n- b\nc");
+        // an h4 is not an H3: setting H3 replaces it
+        let mut b = Buffer::new("#### a");
+        b.set_block(Block::H3);
+        assert_eq!(b.text(), "### a");
+    }
+
+    #[test]
+    fn long_lines_are_not_styled_and_stay_fast() {
+        let start = std::time::Instant::now();
+        for unit in ["a *b ", "**a ", "[", "[x](", "`a ", "~~a ", "<u>a "] {
+            assert!(spans(&unit.repeat(200_000 / unit.len())).is_empty(), "{unit}");
+        }
+        // just under the cap still styles, and pathological input there is cheap too
+        assert!(!spans(&format!("**b** {}", "a".repeat(STYLE_MAX - 20))).is_empty());
+        for unit in ["a *b ", "**a ", "[", "[x](", "~~a "] {
+            spans(&unit.repeat(STYLE_MAX / unit.len()));
+        }
+        assert!(start.elapsed().as_secs() < 2);
     }
 
     fn styled(line: &str) -> Vec<(&str, Style)> {
