@@ -16,6 +16,9 @@ mod foreground;
 mod hdr;
 mod keys;
 mod net;
+// Task 11 wires the notes window and commands to this; until then only the tests build it.
+#[cfg(test)]
+mod notes;
 mod ntfs;
 mod scripts;
 mod search;
