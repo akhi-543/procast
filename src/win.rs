@@ -102,6 +102,10 @@ pub enum Msg {
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
+    /// The foreground window changed: its handle, process id, program file name (lower case)
+    /// and whether it is a game (see foreground.rs).
+    #[allow(dead_code)] // fields are read by Auto HDR and Focus (tasks 6, 7)
+    Foreground { hwnd: isize, pid: u32, exe: String, game: bool },
     /// A command's result (true) or why it failed (false): shown as a toast that fades away.
     Toast(bool, String),
 }
@@ -259,14 +263,6 @@ pub fn cloak(hwnd: HWND, on: bool) {
 
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
-}
-
-/// A full-screen app or game has focus (game mode turns hotkeys off then).
-/// ponytail: the hotkey is still registered, so the key never reaches the game; unregister
-/// on a foreground-change hook if that matters.
-pub fn full_screen_app() -> bool {
-    use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
-    unsafe { SHQueryUserNotificationState() }.is_ok_and(|s| [QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE].contains(&s))
 }
 
 pub fn focus(hwnd: HWND) {

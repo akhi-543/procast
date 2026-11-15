@@ -10,6 +10,7 @@ mod dict;
 mod desktops;
 mod ext;
 mod files;
+mod foreground;
 mod keys;
 mod net;
 mod ntfs;
@@ -401,6 +402,7 @@ impl Launcher {
             let tx = tx.clone();
             std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
         }
+        foreground::watch(tx.clone());
         std::thread::spawn(|| _ = browser::register());
         let browsers = browser::serve(tx.clone());
         let mut this = Self {
@@ -2449,7 +2451,7 @@ impl Launcher {
 
     fn on_msg(&mut self, msg: Msg, window: &mut Window, cx: &mut Context<Self>) {
         match msg {
-            Msg::Hotkey(_) if self.cfg.launcher.game_mode && !self.visible && win::full_screen_app() => {}
+            Msg::Hotkey(_) if self.cfg.launcher.game_mode && !self.visible && foreground::full_screen_app() => {}
             Msg::Hotkey(i) if i >= BINDS.len() => self.run_hotkey(i, window, cx),
             Msg::Hotkey(i) if self.visible && self.mode == Mode::of(BINDS[i]) => self.hide(true, cx),
             Msg::Hotkey(i) => self.show(Mode::of(BINDS[i]), window, cx),
@@ -2529,6 +2531,7 @@ impl Launcher {
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
+            Msg::Foreground { .. } => {} // Auto HDR and Focus act on it
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -3758,7 +3761,7 @@ fn main() {
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
                 // proc re-borrows the app, so the window is moved here, between updates.
                 let opens = match msg {
-                    Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
+                    Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && foreground::full_screen_app())).unwrap_or(false),
                     Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
                     _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
                 };
