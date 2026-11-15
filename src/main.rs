@@ -17,6 +17,7 @@ mod search;
 mod settings;
 mod snippets;
 mod system;
+mod timers;
 mod toast;
 mod win;
 
@@ -27,7 +28,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -309,6 +310,10 @@ struct Launcher {
     /// Program icons by path, so the running list fills in at once next time.
     exe_icons: HashMap<String, Option<Arc<RenderImage>>>,
     autoquit: apps::AutoQuit,
+    /// Running timers and stopwatches, and the flag that stops the 1 s tick thread (present
+    /// only while something runs).
+    timers: timers::Timers,
+    timer_tick: Option<Arc<AtomicBool>>,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -400,6 +405,8 @@ impl Launcher {
             tabs: vec![],
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
+            timers: timers::Timers::load(config::dir().join("timers.json")),
+            timer_tick: None,
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -445,6 +452,7 @@ impl Launcher {
             _subs: subs,
         };
         this.load_extensions();
+        this.watch_timers();
         this
     }
 
@@ -690,7 +698,9 @@ impl Launcher {
                     self.file_gen += 1;
                     f.search(self.file_gen, &query, 5);
                 }
-                search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher)
+                let mut rows = self.timer_rows(&query);
+                rows.extend(search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher));
+                rows
             }
             Mode::Clipboard => {
                 if self.clip_images.len() > 300 {
@@ -831,6 +841,63 @@ impl Launcher {
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
+    }
+
+    /// Running timers and stopwatches as root rows: all of them in an empty search, else the
+    /// ones whose title contains the query.
+    fn timer_rows(&self, query: &str) -> Vec<Item> {
+        let q = query.trim().to_lowercase();
+        let row = |(id, title, left): (u64, String, String)| Item::new(title, "", Icon::Vector(g::TIMER), Act::StopTimer(id)).acc(left).sec("Timers");
+        self.timers.rows(SystemTime::now()).into_iter().filter(|r| r.1.to_lowercase().contains(&q)).map(row).collect()
+    }
+
+    /// Starts the 1 s tick while a timer runs; the thread ends when its flag is set.
+    fn watch_timers(&mut self) {
+        if self.timer_tick.is_some() || !self.timers.any() {
+            return;
+        }
+        let (stop, tx) = (Arc::new(AtomicBool::new(false)), self.tx.clone());
+        self.timer_tick = Some(stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) || tx.unbounded_send(Msg::TimerTick).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Announces timers that ran out, keeps the visible timer rows current, ends the tick
+    /// when nothing is left.
+    fn on_timer_tick(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        for (_, label) in self.timers.due(now) {
+            let _ = self.tx.unbounded_send(Msg::Toast(true, if label.is_empty() { "Timer done".into() } else { format!("Timer done: {label}") }));
+            timers::beep();
+        }
+        if !self.timers.any()
+            && let Some(stop) = self.timer_tick.take()
+        {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if self.visible && self.mode == Mode::Root {
+            if self.items.iter().any(|it| matches!(it.act, Act::StopTimer(_))) {
+                let rows = self.timers.rows(now);
+                // A finished timer's row goes away; the rest only change their time.
+                if self.items.iter().filter(|it| matches!(it.act, Act::StopTimer(_))).count() != rows.len() {
+                    return self.refresh(cx);
+                }
+                for it in &mut self.items {
+                    if let Act::StopTimer(id) = it.act
+                        && let Some(r) = rows.iter().find(|r| r.0 == id)
+                    {
+                        it.accessory = r.2.clone();
+                    }
+                }
+            }
+            cx.notify();
+        }
     }
 
     /// Scrolls the selected row into view (section headers take list slots too).
@@ -1805,6 +1872,29 @@ impl Launcher {
                 return;
             }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
+            Act::Cmd(Cmd::StartTimer) => return self.input.update(cx, |s, cx| s.emplace("timer ", cx)),
+            Act::Cmd(Cmd::StartStopwatch) => {
+                self.timers.stopwatch();
+                self.watch_timers();
+                let _ = self.tx.unbounded_send(Msg::Toast(true, "Stopwatch started".into()));
+            }
+            Act::StartTimer(secs, label) => {
+                self.timers.start(label.clone(), Duration::from_secs(secs));
+                self.watch_timers();
+                let _ = self.tx.unbounded_send(Msg::Toast(true, format!("Timer started: {}", if label.is_empty() { timers::fmt_duration(Duration::from_secs(secs)) } else { label })));
+            }
+            Act::StopTimer(id) => {
+                // A stopwatch's time goes to the clipboard; a timer is just cancelled.
+                self.status = Some(match self.timers.elapsed(id, SystemTime::now()).map(timers::fmt_duration) {
+                    Some(time) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(time.clone()));
+                        (Tone::Ok, format!("Stopped at {time}, copied"))
+                    }
+                    None => (Tone::Info, "Timer cancelled".into()),
+                });
+                self.timers.cancel(id);
+                return self.refresh(cx);
+            }
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
                 self.pending = Some(Pending::RenameDesktop);
                 return self.set_mode(Mode::Args, cx);
@@ -1895,7 +1985,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -2223,6 +2313,7 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
+            Msg::TimerTick => self.on_timer_tick(cx),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);

@@ -77,6 +77,10 @@ pub enum Act {
     ForceQuit(u32),
     /// Switch to a browser tab: (browser connection, tab id).
     Tab(u32, i64),
+    /// Start a timer: seconds and label.
+    StartTimer(u64, String),
+    /// Cancel a timer, or stop a stopwatch and copy its time, by id.
+    StopTimer(u64),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -110,6 +114,8 @@ impl Act {
             Act::QuitApp(_) => "Quit",
             Act::Tab(..) => "Switch to Tab",
             Act::ForceQuit(_) => "Force Quit",
+            Act::StartTimer(..) => "Start Timer",
+            Act::StopTimer(_) => "Stop",
             Act::None => "",
         }
     }
@@ -442,6 +448,10 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         let url = link.url.replace("{query}", &url_encode(rest.trim()));
         top.push(Item::new(rest.trim(), link.title(), quicklink_icon(catalog, link.title()), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
     }
+    if let Some((d, label)) = crate::timers::from_query(q) {
+        let title = format!("Start a timer for {}", crate::timers::fmt_duration(d));
+        top.push(Item::new(title, label.as_str(), Icon::Vector(g::TIMER), Act::StartTimer(d.as_secs(), label.clone())).acc("Timer").tinted(Tint::System));
+    }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
@@ -684,6 +694,15 @@ mod tests {
             let n = (0..20).map(|_| emoji(q, 400, &mut m, &e).len()).last().unwrap();
             println!("{q:>10}: {n} rows, {:.2?} each", t.elapsed() / 20);
         }
+    }
+
+    #[test]
+    fn timer_query_offers_to_start_a_timer_first() {
+        let cfg = crate::config::parse("").unwrap();
+        let r = root("timer 5m tea", &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert_eq!((r[0].act.clone(), r[0].subtitle.as_str()), (Act::StartTimer(300, "tea".into()), "tea"));
+        let r = root("timer soon", &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert!(r.iter().all(|it| !matches!(it.act, Act::StartTimer(..))));
     }
 
     #[test]

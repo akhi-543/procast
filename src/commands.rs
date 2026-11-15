@@ -76,6 +76,9 @@ pub enum Cmd {
     /// Show the browser extension's folder, to load it in the browser.
     BrowserSetup,
     Desktop(Desk),
+    /// Ask for a duration and label in the search bar (`timer 5m tea`).
+    StartTimer,
+    StartStopwatch,
     Quit,
 }
 
@@ -139,6 +142,8 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::SPARKLES),
     (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::PANELS_TOP_LEFT),
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
+    (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
+    (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -241,6 +246,7 @@ impl Cmd {
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
+            Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -290,7 +296,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch => {}
         }
     }
     Ok(None)

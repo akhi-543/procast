@@ -81,6 +81,8 @@ pub enum Msg {
     Install(String, Option<bool>),
     /// Time to check for extension commands with an `interval`.
     Tick,
+    /// A second passed while a timer or stopwatch runs.
+    TimerTick,
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.
