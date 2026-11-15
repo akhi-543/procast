@@ -11,6 +11,7 @@ mod desktops;
 mod ext;
 mod files;
 mod foreground;
+mod hdr;
 mod keys;
 mod net;
 mod ntfs;
@@ -373,6 +374,8 @@ struct Launcher {
     visible: bool,
     /// The procast notification-area icon (Settings → General → Show in tray).
     tray_icon: Option<TrayIcon>,
+    /// Auto HDR (own thread).
+    hdr: hdr::Auto,
     /// When the window last closed, for "pop to root" after a timeout.
     hidden_at: Option<Instant>,
     /// Earlier root searches (oldest first) and which one Up last restored.
@@ -402,6 +405,7 @@ impl Launcher {
             let tx = tx.clone();
             std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
         }
+        foreground::set_games(&cfg.games.list);
         foreground::watch(tx.clone());
         std::thread::spawn(|| _ = browser::register());
         let browsers = browser::serve(tx.clone());
@@ -473,6 +477,7 @@ impl Launcher {
             prev: HWND::default(),
             visible: false,
             tray_icon: None,
+            hdr: hdr::Auto::start(),
             hidden_at: None,
             searches: std::fs::read_to_string(config::dir().join("search-history.txt")).unwrap_or_default().lines().map(String::from).collect(),
             search_pos: None,
@@ -2421,6 +2426,9 @@ impl Launcher {
                     clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
                     self.history.set_limits(cfg.clipboard.history, &cfg.clipboard.keep);
                 }
+                if cfg.games.list != self.cfg.games.list {
+                    foreground::set_games(&cfg.games.list);
+                }
                 if cfg.apps.folders != self.cfg.apps.folders || cfg.apps.deep != self.cfg.apps.deep {
                     self.scanned = None;
                 }
@@ -2531,7 +2539,7 @@ impl Launcher {
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
-            Msg::Foreground { .. } => {} // Auto HDR and Focus act on it
+            Msg::Foreground { hwnd, game } => self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);

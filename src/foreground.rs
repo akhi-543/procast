@@ -2,7 +2,10 @@
 //! its own thread, shared by Auto HDR and Focus. The callback stays small; the UI thread
 //! decides what a change means.
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{OnceLock, RwLock},
+    time::Duration,
+};
 
 use futures::channel::mpsc::UnboundedSender;
 use windows::Win32::{
@@ -28,6 +31,28 @@ const LIBRARIES: &[&[&str]] = &[&["steamapps", "common"], &["epic games"], &["xb
 const RECHECK: Duration = Duration::from_secs(1);
 
 static TX: OnceLock<UnboundedSender<Msg>> = OnceLock::new();
+/// `[games] list`, lower case file names.
+static GAMES: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Sets the programs always counted as games (applies from the next focus change).
+pub fn set_games(list: &[String]) {
+    if let Ok(mut g) = GAMES.write() {
+        *g = list.iter().map(|g| g.to_lowercase()).collect();
+    }
+}
+
+fn games() -> Vec<String> {
+    GAMES.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// A game has focus right now (for the start-up check; the hook only reports changes).
+pub fn game_in_front() -> bool {
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let path = crate::apps::exe_path(pid).unwrap_or_default();
+    is_game(&path, d3d_full(), covers_monitor(hwnd), &games())
+}
 
 /// Starts the hook (once): every change of the foreground window sends `Msg::Foreground`.
 pub fn watch(tx: UnboundedSender<Msg>) {
@@ -52,17 +77,17 @@ unsafe extern "system" fn changed(_: HWINEVENTHOOK, _: u32, hwnd: HWND, object: 
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let path = crate::apps::exe_path(pid).unwrap_or_default();
-    // ponytail: no user game list yet (the config key comes with the features that use it).
-    let game = is_game(&path, d3d_full(), covers_monitor(hwnd), &[]);
+    let game = is_game(&path, d3d_full(), covers_monitor(hwnd), &games());
     let Some(tx) = TX.get() else { return };
-    let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, pid, exe: file_name(&path), game });
+    let _ = tx.unbounded_send(Msg::Foreground { hwnd: hwnd.0 as isize, game });
     let at = hwnd.0 as isize;
-    std::thread::spawn(move || {
+    // A failed spawn must not unwind out of this extern fn: the re-check is just skipped.
+    let _ = std::thread::Builder::new().spawn(move || {
         std::thread::sleep(RECHECK);
         let hwnd = HWND(at as *mut _);
-        let now = is_game(&path, d3d_full(), covers_monitor(hwnd), &[]);
+        let now = is_game(&path, d3d_full(), covers_monitor(hwnd), &games());
         if resend(unsafe { GetForegroundWindow() } == hwnd, game, now) {
-            let _ = tx.unbounded_send(Msg::Foreground { hwnd: at, pid, exe: file_name(&path), game: now });
+            let _ = tx.unbounded_send(Msg::Foreground { hwnd: at, game: now });
         }
     });
 }
@@ -75,14 +100,6 @@ fn resend(still_foreground: bool, sent: bool, now: bool) -> bool {
 /// "c:\\games\\foo.exe" -> "foo.exe", lower case.
 fn file_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or_default().to_lowercase()
-}
-
-/// A window's program file name, lower case ("chrome.exe").
-#[allow(dead_code)] // Focus (task 7) uses it
-pub fn exe_of(hwnd: HWND) -> Option<String> {
-    let mut pid = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    crate::apps::exe_path(pid).map(|p| file_name(&p))
 }
 
 /// `exe` is the program's full path (or just its file name, which can only match `games`).

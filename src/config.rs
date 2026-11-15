@@ -44,6 +44,7 @@ pub struct Config {
     pub quicklink: Vec<Quicklink>,
     pub snippet: Vec<Snippet>,
     pub snippets: Snippets,
+    pub games: Games,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -60,6 +61,16 @@ pub struct Clipboard {
     pub hotkey: String,
     /// Executable names whose copies are never recorded.
     pub ignore_apps: Vec<String>,
+}
+
+/// What counts as a game, and what happens while one has focus.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct Games {
+    /// Turn HDR on while a game has focus, and off again after (only if procast turned it on).
+    pub auto_hdr: bool,
+    /// Program file names that always count as games, e.g. ["eldenring.exe"].
+    pub list: Vec<String>,
 }
 
 /// Snippets typed anywhere turn into their text.
@@ -480,6 +491,7 @@ impl Default for Config {
             quicklink: vec![],
             snippet: vec![],
             snippets: Snippets::default(),
+            games: Games::default(),
         }
     }
 }
@@ -672,6 +684,10 @@ within_words = false          # also expand when the keyword ends a longer word
 speed = "default"             # pause before the text goes in: instant | quick | default | delayed | extended
 sound = "off"                 # off | default | asterisk | exclamation | question
 ignore_apps = []              # program names where typing never expands, e.g. ["code.exe"]
+
+[games]
+auto_hdr = false              # turn HDR on while a game has focus, off again after
+list = []                     # program names that always count as games, e.g. ["eldenring.exe"]; full-screen D3D apps and borderless Steam/Epic/Xbox/Riot games are found by themselves
 
 [emoji]
 hotkey = ""                   # e.g. "Ctrl+Alt+E"

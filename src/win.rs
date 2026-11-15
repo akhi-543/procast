@@ -102,10 +102,8 @@ pub enum Msg {
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
-    /// The foreground window changed: its handle, process id, program file name (lower case)
-    /// and whether it is a game (see foreground.rs).
-    #[allow(dead_code)] // fields are read by Auto HDR and Focus (tasks 6, 7)
-    Foreground { hwnd: isize, pid: u32, exe: String, game: bool },
+    /// The foreground window changed: its handle and whether it is a game (see foreground.rs).
+    Foreground { hwnd: isize, game: bool },
     /// A command's result (true) or why it failed (false): shown as a toast that fades away.
     Toast(bool, String),
 }

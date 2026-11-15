@@ -245,6 +245,13 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 ],
             ),
             (
+                "Games",
+                vec![
+                    row("Auto HDR", "games.auto_hdr", Kind::Bool, "Turn HDR on while a game has focus and off again after. HDR you turned on yourself stays on."),
+                    row("Games", "games.list", Kind::List, "Program file names that always count as games, e.g. eldenring.exe. Full-screen D3D apps and borderless Steam, Epic, Xbox and Riot games are found by themselves."),
+                ],
+            ),
+            (
                 "Root search items",
                 vec![
                     row("Favourites", "launcher.favorites", Kind::Keys, "Pinned to the top of root search. Add one in procast with Ctrl+K → Add to Favorites."),
