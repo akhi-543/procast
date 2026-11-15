@@ -559,7 +559,7 @@ fn open() -> String {
 
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec(), shell: "run".into(), terminal: false, existing_tab: true }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai", "define"].map(String::from).to_vec(), shell: "run".into(), terminal: false, existing_tab: true }
     }
 }
 
@@ -603,7 +603,7 @@ auto_quit_minutes = 60
 [search]
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
-fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", "define" (one word), or a quicklink name with {query}
+fallbacks = ["web", "chatgpt", "ai", "define"]  # rows for any query, in order: "web", "chatgpt", "ai", "define" (one word), or a quicklink name with {query}
 shell = "run"                 # what runs "> command": run (like Win+R) | cmd | powershell | pwsh
 terminal = false              # open that shell in Windows Terminal
 existing_tab = true           # quicklinks switch to a tab already showing the page (with the procast browser extension)

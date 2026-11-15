@@ -103,8 +103,9 @@ impl Part {
         let stripped = pos.rules().iter().filter_map(|(end, with)| Some(format!("{}{with}", word.strip_suffix(end)?))).filter(|s| s.len() > 1);
         // "running" -> "runn" -> "run".
         let undoubled = pos.rules().iter().filter(|(end, with)| end.starts_with(['e', 'i']) && with.is_empty()).filter_map(|(end, _)| word.strip_suffix(end)).filter_map(|s| {
-            let b = s.as_bytes();
-            (b.len() > 2 && b[b.len() - 1] == b[b.len() - 2]).then(|| s[..s.len() - 1].to_string())
+            let mut chars = s.chars().rev();
+            let last = chars.next()?;
+            (chars.next()? == last && chars.next().is_some()).then(|| s[..s.len() - last.len_utf8()].to_string())
         });
         std::iter::once(word.to_string()).chain(irregular).chain(stripped).chain(undoubled).find_map(|c| self.entry(&c))
     }
@@ -219,9 +220,14 @@ pub fn dir() -> PathBuf {
     config::dir().join("wordnet")
 }
 
-/// The folder under `root` that holds `index.noun`: the extracted archive has it in `dict`.
+/// Whether `dir` holds every index and data file (a half-unpacked archive does not).
+fn complete(dir: &Path) -> bool {
+    Pos::ALL.iter().all(|p| dir.join(format!("index.{}", p.ext())).is_file() && dir.join(format!("data.{}", p.ext())).is_file())
+}
+
+/// The folder under `root` that holds the whole database: the extracted archive has it in `dict`.
 fn locate(root: &Path) -> Option<PathBuf> {
-    if root.join("index.noun").is_file() {
+    if complete(root) {
         return Some(root.to_path_buf());
     }
     fs::read_dir(root).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).find_map(|p| locate(&p))
@@ -232,12 +238,35 @@ pub fn installed() -> Option<PathBuf> {
     locate(&dir())
 }
 
-/// Downloads and unpacks WordNet into [`dir`]. Slow: for a worker thread.
+/// Replaces `root` with `part` once `part` holds the whole database, so a download that died
+/// half way never looks installed.
+fn swap_in(part: &Path, root: &Path) -> Result<PathBuf, String> {
+    if locate(part).is_none() {
+        return Err("The download held no WordNet files".into());
+    }
+    if root.exists() {
+        fs::remove_dir_all(root).map_err(|e| format!("Could not replace {}: {e}", root.display()))?;
+    }
+    // A virus scanner may still hold the new files for a moment.
+    let mut moved = fs::rename(part, root);
+    for _ in 0..10 {
+        if moved.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        moved = fs::rename(part, root);
+    }
+    moved.map_err(|e| format!("Could not install the dictionary: {e}"))?;
+    locate(root).ok_or_else(|| "The download held no WordNet files".into())
+}
+
+/// Downloads WordNet, unpacks it next to [`dir`] and moves it into place. Slow: for a worker thread.
 fn download() -> Result<PathBuf, String> {
     use std::os::windows::process::CommandExt;
     let root = dir();
-    fs::create_dir_all(&root).map_err(|e| format!("Could not create {}: {e}", root.display()))?;
-    let archive = root.join("wordnet.tar.gz");
+    let (part, archive) = (root.with_extension("part"), root.with_extension("tar.gz"));
+    let _ = fs::remove_dir_all(&part);
+    fs::create_dir_all(&part).map_err(|e| format!("Could not create {}: {e}", part.display()))?;
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(300))).build().into();
     let fetch = || -> Result<(), String> {
         let mut resp = agent.get(URL).call().map_err(|e| e.to_string())?;
@@ -248,13 +277,14 @@ fn download() -> Result<PathBuf, String> {
     let unpack = || -> Result<(), String> {
         // The tar that ships with Windows, by full path: another tar on PATH may not read `C:\` paths.
         let tar = Path::new(&std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join(r"System32\tar.exe");
-        let status = std::process::Command::new(tar).arg("-xzf").arg(&archive).arg("-C").arg(&root).creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
+        let status = std::process::Command::new(tar).arg("-xzf").arg(&archive).arg("-C").arg(&part).creation_flags(0x0800_0000).status().map_err(|e| e.to_string())?;
         status.success().then_some(()).ok_or_else(|| "tar failed".into())
     };
     let done = fetch().map_err(|e| format!("Could not download the dictionary: {e}")).and_then(|_| unpack().map_err(|e| format!("Could not unpack the dictionary: {e}")));
     let _ = fs::remove_file(&archive);
-    done?;
-    locate(&root).ok_or_else(|| "The download held no WordNet files".into())
+    let installed = done.and_then(|_| swap_in(&part, &root));
+    let _ = fs::remove_dir_all(&part);
+    installed
 }
 
 /// `define dog` -> "dog".
@@ -275,11 +305,26 @@ pub enum Answer {
     Missing(Vec<String>),
 }
 
-/// Looks `word` up, downloading the dictionary first when it is not there yet.
+/// Looks `word` up, downloading the dictionary first when it is not there yet. Never panics:
+/// the caller is waiting for an answer.
 pub fn define(word: &str) -> Result<Answer, String> {
-    let dir = match installed() {
-        Some(d) => d,
-        None => download()?,
+    guarded(|| lookup_word(word))
+}
+
+/// A panic in `f` becomes an error.
+fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("The dictionary lookup failed".into()))
+}
+
+fn lookup_word(word: &str) -> Result<Answer, String> {
+    // One download at a time: a lookup that arrives meanwhile waits, then finds it installed.
+    static DOWNLOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let dir = {
+        let _one = DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner());
+        match installed() {
+            Some(d) => d,
+            None => download()?,
+        }
     };
     let wn = WordNet::open(&dir)?;
     let senses = wn.lookup(word);
@@ -336,7 +381,12 @@ mod tests {
     fn fixture(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("procast-wordnet-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        fixture_in(&dir);
+        dir
+    }
+
+    fn fixture_in(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
         let (noun, n) = data_file(&[
             "05 n 02 dog 0 domestic_dog 0 001 @ 00000000 n 0000 | a member of the genus Canis; has been domesticated by man since prehistoric times; occurs in many breeds; \"the dog barked all night\"",
             "18 n 02 dog 0 hound 1 001 @ 00000000 n 0000 | informal term for a man; \"you lucky dog\"",
@@ -355,11 +405,11 @@ mod tests {
         for (pos, rows) in index {
             fs::write(dir.join(format!("index.{pos}")), format!("{LICENSE}{rows}")).unwrap();
         }
-        for (pos, text) in [("noun", noun), ("verb", verb), ("adj", adj)] {
+        for (pos, text) in [("noun", noun), ("verb", verb), ("adj", adj), ("adv", LICENSE.into())] {
             fs::write(dir.join(format!("data.{pos}")), text).unwrap();
         }
+        fs::write(dir.join("index.adv"), LICENSE).unwrap();
         fs::write(dir.join("verb.exc"), "ran run\nwent go\n").unwrap();
-        dir
     }
 
     #[test]
@@ -392,6 +442,38 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_words_never_panic() {
+        let wn = WordNet::open(&fixture("unicode")).unwrap();
+        // U+1000 is E1 80 80 in UTF-8: its last two bytes are equal, but it is one character.
+        for w in ["\u{1000}ed", "\u{1000}\u{1000}ing", "\u{1000}\u{1000}\u{1000}ing", "caf\u{e9}s", "\u{e9}\u{e9}ed", "\u{1f600}", "dog\u{1000}", "runn\u{1000}ing"] {
+            assert!(wn.lookup(w).is_empty(), "{w}");
+            assert!(!wn.knows(w));
+        }
+    }
+
+    #[test]
+    fn damaged_files_give_no_senses_instead_of_panicking() {
+        let dir = fixture("damaged");
+        // The index points at offsets the data file does not have, and some lines are cut short.
+        fs::write(dir.join("data.noun"), "garbage\n").unwrap();
+        fs::write(dir.join("data.verb"), "").unwrap();
+        fs::write(dir.join("index.adj"), "big a 9 1 & 1 0 00000000\nlast\n").unwrap();
+        let wn = WordNet::open(&dir).unwrap();
+        assert!(wn.lookup("dog").is_empty() && wn.lookup("run").is_empty() && wn.lookup("big").is_empty() && wn.lookup("last").is_empty());
+        for line in ["", "|", "00000000", "00000000 05 n", "00000000 05 n zz dog 0 | x"] {
+            assert!(parse_synset(line, Pos::Noun, "dog").is_none(), "{line:?}");
+        }
+        // More words promised than listed: what is there is used.
+        assert!(parse_synset("00000000 05 n 05 dog 0 | x", Pos::Noun, "dog").unwrap().synonyms.is_empty());
+    }
+
+    #[test]
+    fn a_panicking_lookup_becomes_an_error() {
+        assert_eq!(guarded::<()>(|| panic!("boom")).err().as_deref(), Some("The dictionary lookup failed"));
+        assert_eq!(guarded(|| Ok(1)), Ok(1));
+    }
+
+    #[test]
     fn unknown_words_have_no_senses() {
         let wn = WordNet::open(&fixture("none")).unwrap();
         assert!(wn.lookup("zzzz").is_empty() && wn.lookup("").is_empty() && wn.lookup("  ").is_empty());
@@ -410,12 +492,33 @@ mod tests {
         let _ = fs::remove_dir_all(&empty);
         fs::create_dir_all(&empty).unwrap();
         assert!(WordNet::open(&empty).is_err() && locate(&empty).is_none());
-        let dict = fixture("locate");
-        let root = dict.with_file_name(format!("procast-wordnet-{}-root", std::process::id()));
+        let root = empty.with_file_name(format!("procast-wordnet-{}-root", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::rename(&dict, root.join("dict")).unwrap();
+        fixture_in(&root.join("dict"));
         assert_eq!(locate(&root), Some(root.join("dict")));
+    }
+
+    #[test]
+    fn a_half_unpacked_archive_is_not_installed() {
+        let tmp = |name: &str| {
+            let dir = std::env::temp_dir().join(format!("procast-wordnet-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let (part, root) = (tmp("part"), tmp("live"));
+        // Died after index.noun: nothing is found, and nothing is moved into place.
+        fs::create_dir_all(part.join("dict")).unwrap();
+        fs::write(part.join("dict").join("index.noun"), LICENSE).unwrap();
+        fs::write(root.join("old"), "stale").unwrap();
+        assert!(locate(&part).is_none());
+        assert!(swap_in(&part, &root).is_err() && root.join("old").exists(), "the old folder stays until the new one is whole");
+        // Whole: replaces the stale folder.
+        fs::remove_dir_all(&part).unwrap();
+        fixture_in(&part.join("dict"));
+        assert_eq!(swap_in(&part, &root), Ok(root.join("dict")));
+        assert!(!root.join("old").exists() && !part.exists());
+        assert!(WordNet::open(&locate(&root).unwrap()).unwrap().knows("dog"));
     }
 
     #[test]

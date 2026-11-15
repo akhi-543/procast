@@ -770,7 +770,9 @@ fallbacks = [\"define\", \"web\"]").unwrap();
         let tail: Vec<_> = ask(&cfg, "dog").into_iter().filter(|it| it.section.as_deref() == Some("Use \"dog\" with")).map(|it| it.act).collect();
         assert_eq!(tail[0], Act::Define("dog".into()), "first, in the configured order");
         assert!(ask(&cfg, "dog food").iter().all(|it| !matches!(it.act, Act::Define(_))), "one word only");
-        assert!(ask(&Config::default(), "dog").iter().all(|it| !matches!(it.act, Act::Define(_))), "off unless listed");
+        assert!(ask(&Config::default(), "dog").iter().any(|it| it.act == Act::Define("dog".into())), "on by default");
+        let unlisted = crate::config::parse("[search]\nfallbacks = [\"web\"]").unwrap();
+        assert!(ask(&unlisted, "dog").iter().all(|it| !matches!(it.act, Act::Define(_))), "off when not listed");
         assert!(catalog(&[], &[], &[], &cfg).iter().any(|it| it.act == Act::Cmd(Cmd::Define)));
 
         let off = crate::config::parse("[dictionary]
@@ -824,7 +826,8 @@ fallbacks = [\"define\"]").unwrap();
 
         let r = root("vsc", &cat, &cfg, &frec, &mut m);
         assert_eq!(r[0].title, "Visual Studio Code");
-        assert_eq!(r.last().unwrap().accessory, "AI");
+        assert_eq!(r.last().unwrap().accessory, "Dictionary", "the last fallback");
+        assert!(r.iter().any(|h| h.accessory == "AI"));
         assert_eq!(r[0].section.as_deref(), Some("Results"));
         assert_eq!(r.last().unwrap().section.as_deref(), Some("Use \"vsc\" with"));
         assert!(r.len() <= 5);
@@ -960,7 +963,8 @@ fallbacks = [\"define\"]").unwrap();
     #[test]
     fn word_starts_beat_scattered_letters() {
         let apps: Vec<App> = ["Clock", "Claude"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
-        let cfg = crate::config::parse("").unwrap();
+        // Room for the results next to the four fallback rows.
+        let cfg = crate::config::parse("max_results = 12").unwrap();
         let cat = catalog(&apps, &[], &[], &cfg);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let titles: Vec<String> = root("cl", &cat, &cfg, &Frecency::default(), &mut m).into_iter().map(|h| h.title).collect();
