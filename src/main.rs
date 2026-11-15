@@ -6,6 +6,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod design;
+mod dict;
 mod desktops;
 mod ext;
 mod files;
@@ -128,6 +129,8 @@ enum Mode {
     Ai,
     /// A translation (see `Launcher::translation`).
     Translate,
+    /// A dictionary answer (see `Launcher::define`).
+    Define,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -347,6 +350,9 @@ struct Launcher {
     translation: Option<(String, Option<translate::Translation>)>,
     /// Number of the newest translation request; answers to older ones are dropped.
     translate_seq: u64,
+    /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
+    define: Option<(String, Option<Result<dict::Answer, String>>)>,
+    define_seq: u64,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -444,6 +450,8 @@ impl Launcher {
             output: None,
             translation: None,
             translate_seq: 0,
+            define: None,
+            define_seq: 0,
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -756,6 +764,25 @@ impl Launcher {
                     t.text.lines().filter(|l| !l.trim().is_empty()).map(|l| Item::new(l, "", Icon::Vector(g::LANGUAGES), act.clone()).sec(section.clone())).collect()
                 }
                 None => vec![],
+            },
+            Mode::Define => match &self.define {
+                None => vec![],
+                Some((_, None)) => {
+                    let title = if dict::installed().is_some() { "Looking it up…" } else { "Downloading the dictionary (16 MB, once)…" };
+                    vec![empty_row(g::CLOCK, title.into(), String::new(), vec![])]
+                }
+                Some((_, Some(Err(e)))) => vec![empty_row(g::WARNING, e.clone(), String::new(), vec![])],
+                Some((word, Some(Ok(dict::Answer::Missing(maybe))))) if maybe.is_empty() => vec![empty_row(g::SEARCH, format!("No definition for \"{word}\""), String::new(), vec![])],
+                Some((_, Some(Ok(dict::Answer::Missing(maybe))))) => maybe.iter().map(|w| Item::new(w, "", Icon::Vector(g::SEARCH), Act::Define(w.clone())).sec("Did you mean")).collect(),
+                Some((_, Some(Ok(dict::Answer::Found(senses))))) => senses
+                    .iter()
+                    .map(|s| {
+                        let example = s.examples.first().map(|e| format!("\"{e}\""));
+                        let synonyms = (!s.synonyms.is_empty()).then(|| s.synonyms.join(", "));
+                        let sub = [example, synonyms].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
+                        Item::new(&s.gloss, sub, Icon::Vector(g::BOOK_OPEN), Act::Copy(s.gloss.clone())).sec(s.pos.name())
+                    })
+                    .collect(),
             },
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
@@ -1235,6 +1262,31 @@ impl Launcher {
         if hidden && !self.visible {
             self.show(Mode::Translate, window, cx);
         } else if self.mode == Mode::Translate {
+            self.refresh(cx);
+        }
+    }
+
+    // ---- dictionary ------------------------------------------------------------------
+
+    /// Looks `word` up off the UI thread; the first lookup also downloads the dictionary.
+    fn define(&mut self, word: String, cx: &mut Context<Self>) {
+        self.define_seq += 1;
+        let (seq, tx) = (self.define_seq, self.tx.clone());
+        self.status = None;
+        self.define = Some((word.clone(), None));
+        self.set_mode(Mode::Define, cx);
+        std::thread::spawn(move || {
+            let result = dict::define(&word);
+            let _ = tx.unbounded_send(Msg::Defined { seq, word, result });
+        });
+    }
+
+    fn on_defined(&mut self, seq: u64, word: String, result: Result<dict::Answer, String>, cx: &mut Context<Self>) {
+        if seq != self.define_seq {
+            return;
+        }
+        self.define = Some((word, Some(result)));
+        if self.mode == Mode::Define {
             self.refresh(cx);
         }
     }
@@ -1949,6 +2001,8 @@ impl Launcher {
             }
             Act::Cmd(Cmd::Translate) => return self.input.update(cx, |s, cx| s.emplace("translate ", cx)),
             Act::Translate(job) => return self.translate(job, cx),
+            Act::Define(word) => return self.define(word, cx),
+            Act::Cmd(Cmd::Define) => return self.input.update(cx, |s, cx| s.emplace("define ", cx)),
             Act::Cmd(Cmd::StartTimer) => return self.input.update(cx, |s, cx| s.emplace("timer ", cx)),
             Act::Cmd(Cmd::StartStopwatch) => {
                 self.timers.stopwatch();
@@ -2063,7 +2117,7 @@ impl Launcher {
     fn needs_window(&self, act: &Act) -> bool {
         match act {
             Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -2393,6 +2447,7 @@ impl Launcher {
             Msg::Toast(..) => {}
             Msg::TimerTick => self.on_timer_tick(cx),
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
+            Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2512,6 +2567,7 @@ impl Launcher {
             }),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate => Some("Translator".into()),
+            Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -2548,6 +2604,7 @@ impl Launcher {
                 .unwrap_or_default()
                 .into(),
             Mode::Output => "Enter copies the output".into(),
+            Mode::Define => "Enter copies the definition".into(),
             Mode::Translate => if self.cfg.translator.primary == "paste" { "Enter pastes the translation" } else { "Enter copies the translation" }.into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
@@ -2599,6 +2656,7 @@ impl Launcher {
             Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
             Mode::Translate => Icon::Vector(g::LANGUAGES),
+            Mode::Define => Icon::Vector(g::BOOK_OPEN),
         }
     }
 

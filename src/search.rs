@@ -81,6 +81,8 @@ pub enum Act {
     StartTimer(u64, String),
     /// Cancel a timer, or stop a stopwatch and copy its time, by id.
     StopTimer(u64),
+    /// Look a word up in the offline dictionary; the answer opens in its own view.
+    Define(String),
     /// Translate with DeepL; the result opens in its own view or pastes over the selection.
     Translate(crate::translate::Job),
     /// A row with nothing to do (loading, empty views).
@@ -119,6 +121,7 @@ impl Act {
             Act::StartTimer(..) => "Start Timer",
             Act::StopTimer(_) => "Stop",
             Act::Translate(_) => "Translate",
+            Act::Define(_) => "Define",
             Act::None => "",
         }
     }
@@ -304,6 +307,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         .collect();
     for &(cmd, title, words, glyph) in commands::ALL {
         if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled
+            || cmd == Cmd::Define && !cfg.dictionary.enabled
             || cmd == Cmd::SearchFiles && !cfg.files.enabled
             || matches!(cmd, Cmd::Desktop(_)) && !desktops::supported()
         {
@@ -465,6 +469,11 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         let job = crate::translate::Job { text: text.clone(), from: cfg.translator.from.clone(), to, replace: false };
         top.push(Item::new(title, text.as_str(), Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Translator").tinted(Tint::Web));
     }
+    if cfg.dictionary.enabled
+        && let Some(word) = crate::dict::from_query(q)
+    {
+        top.push(Item::new(format!("Define \"{word}\""), "", Icon::Vector(g::BOOK_OPEN), Act::Define(word)).acc("Dictionary").tinted(Tint::System));
+    }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
     {
@@ -480,6 +489,9 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         .filter_map(|name| {
             if name.eq_ignore_ascii_case("ai") {
                 return Some(Item::new("Ask AI", "", Icon::Vector(g::SPARKLES), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
+            }
+            if name.eq_ignore_ascii_case("define") {
+                return (cfg.dictionary.enabled && crate::dict::looks_like_word(q)).then(|| Item::new("Define", "", Icon::Vector(g::BOOK_OPEN), Act::Define(q.to_string())).acc("Dictionary").tinted(Tint::System).sec(format!("Use \"{q}\" with")));
             }
             let (title, url, icon, kind) = if name.eq_ignore_ascii_case("web") {
                 (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), Icon::Vector(g::GLOBE), "Web"))?
@@ -746,6 +758,27 @@ to = \"ES\"").unwrap();
         assert_eq!(german.act, Act::Translate(crate::translate::Job { text: String::new(), from: "auto".into(), to: "DE".into(), replace: true }));
         let spanish = items.iter().find(|it| it.title == "Spanish, please").unwrap();
         assert_eq!(spanish.act, Act::Translate(crate::translate::Job { text: String::new(), from: "EN".into(), to: "ES".into(), replace: false }));
+    }
+
+    #[test]
+    fn define_offers_a_row_for_the_query_and_as_a_fallback() {
+        let ask = |cfg: &Config, q: &str| root(q, &catalog(&[], &[], &[], cfg), cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        let cfg = crate::config::parse("[search]
+fallbacks = [\"define\", \"web\"]").unwrap();
+        let r = ask(&cfg, "define dog");
+        assert_eq!((r[0].act.clone(), r[0].title.as_str()), (Act::Define("dog".into()), "Define \"dog\""));
+        let tail: Vec<_> = ask(&cfg, "dog").into_iter().filter(|it| it.section.as_deref() == Some("Use \"dog\" with")).map(|it| it.act).collect();
+        assert_eq!(tail[0], Act::Define("dog".into()), "first, in the configured order");
+        assert!(ask(&cfg, "dog food").iter().all(|it| !matches!(it.act, Act::Define(_))), "one word only");
+        assert!(ask(&Config::default(), "dog").iter().all(|it| !matches!(it.act, Act::Define(_))), "off unless listed");
+        assert!(catalog(&[], &[], &[], &cfg).iter().any(|it| it.act == Act::Cmd(Cmd::Define)));
+
+        let off = crate::config::parse("[dictionary]
+enabled = false
+[search]
+fallbacks = [\"define\"]").unwrap();
+        assert!(ask(&off, "define dog").iter().chain(&ask(&off, "dog")).all(|it| !matches!(it.act, Act::Define(_))));
+        assert!(catalog(&[], &[], &[], &off).iter().all(|it| it.act != Act::Cmd(Cmd::Define)));
     }
 
     #[test]

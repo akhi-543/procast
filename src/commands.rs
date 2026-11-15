@@ -81,6 +81,8 @@ pub enum Cmd {
     StartStopwatch,
     /// Translate text typed in the search bar (`translate hola`), or the selection.
     Translate,
+    /// Ask for a word in the search bar (`define dog`).
+    Define,
     Quit,
 }
 
@@ -147,6 +149,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
+    (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -251,6 +254,7 @@ impl Cmd {
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
             Cmd::Translate => "Translator",
+            Cmd::Define => "Dictionary",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -300,7 +304,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::Define => {}
         }
     }
     Ok(None)

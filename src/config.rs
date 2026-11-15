@@ -24,6 +24,7 @@ pub struct Config {
     pub search: Search,
     pub ai: Ai,
     pub translator: Translator,
+    pub dictionary: Dictionary,
     /// `[[translate]]`: commands that translate the selected text into one language.
     pub translate: Vec<TranslateCmd>,
     pub clipboard: Clipboard,
@@ -462,6 +463,7 @@ impl Default for Config {
             search: Search::default(),
             ai: Ai::default(),
             translator: Translator::default(),
+            dictionary: Dictionary::default(),
             translate: vec![],
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
@@ -490,6 +492,19 @@ pub struct Ai {
 impl Default for Ai {
     fn default() -> Self {
         Self { model: "haiku".into() }
+    }
+}
+
+/// The offline dictionary (WordNet): `define dog` in root search.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Dictionary {
+    pub enabled: bool,
+}
+
+impl Default for Dictionary {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -588,7 +603,7 @@ auto_quit_minutes = 60
 [search]
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
-fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", or a quicklink name with {query}
+fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", "define" (one word), or a quicklink name with {query}
 shell = "run"                 # what runs "> command": run (like Win+R) | cmd | powershell | pwsh
 terminal = false              # open that shell in Windows Terminal
 existing_tab = true           # quicklinks switch to a tab already showing the page (with the procast browser extension)
@@ -607,6 +622,9 @@ prefill_selection = false     # "Translate" starts from the text selected in the
 # [[translate]]
 # to = "DE"
 # output = "replace"
+
+[dictionary]
+enabled = true                # define dog: offline WordNet, downloaded once (16 MB) into %APPDATA%\procast\wordnet
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account
