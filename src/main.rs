@@ -364,8 +364,8 @@ struct Launcher {
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     ai: Option<AiChat>,
-    /// The translation view: the target language and the answer (None while it is on its way).
-    translation: Option<(String, Option<translate::Translation>)>,
+    /// The translation view: what was asked and the answers (None while they are on their way).
+    translation: Option<(translate::Job, Option<Vec<translate::Translation>>)>,
     /// Number of the newest translation request; answers to older ones are dropped.
     translate_seq: u64,
     /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
@@ -799,12 +799,24 @@ impl Launcher {
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Translate => match &self.translation {
-                Some((to, None)) => vec![empty_row(g::CLOCK, format!("Translating to {}…", translate::language_name(to)), String::new(), vec![])],
-                Some((to, Some(t))) => {
-                    let act = if self.cfg.translator.primary == "paste" { Act::Paste(t.text.clone()) } else { Act::Copy(t.text.clone()) };
-                    let section = if t.detected.is_empty() { format!("To {}", translate::language_name(to)) } else { format!("{} to {}", translate::language_name(&t.detected), translate::language_name(to)) };
-                    t.text.lines().filter(|l| !l.trim().is_empty()).map(|l| Item::new(l, "", Icon::Vector(g::LANGUAGES), act.clone()).sec(section.clone())).collect()
-                }
+                Some((job, None)) => vec![empty_row(g::CLOCK, format!("Translating to {}…", translate::names(&job.to)), String::new(), vec![])],
+                Some((job, Some(all))) => all
+                    .iter()
+                    .flat_map(|t| {
+                        let act = if self.cfg.translator.primary == "paste" { Act::Paste(t.text.clone()) } else { Act::Copy(t.text.clone()) };
+                        let section = if t.detected.is_empty() { format!("To {}", translate::language_name(&t.to)) } else { format!("{} to {}", translate::language_name(&t.detected), translate::language_name(&t.to)) };
+                        let lines = t.text.lines().filter(|l| !l.trim().is_empty()).map(|l| Item::new(l, "", Icon::Vector(g::LANGUAGES), act.clone()).sec(section.clone()));
+                        let say = t.pronunciation.iter().map(|p| Item::new(p, "Pronunciation", Icon::Vector(g::LANGUAGES), Act::Copy(p.clone())).sec(section.clone()));
+                        // The corrected text, to translate instead of what was typed.
+                        let fix = t.suggestion.iter().map(|s| {
+                            let text = s.replace(['[', ']'], "");
+                            let again = translate::Job { text, after: translate::After::Open, ..job.clone() };
+                            let sec = if t.corrected { "Showing results for" } else { "Did you mean" };
+                            Item::new(s, "", Icon::Vector(g::SEARCH), Act::Translate(again)).sec(sec)
+                        });
+                        lines.chain(say).chain(fix).collect::<Vec<_>>()
+                    })
+                    .collect(),
                 None => vec![],
             },
             Mode::Define => match &self.define {
@@ -1547,17 +1559,17 @@ impl Launcher {
     /// paste-over-selection job) hides the launcher first, so the app you came from has focus.
     fn translate(&mut self, mut job: translate::Job, cx: &mut Context<Self>) {
         self.translate_seq += 1;
-        let (seq, hidden) = (self.translate_seq, job.replace || job.text.trim().is_empty());
+        let (seq, hidden) = (self.translate_seq, job.after != translate::After::Open || job.text.trim().is_empty());
         if hidden {
             if self.visible {
                 self.hide(true, cx);
             }
         } else {
             self.status = None;
-            self.translation = Some((job.to.clone(), None));
+            self.translation = Some((job.clone(), None));
             self.set_mode(Mode::Translate, cx);
         }
-        let (tx, key, owner) = (self.tx.clone(), self.cfg.translator.deepl_key.clone(), self.hwnd.0 as isize);
+        let (tx, owner) = (self.tx.clone(), self.hwnd.0 as isize);
         std::thread::spawn(move || {
             if job.text.trim().is_empty() {
                 match snippets::grab_selection(HWND(owner as _)).filter(|s| !s.trim().is_empty()) {
@@ -1565,12 +1577,12 @@ impl Launcher {
                     None => return drop(tx.unbounded_send(Msg::Toast(false, "No text selected".into()))),
                 }
             }
-            let result = translate::translate(&key, &job.text, &job.from, &job.to);
+            let result = translate::run(&job);
             let _ = tx.unbounded_send(Msg::Translated { seq, job, hidden, result });
         });
     }
 
-    fn on_translated(&mut self, seq: u64, job: translate::Job, hidden: bool, result: Result<translate::Translation, String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_translated(&mut self, seq: u64, job: translate::Job, hidden: bool, result: Result<Vec<translate::Translation>, String>, window: &mut Window, cx: &mut Context<Self>) {
         if seq != self.translate_seq {
             return;
         }
@@ -1583,12 +1595,19 @@ impl Launcher {
             }
             Err(e) => return drop(self.tx.unbounded_send(Msg::Toast(false, e))),
         };
-        if job.replace {
-            // Over the selection the launcher gave focus back to.
-            cx.write_to_clipboard(ClipboardItem::new_string(translation.text));
-            return clipboard::paste_soon();
+        match job.after {
+            translate::After::Replace => {
+                // Over the selection the launcher gave focus back to.
+                cx.write_to_clipboard(ClipboardItem::new_string(translation[0].text.clone()));
+                return clipboard::paste_soon();
+            }
+            translate::After::Copy => {
+                cx.write_to_clipboard(ClipboardItem::new_string(translation[0].text.clone()));
+                return drop(self.tx.unbounded_send(Msg::Toast(true, "Copied the translation".into())));
+            }
+            translate::After::Open => {}
         }
-        self.translation = Some((job.to, Some(translation)));
+        self.translation = Some((job, Some(translation)));
         if hidden && !self.visible {
             self.show(Mode::Translate, window, cx);
         } else if self.mode == Mode::Translate {
@@ -2398,7 +2417,7 @@ impl Launcher {
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
             Act::Cmd(Cmd::Translate) if self.cfg.translator.prefill_selection => {
                 let t = &self.cfg.translator;
-                return self.translate(translate::Job { text: String::new(), from: t.from.clone(), to: t.to.to_uppercase(), replace: false }, cx);
+                return self.translate(translate::Job { text: String::new(), from: translate::language(&t.from), to: translate::languages(&t.to), all: false, after: translate::After::Open }, cx);
             }
             Act::Cmd(Cmd::Translate) => return self.input.update(cx, |s, cx| s.emplace("translate ", cx)),
             Act::Translate(job) => return self.translate(job, cx),
@@ -4126,7 +4145,7 @@ fn main() {
                 };
                 let opens = opens || match &msg {
                     // The launcher was hidden to read the selection: the answer brings it back.
-                    Msg::Translated { hidden: true, job, result: Ok(_), .. } => !job.replace,
+                    Msg::Translated { hidden: true, job, result: Ok(_), .. } => job.after == translate::After::Open,
                     _ => false,
                 };
                 let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));

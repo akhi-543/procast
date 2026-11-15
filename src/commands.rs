@@ -194,7 +194,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::SHIELD),
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
-    (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
+    (Cmd::Translate, "Translate", "translator google language tr", g::LANGUAGES),
     (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
     (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR),
     (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::PICTURE),

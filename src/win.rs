@@ -84,8 +84,9 @@ pub enum Msg {
     /// A second passed while a timer or stopwatch runs.
     TimerTick,
     /// A translation came back (or failed): the request number (older ones are dropped), what
-    /// was asked, whether the launcher was hidden meanwhile, and DeepL's answer.
-    Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<crate::translate::Translation, String> },
+    /// was asked, whether the launcher was hidden meanwhile, and Google's answer (one translation
+    /// per target for a quick translate).
+    Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<Vec<crate::translate::Translation>, String> },
     /// A calendar fetch finished: each feed's address and its events, or why it failed.
     Calendar(Vec<(String, Result<Vec<crate::calendar::Event>, String>)>),
     /// A word was looked up (or the dictionary could not be fetched): the request number, the word, the answer.

@@ -605,16 +605,15 @@ impl Default for Dictionary {
     }
 }
 
-/// The translator (DeepL): `translate hola` in root search, and `[[translate]]` commands.
+/// The translator (Google Translate, no key): `translate hola` in root search, and `[[translate]]` commands.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Translator {
-    /// From deepl.com/pro-api; a key ending in `:fx` is a free one.
-    pub deepl_key: String,
     /// Source language code, or "auto".
     pub from: String,
-    /// Target language code (see `translate::TARGETS`).
-    pub to: String,
+    /// Target language codes (see `translate::LANGUAGES`); one code as a plain string also loads.
+    #[serde(deserialize_with = "one_or_many")]
+    pub to: Vec<String>,
     /// What Enter does with a translation: copy | paste.
     pub primary: String,
     /// "Translate" starts from the text selected in the app you came from.
@@ -623,8 +622,22 @@ pub struct Translator {
 
 impl Default for Translator {
     fn default() -> Self {
-        Self { deepl_key: String::new(), from: "auto".into(), to: "EN-US".into(), primary: "copy".into(), prefill_selection: false }
+        Self { from: "auto".into(), to: vec!["en".into()], primary: "copy".into(), prefill_selection: false }
     }
+}
+
+/// `to = "de"` (how older configs wrote it) or `to = ["en", "de"]`.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// A `[[translate]]` command: translates the selected text into `to`.
@@ -647,7 +660,7 @@ fn auto() -> String {
 }
 
 fn english() -> String {
-    "EN-US".into()
+    "en".into()
 }
 
 fn open() -> String {
@@ -709,9 +722,8 @@ existing_tab = true           # quicklinks switch to a tab already showing the p
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus
 
 [translator]
-deepl_key = ""                # translate hola | tr de hola; a free key (ending :fx) is at deepl.com/pro-api
-from = "auto"                 # source language, or "auto"
-to = "EN-US"                  # target: DE, ES, FR, JA, PT-BR, ZH-HANS, …
+from = "auto"                 # source language, or "auto"; translate hola | tr de hola, no key needed (Google Translate)
+to = ["en"]                   # targets: de, es, fr, ja, zh-CN, …; with two, a text already in the first goes to the second
 primary = "copy"              # Enter on a translation: copy | paste
 prefill_selection = false     # "Translate" starts from the text selected in the app you came from
 
@@ -1134,6 +1146,32 @@ mod tests {
         let d = parse("[[window.layouts]]\nname = \"X\"\nslots = [{ app = \"a.exe\", snap = \"LeftHalf\", display = 2 }]\n").unwrap();
         assert_eq!(d.window.layouts[0].slots[0].display, Some(2));
         assert!(parse(TEMPLATE).unwrap().window.layouts.is_empty(), "the template's example is commented out");
+    }
+
+    #[test]
+    fn translator_targets_load_as_a_list_or_a_single_string() {
+        assert_eq!(parse("").unwrap().translator.to, vec!["en".to_string()]);
+        assert_eq!(parse("[translator]
+to = [\"en\", \"de\"]").unwrap().translator.to, vec!["en".to_string(), "de".to_string()]);
+        assert_eq!(parse("[translator]
+to = \"DE\"").unwrap().translator.to, vec!["DE".to_string()]);
+        assert!(parse("[translator]
+to = 3").is_err());
+    }
+
+    #[test]
+    fn a_deepl_config_still_loads() {
+        let c = parse("[translator]
+deepl_key = \"abc:fx\"
+from = \"auto\"
+to = \"EN-US\"
+primary = \"paste\"
+
+[[translate]]
+to = \"PT-BR\"").unwrap();
+        assert_eq!((c.translator.to, c.translator.primary.as_str()), (vec!["EN-US".to_string()], "paste"));
+        assert_eq!(c.translate[0].to, "PT-BR");
+        assert!(!TEMPLATE.to_lowercase().contains("deepl"));
     }
 
     #[test]
