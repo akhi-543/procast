@@ -217,6 +217,26 @@
 - [ ] **Step 2–4:** Fail, implement, pass. Manual: note survives restart; window on top; capture excludes it when sharing.
 - [ ] **Step 5:** Commit `feat(notes): floating notes window (O1)`.
 
+### Task 12: O3b — Translator rework: Google (keyless), replaces DeepL
+
+**Why:** user decision 2026-11-16: drop DeepL; build in the behaviour of the Raycast "Google Translate" store extension (installed at `%USERPROFILE%\.configaycast\extensions e43920f-…`), which needs no API key.
+
+**Observed in that extension (reference, do not copy code):** GET `https://translate.google.com/translate_a/single` with query `client=dict-chrome-ex`, `sl=<from|auto>`, `tl=<to>`, `hl=<to>`, `dt=at,bd,ex,ld,md,qca,rw,rm,ss,t` (repeated `dt` params), `ie=UTF-8`, `oe=UTF-8`, `otf=1`, `ssel=0`, `tsel=0`, `kc=7`, `q=<text>`; when the URL exceeds 2048 chars, POST the same URL without `q` and send `q` as `application/x-www-form-urlencoded;charset=UTF-8` body. Reply is a nested JSON array: translation = concatenation of `r[0][i][0]` (non-null); detected source = `r[2]` (if it differs from `r[8][0][0]`, use `r[8][0][0]`); pronunciation = `r[0][1][2]` or `r[0][1][3]` when a string; spelling suggestion = `r[7][0]` with `<b><i>…</i></b>` → `[…]`, autocorrected when `r[7][5] == true`. Two-target rule: targets are a list; if the (detected) source matches the first target by base language (`en` = `en-GB`), translate to the second target instead. Commands there: Translate, Translate Form, Quick Translate (several targets at once), Instant Translate Copy / Paste / View (selected text). Preferences: from (auto), targets, auto input from selection, default action, proxy.
+
+**Files:** modify `src/translate.rs` (replace the DeepL client), `src/config.rs` (`[translator]`: remove `deepl_key`; `from = "auto"`, `to = ["en"]` list, `primary`, `prefill_selection`; keep `[[translate]]` commands), `src/search.rs`/`src/commands.rs`/`src/main.rs` only where the DeepL types leak.
+
+**Interfaces:**
+- `pub fn build_url(text: &str, from: &str, to: &str) -> (String /*url*/, Option<String> /*form body when POST*/)`.
+- `pub fn parse_reply(json: &str) -> Option<Translation>`; `Translation { text, detected, pronunciation: Option<String>, suggestion: Option<String> }`.
+- `pub fn pick_target(source: &str, targets: &[String]) -> &str` (two-target rule).
+- `pub fn translate(text, from, targets) -> Result<Translation, String>` off the UI thread; errors: offline → "Could not reach Google Translate"; HTTP 429 → "Google Translate is rate limiting, try again later"; unparsable → "Google Translate changed its reply".
+- Language list: Google's codes (`auto`, `en`, `de`, `fr`, `es`, `zh-CN`, `zh-TW`, `pt`, `ja`, …) replace DeepL's `TARGETS`; `tr de hello` keeps working.
+- New commands like the extension: "Quick Translate" (all configured targets at once, one row each) and "Translate Selection" (instant: selected text → `primary` copy/paste). Raycast titles must not parse as their own queries.
+
+- [ ] **Step 1:** Tests: `build_url` GET for short text has every param above and URL-encodes `q`; text making URL > 2048 → POST with body `q=…`; `parse_reply` on a recorded fixture (multi-segment text, detected `de`, pronunciation, suggestion with `[…]`); `pick_target("en", ["en-GB","de"]) == "de"`; error mapping; config migration: an old config with `deepl_key` still loads.
+- [ ] **Step 2–4:** Fail, implement, pass. Manual: `tr de good morning`.
+- [ ] **Step 5:** Commit `feat(translate): keyless Google Translate replaces DeepL (O3)`.
+
 ### Wrap-up
 
 - [ ] Tick O1–O8 in `docs/roadmap.md` and `TODO.md`, update README. Commit `docs: mark O1–O8 done`.
