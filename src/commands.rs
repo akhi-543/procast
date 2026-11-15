@@ -79,6 +79,8 @@ pub enum Cmd {
     /// Ask for a duration and label in the search bar (`timer 5m tea`).
     StartTimer,
     StartStopwatch,
+    /// Translate text typed in the search bar (`translate hola`), or the selection.
+    Translate,
     Quit,
 }
 
@@ -144,6 +146,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
+    (Cmd::Translate, "Translate", "translator deepl language tr", g::LANGUAGES),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -247,6 +250,7 @@ impl Cmd {
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
+            Cmd::Translate => "Translator",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -258,7 +262,7 @@ impl Cmd {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi => Tint::Web,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -296,7 +300,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate => {}
         }
     }
     Ok(None)

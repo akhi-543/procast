@@ -327,6 +327,18 @@ fn selection() -> Option<String> {
     None
 }
 
+/// Off the UI thread: the text selected in the app you came from, once focus is back there.
+/// The clipboard gets its old text back (ponytail: only text, as with snippets).
+pub fn grab_selection(owner: HWND) -> Option<String> {
+    std::thread::sleep(Duration::from_millis(80));
+    let old = clipboard::text();
+    let sel = selection();
+    if let Some(old) = &old {
+        clipboard::set(owner, clipboard::Put::Text(old), true);
+    }
+    sel
+}
+
 /// Whether a link needs filling in from the app you came from.
 pub fn link_needs_fill(url: &str) -> bool {
     url.contains("{selection}") || url.contains("{clipboard}")

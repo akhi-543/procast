@@ -81,6 +81,8 @@ pub enum Act {
     StartTimer(u64, String),
     /// Cancel a timer, or stop a stopwatch and copy its time, by id.
     StopTimer(u64),
+    /// Translate with DeepL; the result opens in its own view or pastes over the selection.
+    Translate(crate::translate::Job),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -116,6 +118,7 @@ impl Act {
             Act::ForceQuit(_) => "Force Quit",
             Act::StartTimer(..) => "Start Timer",
             Act::StopTimer(_) => "Stop",
+            Act::Translate(_) => "Translate",
             Act::None => "",
         }
     }
@@ -328,6 +331,11 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         it = it.acc("Quicklink").keyed(format!("ql:{}", q.title())).words(&q.keyword).tinted(Tint::Web);
         items.push(it);
     }
+    for t in &cfg.translate {
+        let title = crate::translate::command_title(&t.name, &t.to);
+        let job = crate::translate::Job { text: String::new(), from: t.from.clone(), to: t.to.to_uppercase(), replace: t.output == "replace" };
+        items.push(Item::new(&title, "Translator", Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Command").keyed(format!("tr:{title}")).words("translate language deepl selection").tinted(Tint::Web));
+    }
     for s in &cfg.snippet {
         items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
     }
@@ -451,6 +459,11 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     if let Some((d, label)) = crate::timers::from_query(q) {
         let title = format!("Start a timer for {}", crate::timers::fmt_duration(d));
         top.push(Item::new(title, label.as_str(), Icon::Vector(g::TIMER), Act::StartTimer(d.as_secs(), label.clone())).acc("Timer").tinted(Tint::System));
+    }
+    if let Some((to, text)) = crate::translate::from_query(q, &cfg.translator.to) {
+        let title = format!("Translate to {}", crate::translate::language_name(&to));
+        let job = crate::translate::Job { text: text.clone(), from: cfg.translator.from.clone(), to, replace: false };
+        top.push(Item::new(title, text.as_str(), Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Translator").tinted(Tint::Web));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
@@ -703,6 +716,36 @@ mod tests {
         assert_eq!((r[0].act.clone(), r[0].subtitle.as_str()), (Act::StartTimer(300, "tea".into()), "tea"));
         let r = root("timer soon", &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
         assert!(r.iter().all(|it| !matches!(it.act, Act::StartTimer(..))));
+    }
+
+    #[test]
+    fn translate_query_offers_a_translation_first() {
+        let cfg = crate::config::parse("[translator]
+to = \"FR\"").unwrap();
+        let ask = |q: &str| root(q, &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        let job = |text: &str, to: &str| crate::translate::Job { text: text.into(), from: "auto".into(), to: to.into(), replace: false };
+        let r = ask("tr de hola mundo");
+        assert_eq!((r[0].act.clone(), r[0].title.as_str(), r[0].subtitle.as_str()), (Act::Translate(job("hola mundo", "DE")), "Translate to German", "hola mundo"));
+        assert_eq!(ask("translate hola")[0].act, Act::Translate(job("hola", "FR")), "the configured target");
+        assert!(ask("tr").iter().all(|it| !matches!(it.act, Act::Translate(_))));
+    }
+
+    #[test]
+    fn translate_commands_become_rows_with_stable_keys() {
+        let cfg = crate::config::parse("[[translate]]
+to = \"de\"
+output = \"replace\"
+
+[[translate]]
+name = \"Spanish, please\"
+from = \"EN\"
+to = \"ES\"").unwrap();
+        let items = items(&[], &[], &[], &cfg);
+        let german = items.iter().find(|it| it.title == "Translate to German").unwrap();
+        assert_eq!(german.key.as_deref(), Some("tr:Translate to German"));
+        assert_eq!(german.act, Act::Translate(crate::translate::Job { text: String::new(), from: "auto".into(), to: "DE".into(), replace: true }));
+        let spanish = items.iter().find(|it| it.title == "Spanish, please").unwrap();
+        assert_eq!(spanish.act, Act::Translate(crate::translate::Job { text: String::new(), from: "EN".into(), to: "ES".into(), replace: false }));
     }
 
     #[test]

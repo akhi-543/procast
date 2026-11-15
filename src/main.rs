@@ -19,6 +19,7 @@ mod snippets;
 mod system;
 mod timers;
 mod toast;
+mod translate;
 mod win;
 
 use std::{
@@ -125,6 +126,8 @@ enum Mode {
     Tabs,
     /// A Quick AI answer (see `Launcher::ai`).
     Ai,
+    /// A translation (see `Launcher::translation`).
+    Translate,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -340,6 +343,10 @@ struct Launcher {
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     ai: Option<AiChat>,
+    /// The translation view: the target language and the answer (None while it is on its way).
+    translation: Option<(String, Option<translate::Translation>)>,
+    /// Number of the newest translation request; answers to older ones are dropped.
+    translate_seq: u64,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -435,6 +442,8 @@ impl Launcher {
             file_seq: Arc::new(AtomicU64::new(0)),
             grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
+            translation: None,
+            translate_seq: 0,
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -739,6 +748,15 @@ impl Launcher {
             // Typed text is the next question; with an empty bar, Enter copies the answer.
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
+            Mode::Translate => match &self.translation {
+                Some((to, None)) => vec![empty_row(g::CLOCK, format!("Translating to {}…", translate::language_name(to)), String::new(), vec![])],
+                Some((to, Some(t))) => {
+                    let act = if self.cfg.translator.primary == "paste" { Act::Paste(t.text.clone()) } else { Act::Copy(t.text.clone()) };
+                    let section = if t.detected.is_empty() { format!("To {}", translate::language_name(to)) } else { format!("{} to {}", translate::language_name(&t.detected), translate::language_name(to)) };
+                    t.text.lines().filter(|l| !l.trim().is_empty()).map(|l| Item::new(l, "", Icon::Vector(g::LANGUAGES), act.clone()).sec(section.clone())).collect()
+                }
+                None => vec![],
+            },
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
@@ -1163,6 +1181,61 @@ impl Launcher {
                 }
                 self.start_snippet(s.name, s.text, erase, then, window, cx);
             }
+        }
+    }
+
+    // ---- translator ------------------------------------------------------------------
+
+    /// Translates `job`. Typed text opens the translation view at once; the selection (or a
+    /// paste-over-selection job) hides the launcher first, so the app you came from has focus.
+    fn translate(&mut self, mut job: translate::Job, cx: &mut Context<Self>) {
+        self.translate_seq += 1;
+        let (seq, hidden) = (self.translate_seq, job.replace || job.text.trim().is_empty());
+        if hidden {
+            if self.visible {
+                self.hide(true, cx);
+            }
+        } else {
+            self.status = None;
+            self.translation = Some((job.to.clone(), None));
+            self.set_mode(Mode::Translate, cx);
+        }
+        let (tx, key, owner) = (self.tx.clone(), self.cfg.translator.deepl_key.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            if job.text.trim().is_empty() {
+                match snippets::grab_selection(HWND(owner as _)).filter(|s| !s.trim().is_empty()) {
+                    Some(sel) => job.text = sel,
+                    None => return drop(tx.unbounded_send(Msg::Toast(false, "No text selected".into()))),
+                }
+            }
+            let result = translate::translate(&key, &job.text, &job.from, &job.to);
+            let _ = tx.unbounded_send(Msg::Translated { seq, job, hidden, result });
+        });
+    }
+
+    fn on_translated(&mut self, seq: u64, job: translate::Job, hidden: bool, result: Result<translate::Translation, String>, window: &mut Window, cx: &mut Context<Self>) {
+        if seq != self.translate_seq {
+            return;
+        }
+        let translation = match result {
+            Ok(t) => t,
+            Err(e) if self.visible => {
+                self.translation = None;
+                self.status = Some((Tone::Error, e));
+                return self.refresh(cx);
+            }
+            Err(e) => return drop(self.tx.unbounded_send(Msg::Toast(false, e))),
+        };
+        if job.replace {
+            // Over the selection the launcher gave focus back to.
+            cx.write_to_clipboard(ClipboardItem::new_string(translation.text));
+            return clipboard::paste_soon();
+        }
+        self.translation = Some((job.to, Some(translation)));
+        if hidden && !self.visible {
+            self.show(Mode::Translate, window, cx);
+        } else if self.mode == Mode::Translate {
+            self.refresh(cx);
         }
     }
 
@@ -1870,6 +1943,12 @@ impl Launcher {
                 return;
             }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
+            Act::Cmd(Cmd::Translate) if self.cfg.translator.prefill_selection => {
+                let t = &self.cfg.translator;
+                return self.translate(translate::Job { text: String::new(), from: t.from.clone(), to: t.to.to_uppercase(), replace: false }, cx);
+            }
+            Act::Cmd(Cmd::Translate) => return self.input.update(cx, |s, cx| s.emplace("translate ", cx)),
+            Act::Translate(job) => return self.translate(job, cx),
             Act::Cmd(Cmd::StartTimer) => return self.input.update(cx, |s, cx| s.emplace("timer ", cx)),
             Act::Cmd(Cmd::StartStopwatch) => {
                 self.timers.stopwatch();
@@ -1983,6 +2062,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
+            Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
             Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
@@ -2312,6 +2392,7 @@ impl Launcher {
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
             Msg::TimerTick => self.on_timer_tick(cx),
+            Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2430,6 +2511,7 @@ impl Launcher {
                 Pending::RenameDesktop => "Rename Desktop".into(),
             }),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
+            Mode::Translate => Some("Translator".into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -2466,6 +2548,7 @@ impl Launcher {
                 .unwrap_or_default()
                 .into(),
             Mode::Output => "Enter copies the output".into(),
+            Mode::Translate => if self.cfg.translator.primary == "paste" { "Enter pastes the translation" } else { "Enter copies the translation" }.into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
         }
@@ -2515,6 +2598,7 @@ impl Launcher {
             Mode::Tabs => Icon::Vector(g::GLOBE),
             Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
+            Mode::Translate => Icon::Vector(g::LANGUAGES),
         }
     }
 
@@ -3532,6 +3616,11 @@ fn main() {
                     Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
                     Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
                     _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
+                };
+                let opens = opens || match &msg {
+                    // The launcher was hidden to read the selection: the answer brings it back.
+                    Msg::Translated { hidden: true, job, result: Ok(_), .. } => !job.replace,
+                    _ => false,
                 };
                 let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
                 let geometry = handle.update(cx, |this, _, cx| {

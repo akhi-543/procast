@@ -83,6 +83,9 @@ pub enum Msg {
     Tick,
     /// A second passed while a timer or stopwatch runs.
     TimerTick,
+    /// A translation came back (or failed): the request number (older ones are dropped), what
+    /// was asked, whether the launcher was hidden meanwhile, and DeepL's answer.
+    Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<crate::translate::Translation, String> },
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.

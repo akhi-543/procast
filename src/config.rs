@@ -23,6 +23,9 @@ pub struct Config {
     pub launcher: Launcher,
     pub search: Search,
     pub ai: Ai,
+    pub translator: Translator,
+    /// `[[translate]]`: commands that translate the selected text into one language.
+    pub translate: Vec<TranslateCmd>,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
     pub files: Files,
@@ -458,6 +461,8 @@ impl Default for Config {
             launcher: Launcher::default(),
             search: Search::default(),
             ai: Ai::default(),
+            translator: Translator::default(),
+            translate: vec![],
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
             files: Files::default(),
@@ -486,6 +491,55 @@ impl Default for Ai {
     fn default() -> Self {
         Self { model: "haiku".into() }
     }
+}
+
+/// The translator (DeepL): `translate hola` in root search, and `[[translate]]` commands.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Translator {
+    /// From deepl.com/pro-api; a key ending in `:fx` is a free one.
+    pub deepl_key: String,
+    /// Source language code, or "auto".
+    pub from: String,
+    /// Target language code (see `translate::TARGETS`).
+    pub to: String,
+    /// What Enter does with a translation: copy | paste.
+    pub primary: String,
+    /// "Translate" starts from the text selected in the app you came from.
+    pub prefill_selection: bool,
+}
+
+impl Default for Translator {
+    fn default() -> Self {
+        Self { deepl_key: String::new(), from: "auto".into(), to: "EN-US".into(), primary: "copy".into(), prefill_selection: false }
+    }
+}
+
+/// A `[[translate]]` command: translates the selected text into `to`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TranslateCmd {
+    /// Shown instead of "Translate to <language>".
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "auto")]
+    pub from: String,
+    #[serde(default = "english")]
+    pub to: String,
+    /// open (show the translation) | replace (paste it over the selection).
+    #[serde(default = "open")]
+    pub output: String,
+}
+
+fn auto() -> String {
+    "auto".into()
+}
+
+fn english() -> String {
+    "EN-US".into()
+}
+
+fn open() -> String {
+    "open".into()
 }
 
 impl Default for Search {
@@ -541,6 +595,18 @@ existing_tab = true           # quicklinks switch to a tab already showing the p
 
 [ai]
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus
+
+[translator]
+deepl_key = ""                # translate hola | tr de hola; a free key (ending :fx) is at deepl.com/pro-api
+from = "auto"                 # source language, or "auto"
+to = "EN-US"                  # target: DE, ES, FR, JA, PT-BR, ZH-HANS, …
+primary = "copy"              # Enter on a translation: copy | paste
+prefill_selection = false     # "Translate" starts from the text selected in the app you came from
+
+# A command per language: translates the selected text. output: open (show it) | replace (paste over the selection).
+# [[translate]]
+# to = "DE"
+# output = "replace"
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account
