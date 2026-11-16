@@ -373,15 +373,28 @@ pub fn named_in<'a>(item: &Item, q: &'a str, cfg: &Config) -> Option<&'a str> {
 }
 
 /// Whether `q` names this row so that it leads root search with its boxes: its title or a
-/// keyword alone ("timer"), or followed by a space and values ("timer 5m").
+/// keyword of two letters or more alone ("timer"), or either followed by a space and values
+/// ("timer 5m", "t 90").
 pub fn leads(item: &Item, q: &str, cfg: &Config) -> bool {
     !item.args.is_empty() && (named_in(item, q, cfg).is_some() || exact(item, q))
 }
 
-/// `q` is the row's title or one of its keywords, case aside.
+/// Whether this row heads root search above every section: an alias typed exactly, else a
+/// row that `leads`. An alias always wins over a keyword ("t" for Terminal beats "t 90").
+pub fn heads(item: &Item, q: &str, cfg: &Config) -> bool {
+    alias_is(item, q) || leads(item, q, cfg)
+}
+
+/// `q` is the row's alias, case aside.
+fn alias_is(item: &Item, q: &str) -> bool {
+    !item.alias.is_empty() && item.alias.eq_ignore_ascii_case(q.trim())
+}
+
+/// `q` is the row's title or one of its keywords of two letters or more, case aside. A
+/// one-letter keyword alone ("t") is just the start of a word.
 fn exact(item: &Item, q: &str) -> bool {
     let q = q.trim();
-    !q.is_empty() && (item.title.eq_ignore_ascii_case(q) || item.keywords.iter().any(|k| k.eq_ignore_ascii_case(q)))
+    !q.is_empty() && (item.title.eq_ignore_ascii_case(q) || (q.chars().count() > 1 && item.keywords.iter().any(|k| k.eq_ignore_ascii_case(q))))
 }
 
 /// The boxes' values from the rest of a query that names the row: a one-word box takes a
@@ -770,7 +783,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         })
         .collect();
     // An alias typed exactly puts its item first, hidden or not.
-    let aliased: Vec<&Item> = catalog.iter().filter(|it| !it.alias.is_empty() && it.alias.eq_ignore_ascii_case(q)).collect();
+    let aliased: Vec<&Item> = catalog.iter().filter(|it| alias_is(it, q)).collect();
     top.splice(0..0, aliased.iter().map(|it| (*it).clone()));
     let room = max.saturating_sub(top.len() + fallbacks.len());
     let shown = |it: &Item| aliased.iter().chain(&typed).any(|a| std::ptr::eq(*a, it));

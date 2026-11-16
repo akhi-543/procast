@@ -254,20 +254,40 @@ fn timer_kind(stopwatch: bool) -> (&'static str, &'static str) {
 }
 
 /// One Running row. Enter pauses or resumes, Ctrl+Enter (the second action) stops, Ctrl+K
-/// also offers Restart, Rename and Add 5 Minutes; a done timer's Enter dismisses it.
+/// also offers Restart, Rename and Add 5 min; a done timer's Enter or Ctrl+Enter dismisses it.
 fn running_row(r: timers::Row) -> Item {
     let id = r.id;
     let (kind, glyph) = timer_kind(r.stopwatch);
     let acts = if r.done {
-        vec![("Dismiss", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id))]
+        // Enter or Ctrl+Enter (Stop) silences it; only Ctrl+K restarts it.
+        vec![("Dismiss", Act::StopTimer(id)), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id))]
     } else {
         let flip = if r.paused { Act::ResumeTimer(id) } else { Act::PauseTimer(id) };
-        vec![(flip.label(), flip), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id)), ("Rename", Act::RenameTimer(id)), ("Add 5 Minutes", Act::AddTime(id, 300))]
+        vec![(flip.label(), flip), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id)), ("Rename", Act::RenameTimer(id)), ("Add 5 min", Act::AddTime(id, 300))]
     };
     let mut it = Item::new(&r.title, kind, Icon::Vector(glyph), acts[0].1.clone()).acc(r.accessory()).sec(RUNNING).tinted(design::Tint::System);
     it.extra = acts.into_iter().map(|(l, a)| (l.to_string(), a)).collect();
     it.live = true;
     it
+}
+
+/// Root search as shown: Focus, Running and Next (`above`) head the results, except that the
+/// row the query names (an exact alias, or a command with its boxes: `search::heads`) goes
+/// first of all.
+fn head_rows(mut above: Vec<Item>, mut found: Vec<Item>, query: &str, cfg: &Config) -> Vec<Item> {
+    if let Some(i) = found.iter().position(|it| search::heads(it, query.trim_start(), cfg)) {
+        above.insert(0, found.remove(i));
+    }
+    above.extend(found);
+    above
+}
+
+/// Where root search's selection starts: on the row the query names (`search::heads`), so its
+/// boxes show; else, while something is typed, on the first row past the Running rows (Enter
+/// on "te" opens what was searched for, it never pauses a timer); else the top.
+fn root_selection(items: &[Item], query: &str, cfg: &Config) -> usize {
+    let typed = !query.trim().is_empty();
+    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && it.section.as_deref() != Some(RUNNING))).unwrap_or(0)
 }
 
 /// The timer or stopwatch a Running row stands for.
@@ -1001,13 +1021,8 @@ impl Launcher {
                 if query.trim().is_empty() {
                     rows.extend(self.schedule_now());
                 }
-                let mut found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
-                // A command named in the query ("timer 25m tea") leads even those sections.
-                if let Some(i) = found.iter().position(|it| search::leads(it, query.trim_start(), &self.cfg)) {
-                    rows.insert(0, found.remove(i));
-                }
-                rows.extend(found);
-                rows
+                let found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
+                head_rows(rows, found, &query, &self.cfg)
             }
             Mode::Clipboard => {
                 if self.clip_images.len() > 300 {
@@ -1185,13 +1200,29 @@ impl Launcher {
             self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
         }
         let _ = max;
-        // A command named alone or with a space after it is selected, so its boxes show.
-        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| search::leads(it, query.trim_start(), &self.cfg))).flatten();
-        self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { named.unwrap_or(0) };
+        self.selected = if keep_selection {
+            self.selected.min(self.items.len().saturating_sub(1))
+        } else if self.mode == Mode::Root {
+            root_selection(&self.items, &query, &self.cfg)
+        } else {
+            0
+        };
         self.sync_args(cx);
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
+    }
+
+    /// `refresh`, with the selection kept on the Running row it was on: pausing the second timer
+    /// must not move Enter onto the first.
+    fn refresh_keeping_timer(&mut self, cx: &mut Context<Self>) {
+        let kept = self.items.get(self.selected).and_then(timer_id);
+        self.refresh(cx);
+        if let Some(i) = kept.and_then(|id| self.items.iter().position(|it| timer_id(it) == Some(id))) {
+            self.selected = i;
+            self.sync_args(cx);
+            self.scroll_to_selected();
+        }
     }
 
     /// Running timers and stopwatches as the Running section (`Timers::matching` picks them).
@@ -1240,7 +1271,7 @@ impl Launcher {
         let rows = self.timers.matching(now, &self.query(cx));
         // A timer that finished, appeared or went away rebuilds the list; otherwise only the times change.
         if !due.is_empty() || timers::rows_changed(&shown, &rows) {
-            return self.refresh(cx);
+            return self.refresh_keeping_timer(cx);
         }
         for it in &mut self.items {
             if let Some(id) = timer_id(it)
@@ -2708,21 +2739,21 @@ impl Launcher {
             }
             Act::PauseTimer(id) => {
                 self.timers.pause(id, SystemTime::now());
-                return self.refresh(cx);
+                return self.refresh_keeping_timer(cx);
             }
             Act::ResumeTimer(id) => {
                 self.timers.resume(id, SystemTime::now());
                 self.watch_timers();
-                return self.refresh(cx);
+                return self.refresh_keeping_timer(cx);
             }
             Act::RestartTimer(id) => {
                 self.timers.restart(id, SystemTime::now());
                 self.watch_timers();
-                return self.refresh(cx);
+                return self.refresh_keeping_timer(cx);
             }
             Act::AddTime(id, secs) => {
                 self.timers.add(id, Duration::from_secs(secs));
-                return self.refresh(cx);
+                return self.refresh_keeping_timer(cx);
             }
             Act::RenameTimer(id) => {
                 let Some(r) = self.timers.rows(SystemTime::now()).into_iter().find(|r| r.id == id) else { return };
@@ -4690,13 +4721,49 @@ mod tests {
         assert_eq!((it.subtitle.as_str(), it.accessory.as_str(), it.section.as_deref(), it.live), ("Timer", "4:12 left", Some(RUNNING), true));
         assert!(matches!(it.icon, Icon::Vector(g::ALARM_CLOCK)) && matches!(row(false, false, true).icon, Icon::Vector(g::TIMER)));
         assert_eq!((it.act.clone(), it.actions()[1].1.clone()), (Act::PauseTimer(4), Act::StopTimer(4)));
-        assert_eq!(labels(&it), ["Pause", "Stop", "Restart", "Rename", "Add 5 Minutes"]);
+        assert_eq!(labels(&it), ["Pause", "Stop", "Restart", "Rename", "Add 5 min"]);
         assert_eq!(it.extra[4].1, Act::AddTime(4, 300));
         let paused = row(true, false, false);
         assert_eq!((paused.act, paused.accessory.as_str()), (Act::ResumeTimer(4), "Paused · 4:12"));
         let done = row(false, true, false);
-        assert_eq!((done.act.clone(), done.accessory.as_str(), labels(&done)), (Act::StopTimer(4), timers::DONE, vec!["Dismiss".to_string(), "Restart".into()]));
+        assert_eq!((done.act.clone(), done.accessory.as_str(), labels(&done)), (Act::StopTimer(4), timers::DONE, vec!["Dismiss".to_string(), "Stop".into(), "Restart".into()]));
+        assert_eq!(done.actions()[1].1, Act::StopTimer(4), "Ctrl+Enter stops a done timer, never restarts it");
         assert_eq!(timer_id(&done), Some(4));
+    }
+
+    #[test]
+    fn an_alias_heads_root_over_a_keyword_and_a_lone_letter_keyword_leads_nothing() {
+        let mut cfg = Config::default();
+        cfg.launcher.aliases.insert(Cmd::Settings.key(), "t".into());
+        let cat = search::catalog(&[], &[], &[], &cfg);
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let shown = |q: &str| {
+            let found = search::root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+            let rows = head_rows(vec![running.clone()], found, q, &cfg);
+            let at = root_selection(&rows, q, &cfg);
+            (rows, at)
+        };
+        let (rows, at) = shown("t");
+        assert_eq!((rows[0].act.clone(), at), (Act::Cmd(Cmd::Settings), 0), "the alias, not Start Timer");
+        let (rows, at) = shown("t 90");
+        assert_eq!((rows[0].title.as_str(), at), ("Start Timer", 0), "a keyword with a value leads");
+        let (rows, at) = shown("timer");
+        assert_eq!((rows[0].title.as_str(), at), ("Start Timer", 0));
+        cfg.launcher.aliases.clear();
+        let cat = search::catalog(&[], &[], &[], &cfg);
+        let found = search::root("t", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert!(found.iter().all(|it| !search::leads(it, "t", &cfg)), "a bare one-letter keyword is just a letter");
+        assert!(found.iter().any(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use "))), "so the fallbacks stay");
+    }
+
+    #[test]
+    fn a_typed_query_starts_past_the_running_rows() {
+        let cfg = Config::default();
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let rows = vec![running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(root_selection(&rows, "te", &cfg), 1, "Enter on \"te\" opens Terminal, it does not pause tea");
+        assert_eq!(root_selection(&rows, "", &cfg), 0, "an empty search starts on the top row");
+        assert_eq!(root_selection(&rows[..1], "tea", &cfg), 0, "only Running rows: the first of them");
     }
 
     #[test]

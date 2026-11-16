@@ -1292,8 +1292,10 @@ fn shaped_width(text: &str, size: f32, font: gpui::Font, window: &Window) -> Pix
     window.text_system().shape_line(text.to_string().into(), px(size), &[run]).width
 }
 
-/// The widest form a live accessory takes while it ticks; its width is kept for every form.
-const LIVE_WIDEST: &str = "00:00 left";
+/// The widest form a live accessory takes (a paused timer of ten hours or more); its width is
+/// kept for every form, so crossing an hour never changes the row's width.
+// ponytail: 100 h or more is wider; widen this if timers that long turn up.
+const LIVE_WIDEST: &str = "Paused · 00:00:00";
 
 /// Tabular figures: every digit as wide as the others, so a ticking time does not jitter.
 fn tabular() -> gpui::FontFeatures {
@@ -1532,6 +1534,25 @@ mod tests {
         let win = pane("win-left-half");
         assert!(win.contains(r#"stroke="none"><rect x="3" y="4" width="18" height="16" rx="3"/></g>"#), "{win}");
         assert_eq!(win.matches("width=\"6.11\"").count(), 1);
+    }
+
+    /// Every accessory a Running row can show fits in `live_width`: digits drawn as wide as
+    /// "0" (tabular figures), up to 99 hours.
+    #[test]
+    fn the_live_width_holds_every_running_form() {
+        gpui_ce_platform::application().run(|cx| {
+            register_fonts(cx);
+            let text = cx.text_system();
+            let font = text.resolve_font(&gpui::font(FONT_UI));
+            let width = |s: &str| s.chars().map(|c| text.advance(font, px(ts::BODY_SM), if c.is_ascii_digit() { '0' } else { c }).map_or(0., |a| f32::from(a.width))).sum::<f32>();
+            let row = |paused, done, stopwatch, time: &str| crate::timers::Row { id: 0, title: String::new(), stopwatch, paused, done, time: time.into() }.accessory();
+            for time in ["0:00", "00:00", "0:00:00", "00:00:00"] {
+                for form in [row(false, false, false, time), row(true, false, false, time), row(false, false, true, time), row(false, true, false, time)] {
+                    assert!(width(&form) <= width(LIVE_WIDEST) + 0.01, "{form} is wider than {LIVE_WIDEST}");
+                }
+            }
+            cx.quit();
+        });
     }
 
     /// The family name the embedded font reports is the one `FONT_UI` asks for.

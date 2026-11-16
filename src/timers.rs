@@ -259,10 +259,10 @@ impl Timers {
     }
 }
 
-/// `q` (lower case) fuzzy-matches "timer" from its first letter, or starts with a timer keyword.
+/// `q` (lower case) is "timer" being typed ("ti" on, never just "t": "te" is Terminal, not
+/// timers) or starts with a timer keyword ("timer 5m", "t 90").
 fn names_timers(q: &str) -> bool {
-    let mut word = "timer".chars();
-    q.starts_with("timer ") || q.starts_with("t ") || (q.starts_with('t') && q.chars().all(|c| word.any(|w| w == c)))
+    q.starts_with("timer ") || q.starts_with("t ") || (q.len() >= 2 && "timer".starts_with(q))
 }
 
 /// Whether the timer rows on screen (their ids, in order) are no longer the `rows` that should
@@ -339,7 +339,7 @@ mod tests {
         let at = |s| UNIX_EPOCH + Duration::from_millis(s);
         let ids = |q: &str| t.matching(at(1_000), q).iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!((ids(""), ids("tea"), ids(" STOP "), ids("x")), (vec![1, 2], vec![1], vec![2], vec![]));
-        assert_eq!((ids("tim"), ids("tmr"), ids("timer 5m"), ids("t 90"), ids("e")), (vec![1, 2], vec![1, 2], vec![1, 2], vec![1, 2], vec![1]), "a query for timers shows them all");
+        assert_eq!((ids("tim"), ids("timer"), ids("timer 5m"), ids("t 90"), ids("e")), (vec![1, 2], vec![1, 2], vec![1, 2], vec![1, 2], vec![1]), "a query for timers shows them all");
         // Query "tea" with both running: one row shown, one expected, so a tick only updates times.
         let rows = t.matching(at(2_000), "tea");
         assert!(!rows_changed(&[1], &rows));
@@ -350,6 +350,16 @@ mod tests {
         assert!(rows_changed(&[], &t.matching(at(3_000), "")));
         assert!(rows_changed(&[1, 2], &t.matching(at(3_000), "")));
         assert!(rows_changed(&[1], &t.matching(at(3_000), "")));
+    }
+
+    #[test]
+    fn only_timer_being_typed_or_a_timer_keyword_names_timers() {
+        for q in ["ti", "tim", "time", "timer", "timer 5m", "t 90"] {
+            assert!(names_timers(q), "{q}");
+        }
+        for q in ["t", "te", "ter", "tm", "tmr", "timers", "tea", "stopwatch"] {
+            assert!(!names_timers(q), "{q}: an ordinary word");
+        }
     }
 
     #[test]
