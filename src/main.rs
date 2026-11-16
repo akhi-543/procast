@@ -165,7 +165,7 @@ enum Mode {
 
 /// A native launcher form: what it is for, which names its title and primary action.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[allow(dead_code)] // Tasks 12, 15 and 9 open these.
+#[expect(dead_code, reason = "opened by Tasks 9/12/15")]
 enum FormKind {
     Focus,
     AddCalendar,
@@ -217,6 +217,7 @@ impl FormField {
 }
 
 /// A native form's values by label: the text typed, or the picked id.
+#[cfg_attr(not(test), expect(dead_code, reason = "opened by Tasks 9/12/15"))]
 fn form_values(fields: &[FormField]) -> HashMap<&str, &str> {
     fields.iter().filter(|f| f.focusable()).map(|f| (f.label.as_ref(), f.value.as_str())).collect()
 }
@@ -2649,7 +2650,7 @@ impl Launcher {
     }
 
     /// Opens a native form on `fields` (text controls get their boxes here), the first control focused.
-    #[allow(dead_code)] // Tasks 12, 15 and 9 open their forms with this.
+    #[expect(dead_code, reason = "opened by Tasks 9/12/15")]
     fn open_form(&mut self, kind: FormKind, mut fields: Vec<FormField>, window: &mut Window, cx: &mut Context<Self>) {
         let mut subs = vec![];
         for (i, f) in fields.iter_mut().enumerate().filter(|(_, f)| matches!(f.ctl, Ctl::Text { .. })) {
@@ -2695,19 +2696,19 @@ impl Launcher {
     fn open_field_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some((fields, i)) = self.form_fields() else { return false };
         let Some(m) = fields.get(i).and_then(|f| field_menu(f, self.form_at.get())) else { return false };
+        // An extension may re-render while the menu is open: its field is known by id, not place.
+        let ext_id = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.fields.get(i)).map(|f| f.id.clone());
         self.open_menu(
             m,
-            move |this, id, window, cx| match &mut this.form {
-                Some(f) if matches!(this.mode, Mode::Form(_)) => {
+            move |this, id, window, cx| match (&mut this.form, &ext_id) {
+                (Some(f), _) if matches!(this.mode, Mode::Form(_)) => {
                     if let Some(f) = f.fields.get_mut(i) {
                         f.value = id;
                     }
                     cx.notify();
                 }
-                _ => {
-                    let Some(fid) = this.extv.as_ref().and_then(|e| e.view.fields.get(i)).map(|f| f.id.clone()) else { return };
-                    this.run(Act::FormSet(fid, id), None, window, cx);
-                }
+                (_, Some(fid)) => this.run(Act::FormSet(fid.clone(), id), None, window, cx),
+                _ => {}
             },
             window,
             cx,
@@ -2730,8 +2731,7 @@ impl Launcher {
 
     fn submit_form(&mut self, cx: &mut Context<Self>) {
         if let Mode::Form(kind) = self.mode {
-            // Each form acts on these: Task 12 starts the session, Task 15 fetches the feed, Task 9 saves the set.
-            let _values = self.form.as_ref().map(|f| form_values(&f.fields));
+            // Each form acts on `form_values`: Task 12 starts the session, Task 15 fetches the feed, Task 9 saves the set.
             match kind {
                 FormKind::Focus => {}
                 FormKind::AddCalendar => {}
@@ -3841,8 +3841,6 @@ impl Launcher {
         });
         div()
             .id("form")
-            .track_focus(&self.form_focus)
-            .key_context("Form")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -4644,7 +4642,11 @@ impl Render for Launcher {
             design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
         });
 
+        // A form's keys live on the root, which stays drawn while Ctrl+K or a confirm covers
+        // the form: a focused control that is not drawn then leaves the keys here.
+        let form_under = matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"));
         design::glass_window(&t)
+            .when(form_under, |d| d.track_focus(&self.form_focus).key_context("Form"))
             .size_full()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
