@@ -406,6 +406,8 @@ struct Launcher {
     hwnd: HWND,
     prev: HWND,
     visible: bool,
+    /// The toast window (toast.rs), set once it exists.
+    toast: Option<gpui::WindowHandle<toast::Toast>>,
     /// The procast notification-area icon (Settings → General → Show in tray).
     tray_icon: Option<TrayIcon>,
     /// Auto HDR (own thread).
@@ -532,6 +534,7 @@ impl Launcher {
             hwnd: HWND::default(),
             prev: HWND::default(),
             visible: false,
+            toast: None,
             tray_icon: None,
             hdr: hdr::Auto::start(),
             hidden_at: None,
@@ -777,7 +780,7 @@ impl Launcher {
         }
         if *act == Act::Cmd(Cmd::Focus(FocusCmd::Edit)) {
             let Some(s) = &self.focus.session else {
-                self.say(false, "No Focus session is running".into());
+                self.say(Msg::error("No Focus session running: start one first"));
                 return true;
             };
             it.values = vec![s.title.clone(), s.minutes.to_string()];
@@ -1177,7 +1180,7 @@ impl Launcher {
         let now = SystemTime::now();
         self.on_focus_tick(cx);
         for (_, label) in self.timers.due(now) {
-            let _ = self.tx.unbounded_send(Msg::Toast(true, if label.is_empty() { "Timer done".into() } else { format!("Timer done: {label}") }));
+            let _ = self.tx.unbounded_send(Msg::done(if label.is_empty() { "Timer done".into() } else { format!("Timer done: {label}") }));
             timers::beep();
         }
         if !self.timers.any()
@@ -1254,14 +1257,15 @@ impl Launcher {
         }
         let events = self.calendar_events();
         for text in self.calendar.due(&events, search::now() as i64, self.cfg.calendar.remind_minutes) {
-            self.say(true, text);
+            self.say(Msg::done(text));
         }
     }
 
     // ---- Focus sessions (the decisions are in focus.rs) -----------------------------
 
-    fn say(&self, ok: bool, text: String) {
-        let _ = self.tx.unbounded_send(Msg::Toast(ok, text));
+    /// Shows a toast (`Msg::done`, `Msg::error`, …).
+    fn say(&self, toast: Msg) {
+        let _ = self.tx.unbounded_send(toast);
     }
 
     /// Gives the browser companion the site filter (or switches it off).
@@ -1343,7 +1347,7 @@ impl Launcher {
         };
         match done {
             Ok(text) => {
-                self.say(true, text);
+                self.say(Msg::done(text));
                 self.hide(true, cx);
             }
             Err(e) => {
@@ -1357,7 +1361,7 @@ impl Launcher {
         let now = SystemTime::now();
         let needs_session = matches!(f, FocusCmd::Pause | FocusCmd::Resume | FocusCmd::Complete | FocusCmd::Cancel | FocusCmd::Restart | FocusCmd::Edit | FocusCmd::Snooze);
         if needs_session && self.focus.session.is_none() {
-            return self.say(false, "No Focus session is running".into());
+            return self.say(Msg::error("No Focus session running: start one first"));
         }
         match f {
             // They take arguments: `run` asks for them (Mode::Args) before they get here.
@@ -1368,7 +1372,7 @@ impl Launcher {
                     return;
                 };
                 let text = self.focus_begin(last.start(), false);
-                self.say(true, text);
+                self.say(Msg::done(text));
                 if self.visible {
                     self.hide(true, cx);
                 }
@@ -1388,9 +1392,9 @@ impl Launcher {
             }
             FocusCmd::Snooze => {
                 let Some(mins) = focus::snooze_for(self.cfg.focus.snooze_minutes) else {
-                    return self.say(false, "Snooze is off (snooze_minutes = 0 in config.toml)".into());
+                    return self.say(Msg::error("Snooze is off: set snooze_minutes in config.toml"));
                 };
-                let Some((exe, path)) = self.focus.last_closed() else { return self.say(false, "Focus has not closed an app yet".into()) };
+                let Some((exe, path)) = self.focus.last_closed() else { return self.say(Msg::info("Focus has not closed an app yet")) };
                 self.focus.update(|s| {
                     s.snooze(&exe, mins);
                     s.closed.retain(|p| *p != path);
@@ -1398,7 +1402,7 @@ impl Launcher {
                 if !path.is_empty() {
                     win::launch_app(&path);
                 }
-                return self.say(true, format!("Focus: {} allowed for {mins} min", focus::app_label(&exe)));
+                return self.say(Msg::done(format!("Focus: {} allowed for {mins} min", focus::app_label(&exe))));
             }
         }
         self.focus_push();
@@ -1407,7 +1411,7 @@ impl Launcher {
             FocusCmd::Resume => "Focus resumed",
             _ => "Focus restarted",
         };
-        self.say(true, said.into());
+        self.say(Msg::done(said));
         if self.visible && self.mode == Mode::Root {
             self.refresh(cx);
         }
@@ -1423,7 +1427,7 @@ impl Launcher {
         if done && self.cfg.focus.sound {
             focus::beep();
         }
-        self.say(true, format!("Focus {}: {}", if done { "done" } else { "cancelled" }, s.title));
+        self.say(Msg::done(format!("Focus {}: {}", if done { "done" } else { "cancelled" }, s.title)));
         self.focus_push();
         if self.visible && self.mode == Mode::Root {
             self.refresh(cx);
@@ -1467,7 +1471,7 @@ impl Launcher {
         let path = focus::close_window(hwnd);
         self.focus.closed_app(exe, path, self.cfg.focus.restore_apps, Instant::now());
         let app = focus::app_label(exe);
-        self.say(true, left.map_or_else(|| format!("Focus: {app} blocked"), |m| format!("Focus: {app} blocked for {m} min")));
+        self.say(Msg::done(left.map_or_else(|| format!("Focus: {app} blocked"), |m| format!("Focus: {app} blocked for {m} min"))));
     }
 
     /// Scrolls the selected row into view (section headers take list slots too).
@@ -1586,7 +1590,15 @@ impl Launcher {
             self.scripts = scripts;
             self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
         }
-        self.status = None;
+        // A sticky toast closes; its text shows once in the ActionBar instead.
+        self.status = self.toast.and_then(|t| t.update(cx, |t, _, cx| t.dismiss(cx)).ok().flatten()).map(|(kind, text)| {
+            let tone = match kind {
+                toast::Kind::Done => Tone::Ok,
+                toast::Kind::Error => Tone::Error,
+                toast::Kind::Info => Tone::Info,
+            };
+            (tone, text)
+        });
         // Within the pop-to-root timeout the launcher reopens where it was.
         if mode == Mode::Root && self.keeps_state() {
             self.refresh(cx);
@@ -1769,7 +1781,7 @@ impl Launcher {
             if job.text.trim().is_empty() {
                 match snippets::grab_selection(HWND(owner as _)).filter(|s| !s.trim().is_empty()) {
                     Some(sel) => job.text = sel,
-                    None => return drop(tx.unbounded_send(Msg::Toast(false, "No text selected".into()))),
+                    None => return drop(tx.unbounded_send(Msg::error("Select some text first"))),
                 }
             }
             let result = translate::run(&job);
@@ -1788,7 +1800,7 @@ impl Launcher {
                 self.status = Some((Tone::Error, e));
                 return self.refresh(cx);
             }
-            Err(e) => return drop(self.tx.unbounded_send(Msg::Toast(false, e))),
+            Err(e) => return drop(self.tx.unbounded_send(Msg::error(e))),
         };
         match job.after {
             translate::After::Replace => {
@@ -1798,7 +1810,7 @@ impl Launcher {
             }
             translate::After::Copy => {
                 cx.write_to_clipboard(ClipboardItem::new_string(translation[0].text.clone()));
-                return drop(self.tx.unbounded_send(Msg::Toast(true, "Copied the translation".into())));
+                return drop(self.tx.unbounded_send(Msg::done("Copied translation")));
             }
             translate::After::Open => {}
         }
@@ -1882,8 +1894,8 @@ impl Launcher {
             let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(put)).unwrap_or_else(|_| Err("Could not read that screenshot".into()));
             match done {
                 Ok(()) if paste => clipboard::paste_soon(),
-                Ok(()) => drop(tx.unbounded_send(Msg::Toast(true, "Screenshot copied".into()))),
-                Err(e) => drop(tx.unbounded_send(Msg::Toast(false, e))),
+                Ok(()) => drop(tx.unbounded_send(Msg::done("Screenshot copied"))),
+                Err(e) => drop(tx.unbounded_send(Msg::error(e))),
             }
         });
     }
@@ -2491,13 +2503,13 @@ impl Launcher {
             // A quicklink switches to a tab already showing it, when a browser is connected.
             // The browser companion can't see a link procast opens itself, so check it here.
             Act::Open(url) if self.focus.blocked_url(&url, SystemTime::now()).is_some() => {
-                self.say(false, format!("Focus: {} is blocked", focus::host_of(&url).unwrap_or_default()));
+                self.say(Msg::error(format!("{} is blocked until Focus ends", focus::host_of(&url).unwrap_or_default())));
             }
             Act::FocusStart(name, mode) => {
                 let Some(c) = focus::category(&self.cfg.focus_category, &name).cloned() else { return };
                 let start = focus::Start { title: name, minutes: self.cfg.focus.default_minutes, filter: Some((mode, c.apps, c.sites)) };
                 let text = self.focus_begin(start, false);
-                self.say(true, text);
+                self.say(Msg::done(text));
             }
             Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, window, cx),
             Act::With(act, got) => return self.run_with(*act, got, window, cx),
@@ -2609,7 +2621,8 @@ impl Launcher {
                     return cx.notify();
                 }
                 win::open(&browser::extension_dir().to_string_lossy());
-                let _ = self.tx.unbounded_send(Msg::Toast(true, "In chrome://extensions or edge://extensions: Developer mode, Load unpacked, this folder".into()));
+                // An instruction to follow while the folder opens: it stays until dismissed.
+                let _ = self.tx.unbounded_send(Msg::sticky(toast::Kind::Info, "Load unpacked in chrome://extensions, Developer mode on"));
             }
             Act::Tab(conn, id) => {
                 let window = self.tabs.iter().find(|(c, _, t)| *c == conn && t.id == id).map_or(0, |t| t.2.window);
@@ -2637,7 +2650,7 @@ impl Launcher {
             Act::StartTimer(secs, label) => {
                 self.timers.start(label.clone(), Duration::from_secs(secs));
                 self.watch_timers();
-                let _ = self.tx.unbounded_send(Msg::Toast(true, format!("Timer started: {}", if label.is_empty() { timers::fmt_duration(Duration::from_secs(secs)) } else { label })));
+                let _ = self.tx.unbounded_send(Msg::done(format!("Timer started: {}", if label.is_empty() { timers::fmt_duration(Duration::from_secs(secs)) } else { label })));
             }
             Act::StopTimer(id) => {
                 // A stopwatch's time goes to the clipboard; a timer is just cancelled.
@@ -2678,7 +2691,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = commands::run_layout(&layout, &w, &ids) {
-                        let _ = tx.unbounded_send(Msg::Toast(false, e));
+                        let _ = tx.unbounded_send(Msg::error(e));
                     }
                 });
                 return;
@@ -2693,11 +2706,11 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     let said = match commands::run(cmd, HWND(target as _), &w) {
-                        Ok(done) => done.map(|d| (true, d)),
-                        Err(e) => Some((false, e)),
+                        Ok(done) => done.map(Msg::done),
+                        Err(e) => Some(Msg::error(e)),
                     };
-                    if let Some((ok, text)) = said {
-                        let _ = tx.unbounded_send(Msg::Toast(ok, text));
+                    if let Some(toast) = said {
+                        let _ = tx.unbounded_send(toast);
                     }
                 });
                 return;
@@ -2721,7 +2734,7 @@ impl Launcher {
             Act::Cmd(Cmd::StartStopwatch) => {
                 self.timers.stopwatch(got[0].clone());
                 self.watch_timers();
-                self.say(true, "Stopwatch started".into());
+                self.say(Msg::done("Stopwatch started"));
                 // A hotkey starts it without opening the launcher.
                 if self.visible {
                     self.hide(true, cx);
@@ -2732,7 +2745,7 @@ impl Launcher {
                 let (tx, name) = (self.tx.clone(), got[0].clone());
                 std::thread::spawn(move || {
                     if let Err(e) = desktops::rename(&name) {
-                        let _ = tx.unbounded_send(Msg::Toast(false, e));
+                        let _ = tx.unbounded_send(Msg::error(e));
                     }
                 });
             }
@@ -3067,6 +3080,11 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
+            Msg::ToastClose => {
+                if let Some(t) = self.toast {
+                    _ = t.update(cx, |t, _, cx| t.dismiss(cx));
+                }
+            }
             Msg::TimerTick => self.on_timer_tick(cx),
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
@@ -3106,7 +3124,7 @@ impl Launcher {
             }
             Msg::Calendar(results) => {
                 for text in self.calendar.done(results) {
-                    self.say(false, text);
+                    self.say(Msg::error(text));
                 }
                 if self.visible && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
                     self.refresh(cx);
@@ -3144,7 +3162,7 @@ impl Launcher {
                     }
                 }
                 browser::Reply::Done(Err(e)) => {
-                    let _ = self.tx.unbounded_send(Msg::Toast(false, e));
+                    let _ = self.tx.unbounded_send(Msg::error(e));
                 }
                 browser::Reply::Done(Ok(())) => {}
             },
@@ -4483,6 +4501,7 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let toast = toast::open(cx);
+            _ = handle.update(cx, |this, _, _| this.toast = toast);
             while let Some(msg) = rx.next().await {
                 if let Msg::Resize = msg {
                     if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
@@ -4490,10 +4509,9 @@ fn main() {
                     }
                     continue;
                 }
-                if let Msg::Toast(ok, text) = msg {
-                    let text: String = text.lines().next().unwrap_or_default().chars().take(200).collect();
+                if let Msg::Toast(kind, stay, text) = msg {
                     let theme = handle.update(cx, |this, _, _| this.cfg.theme.clone()).unwrap_or_default();
-                    toast::show(cx, toast, ok, text, theme);
+                    toast::show(cx, toast, kind, stay, &text, theme);
                     continue;
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window

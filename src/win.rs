@@ -110,8 +110,35 @@ pub enum Msg {
     /// The foreground window changed: its handle, whether it is a game, and its program's file
     /// name in lower case, empty if Windows won't say (see foreground.rs).
     Foreground { hwnd: isize, game: bool, exe: String },
-    /// A command's result (true) or why it failed (false): shown as a toast that fades away.
-    Toast(bool, String),
+    /// A command's result, or why it failed: shown as a toast (toast.rs). Build it with
+    /// `Msg::done`, `Msg::error`, `Msg::info` or `Msg::sticky`.
+    Toast(crate::toast::Kind, crate::toast::Stay, String),
+    /// Esc was pressed while a sticky toast showed (keys.rs).
+    ToastClose,
+}
+
+impl Msg {
+    pub fn done(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Done, text)
+    }
+
+    /// Stays until Esc, a click or the launcher opening; say what to do next.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Error, text)
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Info, text)
+    }
+
+    /// Any kind, staying until dismissed.
+    pub fn sticky(kind: crate::toast::Kind, text: impl Into<String>) -> Self {
+        Self::Toast(kind, crate::toast::Stay::Sticky, text.into())
+    }
+
+    fn toast(kind: crate::toast::Kind, text: impl Into<String>) -> Self {
+        Self::Toast(kind, kind.stay(), text.into())
+    }
 }
 
 pub enum TrayCmd {
@@ -234,6 +261,14 @@ pub fn make_overlay(hwnd: HWND) {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOPMOST.0) as isize);
         _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    }
+}
+
+/// Whether clicks pass through an overlay (`make_overlay`) to what is beneath.
+pub fn click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & !(WS_EX_TRANSPARENT.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, if on { ex | WS_EX_TRANSPARENT.0 as isize } else { ex });
     }
 }
 

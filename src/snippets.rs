@@ -364,7 +364,7 @@ pub fn open_link(owner: HWND, url: String, tx: futures::channel::mpsc::Unbounded
         let old = clipboard::text();
         let sel = if url.contains("{selection}") {
             let Some(sel) = selection().filter(|s| !s.trim().is_empty()) else {
-                let _ = tx.unbounded_send(crate::win::Msg::Toast(false, "No text selected".into()));
+                let _ = tx.unbounded_send(crate::win::Msg::error("Select some text first"));
                 return;
             };
             // ponytail: only text comes back, as with snippets.

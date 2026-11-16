@@ -140,6 +140,7 @@ pub mod sp {
     pub const S4: f32 = 4.;
     pub const S8: f32 = 8.;
     pub const S12: f32 = 12.;
+    pub const S16: f32 = 16.;
 }
 
 /// `.pc-pop--right`: the menu under the bar's Dropdown.
@@ -1144,19 +1145,26 @@ pub fn glass_window(t: &Tokens) -> Div {
     }
 }
 
-/// The Toast pill: an error's warning icon in `danger` (or a result's check in `success`), then one line of text. On `bg_elevated`,
+/// The Toast pill: an icon that alone carries the kind's colour (error: warning in `danger`, done:
+/// check in `success`, info: info in `text_muted`), then one line of text. On `bg_elevated`,
 /// not the glass `bg`: its window has no OS blur behind it, and the thin pane alone would not
 /// hold 4.5:1 over a busy wallpaper. Unscaled: it lives on the desktop, not in the launcher.
-pub fn toast(text: &str, ok: bool, t: &Tokens) -> Div {
+pub fn toast(text: &str, kind: crate::toast::Kind, t: &Tokens) -> Div {
+    use crate::toast::Kind;
     let p = gpui::px;
+    let (glyph, tint) = match kind {
+        Kind::Done => (g::CHECK, t.success),
+        Kind::Error => (g::WARNING, t.danger),
+        Kind::Info => (g::INFO, t.text_muted),
+    };
     div()
         .h(p(ROW))
         .max_w(p(480.))
-        .pl(p(12.))
-        .pr(p(16.))
+        .pl(p(sp::S12))
+        .pr(p(sp::S16))
         .flex()
         .items_center()
-        .gap(p(8.))
+        .gap(p(sp::S8))
         .rounded_full()
         .bg(t.bg_elevated)
         .border_1()
@@ -1165,7 +1173,7 @@ pub fn toast(text: &str, ok: bool, t: &Tokens) -> Div {
         .font_family(FONT_UI)
         .text_size(p(ts::BODY_SM))
         .text_color(t.text)
-        .child(svg().path(format!("icons/{}.svg", if ok { g::CHECK } else { g::WARNING })).size(p(ic::MD)).flex_none().text_color(if ok { t.success } else { t.danger }))
+        .child(svg().path(format!("icons/{glyph}.svg")).size(p(ic::MD)).flex_none().text_color(tint))
         .child(div().min_w_0().truncate().child(text.to_string()))
 }
 
