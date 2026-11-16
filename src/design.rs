@@ -1284,8 +1284,31 @@ pub fn pop_menu(
 
 /// How wide `text` draws in Space Grotesk at `size` (scaled).
 pub fn text_width(text: &str, size: f32, window: &Window) -> Pixels {
-    let run = gpui::TextRun { len: text.len(), font: gpui::font(FONT_UI), color: Hsla::default(), background_color: None, underline: None, strikethrough: None, letter_spacing: None };
+    shaped_width(text, size, gpui::font(FONT_UI), window)
+}
+
+fn shaped_width(text: &str, size: f32, font: gpui::Font, window: &Window) -> Pixels {
+    let run = gpui::TextRun { len: text.len(), font, color: Hsla::default(), background_color: None, underline: None, strikethrough: None, letter_spacing: None };
     window.text_system().shape_line(text.to_string().into(), px(size), &[run]).width
+}
+
+/// The widest form a live accessory takes while it ticks; its width is kept for every form.
+const LIVE_WIDEST: &str = "00:00 left";
+
+/// Tabular figures: every digit as wide as the others, so a ticking time does not jitter.
+fn tabular() -> gpui::FontFeatures {
+    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
+}
+
+/// The live accessory's width: `LIVE_WIDEST` in tabular figures at the accessory's size.
+pub fn live_width(window: &Window) -> Pixels {
+    shaped_width(LIVE_WIDEST, ts::BODY_SM, gpui::Font { features: tabular(), ..gpui::font(FONT_UI) }, window)
+}
+
+/// A live accessory (`.pc-live`): tabular figures, right-aligned in at least `width`
+/// (`live_width`), so the row never changes width while it ticks.
+pub fn live(text: &str, width: Pixels, color: Hsla) -> Div {
+    div().min_w(width).flex().justify_end().font_features(tabular()).text_color(color).child(text.to_string())
 }
 
 /// An argument box's look: `width` from `arg_width`; the "optional" tag while it is empty and

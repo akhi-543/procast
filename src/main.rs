@@ -218,21 +218,23 @@ fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> 
 
 /// Section marker for a row that stands in for an empty view (drawn as an empty state).
 const EMPTY: &str = "\u{0}empty";
+/// The section of running timers and stopwatches at the head of root search.
+const RUNNING: &str = "Running";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
 /// with the same section share one header.
 fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
-    // A header says something only when there is more than one section, and "Results"
-    // right under the search field says nothing.
+    // A header says something only when there is more than one section (Running, with its
+    // count, always heads its rows), and "Results" right under the search field says nothing.
     let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
         if is_answer(items, i) {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last && !one && sec != Some("Results") {
+        if sec.is_some() && sec != last && (!one || sec == Some(RUNNING)) && !(sec == Some("Results") && out.is_empty()) {
             out.push(None);
         }
         last = sec;
@@ -244,6 +246,33 @@ fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
 /// The calculator's answer leads root results and is drawn as a card above the list.
 fn is_answer(items: &[Item], i: usize) -> bool {
     i == 0 && items.first().is_some_and(|it| it.accessory == "Calculator")
+}
+
+/// A timer's or stopwatch's name and icon.
+fn timer_kind(stopwatch: bool) -> (&'static str, &'static str) {
+    if stopwatch { ("Stopwatch", g::TIMER) } else { ("Timer", g::ALARM_CLOCK) }
+}
+
+/// One Running row. Enter pauses or resumes, Ctrl+Enter (the second action) stops, Ctrl+K
+/// also offers Restart, Rename and Add 5 Minutes; a done timer's Enter dismisses it.
+fn running_row(r: timers::Row) -> Item {
+    let id = r.id;
+    let (kind, glyph) = timer_kind(r.stopwatch);
+    let acts = if r.done {
+        vec![("Dismiss", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id))]
+    } else {
+        let flip = if r.paused { Act::ResumeTimer(id) } else { Act::PauseTimer(id) };
+        vec![(flip.label(), flip), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id)), ("Rename", Act::RenameTimer(id)), ("Add 5 Minutes", Act::AddTime(id, 300))]
+    };
+    let mut it = Item::new(&r.title, kind, Icon::Vector(glyph), acts[0].1.clone()).acc(r.accessory()).sec(RUNNING).tinted(design::Tint::System);
+    it.extra = acts.into_iter().map(|(l, a)| (l.to_string(), a)).collect();
+    it.live = true;
+    it
+}
+
+/// The timer or stopwatch a Running row stands for.
+fn timer_id(it: &Item) -> Option<u64> {
+    it.live.then(|| it.extra.iter().find_map(|(_, a)| if let Act::StopTimer(id) = a { Some(*id) } else { None })).flatten()
 }
 
 fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
@@ -967,12 +996,17 @@ impl Launcher {
                     self.file_gen += 1;
                     f.search(self.file_gen, &query, 5);
                 }
-                let mut rows = self.timer_rows(&query);
-                rows.extend(self.focus_rows(&query));
+                let mut rows = self.focus_rows(&query);
+                rows.extend(self.timer_rows(&query));
                 if query.trim().is_empty() {
                     rows.extend(self.schedule_now());
                 }
-                rows.extend(search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher));
+                let mut found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
+                // A command named in the query ("timer 25m tea") leads even those sections.
+                if let Some(i) = found.iter().position(|it| search::leads(it, query.trim_start(), &self.cfg)) {
+                    rows.insert(0, found.remove(i));
+                }
+                rows.extend(found);
                 rows
             }
             Mode::Clipboard => {
@@ -1151,8 +1185,8 @@ impl Launcher {
             self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
         }
         let _ = max;
-        // A command named with a space after it is selected, so its boxes show.
-        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| !it.args.is_empty() && search::named_in(it, query.trim_start(), &self.cfg).is_some())).flatten();
+        // A command named alone or with a space after it is selected, so its boxes show.
+        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| search::leads(it, query.trim_start(), &self.cfg))).flatten();
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { named.unwrap_or(0) };
         self.sync_args(cx);
         self.scroll_to_selected();
@@ -1160,16 +1194,14 @@ impl Launcher {
         cx.notify();
     }
 
-    /// Running timers and stopwatches as root rows: all of them in an empty search, else the
-    /// ones whose title contains the query.
+    /// Running timers and stopwatches as the Running section (`Timers::matching` picks them).
     fn timer_rows(&self, query: &str) -> Vec<Item> {
-        let row = |(id, title, left): (u64, String, String)| Item::new(title, "", Icon::Vector(g::TIMER), Act::StopTimer(id)).acc(left).sec("Timers");
-        self.timers.matching(SystemTime::now(), query).into_iter().map(row).collect()
+        self.timers.matching(SystemTime::now(), query).into_iter().map(running_row).collect()
     }
 
     /// Starts the 1 s tick while a timer runs; the thread ends when its flag is set.
     fn watch_timers(&mut self) {
-        if self.timer_tick.is_some() || (!self.timers.any() && !self.focus.ticking()) {
+        if self.timer_tick.is_some() || (!self.timers.ticking() && !self.focus.ticking()) {
             return;
         }
         let (stop, tx) = (Arc::new(AtomicBool::new(false)), self.tx.clone());
@@ -1184,37 +1216,40 @@ impl Launcher {
         });
     }
 
-    /// Announces timers that ran out, keeps the visible timer rows current, ends the tick
-    /// when nothing is left.
+    /// Announces timers that ran out (a sticky toast and the system sound), keeps the visible
+    /// Running rows current, ends the tick when nothing counts any more.
     fn on_timer_tick(&mut self, cx: &mut Context<Self>) {
         let now = SystemTime::now();
         self.on_focus_tick(cx);
-        for (_, label) in self.timers.due(now) {
-            let _ = self.tx.unbounded_send(Msg::done(if label.is_empty() { "Timer done".into() } else { format!("Timer done: {label}") }));
+        let due = self.timers.due(now);
+        for (_, label, length) in &due {
+            self.say(Msg::sticky(toast::Kind::Done, timers::done_text(label, *length)));
             timers::beep();
         }
-        if !self.timers.any()
+        if !self.timers.ticking()
             && !self.focus.ticking()
             && let Some(stop) = self.timer_tick.take()
         {
             stop.store(true, Ordering::Relaxed);
         }
-        if self.visible && self.mode == Mode::Root {
-            let shown: Vec<u64> = self.items.iter().filter_map(|it| if let Act::StopTimer(id) = it.act { Some(id) } else { None }).collect();
-            let rows = self.timers.matching(now, &self.query(cx));
-            // A finished timer's row goes away; otherwise the rows only change their time.
-            if timers::rows_changed(&shown, &rows) {
-                return self.refresh(cx);
-            }
-            for it in &mut self.items {
-                if let Act::StopTimer(id) = it.act
-                    && let Some(r) = rows.iter().find(|r| r.0 == id)
-                {
-                    it.accessory = r.2.clone();
-                }
-            }
-            cx.notify();
+        // Hidden: nothing to redraw; the toasts above still go out.
+        if !self.visible || self.mode != Mode::Root {
+            return;
         }
+        let shown: Vec<u64> = self.items.iter().filter_map(timer_id).collect();
+        let rows = self.timers.matching(now, &self.query(cx));
+        // A timer that finished, appeared or went away rebuilds the list; otherwise only the times change.
+        if !due.is_empty() || timers::rows_changed(&shown, &rows) {
+            return self.refresh(cx);
+        }
+        for it in &mut self.items {
+            if let Some(id) = timer_id(it)
+                && let Some(r) = rows.iter().find(|r| r.id == id)
+            {
+                it.accessory = r.accessory();
+            }
+        }
+        cx.notify();
     }
 
     // ---- My Schedule (the decisions are in calendar.rs) ------------------------------
@@ -2651,21 +2686,51 @@ impl Launcher {
             }
             Act::Define(word) => return self.define(word, cx),
             Act::StartTimer(secs, label) => {
-                self.timers.start(label.clone(), Duration::from_secs(secs));
+                let d = Duration::from_secs(secs);
+                self.timers.start(label.clone(), d);
                 self.watch_timers();
-                let _ = self.tx.unbounded_send(Msg::done(format!("Timer started: {}", if label.is_empty() { timers::fmt_duration(Duration::from_secs(secs)) } else { label })));
+                self.say(Msg::done(["Timer set", &timers::fmt_spoken(d), &label].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")));
             }
             Act::StopTimer(id) => {
-                // A stopwatch's time goes to the clipboard; a timer is just cancelled.
-                self.status = Some(match self.timers.elapsed(id, SystemTime::now()).map(timers::fmt_duration) {
+                // A stopwatch's time goes to the clipboard; a timer is cancelled, a done one dismissed.
+                let now = SystemTime::now();
+                let done = self.timers.rows(now).iter().any(|r| r.id == id && r.done);
+                self.status = match self.timers.elapsed(id, now).map(timers::fmt_duration) {
                     Some(time) => {
                         cx.write_to_clipboard(ClipboardItem::new_string(time.clone()));
-                        (Tone::Ok, format!("Stopped at {time}, copied"))
+                        Some((Tone::Ok, format!("Stopped at {time}, copied")))
                     }
-                    None => (Tone::Info, "Timer cancelled".into()),
-                });
+                    None if done => None,
+                    None => Some((Tone::Info, "Timer cancelled".into())),
+                };
                 self.timers.cancel(id);
                 return self.refresh(cx);
+            }
+            Act::PauseTimer(id) => {
+                self.timers.pause(id, SystemTime::now());
+                return self.refresh(cx);
+            }
+            Act::ResumeTimer(id) => {
+                self.timers.resume(id, SystemTime::now());
+                self.watch_timers();
+                return self.refresh(cx);
+            }
+            Act::RestartTimer(id) => {
+                self.timers.restart(id, SystemTime::now());
+                self.watch_timers();
+                return self.refresh(cx);
+            }
+            Act::AddTime(id, secs) => {
+                self.timers.add(id, Duration::from_secs(secs));
+                return self.refresh(cx);
+            }
+            Act::RenameTimer(id) => {
+                let Some(r) = self.timers.rows(SystemTime::now()).into_iter().find(|r| r.id == id) else { return };
+                let (kind, glyph) = timer_kind(r.stopwatch);
+                let name = search::Arg { optional: true, placeholder: "Type name".into(), ..search::Arg::new("Name") };
+                let mut it = Item::new(format!("Rename {kind}"), "", Icon::Vector(glyph), Act::RenameTimer(id)).tinted(design::Tint::System).boxes(vec![name], &[]);
+                it.values = vec![r.title];
+                return self.ask_args(it, window, cx);
             }
             Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
@@ -2742,6 +2807,12 @@ impl Launcher {
                 if self.visible {
                     self.hide(true, cx);
                 }
+            }
+            Act::RenameTimer(id) => {
+                self.timers.rename(id, got[0].trim().to_string());
+                self.args_row = None;
+                self.set_mode(Mode::Root, cx);
+                window.focus(&self.input.focus_handle(cx), cx);
             }
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
                 self.hide(true, cx);
@@ -3282,6 +3353,8 @@ impl Launcher {
             return label;
         }
         match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
+            // A Running row's accessory is its time; its kind is the subtitle.
+            Some(it) if it.live => it.subtitle.clone(),
             Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
             _ => "procast".into(),
         }
@@ -3775,7 +3848,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint> },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool },
 }
 
 impl Render for Launcher {
@@ -3880,13 +3953,15 @@ impl Render for Launcher {
                         let it = &self.items[rows[k + 1].unwrap_or(0)];
                         let sec = it.section.clone();
                         above.clear();
-                        out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root).then(|| count(&sec))));
+                        out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root || sec.as_deref() == Some(RUNNING)).then(|| count(&sec))));
                     }
                     Some(i) => {
                         let it = &self.items[*i];
                         let hotkey = it.key.as_ref().filter(|_| root).and_then(|k| self.cfg.launcher.hotkeys.get(k)).cloned().unwrap_or_default();
                         // A row with arguments says how many until it is selected.
-                        let accessory = if root {
+                        let accessory = if it.live {
+                            it.accessory.clone()
+                        } else if root {
                             if it.alias.is_empty() && *i != self.selected { it.arg_count().unwrap_or_default() } else { it.alias.clone() }
                         } else if it.accessory == above {
                             String::new()
@@ -3897,7 +3972,7 @@ impl Render for Launcher {
                         // Its subtitle repeats what its boxes hold.
                         let mirrored = search::mirror(it, if *i == self.selected && arg_row.is_some() { &arg_values } else { &it.values });
                         let subtitle = if mirrored.is_empty() { it.subtitle.clone() } else { mirrored };
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint });
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live });
                     }
                 }
             }
@@ -3908,17 +3983,20 @@ impl Render for Launcher {
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
         let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Shots) { 110. } else { design::ACCESSORY_MAX };
+        let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint } => {
+                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
                             let accessory = if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
+                            } else if *live {
+                                Some(design::live(accessory, live_w, if accessory == timers::DONE { t.success } else { t.text_muted }).into_any_element())
                             } else if !accessory.is_empty() {
                                 Some(accessory.clone().into_any_element())
                             } else {
@@ -4594,6 +4672,31 @@ mod tests {
         assert_eq!(shape, ["Smileys", "[0, 1, 2, 3]", "[4, 5]", "People", "[6, 7]"]);
         let searched: Vec<Item> = (0..5).map(|_| Item::new("x", "", Icon::glyph("x"), Act::None)).collect();
         assert_eq!(grid_rows(&searched, 4).len(), 2, "no sections: just rows");
+    }
+
+    #[test]
+    fn running_is_always_headed_and_results_are_headed_below_another_section() {
+        let it = |sec: &str| Item::new("x", "", Icon::glyph("x"), Act::None).sec(sec);
+        assert_eq!(display_rows(&[it("Running")]), [None, Some(0)], "alone, still headed");
+        assert_eq!(display_rows(&[it("Results"), it("Running"), it("Results")]), [Some(0), None, Some(1), None, Some(2)]);
+        assert_eq!(display_rows(&[it("Results"), it("Results")]), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn running_rows_pause_on_enter_stop_on_ctrl_enter_and_dismiss_when_done() {
+        let row = |paused, done, stopwatch| running_row(timers::Row { id: 4, title: "tea".into(), stopwatch, paused, done, time: "4:12".into() });
+        let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        let it = row(false, false, false);
+        assert_eq!((it.subtitle.as_str(), it.accessory.as_str(), it.section.as_deref(), it.live), ("Timer", "4:12 left", Some(RUNNING), true));
+        assert!(matches!(it.icon, Icon::Vector(g::ALARM_CLOCK)) && matches!(row(false, false, true).icon, Icon::Vector(g::TIMER)));
+        assert_eq!((it.act.clone(), it.actions()[1].1.clone()), (Act::PauseTimer(4), Act::StopTimer(4)));
+        assert_eq!(labels(&it), ["Pause", "Stop", "Restart", "Rename", "Add 5 Minutes"]);
+        assert_eq!(it.extra[4].1, Act::AddTime(4, 300));
+        let paused = row(true, false, false);
+        assert_eq!((paused.act, paused.accessory.as_str()), (Act::ResumeTimer(4), "Paused · 4:12"));
+        let done = row(false, true, false);
+        assert_eq!((done.act.clone(), done.accessory.as_str(), labels(&done)), (Act::StopTimer(4), timers::DONE, vec!["Dismiss".to_string(), "Restart".into()]));
+        assert_eq!(timer_id(&done), Some(4));
     }
 
     #[test]

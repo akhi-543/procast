@@ -52,6 +52,21 @@ pub fn fmt_duration(d: Duration) -> String {
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
+/// "25 min", "1 h 30 min", "45 s": a length as a toast or subtitle says it.
+pub fn fmt_spoken(d: Duration) -> String {
+    let s = d.as_secs();
+    let parts: Vec<String> = [(s / 3600, "h"), (s / 60 % 60, "min"), (s % 60, "s")].iter().filter(|p| p.0 > 0).map(|(n, unit)| format!("{n} {unit}")).collect();
+    if parts.is_empty() { "0 s".into() } else { parts.join(" ") }
+}
+
+/// The toast when a timer runs out: "tea · 25 min done".
+pub fn done_text(label: &str, length: Duration) -> String {
+    format!("{} · {} done", if label.is_empty() { "Timer" } else { label }, fmt_spoken(length))
+}
+
+/// A finished timer's accessory, until it is dismissed.
+pub const DONE: &str = "Done";
+
 /// The system "ding"; silent when there is no sound device.
 pub fn beep() {
     unsafe { _ = MessageBeep(MB_OK) };
@@ -61,14 +76,45 @@ fn millis(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Entry {
     id: u64,
     label: String,
-    /// Wall-clock start, ms since the epoch.
+    /// Wall-clock start, ms since the epoch; moved on by the time spent paused.
     start: u64,
     /// Length in ms; None for a stopwatch.
     length: Option<u64>,
+    /// When it was paused, ms since the epoch: the clock stands still from then.
+    #[serde(default)]
+    paused_at: Option<u64>,
+    /// A timer that ran out and was announced; it says "Done" until stopped.
+    #[serde(default)]
+    done: bool,
+}
+
+/// One running row: what root search shows for a timer or stopwatch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub id: u64,
+    /// The label, or "Timer" / "Stopwatch".
+    pub title: String,
+    pub stopwatch: bool,
+    pub paused: bool,
+    pub done: bool,
+    /// Time left, or a stopwatch's elapsed time ("4:12").
+    pub time: String,
+}
+
+impl Row {
+    /// "4:12 left", "12:48", "Paused · 4:12" or "Done".
+    pub fn accessory(&self) -> String {
+        match (self.done, self.paused, self.stopwatch) {
+            (true, ..) => DONE.into(),
+            (_, true, _) => format!("Paused · {}", self.time),
+            (_, _, true) => self.time.clone(),
+            _ => format!("{} left", self.time),
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -88,23 +134,65 @@ impl Timers {
 
     fn save(&self) {
         if let Some(path) = &self.path {
-            let _ = fs::write(path, serde_json::to_string(self).unwrap_or_default());
+            let _ = crate::focus::write_atomic(path, &serde_json::to_string(self).unwrap_or_default());
         }
     }
 
-    fn add(&mut self, label: String, length: Option<u64>) -> u64 {
+    fn push(&mut self, label: String, length: Option<u64>) -> u64 {
         self.next += 1;
-        self.items.push(Entry { id: self.next, label, start: millis(SystemTime::now()), length });
+        self.items.push(Entry { id: self.next, label, start: millis(SystemTime::now()), length, ..Default::default() });
         self.save();
         self.next
     }
 
     pub fn start(&mut self, label: String, d: Duration) -> u64 {
-        self.add(label, Some(d.as_millis() as u64))
+        self.push(label, Some(d.as_millis() as u64))
     }
 
     pub fn stopwatch(&mut self, label: String) -> u64 {
-        self.add(label, None)
+        self.push(label, None)
+    }
+
+    /// Changes entry `id` and saves; nothing for an unknown id.
+    fn edit(&mut self, id: u64, f: impl FnOnce(&mut Entry)) {
+        if let Some(e) = self.items.iter_mut().find(|e| e.id == id) {
+            f(e);
+            self.save();
+        }
+    }
+
+    pub fn pause(&mut self, id: u64, now: SystemTime) {
+        self.edit(id, |e| {
+            if !e.done {
+                e.paused_at.get_or_insert(millis(now));
+            }
+        });
+    }
+
+    pub fn resume(&mut self, id: u64, now: SystemTime) {
+        self.edit(id, |e| {
+            if let Some(at) = e.paused_at.take() {
+                e.start += millis(now).saturating_sub(at);
+            }
+        });
+    }
+
+    /// From the start again, running.
+    pub fn restart(&mut self, id: u64, now: SystemTime) {
+        self.edit(id, |e| (e.start, e.paused_at, e.done) = (millis(now), None, false));
+    }
+
+    /// More time on a timer; a stopwatch counts it as already elapsed.
+    pub fn add(&mut self, id: u64, d: Duration) {
+        let ms = d.as_millis() as u64;
+        self.edit(id, |e| match &mut e.length {
+            Some(l) => *l += ms,
+            None => e.start = e.start.saturating_sub(ms),
+        });
+    }
+
+    pub fn rename(&mut self, id: u64, name: String) {
+        self.edit(id, |e| e.label = name);
     }
 
     pub fn cancel(&mut self, id: u64) {
@@ -112,56 +200,75 @@ impl Timers {
         self.save();
     }
 
-    pub fn any(&self) -> bool {
-        !self.items.is_empty()
+    /// Whether anything still counts (not paused, not done): the 1 s tick runs only then.
+    pub fn ticking(&self) -> bool {
+        self.items.iter().any(|e| !e.done && e.paused_at.is_none())
     }
 
     /// How long a stopwatch has run (None for a timer or an unknown id).
     pub fn elapsed(&self, id: u64, now: SystemTime) -> Option<Duration> {
         let e = self.items.iter().find(|e| e.id == id && e.length.is_none())?;
-        Some(Duration::from_millis(millis(now).saturating_sub(e.start)))
+        Some(Duration::from_millis(e.paused_at.unwrap_or(millis(now)).saturating_sub(e.start)))
     }
 
-    /// Timers that have run out: each one is handed back once, then forgotten.
-    pub fn due(&mut self, now: SystemTime) -> Vec<(u64, String)> {
+    /// Timers that ran out, (id, label, length): each is handed back once, then shows Done.
+    pub fn due(&mut self, now: SystemTime) -> Vec<(u64, String, Duration)> {
         let now = millis(now);
-        let (done, left): (Vec<_>, Vec<_>) = std::mem::take(&mut self.items).into_iter().partition(|e| e.length.is_some_and(|l| e.start + l <= now));
-        self.items = left;
-        if !done.is_empty() {
+        let mut out = vec![];
+        for e in &mut self.items {
+            if let Some(l) = e.length
+                && !e.done
+                && e.paused_at.is_none()
+                && e.start + l <= now
+            {
+                e.done = true;
+                out.push((e.id, e.label.clone(), Duration::from_millis(l)));
+            }
+        }
+        if !out.is_empty() {
             self.save();
         }
-        done.into_iter().map(|e| (e.id, e.label)).collect()
+        out
     }
 
-    /// The `rows` whose title contains `query` (case aside): what root search shows.
-    pub fn matching(&self, now: SystemTime, query: &str) -> Vec<(u64, String, String)> {
+    /// The `rows` root search shows: all of them while the query is empty or names timers
+    /// ("tim", "tmr", "timer 5m", "t 90"), else those whose title contains it.
+    pub fn matching(&self, now: SystemTime, query: &str) -> Vec<Row> {
         let q = query.trim().to_lowercase();
-        self.rows(now).into_iter().filter(|r| r.1.to_lowercase().contains(&q)).collect()
+        let all = q.is_empty() || names_timers(&q);
+        self.rows(now).into_iter().filter(|r| all || r.title.to_lowercase().contains(&q)).collect()
     }
 
-    /// (id, title, time) of everything running: the time left, or a stopwatch's elapsed time.
-    pub fn rows(&self, now: SystemTime) -> Vec<(u64, String, String)> {
+    /// Everything running, paused or done, oldest first.
+    pub fn rows(&self, now: SystemTime) -> Vec<Row> {
         let now = millis(now);
         self.items
             .iter()
             .map(|e| {
-                let (name, ms) = match e.length {
-                    Some(l) => ("Timer", (e.start + l).saturating_sub(now)),
-                    None => ("Stopwatch", now.saturating_sub(e.start)),
-                };
+                let at = e.paused_at.unwrap_or(now);
                 // A timer counts down in whole seconds, rounded up: 0:00 means done.
-                let ms = if e.length.is_some() { ms.div_ceil(1000) * 1000 } else { ms };
-                let title = if e.label.is_empty() { name.to_string() } else { e.label.clone() };
-                (e.id, title, fmt_duration(Duration::from_millis(ms)))
+                let ms = match e.length {
+                    Some(l) => (e.start + l).saturating_sub(at).div_ceil(1000) * 1000,
+                    None => at.saturating_sub(e.start),
+                };
+                let kind = if e.length.is_some() { "Timer" } else { "Stopwatch" };
+                let title = if e.label.is_empty() { kind.to_string() } else { e.label.clone() };
+                Row { id: e.id, title, stopwatch: e.length.is_none(), paused: e.paused_at.is_some(), done: e.done, time: fmt_duration(Duration::from_millis(ms)) }
             })
             .collect()
     }
 }
 
+/// `q` (lower case) fuzzy-matches "timer" from its first letter, or starts with a timer keyword.
+fn names_timers(q: &str) -> bool {
+    let mut word = "timer".chars();
+    q.starts_with("timer ") || q.starts_with("t ") || (q.starts_with('t') && q.chars().all(|c| word.any(|w| w == c)))
+}
+
 /// Whether the timer rows on screen (their ids, in order) are no longer the `rows` that should
 /// show: the list needs rebuilding, not just the times.
-pub fn rows_changed(shown: &[u64], rows: &[(u64, String, String)]) -> bool {
-    shown.len() != rows.len() || shown.iter().zip(rows).any(|(id, r)| *id != r.0)
+pub fn rows_changed(shown: &[u64], rows: &[Row]) -> bool {
+    shown.len() != rows.len() || shown.iter().zip(rows).any(|(id, r)| *id != r.id)
 }
 
 #[cfg(test)]
@@ -200,37 +307,39 @@ mod tests {
         let now = SystemTime::now();
         assert!(t.due(now).is_empty());
         let later = now + Duration::from_secs(61);
-        assert_eq!(t.due(later), vec![(tea, "tea".to_string())]);
+        assert_eq!(t.due(later), vec![(tea, "tea".to_string(), Duration::from_secs(60))]);
         assert!(t.due(later).is_empty());
         assert!(t.elapsed(watch, later).is_some_and(|e| e >= Duration::from_secs(60)));
-        assert_eq!(t.rows(later).len(), 1);
+        assert_eq!(t.rows(later).len(), 2, "the done timer stays until stopped");
     }
 
     #[test]
     fn a_timer_already_past_when_checked_fires_once() {
         let mut t = Timers::default();
-        t.items.push(Entry { id: 7, label: "old".into(), start: 1_000, length: Some(5_000) });
-        assert_eq!(t.due(SystemTime::now()), vec![(7, "old".to_string())]);
+        t.items.push(Entry { id: 7, label: "old".into(), start: 1_000, length: Some(5_000), ..Default::default() });
+        assert_eq!(t.due(SystemTime::now()), vec![(7, "old".to_string(), Duration::from_secs(5))]);
         assert!(t.due(SystemTime::now()).is_empty());
     }
 
     #[test]
     fn rows_count_down_and_up() {
-        let items = vec![Entry { id: 1, label: "tea".into(), start: 0, length: Some(300_000) }, Entry { id: 2, label: String::new(), start: 0, length: None }];
+        let items = vec![Entry { id: 1, label: "tea".into(), start: 0, length: Some(300_000), ..Default::default() }, Entry { id: 2, start: 0, ..Default::default() }];
         let mut t = Timers { items, ..Default::default() };
         let at = |s| UNIX_EPOCH + Duration::from_millis(s);
-        assert_eq!(t.rows(at(28_500)), vec![(1, "tea".into(), "4:32".into()), (2, "Stopwatch".into(), "0:28".into())]);
+        let shown = |t: &Timers| t.rows(at(28_500)).iter().map(|r| (r.id, r.title.clone(), r.accessory())).collect::<Vec<_>>();
+        assert_eq!(shown(&t), vec![(1, "tea".into(), "4:32 left".into()), (2, "Stopwatch".into(), "0:28".into())]);
         t.cancel(1);
         assert_eq!(t.rows(at(0)).len(), 1);
     }
 
     #[test]
     fn a_query_filters_rows_and_only_a_changed_set_needs_a_rebuild() {
-        let items = vec![Entry { id: 1, label: "Tea".into(), start: 0, length: Some(300_000) }, Entry { id: 2, label: String::new(), start: 0, length: None }];
+        let items = vec![Entry { id: 1, label: "Tea".into(), start: 0, length: Some(300_000), ..Default::default() }, Entry { id: 2, start: 0, ..Default::default() }];
         let mut t = Timers { items, ..Default::default() };
         let at = |s| UNIX_EPOCH + Duration::from_millis(s);
-        let ids = |q: &str| t.matching(at(1_000), q).iter().map(|r| r.0).collect::<Vec<_>>();
+        let ids = |q: &str| t.matching(at(1_000), q).iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!((ids(""), ids("tea"), ids(" STOP "), ids("x")), (vec![1, 2], vec![1], vec![2], vec![]));
+        assert_eq!((ids("tim"), ids("tmr"), ids("timer 5m"), ids("t 90"), ids("e")), (vec![1, 2], vec![1, 2], vec![1, 2], vec![1, 2], vec![1]), "a query for timers shows them all");
         // Query "tea" with both running: one row shown, one expected, so a tick only updates times.
         let rows = t.matching(at(2_000), "tea");
         assert!(!rows_changed(&[1], &rows));
@@ -241,6 +350,71 @@ mod tests {
         assert!(rows_changed(&[], &t.matching(at(3_000), "")));
         assert!(rows_changed(&[1, 2], &t.matching(at(3_000), "")));
         assert!(rows_changed(&[1], &t.matching(at(3_000), "")));
+    }
+
+    #[test]
+    fn durations_are_spoken_in_units() {
+        assert_eq!(fmt_spoken(Duration::from_secs(25 * 60)), "25 min");
+        assert_eq!(fmt_spoken(Duration::from_secs(90 * 60)), "1 h 30 min");
+        assert_eq!(fmt_spoken(Duration::from_secs(45)), "45 s");
+    }
+
+    #[test]
+    fn the_done_toast_names_the_timer_and_its_length() {
+        assert_eq!(done_text("tea", Duration::from_secs(25 * 60)), "tea · 25 min done");
+        assert_eq!(done_text("", Duration::from_secs(25 * 60)), "Timer · 25 min done");
+    }
+
+    #[test]
+    fn pause_then_resume_keeps_the_time_left_and_add_adds_it() {
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        let mut t = Timers { items: vec![Entry { id: 1, label: "tea".into(), start: 0, length: Some(300_000), ..Default::default() }], ..Default::default() };
+        t.pause(1, at(28));
+        assert_eq!(t.rows(at(100))[0].accessory(), "Paused · 4:32", "a paused timer does not count down");
+        assert!(!t.ticking() && t.due(at(1000)).is_empty(), "nor run out");
+        t.resume(1, at(100));
+        assert_eq!(t.rows(at(100))[0].accessory(), "4:32 left");
+        t.add(1, Duration::from_secs(300));
+        assert_eq!(t.rows(at(100))[0].accessory(), "9:32 left");
+        t.restart(1, at(200));
+        assert_eq!(t.rows(at(200))[0].accessory(), "10:00 left");
+        t.rename(1, "pasta".into());
+        assert_eq!(t.rows(at(200))[0].title, "pasta");
+    }
+
+    #[test]
+    fn a_stopwatch_pauses_and_shows_its_time() {
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        let mut t = Timers { items: vec![Entry { id: 2, start: 0, ..Default::default() }], ..Default::default() };
+        assert_eq!(t.rows(at(768))[0].accessory(), "12:48");
+        t.pause(2, at(768));
+        assert_eq!(t.elapsed(2, at(900)), Some(Duration::from_secs(768)));
+        t.resume(2, at(900));
+        assert_eq!(t.rows(at(901))[0].accessory(), "12:49");
+    }
+
+    #[test]
+    fn a_finished_timer_stays_done_until_stopped() {
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        let mut t = Timers { items: vec![Entry { id: 1, label: "tea".into(), start: 0, length: Some(60_000), ..Default::default() }], ..Default::default() };
+        assert_eq!(t.due(at(61)), vec![(1, "tea".to_string(), Duration::from_secs(60))]);
+        let row = &t.rows(at(62))[0];
+        assert!(row.done && row.accessory() == DONE, "the row says Done");
+        assert!(t.due(at(62)).is_empty() && !t.ticking(), "announced once, nothing left to count");
+        t.cancel(1);
+        assert!(t.rows(at(62)).is_empty());
+    }
+
+    #[test]
+    fn the_save_replaces_the_file_through_a_temp_file() {
+        let path = std::env::temp_dir().join(format!("procast-timers-atomic-{}.json", std::process::id()));
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        fs::write(&tmp, "half a file").unwrap();
+        let mut t = Timers::load(path.clone());
+        t.start("tea".into(), Duration::from_secs(60));
+        assert!(!tmp.exists(), "the temp file was renamed over the real one");
+        assert_eq!(Timers::load(path.clone()).items, t.items);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

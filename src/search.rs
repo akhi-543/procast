@@ -82,6 +82,12 @@ pub enum Act {
     StartTimer(u64, String),
     /// Cancel a timer, or stop a stopwatch and copy its time, by id.
     StopTimer(u64),
+    /// A running timer or stopwatch, by id: pause, resume, start over, add seconds, rename.
+    PauseTimer(u64),
+    ResumeTimer(u64),
+    RestartTimer(u64),
+    AddTime(u64, u64),
+    RenameTimer(u64),
     /// Start a Focus session with a category's lists (by name), blocking them or allowing only them.
     FocusStart(String, crate::focus::Mode),
     /// Open a meeting link: event title, address. Asks "Join <title>?" first when `[calendar] confirm_join`.
@@ -137,6 +143,11 @@ impl Act {
             Act::ForceQuit(_) => "Force Quit",
             Act::StartTimer(..) => "Start Timer",
             Act::StopTimer(_) => "Stop",
+            Act::PauseTimer(_) => "Pause",
+            Act::ResumeTimer(_) => "Resume",
+            Act::RestartTimer(_) => "Restart",
+            Act::AddTime(..) => "Add Time",
+            Act::RenameTimer(_) => "Rename",
             Act::Join(..) => "Join Meeting",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
@@ -239,6 +250,8 @@ pub struct Item {
     pub values: Vec<String>,
     /// Words that, typed with a space after them, name this row like its title does ("timer").
     pub keywords: Vec<String>,
+    /// The accessory ticks (a timer's time left): tabular figures at a fixed width, shown in root too.
+    pub live: bool,
 }
 
 impl Item {
@@ -261,6 +274,7 @@ impl Item {
             args: vec![],
             values: vec![],
             keywords: vec![],
+            live: false,
         }
     }
 
@@ -358,6 +372,18 @@ pub fn named_in<'a>(item: &Item, q: &'a str, cfg: &Config) -> Option<&'a str> {
     (!(by_focus && cfg.focus_category.iter().any(|c| c.name.to_lowercase().contains(&rest_lc)))).then_some(rest)
 }
 
+/// Whether `q` names this row so that it leads root search with its boxes: its title or a
+/// keyword alone ("timer"), or followed by a space and values ("timer 5m").
+pub fn leads(item: &Item, q: &str, cfg: &Config) -> bool {
+    !item.args.is_empty() && (named_in(item, q, cfg).is_some() || exact(item, q))
+}
+
+/// `q` is the row's title or one of its keywords, case aside.
+fn exact(item: &Item, q: &str) -> bool {
+    let q = q.trim();
+    !q.is_empty() && (item.title.eq_ignore_ascii_case(q) || item.keywords.iter().any(|k| k.eq_ignore_ascii_case(q)))
+}
+
 /// The boxes' values from the rest of a query that names the row: a one-word box takes a
 /// word, a text box the rest. A list's own word leading the rest goes to that list's box
 /// when more text follows ("tr de hola"). Trailing empty boxes are left out.
@@ -428,10 +454,15 @@ pub fn with_args(item: &Item, values: &[String]) -> Result<Act, (usize, String)>
     })
 }
 
-/// The row's subtitle while its boxes hold something: the values as typed, " · " between
-/// them (a secret never shows). Empty when nothing is filled.
+/// The row's subtitle while its boxes hold something: the values as typed (a timer's
+/// duration as parsed, "25 min"), " · " between them (a secret never shows). Empty when
+/// nothing is filled.
 pub fn mirror(item: &Item, values: &[String]) -> String {
-    item.args.iter().zip(values).filter(|(a, v)| a.kind != ArgKind::Secret && !v.trim().is_empty()).map(|(_, v)| v.trim()).collect::<Vec<_>>().join(" · ")
+    let shown = |i: usize, v: &str| match crate::timers::parse_duration(v) {
+        Some(d) if i == 0 && item.act == Act::Cmd(Cmd::StartTimer) => crate::timers::fmt_spoken(d),
+        _ => v.to_string(),
+    };
+    item.args.iter().zip(values).enumerate().filter(|(_, (a, v))| a.kind != ArgKind::Secret && !v.trim().is_empty()).map(|(i, (_, v))| shown(i, v.trim())).collect::<Vec<_>>().join(" · ")
 }
 
 /// A built-in command's boxes and the keywords that jump into them.
@@ -689,10 +720,16 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
         top.push(Item::new(cmdline, "", Icon::Vector(g::TERMINAL), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
-    // A row named with a space after it ("timer 5m") leads, its boxes filled from the rest.
-    let typed = catalog.iter().find(|it| !it.args.is_empty() && named_in(it, query.trim_start(), cfg).is_some());
+    // A row named alone or with a space after it ("timer 5m") leads, its boxes filled from
+    // the rest; named alone, its subtitle says what the first box wants.
+    let typed = catalog.iter().find(|it| leads(it, query.trim_start(), cfg));
     if let Some(it) = typed {
-        top.push(Item { values: prefill(it, query.trim_start()), ..it.clone() });
+        let values = prefill(it, query.trim_start());
+        let subtitle = match it.args.first() {
+            Some(a) if values.is_empty() && !a.optional => a.missing.clone(),
+            _ => it.subtitle.clone(),
+        };
+        top.push(Item { values, subtitle, ..it.clone() });
     }
     if let Some(text) = translate::quick_query(q) {
         let to = translate::languages(&cfg.translator.to);
@@ -706,11 +743,14 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         top.push(Item::new(tidy_number(&result), q, Icon::Vector(g::CALCULATOR), Act::Copy(full)).acc("Calculator").tinted(Tint::Calc));
     }
 
-    // Fallback commands: the web search and quicklinks that take a query, in the configured order.
+    // Fallback commands: the web search and quicklinks that take a query, in the configured
+    // order. None for a command's exact name or keyword ("timer"): nothing competes with it.
+    let command = catalog.iter().any(|it| matches!(it.act, Act::Cmd(_)) && exact(it, q));
     let fallbacks: Vec<Item> = cfg
         .search
         .fallbacks
         .iter()
+        .filter(|_| !command)
         .filter_map(|name| {
             if name.eq_ignore_ascii_case("ai") {
                 return Some(Item::new("Ask AI", "", Icon::Vector(g::SPARKLES), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
@@ -1289,7 +1329,8 @@ fallbacks = [\"define\"]").unwrap();
         let cat = catalog(&[], &[], &[], &Config::default());
         let cmd = |c: Cmd| cat.iter().find(|it| it.act == Act::Cmd(c)).unwrap();
         let focus = cmd(Cmd::Focus(crate::commands::FocusCmd::Start));
-        assert_eq!(mirror(cmd(Cmd::StartTimer), &strings(["25m", "tea"])), "25m · tea");
+        assert_eq!(mirror(cmd(Cmd::StartTimer), &strings(["25m", "tea"])), "25 min · tea", "the time as parsed");
+        assert_eq!(mirror(cmd(Cmd::StartTimer), &strings(["soon"])), "soon", "not a time: as typed");
         assert_eq!(mirror(focus, &strings(["Deep work", "50", ""])), "Deep work · 50");
         assert_eq!(mirror(focus, &[]), "");
         assert_eq!(focus.arg_count().as_deref(), Some("3 arguments"));
@@ -1312,6 +1353,21 @@ fallbacks = [\"define\"]").unwrap();
         for it in &cat {
             assert!(it.args.len() <= 3, "{}", it.title);
         }
+    }
+
+    #[test]
+    fn timer_keywords_lead_root_search_and_hold_back_the_fallbacks() {
+        let cfg = crate::config::parse("[search]
+fallbacks = [\"define\", \"web\"]").unwrap();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert_eq!(with_args(&ask("t 90")[0], &ask("t 90")[0].values), Ok(Act::StartTimer(90, String::new())));
+        assert_eq!(with_args(&ask("timer 1:30")[0], &ask("timer 1:30")[0].values), Ok(Act::StartTimer(90, String::new())));
+        let r = ask("timer");
+        assert_eq!((r[0].title.as_str(), r[0].subtitle.as_str()), ("Start Timer", "Type a time: 5m, 1h30m, 1:30"));
+        assert!(r.iter().all(|it| it.section.as_deref().is_none_or(|s| !s.starts_with("Use "))), "no Define or web rows for a command's keyword");
+        assert!(ask("Start Timer").iter().all(|it| !matches!(it.act, Act::Define(_) | Act::Open(_))), "nor for its name");
+        assert!(ask("timber").iter().any(|it| matches!(it.act, Act::Define(_))), "a plain word still gets them");
     }
 
     #[test]
