@@ -349,6 +349,15 @@ pub fn named<'a>(item: &Item, q: &'a str) -> Option<&'a str> {
     names.into_iter().find_map(|n| q.get(..n.len()).filter(|head| head.eq_ignore_ascii_case(n)).and_then(|_| q[n.len()..].strip_prefix(' ')))
 }
 
+/// `named`, except that "focus " (also Search Focus Categories' prefix) does not name Start
+/// Focus Session while a focus category's name contains the rest: the category rows win.
+pub fn named_in<'a>(item: &Item, q: &'a str, cfg: &Config) -> Option<&'a str> {
+    let rest = named(item, q)?;
+    let by_focus = q.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("focus ")) && item.act == Act::Cmd(Cmd::Focus(FocusCmd::Start));
+    let rest_lc = rest.trim().to_lowercase();
+    (!(by_focus && cfg.focus_category.iter().any(|c| c.name.to_lowercase().contains(&rest_lc)))).then_some(rest)
+}
+
 /// The boxes' values from the rest of a query that names the row: a one-word box takes a
 /// word, a text box the rest. A list's own word leading the rest goes to that list's box
 /// when more text follows ("tr de hola"). Trailing empty boxes are left out.
@@ -681,7 +690,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
         top.push(Item::new(cmdline, "", Icon::Vector(g::TERMINAL), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
     // A row named with a space after it ("timer 5m") leads, its boxes filled from the rest.
-    let typed = catalog.iter().find(|it| !it.args.is_empty() && named(it, query.trim_start()).is_some());
+    let typed = catalog.iter().find(|it| !it.args.is_empty() && named_in(it, query.trim_start(), cfg).is_some());
     if let Some(it) = typed {
         top.push(Item { values: prefill(it, query.trim_start()), ..it.clone() });
     }
@@ -1303,6 +1312,19 @@ fallbacks = [\"define\"]").unwrap();
         for it in &cat {
             assert!(it.args.len() <= 3, "{}", it.title);
         }
+    }
+
+    #[test]
+    fn focus_names_start_focus_session_only_when_no_category_matches() {
+        let cfg = crate::config::parse("[[focus_category]]\nname = \"Work\"\napps = []\nsites = []").unwrap();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let start = cat.iter().find(|it| it.act == Act::Cmd(Cmd::Focus(FocusCmd::Start))).unwrap();
+        assert_eq!(named_in(start, "focus ", &cfg), None, "Search Focus Categories' prefix lists the categories");
+        assert_eq!(named_in(start, "focus wor", &cfg), None);
+        assert_eq!(named_in(start, "focus deep work", &cfg), Some("deep work"));
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert!(ask("focus wor").iter().all(|it| it.values.is_empty()), "no Goal pre-filled from a category search");
+        assert_eq!(ask("focus deep work")[0].values, strings(["deep work"]));
     }
 
     #[test]

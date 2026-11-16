@@ -634,7 +634,7 @@ impl Launcher {
         self.send_search(cx);
         self.selected = 0;
         self.refresh(cx);
-        if space_typed && self.arg_row().is_some_and(|it| search::named(it, q.trim_start()) == Some("")) {
+        if space_typed && self.arg_row().is_some_and(|it| search::named_in(it, q.trim_start(), &self.cfg) == Some("")) {
             self.focus_arg(0, window, cx);
         }
     }
@@ -669,7 +669,14 @@ impl Launcher {
             return;
         };
         let key = it.key.clone().unwrap_or_else(|| it.title.clone());
-        let seed = it.values.clone();
+        let mut seed = it.values.clone();
+        // Edit Focus Session starts from the running session's title and minutes.
+        if seed.is_empty()
+            && it.act == Act::Cmd(Cmd::Focus(FocusCmd::Edit))
+            && let Some(s) = &self.focus.session
+        {
+            seed = vec![s.title.clone(), s.minutes.to_string()];
+        }
         let kept = self.arg_memory.get(&key).filter(|(s, _)| *s == seed).map(|m| m.1.clone());
         if self.args_for.as_ref() == Some(&key) && kept.is_some() {
             return;
@@ -762,6 +769,12 @@ impl Launcher {
     /// another command), asks for them in Mode::Args and says true.
     fn ask_args_for(&mut self, act: &Act, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(mut it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()).cloned() else { return false };
+        if !self.asks_args(act) {
+            if let Ok(act) = search::with_args(&it, &[]) {
+                self.run(act, None, window, cx);
+            }
+            return true;
+        }
         if *act == Act::Cmd(Cmd::Focus(FocusCmd::Edit)) {
             let Some(s) = &self.focus.session else {
                 self.say(false, "No Focus session is running".into());
@@ -771,6 +784,19 @@ impl Launcher {
         }
         self.ask_args(it, window, cx);
         true
+    }
+
+    /// Whether running `act` without values opens its boxes. A command whose boxes are all
+    /// optional and that shows nothing else (Start Stopwatch, Translate filled with the
+    /// selection, an extension command without a view) runs at once instead.
+    fn asks_args(&self, act: &Act) -> bool {
+        let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()) else { return false };
+        let at_once = match act {
+            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate) => true,
+            Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode != "view"),
+            _ => false,
+        };
+        !(at_once && it.args.iter().all(|a| a.optional))
     }
 
     /// Passes the search text to an extension that filters itself, once per change. Also
@@ -1113,7 +1139,7 @@ impl Launcher {
         }
         let _ = max;
         // A command named with a space after it is selected, so its boxes show.
-        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| !it.args.is_empty() && search::named(it, query.trim_start()).is_some())).flatten();
+        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| !it.args.is_empty() && search::named_in(it, query.trim_start(), &self.cfg).is_some())).flatten();
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { named.unwrap_or(0) };
         self.sync_args(cx);
         self.scroll_to_selected();
@@ -1306,6 +1332,7 @@ impl Launcher {
     /// A refusal keeps the boxes and says why.
     fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, cx: &mut Context<Self>) {
         let done = match f {
+            FocusCmd::Edit if self.focus.session.is_none() => Err("No Focus session is running".to_string()),
             FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &self.cfg.focus_category, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
             FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
             FocusCmd::ImportCategories => std::fs::read_to_string(got[0].trim().trim_matches('"'))
@@ -1511,6 +1538,8 @@ impl Launcher {
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        // A typed snippet keyword's erase belongs to its own Args session only.
+        self.typed = Default::default();
         if mode != Mode::Ext {
             self.stop_ext_view();
         }
@@ -1597,6 +1626,7 @@ impl Launcher {
     /// `restore` hands focus back to the window that was active before we opened;
     /// false only when focus already moved elsewhere (deactivation).
     fn hide(&mut self, restore: bool, cx: &mut Context<Self>) {
+        self.typed = Default::default();
         win::cloak(self.hwnd, true);
         self.visible = false;
         self.hidden_at = Some(Instant::now());
@@ -1668,8 +1698,10 @@ impl Launcher {
     fn start_snippet(&mut self, name: String, template: String, erase: usize, then: String, window: &mut Window, cx: &mut Context<Self>) {
         let key = format!("sn:{name}");
         if let Some(it) = self.catalog.iter().find(|it| it.key.as_ref() == Some(&key) && !it.args.is_empty()).cloned() {
+            self.ask_args(it, window, cx);
+            // After ask_args: opening the session clears what an abandoned one left.
             self.typed = (erase, then);
-            return self.ask_args(it, window, cx);
+            return;
         }
         self.insert_snippet(template, vec![], erase, then, cx);
     }
@@ -2690,7 +2722,10 @@ impl Launcher {
                 self.timers.stopwatch(got[0].clone());
                 self.watch_timers();
                 self.say(true, "Stopwatch started".into());
-                self.hide(true, cx);
+                // A hotkey starts it without opening the launcher.
+                if self.visible {
+                    self.hide(true, cx);
+                }
             }
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
                 self.hide(true, cx);
@@ -2739,12 +2774,14 @@ impl Launcher {
 
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
+        if self.asks_args(act) {
+            return true;
+        }
         match act {
-            Act::Cmd(Cmd::Translate) => !self.cfg.translator.prefill_selection,
             Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
-            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::StartTimer | Cmd::Define | Cmd::Desktop(Desk::Rename)) | Act::Define(_) | Act::Fill(_) => true,
-            Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) | Act::Fill(_) => true,
+            Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
         }

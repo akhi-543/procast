@@ -1310,6 +1310,8 @@ pub fn arg_width(text: &str, tag: bool, help: bool, window: &Window) -> Pixels {
 /// and ring; missing: the danger border and a `mix::MISSING_RING` danger ring.
 pub fn arg_box(i: usize, input: impl IntoElement, b: ArgBox, t: &Tokens) -> gpui::Stateful<Div> {
     let tip = *t;
+    // Focused, the description shows under the box without hovering (drawn on top, unclipped).
+    let focus_tip = b.help.clone().filter(|_| b.focused).map(|h| gpui::deferred(div().absolute().left_0().top(px(CONTROL + sp::S4)).child(Tip::view(h, t))));
     let tag = div().flex_none().px(px(sp::S4)).rounded(px(r::XS)).bg(t.surface).text_size(px(ts::CAPTION)).text_color(t.text_faint).child("optional");
     let help = b.help.map(|h| div().id(("arg-help", i)).flex_none().flex().child(icon(g::CIRCLE_HELP, ic::SM, t.text_faint)).tooltip(move |_, cx| cx.new(|_| Tip(h.clone(), tip)).into()));
     let dots = b.dots.map(|d| div().absolute().left(px(sp::S8)).top_0().bottom_0().flex().items_center().text_color(t.text).child(d));
@@ -1334,15 +1336,22 @@ pub fn arg_box(i: usize, input: impl IntoElement, b: ArgBox, t: &Tokens) -> gpui
         .children(dots)
         .when(b.tag, |d| d.child(tag))
         .children(help)
+        .children(focus_tip)
         .id(("arg", i))
 }
 
 /// A help mark's tooltip: its text on `bg_elevated`.
 struct Tip(SharedString, Tokens);
 
+impl Tip {
+    fn view(text: SharedString, t: &Tokens) -> Div {
+        elevated(t).rounded(px(r::SM)).px(px(sp::S8)).py(px(sp::S4)).font_family(FONT_UI).text_size(px(ts::SMALL)).whitespace_nowrap().child(text)
+    }
+}
+
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        elevated(&self.1).rounded(px(r::SM)).px(px(sp::S8)).py(px(sp::S4)).font_family(FONT_UI).text_size(px(ts::SMALL)).child(self.0.clone())
+        Tip::view(self.0.clone(), &self.1)
     }
 }
 
