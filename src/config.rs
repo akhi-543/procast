@@ -1085,6 +1085,17 @@ fn read_opt(text: &str, path: &[String]) -> Option<String> {
     })
 }
 
+/// Applies `edit` to the config file at `path`: a missing file counts as empty, one that can't
+/// be read (locked, not UTF-8) is left alone; the result must parse and is written atomically.
+/// Returns the new settings and text.
+pub fn edit_file(path: &std::path::Path, edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(Config, String), String> {
+    let text = crate::focus::text_or_empty(fs::read_to_string(path))?;
+    let new = edit(&text)?;
+    let cfg = parse(&new)?;
+    crate::focus::write_atomic(path, &new).map_err(|e| format!("Could not write config.toml: {e}"))?;
+    Ok((cfg, new))
+}
+
 /// Sets one setting in the config text, keeping every comment and the layout; missing
 /// tables (e.g. `[extension.youtube]`) are created.
 pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Result<String, String> {
@@ -1277,6 +1288,34 @@ to = 3").is_err());
         assert!(!new.contains("to =") && !new.contains("prefill_selection"), "{new}");
         let today = "[translator]\nprimary = \"ja\"   # first target\n";
         assert_eq!(write_value(today, &p("translator.secondary"), "es".into()).unwrap(), "[translator]\nprimary = \"ja\"   # first target\nsecondary = \"es\"\n", "today's keys are left alone");
+    }
+
+    #[test]
+    fn edit_file_never_writes_over_a_file_it_could_not_read() {
+        let dir = std::env::temp_dir().join(format!("procast-edit-file-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let current = |t: &str| write_value(t, &["translator".into(), "current".into()], 1i64.into());
+        // Not UTF-8 (or locked): an error, and the file stays byte for byte.
+        let bytes = b"hotkey = \"Alt+Space\"\n# \xff\xfe\n";
+        fs::write(&path, bytes).unwrap();
+        assert!(edit_file(&path, current).unwrap_err().starts_with("Could not read config.toml"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // Read, but an edit that fails (or a result that doesn't parse) writes nothing either.
+        fs::write(&path, "hotkey = [\n").unwrap();
+        assert!(edit_file(&path, current).is_err());
+        assert!(edit_file(&path, |_| Ok("width = \"wide\"".into())).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hotkey = [\n");
+        // A good edit keeps the rest of the file; a missing file counts as empty.
+        fs::write(&path, "hotkey = \"Ctrl+K\"  # mine\n").unwrap();
+        let (cfg, text) = edit_file(&path, current).unwrap();
+        assert_eq!((cfg.hotkey.as_str(), cfg.translator.current), ("Ctrl+K", 1));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        assert!(text.contains("# mine"));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(edit_file(&path, current).unwrap().0.translator.current, 1);
+        assert!(!dir.join("config.toml.tmp").exists(), "the temp file is renamed into place");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

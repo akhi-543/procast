@@ -774,19 +774,15 @@ impl Settings {
     }
 
     fn save(&mut self, path: &[String], value: toml_edit::Value, cx: &mut Context<Self>) {
-        let current = std::fs::read_to_string(config::path()).unwrap_or_else(|_| self.text.clone());
-        match config::write_value(&current, path, value).and_then(|t| config::parse(&t).map(|_| t)) {
-            Ok(text) => match std::fs::write(config::path(), &text) {
-                Ok(()) => {
-                    self.launcher = config::parse(&text).map(|c| c.launcher).unwrap_or_default();
-                    self.text = text;
-                    // Named by its row; a hotkey saved from a Shortcuts row has no row of its own path.
-                    let rows = self.rows();
-                    let name = rows.iter().find(|r| r.path == path).or(rows.get(self.selected)).map_or_else(|| path.join("."), |r| r.label.clone());
-                    self.status = Some((false, format!("{name} saved")));
-                }
-                Err(e) => self.status = Some((true, format!("Could not write config.toml: {e}"))),
-            },
+        match config::edit_file(&config::path(), |t| config::write_value(t, path, value)) {
+            Ok((cfg, text)) => {
+                self.launcher = cfg.launcher;
+                self.text = text;
+                // Named by its row; a hotkey saved from a Shortcuts row has no row of its own path.
+                let rows = self.rows();
+                let name = rows.iter().find(|r| r.path == path).or(rows.get(self.selected)).map_or_else(|| path.join("."), |r| r.label.clone());
+                self.status = Some((false, format!("{name} saved")));
+            }
             Err(e) => self.status = Some((true, e)),
         }
         cx.notify();
@@ -836,24 +832,19 @@ impl Settings {
 
     /// Adds, copies or deletes a snippet or quicklink, then selects what changed.
     fn edit_table(&mut self, list: &'static str, edit: config::TableEdit, window: &mut Window, cx: &mut Context<Self>) {
-        let current = std::fs::read_to_string(config::path()).unwrap_or_else(|_| self.text.clone());
         let (verb, removed) = match edit {
             config::TableEdit::Add(_) => ("added", None),
             config::TableEdit::Duplicate(_) => ("copied", None),
             config::TableEdit::Replace(..) => ("saved", None),
             config::TableEdit::Remove(i) => ("deleted", Some(i)),
         };
-        let text = match config::edit_table(&current, list, edit).and_then(|t| config::parse(&t).map(|_| t)) {
-            Ok(t) => t,
+        let text = match config::edit_file(&config::path(), |t| config::edit_table(t, list, edit)) {
+            Ok((_, t)) => t,
             Err(e) => {
                 self.status = Some((true, e));
                 return cx.notify();
             }
         };
-        if let Err(e) = std::fs::write(config::path(), &text) {
-            self.status = Some((true, format!("Could not write config.toml: {e}")));
-            return cx.notify();
-        }
         self.text = text;
         self.build_inputs(cx);
         let rows = self.rows();

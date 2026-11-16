@@ -897,10 +897,9 @@ impl Launcher {
 
     /// Writes `[launcher] <name>` (favourites / hidden) and applies it at once.
     fn save_launcher_list(&mut self, name: &str, list: Vec<String>, cx: &mut Context<Self>) {
-        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
         let value = toml_edit::Value::Array(list.iter().map(String::as_str).collect());
-        match config::write_value(&text, &["launcher".into(), name.into()], value).and_then(|t| std::fs::write(config::path(), t).map_err(|e| e.to_string())) {
-            Ok(()) => {
+        match config::edit_file(&config::path(), |t| config::write_value(t, &["launcher".into(), name.into()], value)) {
+            Ok(_) => {
                 if name == "favorites" {
                     self.cfg.launcher.favorites = list;
                 } else {
@@ -2169,12 +2168,8 @@ impl Launcher {
     /// Writes a config.toml edit and takes its translator settings and language sets now (the
     /// reload follows); false, with the error in the ActionBar, when it fails.
     fn save_translator(&mut self, edit: impl FnOnce(&str) -> Result<String, String>) -> bool {
-        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
-        let saved = edit(&text)
-            .and_then(|t| Ok((config::parse(&t)?, t)))
-            .and_then(|(c, t)| std::fs::write(config::path(), t).map(|_| c).map_err(|e| format!("Could not write config.toml: {e}")));
-        match saved {
-            Ok(c) => {
+        match config::edit_file(&config::path(), edit) {
+            Ok((c, _)) => {
                 self.cfg.translator = c.translator;
                 self.cfg.language_set = c.language_set;
                 true
