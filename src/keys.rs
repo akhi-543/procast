@@ -27,11 +27,6 @@ use windows::Win32::{
 
 use crate::{snippets::Expander, win::Msg};
 
-/// Keys the Hyper key can be. Values are what config.toml stores.
-pub const HYPER_KEYS: &[&str] = &["off", "capslock", "rightalt", "rightctrl", "scrolllock"];
-/// Modifiers a double tap can use.
-pub const TAP_KEYS: &[&str] = &["off", "ctrl", "shift", "alt"];
-
 const CTRL: u16 = 0xA2;
 const RCTRL: u16 = 0xA3;
 const SHIFT: u16 = 0xA0;

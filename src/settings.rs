@@ -7,7 +7,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Window, div,
+    AnyElement, Context, Entity, FocusHandle, Focusable, FontWeight, KeyDownEvent, ScrollHandle, SharedString, Subscription, Window, div,
     prelude::*,
 };
 use futures::channel::mpsc::UnboundedSender;
@@ -15,8 +15,8 @@ use gpui_ce_elements::editable_text::{EditableTextState, StringStorage, TextChan
 
 use crate::{
     Dismiss, Launch, NextSection, PrevSection, SelectNext, SelectPrev, config,
-    design::{self, px},
-    ext,
+    design::{self, g, px},
+    ext, menu,
     search::{Icon, Item},
     win::Msg,
 };
@@ -27,15 +27,19 @@ enum Kind {
     Number,
     Bool,
     Hotkey,
-    Choice(&'static [&'static str]),
+    /// One of a few labelled values: a segmented control.
+    Choice(&'static [Opt]),
+    /// A language code from `translate::LANGUAGES`, picked in a dropdown with search; these
+    /// options ("Auto-Detect", "None") lead the list.
+    Language(&'static [Opt]),
     /// A list of strings: removable chips plus an Add field.
     List,
     /// A list of launcher item keys, shown by item name; entries can only be removed here.
     Keys,
     /// Opens a file.
     Open(&'static str),
-    /// A line of live status (the file index); nothing to edit.
-    Status,
+    /// A line of live status; nothing to edit.
+    Status(Live),
     /// A button that tells the launcher to do something (by name).
     Action(&'static str),
     /// Shortcuts: which kind of item the table lists (not saved).
@@ -49,6 +53,61 @@ enum Kind {
     /// Copy and Delete for one table of that list.
     TableItem(&'static str, usize),
 }
+
+/// What a `Status` row shows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Live {
+    /// The file index line, in the control column.
+    Index,
+    /// Whether the foreground hook runs, in the row's label.
+    Foreground,
+}
+
+/// What a `Choice` option writes: a string, or a whole number (minutes, days).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Val {
+    S(&'static str),
+    N(i64),
+}
+
+impl Val {
+    fn value(self) -> toml_edit::Value {
+        match self {
+            Val::S(s) => s.into(),
+            Val::N(n) => n.into(),
+        }
+    }
+
+    /// As `config::shown_value` reads it back.
+    fn text(self) -> String {
+        match self {
+            Val::S(s) => s.into(),
+            Val::N(n) => n.to_string(),
+        }
+    }
+}
+
+/// An option: its label, then the value it writes.
+type Opt = (&'static str, Val);
+use Val::{N, S};
+
+const COLOUR_MODES: &[Opt] = &[("System", S("system")), ("Dark", S("dark")), ("Light", S("light"))];
+/// Values are what config.toml stores.
+const TAP_KEYS: &[Opt] = &[("Off", S("off")), ("Ctrl", S("ctrl")), ("Shift", S("shift")), ("Alt", S("alt"))];
+const HYPER_KEYS: &[Opt] = &[("Off", S("off")), ("Caps Lock", S("capslock")), ("Right Alt", S("rightalt")), ("Right Ctrl", S("rightctrl")), ("Scroll Lock", S("scrolllock"))];
+const POP_TO_ROOT: &[Opt] = &[("Now", S("immediately")), ("15 s", S("15s")), ("30 s", S("30s")), ("60 s", S("60s")), ("120 s", S("120s")), ("180 s", S("180s")), ("Never", S("never"))];
+const CLIPBOARD_KEEP: &[Opt] = &[
+    ("By count", S("count")),
+    ("1 hour", S("1h")),
+    ("1 day", S("1d")),
+    ("1 week", S("7d")),
+    ("1 month", S("30d")),
+    ("3 months", S("90d")),
+    ("6 months", S("180d")),
+    ("1 year", S("365d")),
+    ("Forever", S("unlimited")),
+];
+const SKIN_TONES: &[Opt] = &[("None", S("none")), ("Light", S("light")), ("Medium light", S("medium_light")), ("Medium", S("medium")), ("Medium dark", S("medium_dark")), ("Dark", S("dark"))];
 
 /// The fields a `[[list]]` table is edited by, with their labels and help.
 fn table_fields(list: &str) -> &'static [(&'static str, &'static str, &'static str)] {
@@ -76,14 +135,14 @@ fn table_rows(list: &'static str, text: &str) -> Vec<Row> {
     let doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().ok();
     let count = doc.as_ref().and_then(|d| d.get(list)).and_then(|t| t.as_array_of_tables()).map_or(0, |t| t.len());
     let what = if list == "snippet" { "snippet" } else { "quicklink" };
-    let mut out = vec![Row { label: format!("Add a {what}"), help: String::new(), path: vec![], kind: Kind::TableAdd(list), group: format!("{}s", choice_label(what)) }];
+    let mut out = vec![Row { label: format!("Add a {what}"), help: String::new(), path: vec![], kind: Kind::TableAdd(list), group: format!("{}s", capital(what)), icon: "" }];
     for i in 0..count {
         let name = config::shown_value(text, &[list.into(), i.to_string(), "name".into()]);
-        let group = format!("{} {} · {}", choice_label(what), i + 1, if name.is_empty() { "unnamed" } else { &name });
+        let group = format!("{} {} · {}", capital(what), i + 1, if name.is_empty() { "unnamed" } else { &name });
         for (field, label, help) in table_fields(list) {
-            out.push(Row { label: (*label).into(), help: (*help).into(), path: vec![list.into(), i.to_string(), (*field).into()], kind: Kind::Text, group: group.clone() });
+            out.push(Row { label: (*label).into(), help: (*help).into(), path: vec![list.into(), i.to_string(), (*field).into()], kind: Kind::Text, group: group.clone(), icon: "" });
         }
-        out.push(Row { label: "Copy or delete".into(), help: "Ctrl+D copies it, Delete removes it.".into(), path: vec![], kind: Kind::TableItem(list, i), group });
+        out.push(Row { label: "Copy or delete".into(), help: "Ctrl+D copies it, Delete removes it.".into(), path: vec![], kind: Kind::TableItem(list, i), group, icon: "" });
     }
     out
 }
@@ -115,11 +174,40 @@ struct Row {
     kind: Kind,
     /// Heading of the card the row sits in; consecutive rows with the same group share one.
     group: String,
+    /// A `design::g` name; a row with one takes the `.pc-setrow` recipe. Empty: the older look.
+    icon: &'static str,
 }
 
-const SECTIONS: [&str; 13] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Window", "Theme", "Extensions", "Advanced"];
-/// The sidebar icon of each section, in `SECTIONS` order.
-const SECTION_ICONS: [&str; 13] = [
+impl Row {
+    fn with_icon(self, icon: &'static str) -> Row {
+        Row { icon, ..self }
+    }
+}
+
+const SECTIONS: [&str; 19] = [
+    "General",
+    "Launcher",
+    "Shortcuts",
+    "Apps",
+    "Clipboard",
+    "Snippets",
+    "Quicklinks",
+    "Emoji",
+    "Files",
+    "Window",
+    "Theme",
+    "Extensions",
+    "Translator",
+    "Screenshots",
+    "Focus",
+    "Calendar",
+    "Notes",
+    "Games",
+    "Advanced",
+];
+/// The sidebar icon of each section, in `SECTIONS` order. A feature's section takes its
+/// command's icon.
+const SECTION_ICONS: [&str; 19] = [
     design::g::SLIDERS_HORIZONTAL,
     design::g::SEARCH,
     design::g::KEYBOARD,
@@ -132,11 +220,30 @@ const SECTION_ICONS: [&str; 13] = [
     design::g::WIN_LEFT_HALF,
     design::g::PERSONALIZE,
     design::g::PUZZLE,
+    design::g::LANGUAGES,
+    design::g::SCAN_SEARCH,
+    design::g::SHIELD_CHECK,
+    design::g::CALENDAR_CLOCK,
+    design::g::NOTEBOOK_PEN,
+    design::g::GAMEPAD_2,
     design::g::WRENCH,
 ];
 
+/// A feature section's page header (`.pc-sett__head`): its command's tint for the sticker
+/// tile, and one line on what it does.
+fn head(section: &str) -> Option<(design::Tint, &'static str)> {
+    use design::Tint;
+    Some(match section {
+        "Translator" => (Tint::Web, ""),
+        "Screenshots" => (Tint::File, ""),
+        "Calendar" => (Tint::System, "Today's meetings in search, with a one-key join."),
+        "Focus" | "Notes" | "Games" => (Tint::System, ""),
+        _ => return None,
+    })
+}
+
 fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
-    Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: String::new() }
+    Row { label: label.into(), help: help.into(), path: path.split('.').map(String::from).collect(), kind, group: String::new(), icon: "" }
 }
 
 /// Rows under card headings.
@@ -144,44 +251,31 @@ fn groups(list: Vec<(&'static str, Vec<Row>)>) -> Vec<Row> {
     list.into_iter().flat_map(|(g, rows)| rows.into_iter().map(move |r| Row { group: g.into(), ..r })).collect()
 }
 
-/// How a choice value reads on screen.
-fn choice_label(v: &str) -> String {
-    match v {
-        "cursor" => "Mouse".into(),
-        "active" => "Focused window".into(),
-        "primary" => "Main screen".into(),
-        "back" => "Go back".into(),
-        "close" => "Close".into(),
-        "default" => "Default".into(),
-        "immediately" => "Now".into(),
-        "system" => "System".into(),
-        "expanded" => "Full list".into(),
-        "compact" => "Search bar only".into(),
-        "off" => "Off".into(),
-        "capslock" => "Caps Lock".into(),
-        "rightalt" => "Right Alt".into(),
-        "rightctrl" => "Right Ctrl".into(),
-        "scrolllock" => "Scroll Lock".into(),
-        "launch" => "New window".into(),
-        "focus" => "Switch to it".into(),
-        "toggle" => "Switch or hide".into(),
-        "count" => "By count".into(),
-        "1h" => "1 hour".into(),
-        "1d" => "1 day".into(),
-        "7d" => "1 week".into(),
-        "30d" => "1 month".into(),
-        "90d" => "3 months".into(),
-        "180d" => "6 months".into(),
-        "365d" => "1 year".into(),
-        "unlimited" => "Forever".into(),
-        "delimiter" => "After a space".into(),
-        "delimiter_discard" => "Space dropped".into(),
-        s if s.ends_with('s') && s[..s.len() - 1].parse::<u32>().is_ok() => format!("{} s", &s[..s.len() - 1]),
-        s => {
-            let mut c = s.chars();
-            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default().replace('_', " ")
-        }
+/// "snippet" -> "Snippet".
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// The label a language row shows for `code`.
+fn language_label(lead: &[Opt], code: &str) -> String {
+    lead.iter().find(|o| o.1.text() == code).map_or_else(|| crate::translate::language_name(code), |o| o.0.to_string())
+}
+
+/// A language row's dropdown: its leading options, a rule, every language; the current one selected.
+fn language_menu(lead: &[Opt], current: &str) -> menu::Menu {
+    let mut entries: Vec<menu::Entry> = lead.iter().map(|o| menu::Entry { id: o.1.text(), label: o.0.into(), ..Default::default() }).collect();
+    if let Some(last) = entries.last_mut() {
+        last.rule_after = true;
     }
+    entries.extend(crate::translate::LANGUAGES.iter().map(|(code, name)| menu::Entry { id: (*code).into(), label: (*name).into(), ..Default::default() }));
+    // ponytail: opens under the window's top-right corner, not under the row; place it at
+    // the row once rows report their bounds.
+    let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+    if let Some(i) = m.entries.iter().position(|e| e.id == current) {
+        m.selected = i;
+    }
+    m
 }
 
 fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
@@ -198,21 +292,21 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 "Hotkeys",
                 vec![
                     row("Open procast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
-                    row("Double-tap to open", "keyboard.double_tap", Kind::Choice(crate::keys::TAP_KEYS), "Press this key twice quickly to open procast, besides the hotkey above."),
-                    row("Hyper key", "keyboard.hyper", Kind::Choice(crate::keys::HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
+                    row("Double-tap to open", "keyboard.double_tap", Kind::Choice(TAP_KEYS), "Press this key twice quickly to open procast, besides the hotkey above."),
+                    row("Hyper key", "keyboard.hyper", Kind::Choice(HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
                 ],
             ),
             (
                 "Appearance",
                 vec![
-                    row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "System follows the light or dark setting of Windows."),
-                    row("Interface size", "size", Kind::Choice(&["small", "default", "large"]), "Scales text, rows and the window together."),
+                    row("Colour mode", "theme.mode", Kind::Choice(COLOUR_MODES), "System follows the light or dark setting of Windows."),
+                    row("Interface size", "size", Kind::Choice(&[("Small", S("small")), ("Default", S("default")), ("Large", S("large"))]), "Scales text, rows and the window together."),
                 ],
             ),
             (
                 "Window",
                 vec![
-                    row("Window style", "window_mode", Kind::Choice(&["expanded", "compact"]), "Search bar only keeps the window small until you type or press Down."),
+                    row("Window style", "window_mode", Kind::Choice(&[("Full list", S("expanded")), ("Search bar only", S("compact"))]), "Search bar only keeps the window small until you type or press Down."),
                     row("Favourites under the search bar", "launcher.compact_favorites", Kind::Bool, "With the search bar only style, show your favourites as a row of icons."),
                     row("Width", "width", Kind::Number, "A share of the screen, e.g. 0.5 for half: looks the same on every monitor. Numbers above 1 are pixels."),
                 ],
@@ -222,14 +316,14 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             (
                 "Opening",
                 vec![
-                    row("Show procast on", "monitor", Kind::Choice(&["cursor", "active", "primary"]), "Which monitor the window opens on: the one with the mouse, the one with the window you're using, or the main one."),
-                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(config::POP_TO_ROOT), "How long procast remembers where you were after it closes. Now always starts fresh."),
+                    row("Show procast on", "monitor", Kind::Choice(&[("Mouse", S("cursor")), ("Focused window", S("active")), ("Main screen", S("primary"))]), "Which monitor the window opens on: the one with the mouse, the one with the window you're using, or the main one."),
+                    row("Keep the last search", "launcher.pop_to_root", Kind::Choice(POP_TO_ROOT), "How long procast remembers where you were after it closes. Now always starts fresh."),
                 ],
             ),
             (
                 "Results",
                 vec![
-                    row("Match strictness", "launcher.sensitivity", Kind::Choice(&["low", "medium", "high"]), "Low: every word must appear as typed. Medium: drops weak fuzzy matches. High: any fuzzy match."),
+                    row("Match strictness", "launcher.sensitivity", Kind::Choice(&[("Low", S("low")), ("Medium", S("medium")), ("High", S("high"))]), "Low: every word must appear as typed. Medium: drops weak fuzzy matches. High: any fuzzy match."),
                     row("Rows shown", "max_results", Kind::Number, "How many results root search lists at most, e.g. 8."),
                     row("Include files", "launcher.files", Kind::Bool, "Also list matching files below apps and commands."),
                     row("Calculator", "search.calculator", Kind::Bool, "Answer maths, unit and currency conversions as you type (e.g. 5 km in miles)."),
@@ -239,36 +333,9 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 "Keyboard",
                 vec![
                     row("Search history", "launcher.history", Kind::Bool, "Up arrow in an empty search bar brings back earlier searches."),
-                    row("Escape key", "launcher.escape", Kind::Choice(&["back", "close"]), "Inside a command such as Clipboard History: go back one level, or close the window and start fresh next time."),
-                    row("Extra navigation keys", "launcher.navigation", Kind::Choice(&["default", "emacs", "vim"]), "Move without the arrow keys. Emacs: Alt+N/P move, Alt+B back. Vim: Alt+J/K move, Alt+H back."),
+                    row("Escape key", "launcher.escape", Kind::Choice(&[("Go back", S("back")), ("Close", S("close"))]), "Inside a command such as Clipboard History: go back one level, or close the window and start fresh next time."),
+                    row("Extra navigation keys", "launcher.navigation", Kind::Choice(&[("Default", S("default")), ("Emacs", S("emacs")), ("Vim", S("vim"))]), "Move without the arrow keys. Emacs: Alt+N/P move, Alt+B back. Vim: Alt+J/K move, Alt+H back."),
                     row("Game mode", "launcher.game_mode", Kind::Bool, "Hotkeys do nothing while a full-screen app or game has focus."),
-                ],
-            ),
-            (
-                "Games",
-                vec![
-                    row("Auto HDR", "games.auto_hdr", Kind::Bool, "Turn HDR on while a game has focus and off again after. HDR you turned on yourself stays on."),
-                    row("Games", "games.list", Kind::List, "Program file names that always count as games, e.g. eldenring.exe. Full-screen D3D apps and borderless Steam, Epic, Xbox and Riot games are found by themselves."),
-                ],
-            ),
-            (
-                "Focus",
-                vec![
-                    row("Default length", "focus.default_minutes", Kind::Number, "Minutes offered when you start a Focus session. 0 means no limit."),
-                    row("Snooze", "focus.snooze_minutes", Kind::Number, "Minutes Snooze Focus Session lets you use the app Focus just closed. 0 turns Snooze off."),
-                    row("Sound", "focus.sound", Kind::Bool, "Play a sound when a session ends."),
-                    row("Reopen closed apps", "focus.restore_apps", Kind::Bool, "When a session ends, start again the apps Focus closed."),
-                    row("Allow all sites when none listed", "focus.allow_all_on_empty_sites", Kind::Bool, "Allow mode with no websites listed: let every site through. Off blocks every site."),
-                ],
-            ),
-            (
-                "Calendar",
-                vec![
-                    row("Calendar feeds", "calendar.ics", Kind::List, "ICS addresses (https:// or webcal://) of the calendars My Schedule shows, checked every 10 minutes."),
-                    row("Show events within", "calendar.tolerance_secs", Kind::Number, "Seconds around now within which an event shows in an empty search."),
-                    row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask \"Join <title>?\" before opening a meeting link."),
-                    row("Remind before", "calendar.remind_minutes", Kind::Number, "Minutes before an event to show a reminder. 0 turns reminders off."),
-                    row("Ignore events", "calendar.ignore", Kind::List, "Events whose title contains one of these words are left out."),
                 ],
             ),
             (
@@ -281,7 +348,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             (
                 "Windows Run",
                 vec![
-                    row("Run with", "search.shell", Kind::Choice(&["run", "cmd", "powershell", "pwsh"]), "What runs a line typed after >. Run works like Win+R; a shell stays open on what the command printed."),
+                    row("Run with", "search.shell", Kind::Choice(&[("Run", S("run")), ("Cmd", S("cmd")), ("Powershell", S("powershell")), ("Pwsh", S("pwsh"))]), "What runs a line typed after >. Run works like Win+R; a shell stays open on what the command printed."),
                     row("In Windows Terminal", "search.terminal", Kind::Bool, "Open that shell as a Windows Terminal tab instead of its own window."),
                 ],
             ),
@@ -290,7 +357,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 vec![
                     row("Fallback commands", "search.fallbacks", Kind::List, "Offered below every search, in this order. \"web\", \"chatgpt\", \"ai\", or the name of a quicklink with {query}."),
                     row("Web search URL", "search.fallback", Kind::Text, "Used by the \"web\" fallback; {query} becomes what you typed."),
-                    row("Ask AI model", "ai.model", Kind::Choice(&["haiku", "sonnet", "opus"]), "Used by the \"ai\" fallback, on your Claude Code login. Haiku answers fastest."),
+                    row("Ask AI model", "ai.model", Kind::Choice(&[("Haiku", S("haiku")), ("Sonnet", S("sonnet")), ("Opus", S("opus"))]), "Used by the \"ai\" fallback, on your Claude Code login. Haiku answers fastest."),
                 ],
             ),
         ]),
@@ -300,7 +367,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 vec![row(
                     "An app's hotkey",
                     "apps.hotkey_action",
-                    Kind::Choice(&["launch", "focus", "toggle"]),
+                    Kind::Choice(&[("New window", S("launch")), ("Switch to it", S("focus")), ("Switch or hide", S("toggle"))]),
                     "When the app is already open, its hotkey (set under Shortcuts) can open a new window, switch to the open one, or switch to it and hide it again if it's already in front.",
                 )],
             ),
@@ -331,7 +398,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             (
                 "Keeping",
                 vec![
-                    row("Keep entries for", "clipboard.keep", Kind::Choice(crate::clipboard::KEEP), "How long copies stay. By count keeps the newest ones below. Pinned entries (Ctrl+K → Pin Entry) always stay; Forever grows on disk."),
+                    row("Keep entries for", "clipboard.keep", Kind::Choice(CLIPBOARD_KEEP), "How long copies stay. By count keeps the newest ones below. Pinned entries (Ctrl+K → Pin Entry) always stay; Forever grows on disk."),
                     row("Entries kept", "clipboard.history", Kind::Number, "With By count: the oldest entries are dropped beyond this many, e.g. 500."),
                 ],
             ),
@@ -345,10 +412,10 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 "Typing anywhere",
                 vec![
                     row("Expand keywords", "snippets.expand", Kind::Bool, "Typing a snippet's keyword in any app replaces it with the snippet."),
-                    row("Expand", "snippets.trigger", Kind::Choice(&["immediately", "delimiter", "delimiter_discard"]), "Now: as the keyword's last letter goes in. After a space: once you type a space or punctuation after it, which stays or is dropped."),
+                    row("Expand", "snippets.trigger", Kind::Choice(&[("Now", S("immediately")), ("After a space", S("delimiter")), ("Space dropped", S("delimiter_discard"))]), "Now: as the keyword's last letter goes in. After a space: once you type a space or punctuation after it, which stays or is dropped."),
                     row("Inside words", "snippets.within_words", Kind::Bool, "Also expand when the keyword ends a longer word (my;sig)."),
-                    row("Speed", "snippets.speed", Kind::Choice(&["instant", "quick", "default", "delayed", "extended"]), "A slower setting gives slow apps time before the text goes in."),
-                    row("Sound", "snippets.sound", Kind::Choice(&["off", "default", "asterisk", "exclamation", "question"]), "A Windows sound when a snippet goes in."),
+                    row("Speed", "snippets.speed", Kind::Choice(&[("Instant", S("instant")), ("Quick", S("quick")), ("Default", S("default")), ("Delayed", S("delayed")), ("Extended", S("extended"))]), "A slower setting gives slow apps time before the text goes in."),
+                    row("Sound", "snippets.sound", Kind::Choice(&[("Off", S("off")), ("Default", S("default")), ("Asterisk", S("asterisk")), ("Exclamation", S("exclamation")), ("Question", S("question"))]), "A Windows sound when a snippet goes in."),
                     row("Not in these apps", "snippets.ignore_apps", Kind::List, "Program file names, e.g. code.exe. Keywords typed there stay as they are."),
                 ],
             )]);
@@ -373,8 +440,8 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             vec![
                 row("Hotkey", "emoji.hotkey", Kind::Hotkey, "Opens the emoji picker straight away."),
                 row("Columns", "emoji.columns", Kind::Number, "Emoji per row in the picker, 4 to 16."),
-                row("Enter", "emoji.action", Kind::Choice(&["paste", "copy"]), "Paste into the app you came from, or only copy."),
-                row("Skin tone", "emoji.skin_tone", Kind::Choice(config::SKIN_TONES), "Used for every emoji that comes in skin tones."),
+                row("Enter", "emoji.action", Kind::Choice(&[("Paste", S("paste")), ("Copy", S("copy"))]), "Paste into the app you came from, or only copy."),
+                row("Skin tone", "emoji.skin_tone", Kind::Choice(SKIN_TONES), "Used for every emoji that comes in skin tones."),
                 row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
             ],
         )]),
@@ -403,7 +470,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             (
                 "Index",
                 vec![
-                    Row { path: vec![], ..row("Status", "", Kind::Status, "") },
+                    Row { path: vec![], ..row("Status", "", Kind::Status(Live::Index), "") },
                     Row { path: vec![], ..row("Rebuild index", "", Kind::Action("rebuild-index"), "Crawl the folders again and rescan the whole drives.") },
                 ],
             ),
@@ -436,7 +503,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             ] {
                 colours.push(row(label, &format!("theme.{key}"), Kind::Text, "A colour like #1e1e2e. Leave empty to use the theme's own."));
             }
-            groups(vec![("Mode", vec![row("Colour mode", "theme.mode", Kind::Choice(&["system", "dark", "light"]), "System follows the light or dark setting of Windows.")]), ("Colours", colours)])
+            groups(vec![("Mode", vec![row("Colour mode", "theme.mode", Kind::Choice(COLOUR_MODES), "System follows the light or dark setting of Windows.")]), ("Colours", colours)])
         }
         "Extensions" => {
             let mut r = groups(vec![(
@@ -467,16 +534,62 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                         path: vec!["extension".into(), x.name.clone(), p.name.clone()],
                         kind,
                         group: "Extension preferences".into(),
+                        icon: "",
                     });
                 }
             }
             r
         }
-        "Shortcuts" => vec![],
-        _ => vec![
-            Row { label: "Open config.toml".into(), help: format!("Every setting in one text file, with comments: {}. Saved changes apply within 2 seconds.", config::path().display()), path: vec![], kind: Kind::Open("config.toml"), group: "Files".into() },
-            Row { label: "Open extensions log".into(), help: "Errors and console output from extensions, plus file index status.".into(), path: vec![], kind: Kind::Open("extensions.log"), group: "Files".into() },
-        ],
+        "Translator" => groups(vec![(
+            "Languages",
+            vec![
+                row("Translate from", "translator.from", Kind::Language(&[("Auto-Detect", S("auto"))]), "The language you type in; Auto-Detect lets Google tell.").with_icon(g::LANGUAGES),
+                row("Primary language", "translator.primary", Kind::Language(&[]), "What Translate turns your text into.").with_icon(g::LANGUAGES),
+                row("Secondary language", "translator.secondary", Kind::Language(&[("None", S(""))]), "A second translation under the first.").with_icon(g::LANGUAGES),
+            ],
+        )]),
+        "Games" => groups(vec![(
+            "Games",
+            vec![
+                row("Auto HDR", "games.auto_hdr", Kind::Bool, "Turn HDR on while a game has focus and off again after. HDR you turned on yourself stays on.").with_icon(g::SUN_MEDIUM),
+                row("Games", "games.list", Kind::List, "Program file names that always count as games, e.g. eldenring.exe. Full-screen D3D apps and borderless Steam, Epic, Xbox and Riot games are found by themselves.").with_icon(g::GAMEPAD_2),
+            ],
+        )]),
+        "Focus" => groups(vec![(
+            "Sessions",
+            vec![
+                row("Default length", "focus.default_minutes", Kind::Number, "Minutes offered when you start a Focus session. 0 means no limit.").with_icon(g::TIMER),
+                row(
+                    "Snooze duration",
+                    "focus.snooze_minutes",
+                    Kind::Choice(&[("1 min", N(1)), ("3 min", N(3)), ("5 min", N(5)), ("10 min", N(10))]),
+                    "How long Snooze Focus Session lets you use the app Focus just closed.",
+                )
+                .with_icon(g::COFFEE),
+                row("Allow all websites", "focus.allow_all_on_empty_sites", Kind::Bool, "Allow mode with no websites listed: let every site through. Off blocks every site.").with_icon(g::GLOBE),
+                row("Reopen closed apps", "focus.restore_apps", Kind::Bool, "When a session ends, start again the apps Focus closed.").with_icon(g::ROTATE_CCW),
+                row("Play sound", "focus.sound", Kind::Bool, "Play a sound when a session ends.").with_icon(g::VOLUME_2),
+            ],
+        )]),
+        "Calendar" => groups(vec![(
+            "Meetings",
+            vec![
+                row("Calendar feeds", "calendar.ics", Kind::List, "ICS addresses (https:// or webcal://) of the calendars My Schedule shows, checked every 10 minutes.").with_icon(g::CALENDAR_CLOCK),
+                row("Show events within", "calendar.tolerance_secs", Kind::Number, "Seconds around now within which an event shows in an empty search.").with_icon(g::CALENDAR_CLOCK),
+                row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask \"Join <title>?\" before opening a meeting link.").with_icon(g::VIDEO),
+                row("Remind before", "calendar.remind_minutes", Kind::Number, "Minutes before an event to show a reminder. 0 turns reminders off.").with_icon(g::BELL),
+                row("Ignore events", "calendar.ignore", Kind::List, "Events whose title contains one of these words are left out.").with_icon(g::BAN),
+            ],
+        )]),
+        "Shortcuts" | "Screenshots" | "Notes" => vec![],
+        _ => {
+            let watcher = if crate::foreground::RUNNING.load(std::sync::atomic::Ordering::Relaxed) { "Foreground watcher: running" } else { "Foreground watcher: stopped" };
+            vec![
+                Row { label: "Open config.toml".into(), help: format!("Every setting in one text file, with comments: {}. Saved changes apply within 2 seconds.", config::path().display()), path: vec![], kind: Kind::Open("config.toml"), group: "Files".into(), icon: "" },
+                Row { label: "Open extensions log".into(), help: "Errors and console output from extensions, plus file index status.".into(), path: vec![], kind: Kind::Open("extensions.log"), group: "Files".into(), icon: "" },
+                Row { group: "Debugging".into(), path: vec![], ..row(watcher, "", Kind::Status(Live::Foreground), "Tells Auto HDR and Focus which window is in front.").with_icon(g::EYE) },
+            ]
+        }
     }
 }
 
@@ -529,11 +642,32 @@ pub struct Settings {
     dark_caption: Option<(u32, u32, gpui::WindowAppearance)>,
     /// Kept apart from `_subs`, which `build_inputs` clears on every page change.
     _appearance: Subscription,
+    /// An open language dropdown; it takes the keys first. Its search text is `menu_input`.
+    menu: Option<OpenMenu>,
+    menu_input: Entity<EditableTextState>,
+    _menu_filter: Subscription,
+}
+
+struct OpenMenu {
+    menu: menu::Menu,
+    /// The setting a pick writes.
+    path: Vec<String>,
+    scroll: ScrollHandle,
 }
 
 impl Settings {
     pub fn new(items: Vec<Item>, tx: UnboundedSender<Msg>, index_status: Arc<RwLock<String>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let _menu_filter = cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
+            if let Some(open) = &mut this.menu {
+                open.menu.set_filter(input.read(cx).as_str());
+                cx.notify();
+            }
+        });
         let mut this = Self {
+            menu: None,
+            menu_input,
+            _menu_filter,
             text: std::fs::read_to_string(config::path()).unwrap_or_default(),
             tx,
             index_status,
@@ -578,8 +712,8 @@ impl Settings {
     /// The Shortcuts table: category and filter, then every matching item.
     fn shortcut_rows(&self) -> Vec<Row> {
         let mut out = vec![
-            Row { label: "Show".into(), help: "Pick a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: String::new() },
-            Row { label: "Find".into(), help: "Type part of a name or alias.".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter, group: String::new() },
+            Row { label: "Show".into(), help: "Pick a kind, or press Enter for the next one.".into(), path: vec![], kind: Kind::Category, group: String::new(), icon: "" },
+            Row { label: "Find".into(), help: "Type part of a name or alias.".into(), path: vec!["shortcuts-filter".into()], kind: Kind::Filter, group: String::new(), icon: "" },
         ];
         let want = CATEGORIES[self.category];
         let words: Vec<String> = self.filter.split_whitespace().map(str::to_lowercase).collect();
@@ -587,7 +721,7 @@ impl Settings {
             let hay = format!("{} {} {}", it.title, it.subtitle, it.alias).to_lowercase();
             if (want == "All" || category(it) == want) && words.iter().all(|w| hay.contains(w.as_str())) {
                 let help = [category(it).trim_end_matches('s'), &it.subtitle].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: if self.category == 0 { "Everything" } else { CATEGORIES[self.category] }.into() });
+                out.push(Row { label: it.title.clone(), help, path: vec!["launcher".into(), "aliases".into(), key_of(it)], kind: Kind::Command(i), group: if self.category == 0 { "Everything" } else { CATEGORIES[self.category] }.into(), icon: "" });
             }
         }
         out
@@ -718,7 +852,7 @@ impl Settings {
             Some(i) => name_rows.get(i).or(name_rows.last()),
         };
         self.selected = at.copied().unwrap_or(0);
-        self.status = Some((false, format!("{} {verb}", choice_label(list))));
+        self.status = Some((false, format!("{} {verb}", capital(list))));
         self.focus_row(window, cx);
     }
 
@@ -765,6 +899,7 @@ impl Settings {
     fn set_section(&mut self, s: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.commit(cx);
         self.recording = false;
+        self.menu = None;
         self.section = s % SECTIONS.len();
         self.selected = 0;
         // Inputs are built for every row the table can show.
@@ -785,8 +920,14 @@ impl Settings {
                 self.save(&r.path, (!on).into(), cx);
             }
             Kind::Choice(opts) => {
-                let i = opts.iter().position(|o| *o == current).map_or(0, |i| (i + 1) % opts.len());
-                self.save(&r.path, opts[i].into(), cx);
+                let i = opts.iter().position(|o| o.1.text() == current).map_or(0, |i| (i + 1) % opts.len());
+                self.save(&r.path, opts[i].1.value(), cx);
+            }
+            Kind::Language(lead) => {
+                self.menu_input.update(cx, |s, cx| s.emplace("", cx));
+                window.focus(&self.menu_input.focus_handle(cx), cx);
+                self.menu = Some(OpenMenu { menu: language_menu(lead, &current), path: r.path.clone(), scroll: ScrollHandle::new() });
+                cx.notify();
             }
             Kind::Hotkey | Kind::Command(_) => {
                 self.commit(cx);
@@ -806,8 +947,36 @@ impl Settings {
                 self.edit_table(list, config::TableEdit::Add(fields), window, cx);
             }
             Kind::Action("rebuild-index") => drop(self.tx.unbounded_send(Msg::RebuildIndex)),
-            Kind::Action(_) | Kind::Status | Kind::Filter | Kind::Keys | Kind::TableItem(..) => {}
+            Kind::Action(_) | Kind::Status(_) | Kind::Filter | Kind::Keys | Kind::TableItem(..) => {}
         }
+    }
+
+    /// Hands a key to the open dropdown; false when none is open.
+    fn menu_key(&mut self, key: menu::Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(open) = &mut self.menu else { return false };
+        match open.menu.key(key) {
+            menu::Event::Picked(i) => self.menu_pick(i, window, cx),
+            menu::Event::Closed => self.close_menu(window, cx),
+            menu::Event::None => {
+                if let Some(k) = open.menu.selected_row() {
+                    open.scroll.scroll_to_item(k);
+                }
+                cx.notify()
+            }
+        }
+        true
+    }
+
+    /// Closes the dropdown and saves entry `i` to its setting.
+    fn menu_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.menu.take() else { return };
+        self.save(&open.path, open.menu.entries[i].id.as_str().into(), cx);
+        self.focus_row(window, cx);
+    }
+
+    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.focus_row(window, cx);
     }
 
     /// Where a row's hotkey lives: its own key, or the item's entry under `[launcher.hotkeys]`.
@@ -851,6 +1020,9 @@ impl Settings {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() {
+            return;
+        }
         let rows = self.rows();
         let Some(r) = rows.get(self.selected) else { return };
         let k = &ev.keystroke;
@@ -990,18 +1162,20 @@ impl Settings {
                     .into_any_element()
             }
             Kind::Bool => design::toggle(value == "true", t).into_any_element(),
-            Kind::Choice(opts) => {
+            &Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
-                choices(opts, &value, stacked(&r.kind), t, &r.path.join("."), move |v, cx| {
-                    let path = path.clone();
-                    drop(me.update(cx, |this, cx| this.save(&path, v.into(), cx)));
+                let on = opts.iter().position(|o| o.1.text() == value);
+                choices(opts.iter().map(|o| o.0), on, stacked(&r.kind), t, &r.path.join("."), move |k, cx| {
+                    drop(me.update(cx, |this, cx| this.save(&path, opts[k].1.value(), cx)));
                 })
             }
+            Kind::Language(lead) => design::dropdown(&language_label(lead, &value), t).into_any_element(),
             Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Action(_) => design::button("Rebuild", design::Button::Quiet, on, t).into_any_element(),
-            Kind::Status => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(self.index_status.read().unwrap().clone()).into_any_element(),
+            Kind::Status(Live::Index) => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(self.index_status.read().unwrap().clone()).into_any_element(),
+            Kind::Status(Live::Foreground) => div().into_any_element(),
             Kind::TableAdd(_) => design::button("Add", design::Button::Quiet, on, t).into_any_element(),
             &Kind::TableItem(list, i) => {
                 let (copy, delete) = (me.clone(), me.clone());
@@ -1020,9 +1194,9 @@ impl Settings {
             }
             Kind::Category => {
                 let me = me.clone();
-                choices(CATEGORIES, CATEGORIES[self.category], stacked(&r.kind), t, "category", move |v, cx| {
+                choices(CATEGORIES.iter().copied(), Some(self.category), stacked(&r.kind), t, "category", move |k, cx| {
                     drop(me.update(cx, |this, cx| {
-                        this.category = CATEGORIES.iter().position(|c| *c == v).unwrap_or(0);
+                        this.category = k;
                         cx.notify();
                     }));
                 })
@@ -1083,6 +1257,35 @@ impl Settings {
             while i < rows.len() && rows[i].group == group {
                 i += 1;
             }
+            if !rows[start].icon.is_empty() {
+                // `.pc-sett__group`: the label inside the surface group, a hairline above every row.
+                let label = |d: gpui::Div| {
+                    d.child(
+                        div()
+                            .pt(px(design::sp::S8))
+                            .px(px(design::sp::S16))
+                            .pb(px(design::sp::S4))
+                            .font_family(design::FONT_SMALL)
+                            .text_size(px(design::ts::SMALL))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text_faint)
+                            .child(group.clone()),
+                    )
+                };
+                let labelled = !group.is_empty();
+                out.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .rounded(px(design::r::MD))
+                        .bg(t.surface)
+                        .overflow_hidden()
+                        .when(labelled, label)
+                        .children((start..i).map(|j| self.row_view(j, &rows[j], labelled || j > start, t, me)))
+                        .into_any_element(),
+                );
+                continue;
+            }
             out.push(
                 div()
                     .flex()
@@ -1110,15 +1313,12 @@ impl Settings {
         let on = i == self.selected;
         let click = me.clone();
         let stack = stacked(&r.kind);
-        div()
+        let recipe = !r.icon.is_empty();
+        let base = div()
             .id(("row", i))
-            .flex()
-            .map(|d| if stack { d.flex_col().gap(px(8.)) } else { d.items_center().gap(px(16.)) })
-            .px(px(16.))
-            .py(px(12.))
             .relative()
             .when(divider, |d| d.border_t_1().border_color(t.hairline))
-            .when(on, |d| design::lozenge(d.rounded(px(design::r::LG)), t).child(design::pill(t)))
+            .when(on, |d| design::lozenge(d.rounded(px(if recipe { design::r::MD } else { design::r::LG })), t).child(design::pill(t)))
             .on_click(move |_, window, cx| {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
@@ -1128,7 +1328,18 @@ impl Settings {
                         this.activate(window, cx);
                     }
                 }))
-            })
+            });
+        if recipe {
+            // A control too wide for the right edge (lists, long segments) wraps under the title.
+            let wide = stack || matches!(r.kind, Kind::List | Kind::Keys);
+            return base
+                .child(design::set_row(r.icon, &r.label, &r.help, t).when(wide, |d| d.flex_wrap()).child(div().when(wide, |d| d.w_full()).flex().items_center().child(self.control(r, on, t, me))))
+                .into_any_element();
+        }
+        base.flex()
+            .map(|d| if stack { d.flex_col().gap(px(8.)) } else { d.items_center().gap(px(16.)) })
+            .px(px(16.))
+            .py(px(12.))
             .when(matches!(r.kind, Kind::Command(c) if self.is_off(c)), |d| d.text_color(t.text_muted))
             .children(match r.kind {
                 Kind::Command(c) => Some(design::icon_view(&self.items[c].icon, t, on)),
@@ -1186,11 +1397,47 @@ impl Render for Settings {
                 "rows": rows.iter().map(|r| &r.label).collect::<Vec<_>>(),
                 "recording": self.recording,
                 "status": self.status,
+                "menu": self.menu.as_ref().map(|o| o.menu.visible().into_iter().map(|i| o.menu.entries[i].label.clone()).collect::<Vec<_>>()),
             }),
         );
         let maximized = window.is_maximized();
+        let pop = self.menu.as_ref().map(|open| {
+            let me = cx.weak_entity();
+            let pick = move |i: usize, window: &mut Window, cx: &mut gpui::App| drop(me.update(cx, |this, cx| this.menu_pick(i, window, cx)));
+            let me = cx.weak_entity();
+            let outside = move |_: &gpui::MouseDownEvent, window: &mut Window, cx: &mut gpui::App| drop(me.update(cx, |this, cx| this.close_menu(window, cx)));
+            let field = open.menu.search.as_ref().map(|placeholder| {
+                text_input("settings-menu-search")
+                    .state(self.menu_input.downgrade())
+                    .placeholder(placeholder.clone())
+                    .placeholder_color(t.text_faint)
+                    .caret_color(t.accent)
+                    .flex_1()
+                    .whitespace_nowrap()
+                    .into_any_element()
+            });
+            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
+        });
+        let heading = match head(SECTIONS[self.section]) {
+            // `.pc-sett__head`: the sticker tile, the name, the line on what it does.
+            Some((tint, line)) => div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(design::sp::S12))
+                .child(design::icon_tile(&Icon::Vector(SECTION_ICONS[self.section]), &t, false, Some(tint)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(design::ts::HEADING)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]))
+                        .when(!line.is_empty(), |d| d.child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(line))),
+                ),
+            None => div().h(px(design::ROW)).flex().flex_none().items_center().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]),
+        };
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .font_family(design::FONT_UI)
@@ -1200,12 +1447,27 @@ impl Render for Settings {
             .key_context("Settings")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
-            .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.select(this.selected + 1, window, cx)))
-            .on_action(cx.listener(|this, _: &SelectPrev, window, cx| this.select(this.selected.saturating_sub(1), window, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                if !this.menu_key(menu::Key::Down, window, cx) {
+                    this.select(this.selected + 1, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
+                if !this.menu_key(menu::Key::Up, window, cx) {
+                    this.select(this.selected.saturating_sub(1), window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &NextSection, window, cx| this.set_section(this.section + 1, window, cx)))
             .on_action(cx.listener(|this, _: &PrevSection, window, cx| this.set_section(this.section + SECTIONS.len() - 1, window, cx)))
-            .on_action(cx.listener(|this, _: &Launch, window, cx| this.activate(window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| {
+                if !this.menu_key(menu::Key::Enter, window, cx) {
+                    this.activate(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                if this.menu_key(menu::Key::Esc, window, cx) {
+                    return;
+                }
                 if this.recording {
                     this.recording = false;
                     this.status = Some((false, "Cancelled".into()));
@@ -1218,8 +1480,10 @@ impl Render for Settings {
             .child(title_bar(&t, maximized))
             .child(div().flex_1().min_h_0().flex().child(
                 div()
+                    .id("sections")
                     .w(px(design::SIDEBAR))
                     .flex_none()
+                    .overflow_y_scroll()
                     .p(px(12.))
                     .flex()
                     .flex_col()
@@ -1256,7 +1520,7 @@ impl Render for Settings {
                             .flex()
                             .flex_col()
                             .gap(px(24.))
-                            .child(div().h(px(design::ROW)).flex().flex_none().items_center().font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child(SECTIONS[self.section]))
+                            .child(heading)
                             .children((SECTIONS[self.section] == "Theme").then(|| preview(&t)))
                             .children(self.cards(&rows, &t, &me))
                             .children(rows.is_empty().then(|| div().text_color(t.text_muted).child("Nothing to configure here yet."))),
@@ -1288,6 +1552,7 @@ impl Render for Settings {
                             }),
                     ),
             ))
+            .children(pop)
     }
 }
 
@@ -1335,24 +1600,23 @@ fn title_bar(t: &design::Tokens, maximized: bool) -> impl IntoElement {
 /// ponytail: an estimate, not a measurement; at the large size a row weighing near 44 can still
 /// wrap. Measure the column from the viewport if that matters.
 fn stacked(kind: &Kind) -> bool {
-    let opts = match kind {
-        Kind::Choice(o) => o,
-        Kind::Category => CATEGORIES,
+    let labels: Vec<&str> = match kind {
+        Kind::Choice(o) => o.iter().map(|o| o.0).collect(),
+        Kind::Category => CATEGORIES.to_vec(),
         _ => return false,
     };
-    opts.len() > 5 || opts.iter().map(|o| choice_label(o).chars().count() + 4).sum::<usize>() > 44
+    labels.len() > 5 || labels.iter().map(|l| l.chars().count() + 4).sum::<usize>() > 44
 }
 
-/// A segmented control; clicking an option picks it. `stretch` spreads the segments over the
-/// full width (a stacked row).
-fn choices(opts: &[&'static str], current: &str, stretch: bool, t: &design::Tokens, id: &str, pick: impl Fn(&'static str, &mut gpui::App) + Clone + 'static) -> AnyElement {
+/// A segmented control over `labels`, segment `on` lit; clicking one gives `pick` its index.
+/// `stretch` spreads the segments over the full width (a stacked row).
+fn choices<'a>(labels: impl Iterator<Item = &'a str>, on: Option<usize>, stretch: bool, t: &design::Tokens, id: &str, pick: impl Fn(usize, &mut gpui::App) + Clone + 'static) -> AnyElement {
     design::segment_track(
-        opts.iter().map(|o| {
+        labels.enumerate().map(|(k, label)| {
             let pick = pick.clone();
-            let o: &'static str = o;
-            design::segment(&choice_label(o), o == current, t).when(stretch, |d| d.flex_1().justify_center()).id(SharedString::from(format!("{id}={o}"))).on_click(move |_, _, cx| {
+            design::segment(label, on == Some(k), t).when(stretch, |d| d.flex_1().justify_center()).id(SharedString::from(format!("{id}={k}"))).on_click(move |_, _, cx| {
                 cx.stop_propagation();
-                pick(o, cx)
+                pick(k, cx)
             })
         }),
         t,
@@ -1401,5 +1665,68 @@ mod tests {
         let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[], "")).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
         assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone"]);
         assert!(stacked(&Kind::Category));
+    }
+
+    const FEATURES: [&str; 6] = ["Translator", "Screenshots", "Focus", "Calendar", "Notes", "Games"];
+
+    #[test]
+    fn feature_sections_follow_extensions_in_order() {
+        let at = SECTIONS.iter().position(|s| *s == "Extensions").unwrap();
+        assert_eq!(SECTIONS[at + 1..at + 7], FEATURES);
+        assert_eq!(SECTIONS.last(), Some(&"Advanced"));
+    }
+
+    #[test]
+    fn every_feature_row_has_an_icon() {
+        for name in FEATURES {
+            let s = SECTIONS.iter().position(|x| *x == name).unwrap();
+            for r in rows(s, &[], "") {
+                assert!(!r.icon.is_empty(), "{name} › {}", r.label);
+            }
+        }
+        // Not vacuous: the moved groups landed in their sections.
+        for (name, label) in [("Games", "Auto HDR"), ("Focus", "Reopen closed apps"), ("Calendar", "Confirm before joining"), ("Translator", "Primary language")] {
+            let s = SECTIONS.iter().position(|x| *x == name).unwrap();
+            assert!(rows(s, &[], "").iter().any(|r| r.label == label), "{label} in {name}");
+        }
+        let launcher = rows(SECTIONS.iter().position(|x| *x == "Launcher").unwrap(), &[], "");
+        assert!(!launcher.iter().any(|r| ["Games", "Focus", "Calendar"].contains(&r.group.as_str())));
+    }
+
+    #[test]
+    fn a_minutes_choice_writes_an_integer() {
+        let focus = rows(SECTIONS.iter().position(|x| *x == "Focus").unwrap(), &[], "");
+        let snooze = focus.iter().find(|r| r.path == ["focus", "snooze_minutes"]).unwrap();
+        let Kind::Choice(opts) = snooze.kind else { panic!("Snooze is a Choice") };
+        assert_eq!(opts.iter().map(|o| o.0).collect::<Vec<_>>(), ["1 min", "3 min", "5 min", "10 min"]);
+        let text = config::write_value("[focus]\n", &snooze.path, opts[1].1.value()).unwrap();
+        assert!(text.contains("snooze_minutes = 3\n"), "{text}");
+        assert_eq!(config::shown_value(&text, &snooze.path), opts[1].1.text(), "the segment reads back as selected");
+        // A string choice stays a string.
+        let text = config::write_value("", &["emoji".into(), "action".into()], Val::S("copy").value()).unwrap();
+        assert!(text.contains("action = \"copy\""), "{text}");
+    }
+
+    #[test]
+    fn language_menu_leads_with_its_options_and_selects_the_current_one() {
+        let m = language_menu(&[("Auto-Detect", Val::S("auto"))], "de");
+        assert_eq!((m.entries[0].label.as_str(), m.entries[0].id.as_str()), ("Auto-Detect", "auto"));
+        assert!(m.entries[0].rule_after);
+        assert_eq!(m.entries.len(), 1 + crate::translate::LANGUAGES.len());
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("de"));
+        assert!(m.search.is_some());
+        assert_eq!(language_label(&[("None", Val::S(""))], ""), "None");
+        assert_eq!(language_label(&[], "de"), "German");
+    }
+
+    #[test]
+    fn foreground_row_reads_the_watcher_state() {
+        let advanced = SECTIONS.iter().position(|x| *x == "Advanced").unwrap();
+        let label = |on| {
+            crate::foreground::RUNNING.store(on, std::sync::atomic::Ordering::Relaxed);
+            rows(advanced, &[], "").into_iter().find(|r| r.kind == Kind::Status(Live::Foreground)).map(|r| (r.label, r.icon)).unwrap()
+        };
+        assert_eq!(label(false), ("Foreground watcher: stopped".into(), design::g::EYE));
+        assert_eq!(label(true).0, "Foreground watcher: running");
     }
 }

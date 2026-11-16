@@ -3,7 +3,10 @@
 //! decides what a change means.
 
 use std::{
-    sync::{OnceLock, RwLock},
+    sync::{
+        OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,6 +34,8 @@ const LIBRARIES: &[&[&str]] = &[&["steamapps", "common"], &["epic games"], &["xb
 const RECHECK: Duration = Duration::from_secs(1);
 
 static TX: OnceLock<UnboundedSender<Msg>> = OnceLock::new();
+/// The hook thread is alive with its hook set (Settings → Advanced shows it).
+pub static RUNNING: AtomicBool = AtomicBool::new(false);
 /// `[games] list`, lower case file names.
 static GAMES: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
@@ -64,8 +69,10 @@ pub fn watch(tx: UnboundedSender<Msg>) {
         if hook.is_invalid() {
             return;
         }
+        RUNNING.store(true, Ordering::Relaxed);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        RUNNING.store(false, Ordering::Relaxed);
         let _ = UnhookWinEvent(hook);
     });
 }

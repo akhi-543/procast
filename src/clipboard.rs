@@ -106,8 +106,6 @@ pub fn keep_secs(keep: &str) -> Option<u64> {
     })
 }
 
-pub const KEEP: &[&str] = &["count", "1h", "1d", "7d", "30d", "90d", "180d", "365d", "unlimited"];
-
 impl History {
     pub fn load(path: PathBuf, cap: usize, keep: &str) -> Self {
         let entries = fs::read(&path).ok().and_then(|b| unprotect(&b)).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();

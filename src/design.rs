@@ -91,6 +91,8 @@ pub const SIDEBAR: f32 = 192.;
 pub const SPLIT_LIST: f32 = 0.4;
 /// `.pc-tag`: a small tinted label's height.
 pub const TAG: f32 = 20.;
+/// `.pc-setrow`: a Settings row's least height.
+pub const SET_ROW: f32 = 56.;
 
 /// The type scale. Views use only these sizes for text.
 pub mod ts {
@@ -370,6 +372,9 @@ names! {
     LIST_PLUS = "list-plus",
     IMPORT = "import",
     CIRCLE_HELP = "circle-help",
+    NOTEBOOK_PEN = "notebook-pen",
+    EYE = "eye",
+    BAN = "ban",
 }
 
 #[derive(Clone, Copy)]
@@ -1249,6 +1254,29 @@ pub fn dropdown(label: &str, t: &Tokens) -> Div {
         .child(icon(g::FILTER, ic::SM, t.text_muted))
         .child(div().max_w(px(180.)).truncate().child(label.to_string()))
         .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+}
+
+/// `.pc-setrow`: a Settings row: the untinted icon, the title over its muted description, then
+/// what the caller adds (the control, on the right).
+pub fn set_row(glyph: &'static str, title: &str, desc: &str, t: &Tokens) -> Div {
+    div()
+        .min_h(px(SET_ROW))
+        .px(px(sp::S16))
+        .py(px(sp::S8))
+        .flex()
+        .items_center()
+        .gap(px(sp::S12))
+        .child(icon(glyph, ic::LG, t.text_muted))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(sp::S2))
+                .child(div().child(title.to_string()))
+                .when(!desc.is_empty(), |d| d.child(div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(desc.to_string()))),
+        )
 }
 
 /// `.pc-tag`: a small label tinted with a kind's hue ("Auto-Detect", "German").

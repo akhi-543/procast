@@ -227,8 +227,6 @@ impl Launcher {
     }
 }
 
-pub const POP_TO_ROOT: &[&str] = &["immediately", "15s", "30s", "60s", "120s", "180s", "never"];
-
 /// Keys handled by procast's keyboard hook.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
@@ -285,8 +283,6 @@ impl Default for Emoji {
         Self { hotkey: String::new(), columns: 8, action: "paste".into(), skin_tone: "none".into(), shortcodes: true }
     }
 }
-
-pub const SKIN_TONES: &[&str] = &["none", "light", "medium_light", "medium", "medium_dark", "dark"];
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
