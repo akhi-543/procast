@@ -2747,6 +2747,28 @@ impl Launcher {
         cx.notify();
     }
 
+    /// A form is on screen or under Ctrl+K or a confirm; its keys live on the root (`form_focus`).
+    fn form_under(&self) -> bool {
+        matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"))
+    }
+
+    /// Ctrl+K or a confirm over a form stops drawing its text box, and a focused box that is
+    /// not drawn leaves gpui no key context: the root's `form_focus` takes the keys meanwhile,
+    /// and gives them back to the selected box once the form shows again.
+    fn guard_form_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.form_under() || self.menu.is_some() {
+            return;
+        }
+        let on_root = self.form_focus.is_focused(window);
+        if self.panel.is_some() || self.confirm.is_some() {
+            if !on_root && !self.input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.form_focus, cx);
+            }
+        } else if on_root && self.form_fields().is_some_and(|(f, i)| f.get(i).is_some_and(|f| f.input.is_some())) {
+            self.focus_field(window, cx);
+        }
+    }
+
     /// A form is on screen: a native one, or an extension's Form.
     fn is_form(&self) -> bool {
         matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.confirm.is_none() && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"))
@@ -4216,6 +4238,7 @@ impl Render for Launcher {
                 window.focus(&self.input.focus_handle(cx), cx);
             }
         }
+        self.guard_form_focus(window, cx);
         // The same for a box whose row is no longer selected.
         let shown = self.arg_row().map_or(0, |it| it.args.len());
         if self.args[shown..].iter().any(|a| a.focus_handle(cx).is_focused(window)) {
@@ -4644,9 +4667,8 @@ impl Render for Launcher {
 
         // A form's keys live on the root, which stays drawn while Ctrl+K or a confirm covers
         // the form: a focused control that is not drawn then leaves the keys here.
-        let form_under = matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"));
         design::glass_window(&t)
-            .when(form_under, |d| d.track_focus(&self.form_focus).key_context("Form"))
+            .when(self.form_under(), |d| d.track_focus(&self.form_focus).key_context("Form"))
             .size_full()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
