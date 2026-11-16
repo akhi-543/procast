@@ -497,7 +497,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     if cfg.dictionary.enabled
         && let Some(word) = crate::dict::from_query(q)
     {
-        top.push(Item::new(format!("Define \"{word}\""), "", Icon::Vector(g::BOOK_OPEN), Act::Define(word)).acc("Dictionary").tinted(Tint::System));
+        top.push(Item::new(format!("Define \"{word}\""), "", Icon::Vector(g::BOOK_OPEN), Act::Define(word)).acc("Dictionary").tinted(Tint::Web));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
@@ -516,7 +516,7 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
                 return Some(Item::new("Ask AI", "", Icon::Vector(g::SPARKLES), Act::Ask(q.to_string())).acc("AI").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
             }
             if name.eq_ignore_ascii_case("define") {
-                return (cfg.dictionary.enabled && crate::dict::looks_like_word(q)).then(|| Item::new("Define", "", Icon::Vector(g::BOOK_OPEN), Act::Define(q.to_string())).acc("Dictionary").tinted(Tint::System).sec(format!("Use \"{q}\" with")));
+                return (cfg.dictionary.enabled && crate::dict::looks_like_word(q)).then(|| Item::new("Define", "", Icon::Vector(g::BOOK_OPEN), Act::Define(q.to_string())).acc("Dictionary").tinted(Tint::Web).sec(format!("Use \"{q}\" with")));
             }
             let (title, url, icon, kind) = if name.eq_ignore_ascii_case("web") {
                 (!cfg.search.fallback.is_empty()).then(|| ("Search the web".to_string(), cfg.search.fallback.clone(), Icon::Vector(g::GLOBE), "Web"))?

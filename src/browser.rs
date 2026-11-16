@@ -214,6 +214,10 @@ pub fn extension_dir() -> std::path::PathBuf {
 /// Registers procast.exe as the native messaging host for Chrome, Edge and Brave, and
 /// unpacks the extension. Cheap and repeated at every start, so a moved exe stays registered.
 pub fn register() -> std::io::Result<()> {
+    // The user's procast owns the host registration (see `win::dev`).
+    if crate::win::dev() {
+        return Err(std::io::Error::other("not in a dev instance"));
+    }
     let dir = extension_dir();
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.json"), MANIFEST)?;

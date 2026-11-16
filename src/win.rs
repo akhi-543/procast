@@ -153,6 +153,10 @@ pub struct Hotkeys {
 impl Hotkeys {
     pub fn spawn(specs: Vec<String>, tx: UnboundedSender<Msg>) -> Self {
         let wanted = Arc::new(Mutex::new(specs));
+        // No thread, so nothing registers; `set` posts to thread 0, which goes nowhere.
+        if dev() {
+            return Self { thread: 0, wanted };
+        }
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let shared = wanted.clone();
         std::thread::spawn(move || unsafe {
@@ -751,15 +755,26 @@ fn shell(verb: &'static str, file: HSTRING, args: HSTRING) {
 
 // ---- process ------------------------------------------------------------------------
 
-/// False when another procast is already running.
+/// A dev instance (`PROCAST_DEV` set) runs beside the user's procast: its own instance mutex, and
+/// no global hotkeys, keyboard hook, browser host or start-at-login entry. The caller points it at
+/// scratch config by setting `APPDATA`, which `config::dir` reads.
+pub fn dev() -> bool {
+    std::env::var_os("PROCAST_DEV").is_some()
+}
+
+/// False when another procast (for a dev instance: another dev instance) is already running.
 pub fn single_instance() -> bool {
+    let name = if dev() { w!("Local\\procast-dev-instance") } else { w!("Local\\procast-single-instance") };
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\procast-single-instance"));
+        let _ = CreateMutexW(None, true, name);
         GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
 
 pub fn set_start_at_login(on: bool) {
+    if dev() {
+        return;
+    }
     let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     unsafe {
         if on {

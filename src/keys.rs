@@ -147,6 +147,10 @@ static THREAD: Mutex<u32> = Mutex::new(0);
 
 /// Applies the settings: starts the hook when any feature is on, stops it otherwise.
 pub fn configure(hyper: &str, double_tap: &str, expander: Option<Expander>, tx: UnboundedSender<Msg>) {
+    // A dev instance installs no global keyboard hook (see `win::dev`).
+    if crate::win::dev() {
+        return;
+    }
     let (hyper, tap) = (hyper_vk(hyper), tap_vks(double_tap));
     let expander = expander.filter(|x| !x.is_idle());
     let expands = expander.is_some();

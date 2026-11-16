@@ -180,25 +180,25 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::SPARKLES),
     (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::PANELS_TOP_LEFT),
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
-    (Cmd::Focus(FocusCmd::Start), "Start Focus Session", "block distractions apps websites concentrate pomodoro", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Start), "Start Focus Session", "block distractions apps websites concentrate pomodoro", g::SHIELD_CHECK),
     (Cmd::Focus(FocusCmd::Toggle), "Toggle Focus Session", "start stop block distractions concentrate", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Pause), "Pause Focus Session", "break block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Resume), "Resume Focus Session", "continue block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Complete), "Complete Focus Session", "finish end done block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Cancel), "Cancel Focus Session", "stop end abort block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Restart), "Restart Focus Session", "again reset block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Edit), "Edit Focus Session", "change title minutes category block distractions", g::SHIELD),
-    (Cmd::Focus(FocusCmd::Snooze), "Snooze Focus Session", "allow blocked app temporarily unblock", g::SHIELD),
-    (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::SHIELD),
-    (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::SHIELD),
-    (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::SHIELD),
-    (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::TIMER),
+    (Cmd::Focus(FocusCmd::Pause), "Pause Focus Session", "break block distractions", g::PAUSE),
+    (Cmd::Focus(FocusCmd::Resume), "Resume Focus Session", "continue block distractions", g::PLAY),
+    (Cmd::Focus(FocusCmd::Complete), "Complete Focus Session", "finish end done block distractions", g::CIRCLE_CHECK),
+    (Cmd::Focus(FocusCmd::Cancel), "Cancel Focus Session", "stop end abort block distractions", g::SHIELD_OFF),
+    (Cmd::Focus(FocusCmd::Restart), "Restart Focus Session", "again reset block distractions", g::ROTATE_CCW),
+    (Cmd::Focus(FocusCmd::Edit), "Edit Focus Session", "change title minutes category block distractions", g::EDIT),
+    (Cmd::Focus(FocusCmd::Snooze), "Snooze Focus Session", "allow blocked app temporarily unblock", g::COFFEE),
+    (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::LIST_CHECKS),
+    (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::LIST_PLUS),
+    (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::IMPORT),
+    (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::ALARM_CLOCK),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator google language tr", g::LANGUAGES),
     (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
-    (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR),
-    (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::PICTURE),
-    (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::PICTURE),
+    (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR_CLOCK),
+    (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::SCAN_SEARCH),
+    (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::IMAGE_DOWN),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -206,8 +206,8 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::SignOut, "Sign Out", "log out logoff", g::SIGN_OUT),
     (Cmd::EmptyBin, "Empty Recycle Bin", "trash", g::DELETE),
     (Cmd::ToggleDarkMode, "Toggle Dark Mode", "theme appearance light", g::SUN_MOON),
-    (Cmd::ToggleHdr, "Toggle HDR", "high dynamic range display monitor screen color", g::MONITOR),
-    (Cmd::HdrSettings, "HDR Settings", "high dynamic range display monitor windows settings", g::MONITOR),
+    (Cmd::ToggleHdr, "Toggle HDR", "high dynamic range display monitor screen color", g::SUN_MEDIUM),
+    (Cmd::HdrSettings, "HDR Settings", "high dynamic range display monitor windows settings", g::MONITOR_COG),
     (Cmd::GameModeSettings, "Game Mode Settings", "games gaming performance windows settings", g::GAMEPAD_2),
     (Cmd::Volume(Volume::Up), "Volume Up", "sound louder audio", g::VOLUME_2),
     (Cmd::Volume(Volume::Down), "Volume Down", "sound quieter audio", g::VOLUME_1),
@@ -321,7 +321,7 @@ impl Cmd {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles | Cmd::SearchScreenshots => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate => Tint::Web,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate | Cmd::Define => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -702,6 +702,40 @@ fn snap_with(hwnd: HWND, s: Snap, w: &config::Window, cycle: bool, on: Option<HM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Glyph and tile hue of the feature commands, as the design system's Icon map gives them.
+    #[test]
+    fn feature_commands_follow_the_icon_map() {
+        use FocusCmd as F;
+        let map = [
+            (Cmd::StartTimer, g::ALARM_CLOCK, Tint::System),
+            (Cmd::StartStopwatch, g::TIMER, Tint::System),
+            (Cmd::Translate, g::LANGUAGES, Tint::Web),
+            (Cmd::Define, g::BOOK_OPEN, Tint::Web),
+            (Cmd::MySchedule, g::CALENDAR_CLOCK, Tint::System),
+            (Cmd::SearchScreenshots, g::SCAN_SEARCH, Tint::File),
+            (Cmd::PasteLatestScreenshot, g::IMAGE_DOWN, Tint::Paste),
+            (Cmd::ToggleHdr, g::SUN_MEDIUM, Tint::System),
+            (Cmd::HdrSettings, g::MONITOR_COG, Tint::System),
+            (Cmd::Focus(F::Start), g::SHIELD_CHECK, Tint::System),
+            (Cmd::Focus(F::Toggle), g::SHIELD, Tint::System),
+            (Cmd::Focus(F::Pause), g::PAUSE, Tint::System),
+            (Cmd::Focus(F::Resume), g::PLAY, Tint::System),
+            (Cmd::Focus(F::Complete), g::CIRCLE_CHECK, Tint::System),
+            (Cmd::Focus(F::Cancel), g::SHIELD_OFF, Tint::System),
+            (Cmd::Focus(F::Restart), g::ROTATE_CCW, Tint::System),
+            (Cmd::Focus(F::Edit), g::EDIT, Tint::System),
+            (Cmd::Focus(F::Snooze), g::COFFEE, Tint::System),
+            (Cmd::Focus(F::SearchCategories), g::LIST_CHECKS, Tint::System),
+            (Cmd::Focus(F::CreateCategory), g::LIST_PLUS, Tint::System),
+            (Cmd::Focus(F::ImportCategories), g::IMPORT, Tint::System),
+        ];
+        for (cmd, glyph, tint) in map {
+            let (_, title, _, icon) = ALL.iter().find(|(c, ..)| *c == cmd).unwrap_or_else(|| panic!("{cmd:?} not in ALL"));
+            assert_eq!(*icon, glyph, "{title}");
+            assert_eq!(cmd.tint(), tint, "{title}");
+        }
+    }
 
     fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: l, top: t, right: r, bottom: b }
