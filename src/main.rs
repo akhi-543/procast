@@ -3606,6 +3606,15 @@ impl Render for Launcher {
         // Rem-based spacing follows the scale too.
         window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
+        // A menu closed without `close_menu` (a mode change, an extension exiting) would
+        // strand focus on its no longer drawn field, where no key binding matches.
+        if self.menu.is_none() && self.menu_input.focus_handle(cx).is_focused(window) {
+            if self.is_form() {
+                self.focus_field(window, cx);
+            } else {
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+        }
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
         // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.

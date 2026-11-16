@@ -61,7 +61,7 @@ impl Menu {
     /// Selects the first entry that can be picked.
     pub fn new(entries: Vec<Entry>, search: Option<String>, place: Place) -> Self {
         let mut m = Menu { entries, search, filter: String::new(), selected: 0, place };
-        m.set_filter("");
+        m.reselect();
         m
     }
 
@@ -120,9 +120,16 @@ impl Menu {
         self.pickable().contains(&self.selected).then(|| &self.entries[self.selected])
     }
 
-    /// New search text; the selection moves to the first entry that shows.
+    /// New search text; the selection moves to the first entry that shows. The same text
+    /// again changes nothing, so a field cleared on open keeps the opener's pre-selection.
     pub fn set_filter(&mut self, s: &str) {
-        self.filter = s.to_string();
+        if self.filter != s {
+            self.filter = s.to_string();
+            self.reselect();
+        }
+    }
+
+    fn reselect(&mut self) {
         if let Some(&i) = self.pickable().first() {
             self.selected = i;
         }
@@ -193,6 +200,16 @@ mod tests {
         m.set_filter("ger");
         assert_eq!(m.selected, 1);
         assert_eq!(m.picked().map(|e| e.id.as_str()), Some("german"));
+    }
+
+    #[test]
+    fn unchanged_filter_keeps_the_preselection() {
+        let mut m = menu(vec![e("All", None), e("Local", None), e("Network", None)]);
+        m.selected = 2;
+        m.set_filter("");
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("network"), "clearing an empty field on open");
+        m.set_filter("o");
+        assert_eq!(m.selected, 1, "real typing still reselects");
     }
 
     #[test]
