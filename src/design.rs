@@ -145,11 +145,18 @@ pub mod sp {
     pub const S8: f32 = 8.;
     pub const S12: f32 = 12.;
     pub const S16: f32 = 16.;
+    pub const S24: f32 = 24.;
 }
 
 /// `.pc-pop--right`: the menu under the bar's Dropdown.
 pub const POP_RIGHT_W: f32 = 290.;
 pub const POP_RIGHT_TOP: f32 = 50.;
+
+/// `.pc-form--center .pc-form__row`: a launcher form row's width, and its label column (`.pc-form__label`).
+pub const FORM_ROW: f32 = 500.;
+pub const FORM_LABEL: f32 = 120.;
+/// `.pc-form__note`: a form note lines up with the controls (label column plus the row gap).
+pub const FORM_NOTE_INDENT: f32 = 132.;
 
 /// `.pc-arg`: an argument box's width grows with its text between these.
 pub const ARG_MIN: f32 = 72.;
@@ -1033,6 +1040,23 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
         .when(focused, |d| focus_ring(d, t.accent))
 }
 
+/// `.pc-field` holding `body`, with `glyph` after it in text_muted (a select's chevron, a duration's clock).
+pub fn field_with_icon(focused: bool, body: impl IntoElement, glyph: Option<&'static str>, t: &Tokens) -> Div {
+    field(focused, t).gap(px(sp::S8)).child(div().flex_1().min_w_0().truncate().child(body)).children(glyph.map(|g| icon(g, ic::MD, t.text_muted)))
+}
+
+/// `.pc-form__row`: the label right-aligned in its column at control height, then the control
+/// column (the control, and what goes under it such as an error).
+pub fn form_row(label: impl Into<SharedString>, control: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> Div {
+    let label = div().w(px(FORM_LABEL)).flex_none().h(px(CONTROL)).flex().items_center().justify_end().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(label.into());
+    div().w(px(FORM_ROW)).max_w_full().flex().items_start().gap(px(sp::S12)).child(label).child(div().flex_1().min_w_0().flex().flex_col().gap(px(sp::S4)).children(control))
+}
+
+/// `.pc-form__note`: faint text under the controls, lined up with them.
+pub fn form_note(text: impl Into<SharedString>, t: &Tokens) -> Div {
+    div().w(px(FORM_ROW)).max_w_full().pl(px(FORM_NOTE_INDENT)).text_size(px(ts::BODY_SM)).text_color(t.text_faint).child(text.into())
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Button {
     /// The one solid accent fill on a screen.
@@ -1304,6 +1328,7 @@ pub fn pop_menu(
     match m.place {
         Place::Right => layer.items_end().pt(px(POP_RIGHT_TOP)).pr(px(sp::S12)).child(pop.w(px(POP_RIGHT_W))),
         Place::Under(left) => layer.items_start().pt(px(POP_RIGHT_TOP)).pl(left).child(pop.w(px(POP_RIGHT_W))),
+        Place::At(at) => layer.items_start().pt(at.y).pl(at.x).child(pop.w(px(POP_RIGHT_W))),
     }
 }
 

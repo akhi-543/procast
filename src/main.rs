@@ -50,7 +50,7 @@ use futures::{
     channel::mpsc::{self, UnboundedSender},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
+    App, Bounds, ClipboardItem, Context, Entity, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
     actions, div, prelude::*, size, uniform_list,
 };
@@ -159,6 +159,111 @@ enum Mode {
     Shots,
     /// My Schedule: today's and tomorrow's events.
     Schedule,
+    /// A native form (see `Launcher::form`).
+    Form(FormKind),
+}
+
+/// A native launcher form: what it is for, which names its title and primary action.
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[allow(dead_code)] // Tasks 12, 15 and 9 open these.
+enum FormKind {
+    Focus,
+    AddCalendar,
+    /// Some(i) edits language set `i`.
+    AddLanguageSet(Option<usize>),
+}
+
+impl FormKind {
+    /// The ActionBar's icon and title on the left, and the primary action (Ctrl+Enter) on the right.
+    fn bar(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            FormKind::Focus => (g::SHIELD_CHECK, "Focus", "Start Focus Session"),
+            FormKind::AddCalendar => (g::CALENDAR, "Add Calendar", "Add Calendar"),
+            FormKind::AddLanguageSet(_) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
+        }
+    }
+}
+
+/// One control of a launcher form.
+#[derive(Clone)]
+enum Ctl {
+    /// A text box, two lines high when `tall`, with `icon` after the text.
+    Text { placeholder: SharedString, icon: Option<&'static str>, tall: bool },
+    /// Picks one entry's id from a menu; true gives the menu a search field.
+    Select(Vec<menu::Entry>, bool),
+    /// A checkbox named by the field's label; its value is "true" when on.
+    Check,
+    /// Muted text (the value); with no label it is a `form_note`.
+    Note,
+    Rule,
+}
+
+/// One row of a launcher form, native or an extension's.
+#[derive(Clone)]
+struct FormField {
+    label: SharedString,
+    ctl: Ctl,
+    /// The text typed, or the picked entry's id.
+    value: String,
+    /// A Text control's box.
+    input: Option<Entity<EditableTextState>>,
+    error: Option<String>,
+}
+
+impl FormField {
+    fn focusable(&self) -> bool {
+        !matches!(self.ctl, Ctl::Note | Ctl::Rule)
+    }
+}
+
+/// A native form's values by label: the text typed, or the picked id.
+fn form_values(fields: &[FormField]) -> HashMap<&str, &str> {
+    fields.iter().filter(|f| f.focusable()).map(|f| (f.label.as_ref(), f.value.as_str())).collect()
+}
+
+/// The field Tab (`d` 1) or Shift+Tab (-1) moves to from `i`, past notes and rules, wrapping at either end.
+fn next_field(fields: &[FormField], i: usize, d: isize) -> usize {
+    let n = fields.len() as isize;
+    let mut k = i as isize;
+    for _ in 0..n {
+        k = (k + d).rem_euclid(n);
+        if fields[k as usize].focusable() {
+            return k as usize;
+        }
+    }
+    i
+}
+
+/// The menu a Select field opens at `at`, on its current value; None for other controls.
+fn field_menu(f: &FormField, at: gpui::Point<gpui::Pixels>) -> Option<menu::Menu> {
+    let Ctl::Select(entries, search) = &f.ctl else { return None };
+    let mut m = menu::Menu::new(entries.clone(), search.then(|| "Search…".to_string()), menu::Place::At(at));
+    m.selected = entries.iter().position(|e| e.id == f.value).unwrap_or(m.selected);
+    Some(m)
+}
+
+/// An extension's Form field as a form row.
+fn ext_field(f: &ext::Field, ev: &ExtView) -> FormField {
+    let value = match ev.values.get(&f.id).unwrap_or(&f.value) {
+        Value::String(s) => s.clone(),
+        Value::Bool(true) => "true".into(),
+        _ => String::new(),
+    };
+    let ctl = match &f.kind {
+        FieldKind::Text | FieldKind::Password | FieldKind::TextArea => Ctl::Text { placeholder: f.placeholder.clone().into(), icon: None, tall: f.kind == FieldKind::TextArea },
+        FieldKind::Checkbox => Ctl::Check,
+        FieldKind::Dropdown(opts) => Ctl::Select(opts.iter().map(|(v, t)| menu::Entry { id: v.clone(), label: t.clone(), ..Default::default() }).collect(), true),
+        FieldKind::Description => Ctl::Note,
+        FieldKind::Separator => Ctl::Rule,
+    };
+    FormField { label: f.title.clone().into(), ctl, value, input: ev.inputs.get(&f.id).cloned(), error: f.error.clone() }
+}
+
+/// A native form's rows and the selected one (Mode::Form).
+struct NativeForm {
+    fields: Vec<FormField>,
+    field: usize,
+    _subs: Vec<Subscription>,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -465,6 +570,12 @@ struct Launcher {
     panel: Option<(Item, usize)>,
     /// An open Dropdown; it takes the keys before anything else. Its search text is `menu_input`.
     menu: Option<OpenMenu>,
+    /// The native form on screen (Mode::Form).
+    form: Option<NativeForm>,
+    /// Holds the keys while a form's selected control has no text box.
+    form_focus: gpui::FocusHandle,
+    /// Below the selected form control's left edge, as last drawn: its menu opens here.
+    form_at: Rc<Cell<gpui::Point<gpui::Pixels>>>,
     menu_input: Entity<EditableTextState>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
@@ -615,6 +726,9 @@ impl Launcher {
             panel: None,
             menu: None,
             menu_input,
+            form: None,
+            form_focus: cx.focus_handle(),
+            form_at: Rc::new(Cell::new(gpui::Point::default())),
             armed: None,
             args,
             args_for: None,
@@ -1089,6 +1203,8 @@ impl Launcher {
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
             Mode::Shots => shots::rows(&self.shots, &query, &self.cfg.screenshots.primary, 200),
+            // A form draws its own body.
+            Mode::Form(_) => vec![],
             Mode::Schedule => {
                 let rows = self.schedule_rows();
                 search::filter(&query, rows, &mut self.matcher)
@@ -1663,6 +1779,9 @@ impl Launcher {
         self.typed = Default::default();
         if mode != Mode::Ext {
             self.stop_ext_view();
+        }
+        if !matches!(mode, Mode::Form(_)) {
+            self.form = None;
         }
         if mode != Mode::Ai && self.ai.take().is_some() {
             self.send(json!({"t": "aiStop"}));
@@ -2520,34 +2639,106 @@ impl Launcher {
         }
     }
 
+    /// The form on screen as rows, and the selected one: a native form or an extension's.
+    fn form_fields(&self) -> Option<(Vec<FormField>, usize)> {
+        if matches!(self.mode, Mode::Form(_)) {
+            return self.form.as_ref().map(|f| (f.fields.clone(), f.field));
+        }
+        let ev = self.extv.as_ref().filter(|_| self.is_form())?;
+        Some((ev.view.fields.iter().map(|f| ext_field(f, ev)).collect(), ev.field))
+    }
+
+    /// Opens a native form on `fields` (text controls get their boxes here), the first control focused.
+    #[allow(dead_code)] // Tasks 12, 15 and 9 open their forms with this.
+    fn open_form(&mut self, kind: FormKind, mut fields: Vec<FormField>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut subs = vec![];
+        for (i, f) in fields.iter_mut().enumerate().filter(|(_, f)| matches!(f.ctl, Ctl::Text { .. })) {
+            let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+            input.update(cx, |s, cx| s.emplace(&f.value, cx));
+            subs.push(cx.subscribe(&input, move |this, input, _: &TextChanged, cx| {
+                let value = input.read(cx).as_str().to_string();
+                if let Some(f) = this.form.as_mut().and_then(|f| f.fields.get_mut(i)) {
+                    f.value = value;
+                }
+            }));
+            f.input = Some(input);
+        }
+        let field = fields.iter().position(FormField::focusable).unwrap_or(0);
+        self.form = Some(NativeForm { fields, field, _subs: subs });
+        if self.visible {
+            self.set_mode(Mode::Form(kind), cx);
+        } else {
+            self.show(Mode::Form(kind), window, cx);
+        }
+        self.focus_field(window, cx);
+    }
+
     fn focus_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ev) = &self.extv else { return };
-        let handle: FocusHandle = ev
-            .view
-            .fields
-            .get(ev.field)
-            .and_then(|f| ev.inputs.get(&f.id))
-            .map(|i| i.focus_handle(cx))
-            .unwrap_or_else(|| self.input.focus_handle(cx));
+        let Some((fields, i)) = self.form_fields() else { return };
+        let handle = fields.get(i).and_then(|f| f.input.as_ref()).map_or_else(|| self.form_focus.clone(), |input| input.focus_handle(cx));
         window.focus(&handle, cx);
         cx.notify();
     }
 
-    fn move_field(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ev) = &mut self.extv else { return };
-        let n = ev.view.fields.len() as isize;
-        let mut i = ev.field as isize;
-        for _ in 0..n {
-            i = (i + delta).clamp(0, n - 1);
-            if !matches!(ev.view.fields[i as usize].kind, FieldKind::Description | FieldKind::Separator) {
-                break;
-            }
+    fn move_field(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((fields, i)) = self.form_fields() else { return };
+        let i = next_field(&fields, i, d);
+        match (&mut self.form, &mut self.extv) {
+            (Some(f), _) if matches!(self.mode, Mode::Form(_)) => f.field = i,
+            (_, Some(ev)) => ev.field = i,
+            _ => {}
         }
-        ev.field = i.max(0) as usize;
         self.focus_field(window, cx);
     }
 
+    /// Down or Enter on a Select control: its menu under it. False for other controls.
+    fn open_field_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((fields, i)) = self.form_fields() else { return false };
+        let Some(m) = fields.get(i).and_then(|f| field_menu(f, self.form_at.get())) else { return false };
+        self.open_menu(
+            m,
+            move |this, id, window, cx| match &mut this.form {
+                Some(f) if matches!(this.mode, Mode::Form(_)) => {
+                    if let Some(f) = f.fields.get_mut(i) {
+                        f.value = id;
+                    }
+                    cx.notify();
+                }
+                _ => {
+                    let Some(fid) = this.extv.as_ref().and_then(|e| e.view.fields.get(i)).map(|f| f.id.clone()) else { return };
+                    this.run(Act::FormSet(fid, id), None, window, cx);
+                }
+            },
+            window,
+            cx,
+        );
+        true
+    }
+
+    /// Enter on an extension's checkbox.
+    fn toggle_check(&mut self, cx: &mut Context<Self>) {
+        let Some(ev) = &mut self.extv else { return };
+        let Some(f) = ev.view.fields.get(ev.field).cloned() else { return };
+        let on = !ev.values.get(&f.id).and_then(Value::as_bool).unwrap_or(false);
+        ev.values.insert(f.id.clone(), json!(on));
+        if let Some(h) = f.on_change {
+            let run = ev.run;
+            self.send(json!({"t": "event", "run": run, "fn": h, "args": [on]}));
+        }
+        cx.notify();
+    }
+
     fn submit_form(&mut self, cx: &mut Context<Self>) {
+        if let Mode::Form(kind) = self.mode {
+            // Each form acts on these: Task 12 starts the session, Task 15 fetches the feed, Task 9 saves the set.
+            let _values = self.form.as_ref().map(|f| form_values(&f.fields));
+            match kind {
+                FormKind::Focus => {}
+                FormKind::AddCalendar => {}
+                FormKind::AddLanguageSet(_) => {}
+            }
+            return;
+        }
         let Some(ev) = &self.extv else { return };
         if let Some(f) = ev.view.actions.first().and_then(|a| a.on_action.clone()) {
             let (run, values) = (ev.run, json!(ev.values));
@@ -2556,8 +2747,9 @@ impl Launcher {
         cx.notify();
     }
 
+    /// A form is on screen: a native one, or an extension's Form.
     fn is_form(&self) -> bool {
-        self.mode == Mode::Ext && self.confirm.is_none() && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form")
+        matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.confirm.is_none() && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"))
     }
 
     // ---- actions --------------------------------------------------------------------
@@ -2575,31 +2767,14 @@ impl Launcher {
             let what = self.query(cx).trim().to_string();
             return self.install(what, cx);
         }
-        if self.is_form() {
-            let ev = self.extv.as_mut().unwrap();
-            let field = ev.view.fields.get(ev.field).cloned();
-            match field.map(|f| (f.kind.clone(), f)) {
-                Some((FieldKind::Checkbox, f)) => {
-                    let on = !ev.values.get(&f.id).and_then(Value::as_bool).unwrap_or(false);
-                    ev.values.insert(f.id.clone(), json!(on));
-                    if let Some(h) = f.on_change {
-                        let run = ev.run;
-                        self.send(json!({"t": "event", "run": run, "fn": h, "args": [on]}));
-                    }
-                    return cx.notify();
-                }
-                Some((FieldKind::Dropdown(opts), f)) => {
-                    let mut it = Item::new(&f.title, "", Icon::glyph("▾"), Act::None);
-                    it.extra = opts.into_iter().map(|(v, t)| (t, Act::FormSet(f.id.clone(), v))).collect();
-                    self.panel = Some((it, 0));
-                    return cx.notify();
-                }
-                _ => {
-                    let last = ev.view.fields.iter().rposition(|f| !matches!(f.kind, FieldKind::Description | FieldKind::Separator));
-                    if Some(ev.field) == last { self.submit_form(cx) } else { self.move_field(1, window, cx) }
-                    return;
-                }
+        if let Some((fields, i)) = self.form_fields() {
+            match fields.get(i).map(|f| &f.ctl) {
+                Some(Ctl::Select(..)) => _ = self.open_field_menu(window, cx),
+                Some(Ctl::Check) => self.toggle_check(cx),
+                _ if Some(i) == fields.iter().rposition(FormField::focusable) => self.submit_form(cx),
+                _ => self.move_field(1, window, cx),
             }
+            return;
         }
         self.sync_args(cx);
         let Some(item) = self.items.get(self.selected).cloned() else { return };
@@ -3430,6 +3605,7 @@ impl Launcher {
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
             Mode::Shots => Some("Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
+            Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -3454,6 +3630,7 @@ impl Launcher {
             Mode::Define => "Enter copies the definition".into(),
             Mode::Shots => "Search screenshots by text or name…".into(),
             Mode::Schedule => "Search events…".into(),
+            Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
@@ -3514,6 +3691,7 @@ impl Launcher {
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
             Mode::Shots => Icon::Vector(g::PICTURE),
             Mode::Schedule => Icon::Vector(g::CALENDAR),
+            Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
 
@@ -3616,72 +3794,64 @@ impl Launcher {
         true
     }
 
+    /// `.pc-form--center`: the rows centred under the bar, the selected control focused.
     fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
-        let Some(ev) = &self.extv else { return div().into_any_element() };
-        let field_box = |on: bool| design::field(on, t).w_full();
+        let Some((fields, selected)) = self.form_fields() else { return div().into_any_element() };
+        let rows = fields.into_iter().enumerate().map(|(i, f)| {
+            let on = i == selected;
+            let control = match &f.ctl {
+                Ctl::Text { placeholder, icon, tall } => match &f.input {
+                    Some(input) => {
+                        let text = text_input(SharedString::from(format!("field-{i}")))
+                            .state(input.downgrade())
+                            .placeholder(placeholder.clone())
+                            .placeholder_color(t.text_faint)
+                            .caret_color(t.accent)
+                            .w_full()
+                            .whitespace_nowrap();
+                        design::field_with_icon(on, text, *icon, t).when(*tall, |d| d.h(px(2. * design::CONTROL)).items_start().py(px(design::sp::S8))).into_any_element()
+                    }
+                    None => div().into_any_element(),
+                },
+                Ctl::Select(entries, _) => {
+                    let title = entries.iter().find(|e| e.id == f.value).map(|e| e.label.clone()).unwrap_or_default();
+                    design::field_with_icon(on, title, Some(g::CHEVRON_DOWN), t).into_any_element()
+                }
+                Ctl::Check => {
+                    let checked = f.value == "true";
+                    div()
+                        .h(px(design::CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(design::sp::S8))
+                        .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
+                        .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.label.clone()))
+                        .into_any_element()
+                }
+                Ctl::Note if f.label.is_empty() => return design::form_note(f.value.clone(), t).into_any_element(),
+                Ctl::Note => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(f.value.clone()).into_any_element(),
+                Ctl::Rule => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
+            };
+            // A menu opens under the selected control.
+            let at = self.form_at.clone();
+            let control = div().id(("form-ctl", i)).flex().flex_col().when(on, |d| d.on_prepaint(move |p, _, _| at.set(p.bounds.bottom_left() + gpui::point(px(0.), px(design::sp::S4))))).child(control);
+            let label = if matches!(f.ctl, Ctl::Check | Ctl::Rule) { SharedString::default() } else { f.label.clone() };
+            let error = f.error.clone().map(|e| div().text_size(px(design::ts::SMALL)).text_color(t.danger).child(e).into_any_element());
+            design::form_row(label, std::iter::once(control.into_any_element()).chain(error), t).into_any_element()
+        });
         div()
             .id("form")
+            .track_focus(&self.form_focus)
+            .key_context("Form")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
-            .justify_center()
-            .pt(px(24.))
-            .child(div().w(px(520.)).flex().flex_col().gap(px(12.)).children(ev.view.fields.iter().enumerate().map(|(i, f)| {
-                let on = i == ev.field;
-                let value = ev.values.get(&f.id).cloned().unwrap_or(Value::Null);
-                let control = match &f.kind {
-                    FieldKind::Text | FieldKind::Password | FieldKind::TextArea => match ev.inputs.get(&f.id) {
-                        Some(input) => field_box(on)
-                            .when(f.kind == FieldKind::TextArea, |d| d.h(px(2. * design::CONTROL)).items_start().py(px(8.)))
-                            .child(
-                                text_input(SharedString::from(format!("field-{}", f.id)))
-                                    .state(input.downgrade())
-                                    .placeholder(f.placeholder.clone())
-                                    .placeholder_color(t.text_faint)
-                                    .caret_color(t.accent)
-                                    .w_full()
-                                    .whitespace_nowrap(),
-                            )
-                            .into_any_element(),
-                        None => div().into_any_element(),
-                    },
-                    FieldKind::Checkbox => {
-                        let checked = value.as_bool().unwrap_or(false);
-                        div()
-                            .h(px(design::CONTROL))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
-                            .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.title.clone()))
-                            .into_any_element()
-                    }
-                    FieldKind::Dropdown(opts) => {
-                        let cur = value.as_str().unwrap_or_default();
-                        let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::icon(g::CHEVRON_DOWN, design::ic::SM, t.text_muted)).into_any_element()
-                    }
-                    FieldKind::Description => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
-                    FieldKind::Separator => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
-                };
-                let label = if matches!(f.kind, FieldKind::Checkbox | FieldKind::Separator) { String::new() } else { f.title.clone() };
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(12.))
-                    .child(div().w(px(120.)).flex_none().h(px(design::CONTROL)).flex().items_center().justify_end().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(label))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(control)
-                            .children(f.error.clone().map(|e| div().text_size(px(design::ts::SMALL)).text_color(t.danger).child(e))),
-                    )
-            })))
+            .flex_col()
+            .items_center()
+            .gap(px(design::sp::S12))
+            .pt(px(design::sp::S24))
+            .children(rows)
             .into_any_element()
     }
 
@@ -4080,6 +4250,7 @@ impl Render for Launcher {
         } else {
             match (&self.panel, selected_item) {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
+            _ if let Mode::Form(kind) = self.mode => format!("{}  Ctrl+↵", kind.bar().2),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
             (None, Some(it)) if self.armed == Some(self.selected) => match &it.act {
                 Act::Join(title, url) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(url).unwrap_or_default()),
@@ -4112,8 +4283,8 @@ impl Render for Launcher {
                 "ai": self.ai.as_ref().map(|a| json!({"text": a.turns.last().map_or("", |t| t.text.as_str()), "busy": a.busy, "turns": a.turns.len()})),
                 "notice": self.notice,
                 "view": view.as_ref().map(|v| &v.kind),
-                "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
-                "field": self.extv.as_ref().map(|e| e.field),
+                "fields": self.form_fields().map(|(f, _)| f.iter().map(|f| f.label.to_string()).collect::<Vec<_>>()),
+                "field": self.form_fields().map(|(_, i)| i),
                 "trays": self.trays.keys().collect::<Vec<_>>(),
                 "args": arg_values,
                 "arg_missing": self.arg_missing,
@@ -4258,7 +4429,7 @@ impl Render for Launcher {
                 let glyph = if let Icon::Vector(c) = e.icon { c } else { g::SEARCH };
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
-            (_, Some(v)) if v.kind == "Form" => self.render_form(&t),
+            _ if self.panel.is_none() && self.is_form() => self.render_form(&t),
             (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail", None),
             (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
@@ -4330,6 +4501,8 @@ impl Render for Launcher {
         // With boxes the query takes its own width (it gives way first), then the command's
         // icon and the boxes, together at most 60% of the bar.
         let (query, arg_group) = match &arg_row {
+            // A native form's bar holds only Back.
+            None if matches!(self.mode, Mode::Form(_)) => (div().flex_1().into_any_element(), None),
             None => (query_input.flex_1().into_any_element(), None),
             Some(it) => {
                 let q = Some(self.query(cx)).filter(|q| !q.is_empty()).unwrap_or_else(|| self.placeholder().to_string());
@@ -4386,6 +4559,8 @@ impl Render for Launcher {
         let keys = |label: &str, keys: &[&str]| design::shortcut(label, keys, &t).into_any_element();
         let right = if self.panel.is_some() {
             vec![keys("Run", &["↵"]), design::vdivider(&t).into_any_element(), keys("Close", &["Esc"])]
+        } else if let Mode::Form(kind) = self.mode {
+            vec![keys(kind.bar().2, &["Ctrl", "↵"])]
         } else if self.is_form() {
             vec![keys("Submit", &["Ctrl", "↵"]), design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]
         } else if self.armed == Some(self.selected) {
@@ -4486,8 +4661,12 @@ impl Render for Launcher {
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
                 }
+                // On a select Down opens its menu; elsewhere in a form it moves on.
                 if this.panel.is_none() && this.is_form() {
-                    return this.move_field(1, window, cx);
+                    if !this.open_field_menu(window, cx) {
+                        this.move_field(1, window, cx);
+                    }
+                    return;
                 }
                 if this.collapsed(cx) {
                     this.peek = true;
@@ -4546,8 +4725,8 @@ impl Render for Launcher {
             .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
             // Tab and Shift+Tab move between the query and the boxes.
             .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
-            .on_action(cx.listener(|this, _: &NextBox, window, cx| this.step_arg(1, window, cx)))
-            .on_action(cx.listener(|this, _: &PrevBox, window, cx| this.step_arg(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextBox, window, cx| if this.is_form() { this.move_field(1, window, cx) } else { this.step_arg(1, window, cx) }))
+            .on_action(cx.listener(|this, _: &PrevBox, window, cx| if this.is_form() { this.move_field(-1, window, cx) } else { this.step_arg(-1, window, cx) }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
                 if !this.menu_key(menu::Key::Esc, window, cx) && !this.dismiss_args(window, cx) {
                     this.dismiss(window, cx)
@@ -4703,6 +4882,15 @@ fn main() {
             KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
             KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
             KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+            // A form control without a text box (a select, a checkbox) holds the keys itself.
+            KeyBinding::new("tab", NextBox, Some("Form")),
+            KeyBinding::new("shift-tab", PrevBox, Some("Form")),
+            KeyBinding::new("up", SelectPrev, Some("Form")),
+            KeyBinding::new("down", SelectNext, Some("Form")),
+            KeyBinding::new("enter", Launch, Some("Form")),
+            KeyBinding::new("ctrl-enter", Submit, Some("Form")),
+            KeyBinding::new("escape", Dismiss, Some("Form")),
+            KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),
@@ -4854,6 +5042,66 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn field(label: &'static str, ctl: Ctl, value: &str) -> FormField {
+        FormField { label: label.into(), ctl, value: value.into(), input: None, error: None }
+    }
+
+    fn text(label: &'static str, value: &str) -> FormField {
+        field(label, Ctl::Text { placeholder: "".into(), icon: None, tall: false }, value)
+    }
+
+    fn entry(id: &str, label: &str) -> menu::Entry {
+        menu::Entry { id: id.into(), label: label.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn form_values_collects_text_and_picked_ids_by_label() {
+        let mode = Ctl::Select(vec![entry("block", "Block Apps & Websites"), entry("allow", "Allow Apps & Websites")], true);
+        let fields = [text("Goal", "Deep work"), field("", Ctl::Note, "a note"), field("Mode", mode, "allow"), field("", Ctl::Rule, ""), text("Duration", "")];
+        let v = form_values(&fields);
+        assert_eq!(v["Goal"], "Deep work");
+        assert_eq!(v["Mode"], "allow", "the picked id, not its label");
+        assert_eq!(v["Duration"], "");
+        assert_eq!(v.len(), 3, "notes and rules carry no value: {v:?}");
+    }
+
+    #[test]
+    fn moving_past_the_last_field_wraps_and_skips_notes() {
+        let fields = [field("", Ctl::Note, "intro"), text("Goal", ""), field("", Ctl::Rule, ""), text("Duration", ""), field("", Ctl::Note, "note")];
+        assert_eq!(next_field(&fields, 1, 1), 3, "past the rule");
+        assert_eq!(next_field(&fields, 3, 1), 1, "Tab on the last field wraps to the first");
+        assert_eq!(next_field(&fields, 1, -1), 3, "Shift+Tab on the first wraps to the last");
+        assert_eq!(next_field(&[], 0, 1), 0);
+    }
+
+    #[test]
+    fn a_select_opens_its_menu_on_the_current_value_and_a_text_field_has_none() {
+        let at = gpui::point(px(10.), px(20.));
+        let mode = field("Mode", Ctl::Select(vec![entry("block", "Block Apps & Websites"), entry("allow", "Allow Apps & Websites")], true), "allow");
+        let m = field_menu(&mode, at).expect("a select opens a menu");
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("allow"));
+        assert_eq!(m.search.as_deref(), Some("Search…"));
+        assert!(matches!(m.place, menu::Place::At(p) if p == at));
+        let plain = field("Mode", Ctl::Select(vec![entry("a", "A")], false), "");
+        assert!(field_menu(&plain, at).is_some_and(|m| m.search.is_none()), "no search field when asked for none");
+        assert!(field_menu(&text("Goal", ""), at).is_none());
+    }
+
+    #[test]
+    fn an_extension_dropdown_becomes_a_select_on_its_value() {
+        let dd = ext::Field { id: "lang".into(), kind: FieldKind::Dropdown(vec![("en".into(), "English".into()), ("de".into(), "German".into())]), title: "Language".into(), placeholder: String::new(), value: json!("en"), controlled: false, on_change: None, error: None };
+        let check = ext::Field { id: "ok".into(), kind: FieldKind::Checkbox, title: "Remember".into(), value: json!(false), ..dd.clone() };
+        let view = ext::View { kind: "Form".into(), fields: vec![dd.clone(), check.clone()], ..Default::default() };
+        let values = HashMap::from([("lang".to_string(), json!("de")), ("ok".to_string(), json!(true))]);
+        let ev = ExtView { run: 1, ext: 0, view, depth: 1, values, inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] };
+        let f = ext_field(&dd, &ev);
+        assert_eq!((f.label.as_ref(), f.value.as_str()), ("Language", "de"), "the value as last set, not the default");
+        let m = field_menu(&f, gpui::point(px(0.), px(0.))).expect("the dropdown opens the shared menu");
+        assert_eq!(m.picked().map(|e| e.label.as_str()), Some("German"));
+        let c = ext_field(&check, &ev);
+        assert!(matches!(c.ctl, Ctl::Check) && c.value == "true");
+    }
 
     #[test]
     fn translator_rows_copy_or_paste_per_action_and_end_with_the_pronunciation() {
