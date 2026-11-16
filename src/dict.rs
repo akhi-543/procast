@@ -287,13 +287,6 @@ fn download() -> Result<PathBuf, String> {
     installed
 }
 
-/// `define dog` -> "dog".
-pub fn from_query(q: &str) -> Option<String> {
-    let (cmd, word) = q.trim().split_once(char::is_whitespace)?;
-    let word = word.trim();
-    (cmd.eq_ignore_ascii_case("define") && !word.is_empty()).then(|| word.to_string())
-}
-
 /// Whether a root-search query reads as one word, so a "Define" row is worth showing.
 pub fn looks_like_word(q: &str) -> bool {
     q.chars().any(char::is_alphabetic) && q.chars().all(|c| c.is_alphabetic() || c == '\'' || c == '-')
@@ -519,13 +512,6 @@ mod tests {
         assert_eq!(swap_in(&part, &root), Ok(root.join("dict")));
         assert!(!root.join("old").exists() && !part.exists());
         assert!(WordNet::open(&locate(&root).unwrap()).unwrap().knows("dog"));
-    }
-
-    #[test]
-    fn define_queries() {
-        assert_eq!(from_query("define dog").as_deref(), Some("dog"));
-        assert_eq!(from_query("Define  ice cream ").as_deref(), Some("ice cream"));
-        assert_eq!((from_query("define"), from_query("define "), from_query("redefine dog"), from_query("dog")), (None, None, None, None));
     }
 
     #[test]

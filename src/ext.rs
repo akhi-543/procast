@@ -11,7 +11,10 @@ use std::{
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::{Value, json};
 
-use crate::win::Msg;
+use crate::{
+    search::{self, ArgKind},
+    win::Msg,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pref {
@@ -30,6 +33,8 @@ pub struct ExtCommand {
     pub mode: String,
     pub interval: Option<Duration>,
     pub prefs: Vec<Pref>,
+    /// The manifest's `arguments`, as boxes in the search bar.
+    pub args: Vec<search::Arg>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +70,25 @@ fn prefs(v: &Value) -> Vec<Pref> {
         .collect()
 }
 
+/// Raycast's command `arguments`: `{name, placeholder, type: text | password | dropdown,
+/// required, data: [{title, value}]}`.
+fn arguments(v: &Value) -> Vec<search::Arg> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let name = a["name"].as_str()?.to_string();
+            let kind = match a["type"].as_str() {
+                Some("password") => ArgKind::Secret,
+                Some("dropdown") => ArgKind::Choice(a["data"].as_array().into_iter().flatten().filter_map(|d| Some((d["value"].as_str()?.to_string(), d["title"].as_str()?.to_string()))).collect()),
+                _ => ArgKind::Text,
+            };
+            let placeholder = a["placeholder"].as_str().unwrap_or(&name).to_string();
+            Some(search::Arg { missing: format!("Type {}", placeholder.to_lowercase()), placeholder: placeholder.into(), kind, optional: !a["required"].as_bool().unwrap_or(false), ..search::Arg::new(name) })
+        })
+        .collect()
+}
+
 /// "5m", "30s", "1h", "1d" -> Duration. Raycast's minimum is 10 s.
 pub fn parse_interval(s: &str) -> Option<Duration> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
@@ -91,6 +115,7 @@ pub fn parse_manifest(dir: &Path, v: &Value) -> Option<Extension> {
                 mode: c["mode"].as_str().unwrap_or("view").into(),
                 interval: c["interval"].as_str().and_then(parse_interval),
                 prefs: prefs(&c["preferences"]),
+                args: arguments(&c["arguments"]),
             })
         })
         .collect();
@@ -772,6 +797,17 @@ mod tests {
         assert_eq!((v.kind.as_str(), v.title.as_deref(), v.items.len()), ("List", Some("3 ports"), 2));
         assert_eq!((v.items[0].section.as_deref(), v.items[0].actions[0].on_action.as_deref()), (Some("Listening"), Some("k:onAction")));
         assert_eq!(v.items[1].section.as_deref(), Some("More"));
+
+        let with_args = parse_manifest(Path::new("C:\\x"), &json!({"name": "gh", "commands": [{"name": "issue", "title": "New Issue", "arguments": [
+            {"name": "title", "placeholder": "Title", "type": "text", "required": true},
+            {"name": "token", "placeholder": "Token", "type": "password"},
+            {"name": "repo", "placeholder": "Repo", "type": "dropdown", "data": [{"title": "Procast", "value": "pc"}, {"title": "Docs", "value": "docs"}]}]}]}))
+        .unwrap();
+        let args = &with_args.commands[0].args;
+        assert_eq!(args.iter().map(|a| (a.name.as_ref(), a.placeholder.as_ref(), a.optional)).collect::<Vec<_>>(), [("title", "Title", false), ("token", "Token", true), ("repo", "Repo", true)]);
+        use crate::search::ArgKind;
+        assert_eq!((&args[0].kind, &args[1].kind), (&ArgKind::Text, &ArgKind::Secret));
+        assert_eq!(args[2].kind, ArgKind::Choice(vec![("pc".into(), "Procast".into()), ("docs".into(), "Docs".into())]));
 
         let md = markdown_lines("# Title\nSee [docs](https://x.y) and **bold**\n![img](a.png)\n- item\n```\ncode\n```");
         assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (0, "".into()), (0, "• item".into()), (9, "code".into())]);

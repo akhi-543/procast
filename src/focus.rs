@@ -414,56 +414,6 @@ impl Focus {
 
 // ---- what the launcher asks ----------------------------------------------------------
 
-/// A question sequence typed in the search bar, one answer at a time.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Ask {
-    Start,
-    Edit,
-    Category,
-    Import,
-}
-
-impl Ask {
-    pub fn title(self) -> &'static str {
-        match self {
-            Ask::Start => "Start Focus Session",
-            Ask::Edit => "Edit Focus Session",
-            Ask::Category => "Create Focus Category",
-            Ask::Import => "Import Focus Categories",
-        }
-    }
-
-    pub fn count(self) -> usize {
-        match self {
-            Ask::Start | Ask::Edit | Ask::Category => 3,
-            Ask::Import => 1,
-        }
-    }
-
-    /// What the search bar says for question `i`.
-    pub fn placeholder(self, i: usize, default_minutes: u32) -> String {
-        match (self, i) {
-            (Ask::Start | Ask::Edit, 0) => "What are you focusing on? (empty: Focus)".into(),
-            (Ask::Start | Ask::Edit, 1) => format!("Minutes, 0 for no limit (empty: {default_minutes})"),
-            (Ask::Start, _) => "Category, then allow or block (empty: block nothing)".into(),
-            (Ask::Edit, _) => "Category, then allow or block (empty: keep)".into(),
-            (Ask::Category, 0) => "Category name".into(),
-            (Ask::Category, 1) => "Apps, comma separated (e.g. discord.exe, slack.exe)".into(),
-            (Ask::Category, _) => "Websites, comma separated (e.g. reddit.com, x.com)".into(),
-            (Ask::Import, _) => "Path to a Raycast focus categories .json file".into(),
-        }
-    }
-
-    /// What question `i` starts with: when editing, the session's own answer.
-    pub fn prefill(self, i: usize, session: Option<&Session>) -> String {
-        match (self, i, session) {
-            (Ask::Edit, 0, Some(s)) => s.title.clone(),
-            (Ask::Edit, 1, Some(s)) => s.minutes.to_string(),
-            _ => String::new(),
-        }
-    }
-}
-
 /// A session as asked for. `filter` None: the third answer was empty.
 #[derive(Debug, PartialEq)]
 pub struct Start {

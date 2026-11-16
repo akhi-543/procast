@@ -302,22 +302,6 @@ pub fn run(job: &Job) -> Result<Vec<Translation>, String> {
         .unwrap_or_else(|_| Err("Translation failed".into()))
 }
 
-/// `translate hola`, `tr hola` or `tr de hola` as typed in the search bar: (targets, text).
-/// Without a code of its own the text goes to `default_to`.
-pub fn from_query(q: &str, default_to: &[String]) -> Option<(Vec<String>, String)> {
-    let (kw, rest) = q.trim().split_once(' ')?;
-    let rest = rest.trim();
-    if !(kw.eq_ignore_ascii_case("translate") || kw.eq_ignore_ascii_case("tr")) || rest.is_empty() {
-        return None;
-    }
-    if let Some((first, text)) = rest.split_once(' ')
-        && is_code(first)
-    {
-        return Some((vec![language(first)], text.trim().to_string()));
-    }
-    Some((languages(default_to), rest.to_string()))
-}
-
 const QUICK: &str = "quick translate ";
 
 /// `quick translate hola`: the text, to be translated into every target.
@@ -325,11 +309,6 @@ pub fn quick_query(q: &str) -> Option<String> {
     let q = q.trim_start();
     let head = q.get(..QUICK.len())?;
     head.eq_ignore_ascii_case(QUICK).then(|| q[QUICK.len()..].trim().to_string()).filter(|t| !t.is_empty())
-}
-
-fn is_code(word: &str) -> bool {
-    let c = language(word);
-    LANGUAGES.iter().any(|l| l.0 == c)
 }
 
 /// A `[[translate]]` command's title: its name, else "Translate to German".
@@ -435,23 +414,8 @@ mod tests {
     }
 
     #[test]
-    fn query_names_a_target_with_its_first_word() {
-        let en = v(&["en"]);
-        assert_eq!(from_query("tr de hola", &en), Some((v(&["de"]), "hola".into())));
-        assert_eq!(from_query("Translate ZH good morning", &en), Some((v(&["zh-CN"]), "good morning".into())));
-        assert_eq!(from_query("tr zh-TW hola", &en), Some((v(&["zh-TW"]), "hola".into())));
-        assert_eq!(from_query("tr hola mundo", &v(&["EN-GB", "de"])), Some((v(&["en", "de"]), "hola mundo".into())));
-        assert_eq!(from_query("translate hola", &v(&["fr"])), Some((v(&["fr"]), "hola".into())));
-        assert_eq!(from_query("tr it works", &en), Some((v(&["it"]), "works".into())), "a code word is a target");
-        assert_eq!(from_query("tr de", &en), Some((en.clone(), "de".into())), "a lone code is the text");
-        assert_eq!(from_query("tr ", &en), None);
-        assert_eq!(from_query("tree house", &en), None);
-    }
-
-    #[test]
     fn command_titles_are_not_queries() {
         for title in ["Quick Translate", "Instant Translate", "Translate"] {
-            assert_eq!(from_query(title, &v(&["en"])), None, "{title}");
             assert_eq!(quick_query(title), None, "{title}");
         }
         assert_eq!(quick_query("Quick Translate hola mundo"), Some("hola mundo".into()));

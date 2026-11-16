@@ -18,7 +18,7 @@ use nucleo_matcher::{
 
 use crate::{
     clipboard::Entry,
-    commands::{self, Cmd},
+    commands::{self, Cmd, Desk, FocusCmd},
     desktops,
     config::Config,
     design::{Tint, g},
@@ -93,6 +93,8 @@ pub enum Act {
     Define(String),
     /// Translate with Google Translate; the result opens in its own view, is copied, or pastes over the selection.
     Translate(Job),
+    /// A row's own act with its argument boxes' values (`with_args`), for the acts that take them as they are.
+    With(Box<Act>, Vec<String>),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -106,6 +108,11 @@ impl Act {
             Act::Reveal(_) => "Show in Explorer",
             Act::Run(_) | Act::Script(_) => "Run",
             Act::Ask(_) => "Ask",
+            Act::With(act, _) => act.label(),
+            Act::Cmd(Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Focus(FocusCmd::Start)) => "Start",
+            Act::Cmd(Cmd::Translate) => "Translate",
+            Act::Cmd(Cmd::Define) => "Define",
+            Act::Cmd(Cmd::Desktop(Desk::Rename)) => "Rename",
             Act::Copy(_) | Act::CopyClip(_) => "Copy",
             Act::CopyShot(_) => "Copy Image",
             Act::PasteShot(_) => "Paste Image",
@@ -160,6 +167,47 @@ impl Icon {
     }
 }
 
+/// What an argument box takes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArgKind {
+    Text,
+    /// Drawn as dots.
+    Secret,
+    /// A fixed list, (id, label), opened as a menu under the box. An empty id is a row
+    /// that cannot be picked yet.
+    Choice(Vec<(String, String)>),
+}
+
+/// One argument box in the search bar (a row has at most `MAX_ARGS`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arg {
+    pub name: SharedString,
+    pub placeholder: SharedString,
+    pub kind: ArgKind,
+    pub optional: bool,
+    /// One word only: a space moves on to the next box.
+    pub word: bool,
+    /// The help mark's tooltip; empty = no mark.
+    pub help: String,
+    /// What the action bar says when Enter finds this box empty.
+    pub missing: String,
+}
+
+impl Arg {
+    /// A required text box whose placeholder is its name.
+    pub fn new(name: impl Into<SharedString>) -> Self {
+        let name = name.into();
+        Arg { missing: format!("Type {}", name.to_lowercase()), placeholder: name.clone(), name, kind: ArgKind::Text, optional: false, word: false, help: String::new() }
+    }
+
+    fn optional(name: impl Into<SharedString>) -> Self {
+        Arg { optional: true, ..Arg::new(name) }
+    }
+}
+
+/// Raycast's limit, and what fits in the bar.
+pub const MAX_ARGS: usize = 3;
+
 #[derive(Clone)]
 pub struct Item {
     pub title: String,
@@ -185,12 +233,52 @@ pub struct Item {
     pub hidden: bool,
     /// The hue of its icon tile (what kind of thing it is).
     pub tint: Option<Tint>,
+    /// Argument boxes shown in the search bar while this row is selected.
+    pub args: Vec<Arg>,
+    /// The boxes' values as the query filled them (`prefill`).
+    pub values: Vec<String>,
+    /// Words that, typed with a space after them, name this row like its title does ("timer").
+    pub keywords: Vec<String>,
 }
 
 impl Item {
     pub fn new(title: impl Into<String>, subtitle: impl Into<String>, icon: Icon, act: Act) -> Self {
         let title = title.into();
-        Self { hay: title.clone(), title, subtitle: subtitle.into(), accessory: String::new(), section: None, icon, act, key: None, extra: vec![], fav: None, alias: String::new(), hidden: false, tint: None }
+        Self {
+            hay: title.clone(),
+            title,
+            subtitle: subtitle.into(),
+            accessory: String::new(),
+            section: None,
+            icon,
+            act,
+            key: None,
+            extra: vec![],
+            fav: None,
+            alias: String::new(),
+            hidden: false,
+            tint: None,
+            args: vec![],
+            values: vec![],
+            keywords: vec![],
+        }
+    }
+
+    /// Argument boxes (the first `MAX_ARGS`) and the keywords that jump into them.
+    pub fn boxes(mut self, mut args: Vec<Arg>, keywords: &[&str]) -> Self {
+        args.truncate(MAX_ARGS);
+        self.args = args;
+        self.keywords = keywords.iter().filter(|k| !k.is_empty()).map(|k| k.to_string()).collect();
+        self
+    }
+
+    /// "3 arguments": the row's accessory while it is not selected.
+    pub fn arg_count(&self) -> Option<String> {
+        match self.args.len() {
+            0 => None,
+            1 => Some("1 argument".into()),
+            n => Some(format!("{n} arguments")),
+        }
     }
 
     pub fn acc(mut self, accessory: impl Into<String>) -> Self {
@@ -250,6 +338,121 @@ impl Item {
             self.hay = format!("{} {words}", self.hay);
         }
         self
+    }
+}
+
+/// What follows the row's title, alias or a keyword and a space at the start of `q` ("timer 5m"
+/// gives "5m", "timer " gives ""); None when `q` does not start by naming the row.
+pub fn named<'a>(item: &Item, q: &'a str) -> Option<&'a str> {
+    let mut names: Vec<&str> = [item.title.as_str(), item.alias.as_str()].into_iter().chain(item.keywords.iter().map(String::as_str)).filter(|n| !n.is_empty()).collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    names.into_iter().find_map(|n| q.get(..n.len()).filter(|head| head.eq_ignore_ascii_case(n)).and_then(|_| q[n.len()..].strip_prefix(' ')))
+}
+
+/// The boxes' values from the rest of a query that names the row: a one-word box takes a
+/// word, a text box the rest. A list's own word leading the rest goes to that list's box
+/// when more text follows ("tr de hola"). Trailing empty boxes are left out.
+pub fn prefill(item: &Item, query: &str) -> Vec<String> {
+    let Some(rest) = named(item, query) else { return vec![] };
+    let mut rest = rest.trim();
+    let mut out = vec![String::new(); item.args.len()];
+    for (i, a) in item.args.iter().enumerate() {
+        if let ArgKind::Choice(opts) = &a.kind
+            && let Some((w, more)) = rest.split_once(' ')
+            && let Some((_, label)) = opts.iter().find(|(id, l)| !id.is_empty() && (id.eq_ignore_ascii_case(w) || l.eq_ignore_ascii_case(w)))
+        {
+            out[i] = label.clone();
+            rest = more.trim_start();
+        }
+    }
+    for (i, a) in item.args.iter().enumerate() {
+        if rest.is_empty() {
+            break;
+        }
+        match a.kind {
+            ArgKind::Choice(_) => {}
+            _ if a.word => {
+                let (w, more) = rest.split_once(' ').unwrap_or((rest, ""));
+                out[i] = w.to_string();
+                rest = more.trim_start();
+            }
+            _ => out[i] = std::mem::take(&mut rest).to_string(),
+        }
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// What Enter does with the boxes' values: the act to run, or (box, message) for the first
+/// required box that is empty or does not parse. A list's label becomes its id.
+pub fn with_args(item: &Item, values: &[String]) -> Result<Act, (usize, String)> {
+    let v: Vec<String> = item
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let v = values.get(i).map_or("", |s| s.trim());
+            match &a.kind {
+                ArgKind::Choice(opts) => opts.iter().find(|(id, l)| !id.is_empty() && (l.eq_ignore_ascii_case(v) || id.eq_ignore_ascii_case(v))).map_or(v, |o| o.0.as_str()),
+                _ => v,
+            }
+            .to_string()
+        })
+        .collect();
+    let missing = |i: usize| (i, item.args[i].missing.clone());
+    if let Some(i) = item.args.iter().zip(&v).position(|(a, v)| !a.optional && v.is_empty()) {
+        return Err(missing(i));
+    }
+    Ok(match &item.act {
+        Act::Cmd(Cmd::StartTimer) => Act::StartTimer(crate::timers::parse_duration(&v[0]).ok_or_else(|| missing(0))?.as_secs(), v[1].clone()),
+        // Empty from and to: the configured languages.
+        Act::Cmd(Cmd::Translate) => Act::Translate(Job { text: v[0].clone(), from: String::new(), to: v[1..].iter().filter(|l| !l.is_empty()).map(|l| translate::language(l)).collect(), all: false, after: After::Open }),
+        Act::Cmd(Cmd::Define) => Act::Define(v[0].clone()),
+        Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => {
+            crate::focus::parse_start(&[String::new(), v[1].clone()], &[], 0).map_err(|e| (1, e))?;
+            Act::With(Box::new(item.act.clone()), v)
+        }
+        Act::Open(url) => Act::Open(url.replace("{query}", &url_encode(&v[0]))),
+        act => Act::With(Box::new(act.clone()), v),
+    })
+}
+
+/// The row's subtitle while its boxes hold something: the values as typed, " · " between
+/// them (a secret never shows). Empty when nothing is filled.
+pub fn mirror(item: &Item, values: &[String]) -> String {
+    item.args.iter().zip(values).filter(|(a, v)| a.kind != ArgKind::Secret && !v.trim().is_empty()).map(|(_, v)| v.trim()).collect::<Vec<_>>().join(" · ")
+}
+
+/// A built-in command's boxes and the keywords that jump into them.
+fn command_args(cmd: Cmd, cfg: &Config) -> (Vec<Arg>, &'static [&'static str]) {
+    let named = || Arg { placeholder: "Type name".into(), ..Arg::new("Name") };
+    match cmd {
+        Cmd::StartTimer => (vec![Arg { word: true, missing: "Type a time: 5m, 1h30m, 1:30".into(), ..Arg::new("Duration") }, Arg::optional("Name")], &["timer", "t"]),
+        Cmd::StartStopwatch => (vec![Arg::optional("Name")], &[]),
+        Cmd::Translate => {
+            let to = ArgKind::Choice(translate::LANGUAGES.iter().map(|(code, name)| (code.to_string(), name.to_string())).collect());
+            // With the selection to fall back on, the text may stay empty.
+            let text = Arg { optional: cfg.translator.prefill_selection, missing: "Type the text to translate".into(), ..Arg::new("Text") };
+            (vec![text, Arg { kind: to, ..Arg::optional("To") }], &["translate", "tr"])
+        }
+        Cmd::Define => (vec![Arg { word: true, missing: "Type a word to define".into(), ..Arg::new("Word") }], &["define", "def"]),
+        Cmd::Focus(f @ (FocusCmd::Start | FocusCmd::Edit)) => {
+            let mut cats: Vec<(String, String)> = cfg.focus_category.iter().map(|c| (c.name.clone(), c.name.clone())).collect();
+            // ponytail: not pickable until the app picker (feature screens Task 12).
+            cats.push((String::new(), "Applications…".into()));
+            let args = vec![
+                Arg { help: "What are you focusing on?".into(), ..Arg::optional("Goal") },
+                Arg { word: true, help: format!("0 for no limit; empty: {} min", cfg.focus.default_minutes), ..Arg::optional("Minutes") },
+                Arg { kind: ArgKind::Choice(cats), help: "A category to block; add \"allow\" to allow only it".into(), ..Arg::optional("Block") },
+            ];
+            (args, if f == FocusCmd::Start { &["focus"] } else { &[] })
+        }
+        Cmd::Focus(FocusCmd::CreateCategory) => (vec![Arg { missing: "Type a name for the category".into(), ..named() }, Arg { help: "Comma separated, e.g. discord.exe, slack.exe".into(), ..Arg::optional("Apps") }, Arg { help: "Comma separated, e.g. reddit.com, x.com".into(), ..Arg::optional("Sites") }], &[]),
+        Cmd::Focus(FocusCmd::ImportCategories) => (vec![Arg { help: "A Raycast focus categories .json file".into(), missing: "Type the path to a .json file".into(), ..Arg::new("File") }], &[]),
+        Cmd::Desktop(Desk::Rename) => (vec![Arg { missing: "Type a name for the desktop".into(), ..named() }], &[]),
+        _ => (vec![], &[]),
     }
 }
 
@@ -326,7 +529,8 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         {
             continue;
         }
-        items.push(Item::new(title, cmd.subtitle(), Icon::Vector(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()));
+        let (args, keywords) = command_args(cmd, cfg);
+        items.push(Item::new(title, cmd.subtitle(), Icon::Vector(glyph), Act::Cmd(cmd)).acc("Command").keyed(cmd.key()).words(words).tinted(cmd.tint()).boxes(args, keywords));
     }
     for &(title, page, words) in crate::system::SETTINGS_PAGES {
         let it = Item::new(title, "Windows Settings", Icon::Vector(g::SETTING), Act::Open(format!("ms-settings:{page}")));
@@ -337,7 +541,8 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
     }
     for q in &cfg.quicklink {
         let mut it = if q.url.contains("{query}") {
-            let mut it = Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), Act::Fill(format!("{} ", if q.keyword.is_empty() { q.title() } else { &q.keyword })));
+            let query = Arg { missing: "Type a search query".into(), ..Arg::new("Query") };
+            let mut it = Item::new(q.title(), &q.keyword, Icon::Vector(g::LINK), Act::Open(q.url.clone())).boxes(vec![query], &[q.keyword.as_str()]);
             // The text selected in the app you came from, as the argument.
             let with_selection = Act::Open(q.url.replace("{query}", "{selection}"));
             it.extra = [(it.act.clone(), it.act.label()), (with_selection, "Open with Selected Text"), (Act::Copy(q.url.clone()), "Copy")].map(|(a, l)| (l.to_string(), a)).to_vec();
@@ -361,15 +566,17 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
     items.push(Item::new("Instant Translate", "Translator", Icon::Vector(g::LANGUAGES), Act::Translate(instant)).acc("Command").keyed("tr:Instant Translate".into()).words("translate selection selected text copy paste language").tinted(Tint::Web));
     items.push(Item::new("Quick Translate", "Translator", Icon::Vector(g::LANGUAGES), Act::Fill("quick translate ".into())).acc("Command").keyed("tr:Quick Translate".into()).words("translate all languages targets at once").tinted(Tint::Web));
     for s in &cfg.snippet {
-        items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste));
+        let args = crate::snippets::arguments(&s.text).iter().map(crate::snippets::Arg::to_arg).collect();
+        items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste).boxes(args, &[s.keyword.as_str()]));
     }
     for (i, s) in scripts.iter().enumerate() {
         let icon = s.icon.clone().map(Icon::glyph).unwrap_or(Icon::Vector(g::TERMINAL));
-        items.push(Item::new(&s.title, &s.package, icon, Act::Script(i)).acc("Script Command").keyed(format!("sc:{}", s.path)));
+        let args = s.args.iter().map(crate::scripts::Arg::to_arg).collect();
+        items.push(Item::new(&s.title, &s.package, icon, Act::Script(i)).acc("Script Command").keyed(format!("sc:{}", s.path)).boxes(args, &[]));
     }
     for (e, (ext, icon)) in exts.iter().enumerate() {
         for (c, cmd) in ext.commands.iter().enumerate() {
-            let mut it = Item::new(&cmd.title, &ext.title, icon.clone(), Act::ExtRun(e, c)).acc("Command").keyed(format!("ext:{}/{}", ext.name, cmd.name)).words(&ext.title);
+            let mut it = Item::new(&cmd.title, &ext.title, icon.clone(), Act::ExtRun(e, c)).acc("Command").keyed(format!("ext:{}/{}", ext.name, cmd.name)).words(&ext.title).boxes(cmd.args.clone(), &[]);
             it.extra = vec![("Run Command".into(), Act::ExtRun(e, c)), (format!("Uninstall {}", ext.title), Act::UninstallExt(ext.name.clone()))];
             items.push(it);
         }
@@ -473,31 +680,15 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     if let Some(cmdline) = q.strip_prefix('>').map(str::trim).filter(|c| !c.is_empty()) {
         top.push(Item::new(cmdline, "", Icon::Vector(g::TERMINAL), Act::Run(cmdline.to_string())).acc("Windows Run"));
     }
-    if let Some((kw, rest)) = q.split_once(' ')
-        && let Some(link) = cfg.quicklink.iter().find(|l| !l.keyword.is_empty() && l.keyword.eq_ignore_ascii_case(kw))
-        && !rest.trim().is_empty()
-    {
-        let url = link.url.replace("{query}", &url_encode(rest.trim()));
-        top.push(Item::new(rest.trim(), link.title(), quicklink_icon(catalog, link.title()), Act::Open(url)).acc("Quicklink").keyed(format!("ql:{}", link.title())));
+    // A row named with a space after it ("timer 5m") leads, its boxes filled from the rest.
+    let typed = catalog.iter().find(|it| !it.args.is_empty() && named(it, query.trim_start()).is_some());
+    if let Some(it) = typed {
+        top.push(Item { values: prefill(it, query.trim_start()), ..it.clone() });
     }
-    if let Some((d, label)) = crate::timers::from_query(q) {
-        let title = format!("Start a timer for {}", crate::timers::fmt_duration(d));
-        top.push(Item::new(title, label.as_str(), Icon::Vector(g::TIMER), Act::StartTimer(d.as_secs(), label.clone())).acc("Timer").tinted(Tint::System));
-    }
-    let from = translate::language(&cfg.translator.from);
-    if let Some((to, text)) = translate::from_query(q, &cfg.translator.to) {
-        let title = format!("Translate to {}", translate::names(&to));
-        let job = Job { text: text.clone(), from, to, all: false, after: After::Open };
-        top.push(Item::new(title, text.as_str(), Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Translator").tinted(Tint::Web));
-    } else if let Some(text) = translate::quick_query(q) {
+    if let Some(text) = translate::quick_query(q) {
         let to = translate::languages(&cfg.translator.to);
-        let job = Job { text: text.clone(), from, to: to.clone(), all: true, after: After::Open };
+        let job = Job { text: text.clone(), from: translate::language(&cfg.translator.from), to: to.clone(), all: true, after: After::Open };
         top.push(Item::new(format!("Translate to {}", translate::names(&to)), text.as_str(), Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Translator").tinted(Tint::Web));
-    }
-    if cfg.dictionary.enabled
-        && let Some(word) = crate::dict::from_query(q)
-    {
-        top.push(Item::new(format!("Define \"{word}\""), "", Icon::Vector(g::BOOK_OPEN), Act::Define(word)).acc("Dictionary").tinted(Tint::Web));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
@@ -533,7 +724,8 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
     let aliased: Vec<&Item> = catalog.iter().filter(|it| !it.alias.is_empty() && it.alias.eq_ignore_ascii_case(q)).collect();
     top.splice(0..0, aliased.iter().map(|it| (*it).clone()));
     let room = max.saturating_sub(top.len() + fallbacks.len());
-    let hits = fuzzy(q, catalog.iter().filter(|it| !it.hidden && !aliased.iter().any(|a| std::ptr::eq(*a, *it))), frec, matcher);
+    let shown = |it: &Item| aliased.iter().chain(&typed).any(|a| std::ptr::eq(*a, it));
+    let hits = fuzzy(q, catalog.iter().filter(|it| !it.hidden && !shown(it)), frec, matcher);
     let best = hits.first().map_or(0., |h| h.0);
     let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
     let sensitive = |(score, it): &(f64, &Item)| match cfg.launcher.sensitivity.as_str() {
@@ -749,33 +941,38 @@ mod tests {
     #[test]
     fn timer_query_offers_to_start_a_timer_first() {
         let cfg = crate::config::parse("").unwrap();
-        let r = root("timer 5m tea", &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        assert_eq!((r[0].act.clone(), r[0].subtitle.as_str()), (Act::StartTimer(300, "tea".into()), "tea"));
-        let r = root("timer soon", &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        assert!(r.iter().all(|it| !matches!(it.act, Act::StartTimer(..))));
+        let cat = catalog(&[], &[], &[], &cfg);
+        let r = root("timer 5m tea", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert_eq!(with_args(&r[0], &r[0].values), Ok(Act::StartTimer(300, "tea".into())));
+        let r = root("timer soon", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert_eq!(with_args(&r[0], &r[0].values).map_err(|e| e.0), Err(0), "not a time: Duration is missing");
     }
 
     #[test]
     fn translate_query_offers_a_translation_first() {
         let cfg = crate::config::parse("[translator]
 to = \"FR\"").unwrap();
-        let ask = |q: &str| root(q, &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        let job = |text: &str, to: &[&str]| Job { text: text.into(), from: "auto".into(), to: to.iter().map(|s| s.to_string()).collect(), all: false, after: After::Open };
+        let cat = catalog(&[], &[], &[], &cfg);
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        let job = |text: &str, to: &[&str]| Job { text: text.into(), from: String::new(), to: to.iter().map(|s| s.to_string()).collect(), all: false, after: After::Open };
         let r = ask("tr de hola mundo");
-        assert_eq!((r[0].act.clone(), r[0].title.as_str(), r[0].subtitle.as_str()), (Act::Translate(job("hola mundo", &["de"])), "Translate to German", "hola mundo"));
-        assert_eq!(ask("translate hola")[0].act, Act::Translate(job("hola", &["fr"])), "the configured target");
-        assert!(ask("tr").iter().all(|it| !matches!(it.act, Act::Translate(_))));
+        assert_eq!((r[0].act.clone(), r[0].values.clone()), (Act::Cmd(Cmd::Translate), vec!["hola mundo".to_string(), "German".into()]));
+        assert_eq!(with_args(&r[0], &r[0].values), Ok(Act::Translate(job("hola mundo", &["de"]))));
+        let r = ask("translate hola");
+        assert_eq!(with_args(&r[0], &r[0].values), Ok(Act::Translate(job("hola", &[]))), "the configured target");
+        assert!(ask("tr").iter().all(|it| it.values.is_empty()));
     }
 
     #[test]
     fn quick_translate_query_asks_for_every_target() {
         let cfg = crate::config::parse("[translator]
 to = [\"en\", \"de\"]").unwrap();
-        let ask = |q: &str| root(q, &[], &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        let job = |all| Job { text: "hola".into(), from: "auto".into(), to: vec!["en".into(), "de".into()], all, after: After::Open };
+        let cat = catalog(&[], &[], &[], &cfg);
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        let job = Job { text: "hola".into(), from: "auto".into(), to: vec!["en".into(), "de".into()], all: true, after: After::Open };
         let r = ask("quick translate hola");
-        assert_eq!((r[0].act.clone(), r[0].title.as_str()), (Act::Translate(job(true)), "Translate to English / German"));
-        assert_eq!(ask("tr hola")[0].act, Act::Translate(job(false)));
+        assert_eq!((r[0].act.clone(), r[0].title.as_str()), (Act::Translate(job), "Translate to English / German"));
+        assert_eq!(ask("tr hola")[0].values, ["hola"]);
     }
 
     #[test]
@@ -822,7 +1019,7 @@ to = \"ES\"").unwrap();
         let cfg = crate::config::parse("[search]
 fallbacks = [\"define\", \"web\"]").unwrap();
         let r = ask(&cfg, "define dog");
-        assert_eq!((r[0].act.clone(), r[0].title.as_str()), (Act::Define("dog".into()), "Define \"dog\""));
+        assert_eq!(with_args(&r[0], &r[0].values), Ok(Act::Define("dog".into())));
         let tail: Vec<_> = ask(&cfg, "dog").into_iter().filter(|it| it.section.as_deref() == Some("Use \"dog\" with")).map(|it| it.act).collect();
         assert_eq!(tail[0], Act::Define("dog".into()), "first, in the configured order");
         assert!(ask(&cfg, "dog food").iter().all(|it| !matches!(it.act, Act::Define(_))), "one word only");
@@ -907,9 +1104,11 @@ fallbacks = [\"define\"]").unwrap();
         calculate("9^9^9^9");
         assert!(t.elapsed() < Duration::from_millis(500), "calculator must be time-boxed");
 
-        assert_eq!(root("gh rust gpui", &cat, &cfg, &frec, &mut m)[0].act, Act::Open("https://github.com/search?q=rust%20gpui".into()));
+        let gh = &root("gh rust gpui", &cat, &cfg, &frec, &mut m)[0];
+        assert_eq!(with_args(gh, &gh.values), Ok(Act::Open("https://github.com/search?q=rust%20gpui".into())));
         // A quicklink found by name asks for its argument.
-        assert_eq!(root("github", &cat, &cfg, &frec, &mut m)[0].act, Act::Fill("gh ".into()));
+        let gh = &root("github", &cat, &cfg, &frec, &mut m)[0];
+        assert_eq!((gh.args.len(), with_args(gh, &[]).map_err(|e| e.0)), (1, Err(0)));
         assert_eq!(root("> cmd /k dir", &cat, &cfg, &frec, &mut m)[0].act, Act::Run("cmd /k dir".into()));
         assert_eq!(root(";sig", &cat, &cfg, &frec, &mut m)[0].title, "Signature");
 
@@ -1033,6 +1232,77 @@ fallbacks = [\"define\"]").unwrap();
         assert_eq!(clip_kind("#7c6cff").1, "Colour");
         assert_eq!(clip_kind(r"C:\Users\me").1, "Path");
         assert_eq!(clip_kind("me@example.com").1, "Email");
+    }
+
+    fn strings<const N: usize>(v: [&str; N]) -> Vec<String> {
+        v.map(String::from).to_vec()
+    }
+
+    #[test]
+    fn argument_boxes_fill_from_the_query() {
+        let cat = catalog(&[], &[], &[], &Config::default());
+        let cmd = |c: Cmd| cat.iter().find(|it| it.act == Act::Cmd(c)).unwrap();
+        let timer = cmd(Cmd::StartTimer);
+        assert_eq!(prefill(timer, "timer 25m tea"), ["25m", "tea"]);
+        assert_eq!(prefill(timer, "t 90"), ["90"]);
+        assert_eq!(prefill(timer, "timer 1:30"), ["1:30"]);
+        assert_eq!(prefill(timer, "Start Timer 5m"), ["5m"], "the command's name works too");
+        assert!(prefill(timer, "timer").is_empty() && prefill(timer, "timers 5m").is_empty());
+        let tr = cmd(Cmd::Translate);
+        assert_eq!(prefill(tr, "translate guten Morgen"), ["guten Morgen"]);
+        assert_eq!(prefill(tr, "tr de hola mundo"), ["hola mundo", "German"], "a language code leading the text picks To");
+        assert_eq!(prefill(tr, "tr de"), ["de"], "a lone code is the text");
+        assert_eq!(prefill(cmd(Cmd::Define), "def dog"), ["dog"]);
+    }
+
+    #[test]
+    fn with_args_runs_only_when_the_required_boxes_are_filled() {
+        let cat = catalog(&[], &[], &[], &Config::default());
+        let cmd = |c: Cmd| cat.iter().find(|it| it.act == Act::Cmd(c)).unwrap();
+        let timer = cmd(Cmd::StartTimer);
+        assert_eq!(with_args(timer, &[]), Err((0, "Type a time: 5m, 1h30m, 1:30".to_string())));
+        assert_eq!(with_args(timer, &strings(["soon"])), Err((0, "Type a time: 5m, 1h30m, 1:30".to_string())), "not a time");
+        assert_eq!(with_args(timer, &strings(["25m", "tea"])), Ok(Act::StartTimer(1500, "tea".into())));
+        let tr = cmd(Cmd::Translate);
+        assert_eq!(with_args(tr, &strings(["", "German"])), Err((0, "Type the text to translate".to_string())));
+        let Ok(Act::Translate(job)) = with_args(tr, &strings(["hallo", "German"])) else { panic!("a translation") };
+        assert_eq!((job.text.as_str(), job.to.as_slice()), ("hallo", &["de".to_string()][..]));
+        let Ok(Act::Translate(job)) = with_args(tr, &strings(["hallo"])) else { panic!("a translation") };
+        assert!(job.to.is_empty() && job.from.is_empty(), "empty: the configured languages");
+        assert_eq!(with_args(cmd(Cmd::Define), &strings([" dog "])), Ok(Act::Define("dog".into())));
+        let focus = cmd(Cmd::Focus(crate::commands::FocusCmd::Start));
+        assert_eq!(with_args(focus, &[]), Ok(Act::With(Box::new(focus.act.clone()), strings(["", "", ""]))), "all optional");
+        assert_eq!(with_args(focus, &strings(["Read", "soon"])).map_err(|e| e.0), Err(1), "Minutes is checked");
+    }
+
+    #[test]
+    fn argument_rows_mirror_their_values_and_count_their_boxes() {
+        let cat = catalog(&[], &[], &[], &Config::default());
+        let cmd = |c: Cmd| cat.iter().find(|it| it.act == Act::Cmd(c)).unwrap();
+        let focus = cmd(Cmd::Focus(crate::commands::FocusCmd::Start));
+        assert_eq!(mirror(cmd(Cmd::StartTimer), &strings(["25m", "tea"])), "25m · tea");
+        assert_eq!(mirror(focus, &strings(["Deep work", "50", ""])), "Deep work · 50");
+        assert_eq!(mirror(focus, &[]), "");
+        assert_eq!(focus.arg_count().as_deref(), Some("3 arguments"));
+        assert_eq!(cmd(Cmd::StartStopwatch).arg_count().as_deref(), Some("1 argument"));
+        assert_eq!(cmd(Cmd::Settings).arg_count(), None);
+        let secret = Item { args: vec![Arg { kind: ArgKind::Secret, ..Arg::new("Token") }], ..Item::new("Log In", "", Icon::glyph("•"), Act::None) };
+        assert_eq!(mirror(&secret, &strings(["hunter2"])), "", "a secret is never shown");
+    }
+
+    #[test]
+    fn a_command_named_with_a_space_leads_root_search_with_its_boxes_filled() {
+        let cfg = Config::default();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        let r = ask("timer 25m tea");
+        assert_eq!((r[0].title.as_str(), r[0].values.clone()), ("Start Timer", strings(["25m", "tea"])));
+        assert_eq!(r.iter().filter(|it| it.title == "Start Timer").count(), 1);
+        assert_eq!(ask("timer ")[0].title, "Start Timer", "the space typed after the keyword");
+        assert_eq!(ask("define dog")[0].values, strings(["dog"]));
+        for it in &cat {
+            assert!(it.args.len() <= 3, "{}", it.title);
+        }
     }
 
     #[test]

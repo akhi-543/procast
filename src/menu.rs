@@ -20,6 +20,8 @@ pub struct Entry {
 pub enum Place {
     /// `POP_RIGHT_W` wide, `sp::S12` from the right, `POP_RIGHT_TOP` down: under the bar's Dropdown.
     Right,
+    /// `POP_RIGHT_W` wide, `POP_RIGHT_TOP` down, its left edge here: under a list argument box.
+    Under(gpui::Pixels),
 }
 
 pub struct Menu {

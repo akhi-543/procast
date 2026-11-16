@@ -146,6 +146,19 @@ pub mod sp {
 pub const POP_RIGHT_W: f32 = 290.;
 pub const POP_RIGHT_TOP: f32 = 50.;
 
+/// `.pc-arg`: an argument box's width grows with its text between these.
+pub const ARG_MIN: f32 = 72.;
+pub const ARG_MAX: f32 = 200.;
+
+/// The width of the focus ring around a field (and the missing ring around an argument box).
+const RING: f32 = 2.;
+
+/// `color-mix` shares: how much of a colour a wash keeps.
+pub mod mix {
+    /// `.pc-arg.is-missing`: the danger ring.
+    pub const MISSING_RING: f32 = 0.32;
+}
+
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
 /// glance: window moves are teal, system actions amber, clipboard blue, and so on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,6 +353,7 @@ names! {
     LIST_CHECKS = "list-checks",
     LIST_PLUS = "list-plus",
     IMPORT = "import",
+    CIRCLE_HELP = "circle-help",
 }
 
 #[derive(Clone, Copy)]
@@ -525,7 +539,7 @@ fn shadow(x: f32, y: f32, blur: f32, spread: f32, hex: u32) -> BoxShadow {
 /// stays solid. gpui's ring, not a spread shadow: a shadow fills the whole rect under a
 /// see-through control.
 fn focus_ring(el: Div, color: Hsla) -> Div {
-    el.ring(px(2.)).ring_color(alpha(color, 0.32))
+    el.ring(px(RING)).ring_color(alpha(color, 0.32))
 }
 
 /// The deep, close shadow of an ActionPanel or Dialog.
@@ -1256,6 +1270,79 @@ pub fn pop_menu(
     let layer = div().id("pop-layer").absolute().inset_0().flex().flex_col().pb(px(sp::S12)).occlude().on_mouse_down(gpui::MouseButton::Left, on_outside);
     match m.place {
         Place::Right => layer.items_end().pt(px(POP_RIGHT_TOP)).pr(px(sp::S12)).child(pop.w(px(POP_RIGHT_W))),
+        Place::Under(left) => layer.items_start().pt(px(POP_RIGHT_TOP)).pl(left).child(pop.w(px(POP_RIGHT_W))),
+    }
+}
+
+/// How wide `text` draws in Space Grotesk at `size` (scaled).
+pub fn text_width(text: &str, size: f32, window: &Window) -> Pixels {
+    let run = gpui::TextRun { len: text.len(), font: gpui::font(FONT_UI), color: Hsla::default(), background_color: None, underline: None, strikethrough: None, letter_spacing: None };
+    window.text_system().shape_line(text.to_string().into(), px(size), &[run]).width
+}
+
+/// An argument box's look: `width` from `arg_width`; the "optional" tag while it is empty and
+/// optional; the help mark's tooltip; `dots` drawn over a secret's (transparent) text.
+pub struct ArgBox {
+    pub width: Pixels,
+    pub tag: bool,
+    pub help: Option<SharedString>,
+    pub dots: Option<String>,
+    pub focused: bool,
+    pub missing: bool,
+}
+
+/// `.pc-arg`'s width for `text` (its value, or its placeholder while empty): the text, the
+/// padding, the tag and the help mark, kept between `ARG_MIN` and `ARG_MAX` (past that the
+/// input scrolls).
+pub fn arg_width(text: &str, tag: bool, help: bool, window: &Window) -> Pixels {
+    // The 1 px border on each side, and room for the caret.
+    let mut w = text_width(text, ts::BODY, window) + px(2. * sp::S8 + 2. + sp::S2);
+    if tag {
+        w += text_width("optional", ts::CAPTION, window) + px(2. * sp::S4 + sp::S4);
+    }
+    if help {
+        w += px(ic::SM + sp::S4);
+    }
+    w.clamp(px(ARG_MIN), px(ARG_MAX))
+}
+
+/// `.pc-arg`: an argument box in the search bar around its `input`. Focused: the accent border
+/// and ring; missing: the danger border and a `mix::MISSING_RING` danger ring.
+pub fn arg_box(i: usize, input: impl IntoElement, b: ArgBox, t: &Tokens) -> gpui::Stateful<Div> {
+    let tip = *t;
+    let tag = div().flex_none().px(px(sp::S4)).rounded(px(r::XS)).bg(t.surface).text_size(px(ts::CAPTION)).text_color(t.text_faint).child("optional");
+    let help = b.help.map(|h| div().id(("arg-help", i)).flex_none().flex().child(icon(g::CIRCLE_HELP, ic::SM, t.text_faint)).tooltip(move |_, cx| cx.new(|_| Tip(h.clone(), tip)).into()));
+    let dots = b.dots.map(|d| div().absolute().left(px(sp::S8)).top_0().bottom_0().flex().items_center().text_color(t.text).child(d));
+    div()
+        .relative()
+        .flex_none()
+        .w(b.width)
+        .h(px(CONTROL))
+        .px(px(sp::S8))
+        .flex()
+        .items_center()
+        .gap(px(sp::S4))
+        .overflow_hidden()
+        .rounded(px(r::SM))
+        .bg(t.surface)
+        .border_1()
+        .border_color(if b.missing { t.danger } else if b.focused { t.accent } else { t.border })
+        .map(|d| if b.missing { d.ring(px(RING)).ring_color(alpha(t.danger, mix::MISSING_RING)) } else if b.focused { focus_ring(d, t.accent) } else { d })
+        .text_size(px(ts::BODY))
+        .text_color(t.text)
+        .child(div().flex_1().min_w_0().child(input))
+        .children(dots)
+        .when(b.tag, |d| d.child(tag))
+        .children(help)
+        .id(("arg", i))
+}
+
+/// A help mark's tooltip: its text on `bg_elevated`.
+struct Tip(SharedString, Tokens);
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        elevated(&self.1).rounded(px(r::SM)).px(px(sp::S8)).py(px(sp::S4)).font_family(FONT_UI).text_size(px(ts::SMALL)).child(self.0.clone())
     }
 }
 

@@ -52,16 +52,6 @@ pub fn fmt_duration(d: Duration) -> String {
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
-/// `timer 5m tea` as typed in the search bar: the duration and the label ("tea", maybe empty).
-pub fn from_query(q: &str) -> Option<(Duration, String)> {
-    let (kw, rest) = q.trim().split_once(' ')?;
-    if !kw.eq_ignore_ascii_case("timer") {
-        return None;
-    }
-    let (time, label) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
-    Some((parse_duration(time)?, label.trim().to_string()))
-}
-
 /// The system "ding"; silent when there is no sound device.
 pub fn beep() {
     unsafe { _ = MessageBeep(MB_OK) };
@@ -113,8 +103,8 @@ impl Timers {
         self.add(label, Some(d.as_millis() as u64))
     }
 
-    pub fn stopwatch(&mut self) -> u64 {
-        self.add(String::new(), None)
+    pub fn stopwatch(&mut self, label: String) -> u64 {
+        self.add(label, None)
     }
 
     pub fn cancel(&mut self, id: u64) {
@@ -197,16 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn the_search_bar_form_splits_duration_from_label() {
-        assert_eq!(from_query("timer 5m tea"), Some((Duration::from_secs(300), "tea".into())));
-        assert_eq!(from_query("Timer 90 big  pot "), Some((Duration::from_secs(90), "big  pot".into())));
-        assert_eq!(from_query("timer 1:30"), Some((Duration::from_secs(90), String::new())));
-        assert_eq!(from_query("timer"), None);
-        assert_eq!(from_query("timer soon"), None);
-        assert_eq!(from_query("alarm 5m"), None);
-    }
-
-    #[test]
     fn durations_show_as_clock_time() {
         assert_eq!(fmt_duration(Duration::from_secs(272)), "4:32");
         assert_eq!(fmt_duration(Duration::from_secs(3904)), "1:05:04");
@@ -216,7 +196,7 @@ mod tests {
     fn a_timer_is_due_once_and_a_stopwatch_never() {
         let mut t = Timers::default();
         let tea = t.start("tea".into(), Duration::from_secs(60));
-        let watch = t.stopwatch();
+        let watch = t.stopwatch(String::new());
         let now = SystemTime::now();
         assert!(t.due(now).is_empty());
         let later = now + Duration::from_secs(61);
@@ -267,11 +247,11 @@ mod tests {
     fn timers_survive_a_restart() {
         let path = std::env::temp_dir().join(format!("procast-timers-test-{}.json", std::process::id()));
         let mut t = Timers::load(path.clone());
-        let (a, b) = (t.start("tea".into(), Duration::from_secs(300)), t.stopwatch());
+        let (a, b) = (t.start("tea".into(), Duration::from_secs(300)), t.stopwatch(String::new()));
         let mut back = Timers::load(path.clone());
         assert_eq!(back.items, t.items);
         // Ids go on from where they were.
-        assert!(back.stopwatch() > b.max(a));
+        assert!(back.stopwatch(String::new()) > b.max(a));
         let _ = fs::remove_file(path);
     }
 }

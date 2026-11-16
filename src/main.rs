@@ -33,6 +33,7 @@ mod translate;
 mod win;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::PathBuf,
@@ -77,10 +78,13 @@ use win::{BINDS, Bind, Msg, TrayCmd};
 actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
 // Left and Right in the emoji grid (the search bar keeps them elsewhere).
 actions!(procast, [SelectLeft, SelectRight]);
+// Tab and Shift+Tab while argument boxes show.
+actions!(procast, [NextBox, PrevBox]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
 use design::{BAR, FOOTER, LIST_PAD, ROW};
+use search::MAX_ARGS;
 
 fn window_height(cfg: &Config) -> f32 {
     // The window's 1 px border top and bottom, the bar, whole rows (results plus a section
@@ -120,7 +124,8 @@ enum Mode {
     Clipboard,
     Emoji,
     Files,
-    /// Collecting script or snippet arguments (see `Launcher::pending`).
+    /// One command row with its argument boxes focused (see `Launcher::args_row`): a hotkey,
+    /// a snippet keyword typed in an app, or a command run from elsewhere.
     Args,
     /// Showing a script's output (see `Launcher::output`).
     Output,
@@ -235,18 +240,6 @@ fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(Str
     let mut it = Item::new(title, hint, Icon::Vector(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
     it.extra = actions;
     it
-}
-
-/// Something waiting for its arguments, typed one at a time in the search bar.
-enum Pending {
-    /// A script (index) and what it has so far.
-    Script(usize, Vec<String>),
-    /// A snippet with `{argument}`s; `erase` and `then` as in `snippets::Job` (typed keywords).
-    Snippet { name: String, template: String, args: Vec<snippets::Arg>, got: Vec<String>, erase: usize, then: String },
-    /// The name for the current virtual desktop.
-    RenameDesktop,
-    /// A Focus question sequence and the answers so far.
-    Focus(focus::Ask, Vec<String>),
 }
 
 /// Hook settings: Hyper, double tap, and the snippet keywords and emoji shortcodes typed anywhere.
@@ -364,7 +357,20 @@ struct Launcher {
     menu_input: Entity<EditableTextState>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
-    pending: Option<Pending>,
+    /// The selected row's argument boxes (`arg_row`, at most `MAX_ARGS` show), and that row's key.
+    args: Vec<Entity<EditableTextState>>,
+    args_for: Option<String>,
+    /// The box Enter found empty; it rings in danger until it is typed in.
+    arg_missing: Option<usize>,
+    /// By row key, this visit: the query values the boxes were last filled from, and what they hold.
+    arg_memory: HashMap<String, (Vec<String>, Vec<String>)>,
+    /// Each box's left edge as last drawn: a list opens under it.
+    arg_left: Rc<[Cell<gpui::Pixels>; MAX_ARGS]>,
+    /// Mode::Args: its one row, and for a snippet keyword typed in an app, what to erase and type after.
+    args_row: Option<Item>,
+    typed: (usize, String),
+    /// The query before its last change: a space typed after a command's name jumps into its boxes.
+    last_query: String,
     /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
     clip_images: HashMap<String, Option<Arc<RenderImage>>>,
     /// File Search detail pane: the selected file's information (read when the selection
@@ -420,8 +426,9 @@ impl Launcher {
     fn new(cfg: Config, notice: Option<String>, tx: UnboundedSender<Msg>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
-        let subs = vec![
-            cx.subscribe(&input, |this, _, _: &TextChanged, cx| this.query_changed(cx)),
+        let args: Vec<_> = (0..MAX_ARGS).map(|_| cx.new(|cx| EditableTextState::new(StringStorage::default(), cx))).collect();
+        let mut subs = vec![
+            cx.subscribe_in(&input, window, |this, _, _: &TextChanged, window, cx| this.query_changed(window, cx)),
             cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
                 if let Some(open) = &mut this.menu {
                     open.menu.set_filter(input.read(cx).as_str());
@@ -434,6 +441,9 @@ impl Launcher {
                 }
             }),
         ];
+        for (i, a) in args.iter().enumerate() {
+            subs.push(cx.subscribe_in(a, window, move |this, _, _: &TextChanged, window, cx| this.arg_changed(i, window, cx)));
+        }
         clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
         clipboard::watch(tx.clone());
         for (dir, recursive) in win::app_dirs() {
@@ -493,7 +503,14 @@ impl Launcher {
             menu: None,
             menu_input,
             armed: None,
-            pending: None,
+            args,
+            args_for: None,
+            arg_missing: None,
+            arg_memory: HashMap::new(),
+            arg_left: Rc::new(std::array::from_fn(|_| Cell::new(gpui::px(0.)))),
+            args_row: None,
+            typed: (0, String::new()),
+            last_query: String::new(),
             clip_images: HashMap::new(),
             file_info: None,
             file_images: HashMap::new(),
@@ -609,11 +626,151 @@ impl Launcher {
         cx.notify();
     }
 
-    fn query_changed(&mut self, cx: &mut Context<Self>) {
+    fn query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let q = self.query(cx);
+        let space_typed = q.strip_suffix(' ') == Some(self.last_query.as_str());
+        self.last_query = q.clone();
         self.panel = None;
         self.send_search(cx);
         self.selected = 0;
         self.refresh(cx);
+        if space_typed && self.arg_row().is_some_and(|it| search::named(it, q.trim_start()) == Some("")) {
+            self.focus_arg(0, window, cx);
+        }
+    }
+
+    // ---- argument boxes (the decisions are in search.rs) ----------------------------
+
+    /// The row whose boxes show: the selected one in root search (or Mode::Args), when it has arguments.
+    fn arg_row(&self) -> Option<&Item> {
+        matches!(self.mode, Mode::Root | Mode::Args).then(|| self.items.get(self.selected)).flatten().filter(|it| !it.args.is_empty())
+    }
+
+    fn arg_values(&self, cx: &App) -> Vec<String> {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        self.args[..n].iter().map(|a| a.read(cx).as_str().to_string()).collect()
+    }
+
+    /// The box with keyboard focus, if one shows.
+    fn arg_focused(&self, window: &Window, cx: &App) -> Option<usize> {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        self.args[..n].iter().position(|a| a.focus_handle(cx).is_focused(window))
+    }
+
+    fn focus_arg(&self, i: usize, window: &mut Window, cx: &mut App) {
+        window.focus(&self.args[i].focus_handle(cx), cx);
+    }
+
+    /// Fills the boxes when another row is selected or the query fills them anew: a new query
+    /// value wins, else what this row's boxes held earlier in the visit.
+    fn sync_args(&mut self, cx: &mut Context<Self>) {
+        let Some(it) = self.arg_row() else {
+            self.args_for = None;
+            return;
+        };
+        let key = it.key.clone().unwrap_or_else(|| it.title.clone());
+        let seed = it.values.clone();
+        let kept = self.arg_memory.get(&key).filter(|(s, _)| *s == seed).map(|m| m.1.clone());
+        if self.args_for.as_ref() == Some(&key) && kept.is_some() {
+            return;
+        }
+        let values = kept.unwrap_or_else(|| seed.clone());
+        self.arg_memory.insert(key.clone(), (seed, values.clone()));
+        self.args_for = Some(key);
+        self.arg_missing = None;
+        for (i, a) in self.args.iter().enumerate() {
+            let v = values.get(i).cloned().unwrap_or_default();
+            a.update(cx, |s, cx| s.emplace(&v, cx));
+        }
+    }
+
+    /// Box `i` changed: it is no longer missing, a space in a one-word box moves on, and the
+    /// row remembers the values.
+    fn arg_changed(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(arg) = self.arg_row().and_then(|it| it.args.get(i)).cloned() else { return };
+        if self.arg_missing == Some(i) {
+            self.arg_missing = None;
+            self.status = None;
+        }
+        let text = self.args[i].read(cx).as_str().to_string();
+        if arg.word
+            && let Some((w, rest)) = text.split_once(' ')
+        {
+            let (w, rest) = (w.to_string(), rest.trim().to_string());
+            self.args[i].update(cx, |s, cx| s.emplace(&w, cx));
+            if i + 1 < self.arg_row().map_or(0, |it| it.args.len()) {
+                if !rest.is_empty() {
+                    self.args[i + 1].update(cx, |s, cx| s.emplace(&rest, cx));
+                }
+                self.focus_arg(i + 1, window, cx);
+            }
+            return;
+        }
+        let values = self.arg_values(cx);
+        if let Some(m) = self.args_for.as_ref().and_then(|k| self.arg_memory.get_mut(k)) {
+            m.1 = values;
+        }
+        cx.notify();
+    }
+
+    /// Tab (+1) and Shift+Tab (-1) while boxes show: from the query into box 0, box to box,
+    /// from box 0 back to the query. Never to another row.
+    fn step_arg(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        match (self.arg_focused(window, cx), d) {
+            _ if self.menu.is_some() => {}
+            (None, 1) => self.focus_arg(0, window, cx),
+            (Some(0), -1) => window.focus(&self.input.focus_handle(cx), cx),
+            (Some(i), 1) if i + 1 < n => self.focus_arg(i + 1, window, cx),
+            (Some(i), -1) => self.focus_arg(i - 1, window, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Down on a list box, or a click on it: its menu with a search field, under the box.
+    /// Typing goes to that field, never to the query behind it.
+    fn open_choice(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search::ArgKind::Choice(opts)) = self.arg_row().and_then(|it| it.args.get(i)).map(|a| a.kind.clone()) else { return };
+        let cur = self.args[i].read(cx).as_str().trim().to_string();
+        let entries = opts
+            .iter()
+            .enumerate()
+            .map(|(k, (id, label))| menu::Entry { id: label.clone(), label: label.clone(), off: id.is_empty(), rule_after: opts.get(k + 1).is_some_and(|n| n.0.is_empty()), ..Default::default() })
+            .collect();
+        // Kept inside the window on the right.
+        let room = window.viewport_size().width - px(design::POP_RIGHT_W + design::sp::S12);
+        let left = self.arg_left[i].get();
+        let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Under(if left > room { room } else { left }));
+        m.selected = opts.iter().position(|o| o.1.eq_ignore_ascii_case(&cur)).unwrap_or(m.selected);
+        self.focus_arg(i, window, cx);
+        self.open_menu(m, move |this, label, _, cx| this.args[i].update(cx, |s, cx| s.emplace(&label, cx)), window, cx);
+    }
+
+    /// Opens `it` alone with its boxes, box 0 focused (Mode::Args).
+    fn ask_args(&mut self, it: Item, window: &mut Window, cx: &mut Context<Self>) {
+        self.args_row = Some(it);
+        if self.visible {
+            self.set_mode(Mode::Args, cx);
+        } else {
+            self.show(Mode::Args, window, cx);
+        }
+        self.focus_arg(0, window, cx);
+    }
+
+    /// When `act` is a row with arguments run without their values (a hotkey, a favourite,
+    /// another command), asks for them in Mode::Args and says true.
+    fn ask_args_for(&mut self, act: &Act, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(mut it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()).cloned() else { return false };
+        if *act == Act::Cmd(Cmd::Focus(FocusCmd::Edit)) {
+            let Some(s) = &self.focus.session else {
+                self.say(false, "No Focus session is running".into());
+                return true;
+            };
+            it.values = vec![s.title.clone(), s.minutes.to_string()];
+        }
+        self.ask_args(it, window, cx);
+        true
     }
 
     /// Passes the search text to an extension that filters itself, once per change. Also
@@ -805,20 +962,7 @@ impl Launcher {
                     std::mem::take(&mut self.items)
                 }
             }
-            Mode::Args => match &self.pending {
-                Some(Pending::Script(i, got)) => {
-                    let s = &self.scripts[*i];
-                    let n = s.args.len();
-                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::TERMINAL), Act::Script(*i))]
-                }
-                Some(Pending::Snippet { name, template, args, got, .. }) => {
-                    let sub = format!("{} · {} of {}", args[got.len()].name, got.len() + 1, args.len());
-                    vec![Item::new(format!("Paste {name}"), sub, Icon::Vector(g::EDIT), Act::Snippet(template.clone()))]
-                }
-                Some(Pending::RenameDesktop) => vec![Item::new("Rename Desktop", "Name for the current desktop", Icon::Vector(g::EDIT), Act::Cmd(Cmd::Desktop(Desk::Rename)))],
-                Some(Pending::Focus(ask, got)) => vec![Item::new(ask.title(), format!("question {} of {}", got.len() + 1, ask.count()), Icon::Vector(g::SHIELD), Act::Cmd(Cmd::Focus(FocusCmd::Start)))],
-                None => vec![],
-            },
+            Mode::Args => self.args_row.iter().cloned().collect(),
             // Typed text is the next question; with an empty bar, Enter copies the answer.
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
@@ -968,7 +1112,10 @@ impl Launcher {
             self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
         }
         let _ = max;
-        self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
+        // A command named with a space after it is selected, so its boxes show.
+        let named = (self.mode == Mode::Root).then(|| self.items.iter().position(|it| !it.args.is_empty() && search::named(it, query.trim_start()).is_some())).flatten();
+        self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { named.unwrap_or(0) };
+        self.sync_args(cx);
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
@@ -1143,15 +1290,6 @@ impl Launcher {
         text
     }
 
-    fn ask_focus(&mut self, ask: focus::Ask, cx: &mut Context<Self>) {
-        self.pending = Some(Pending::Focus(ask, vec![]));
-        self.set_mode(Mode::Args, cx);
-        let fill = ask.prefill(0, self.focus.session.as_ref());
-        if !fill.is_empty() {
-            self.input.update(cx, |s, cx| s.emplace(&fill, cx));
-        }
-    }
-
     /// Adds categories to config.toml (the config reload applies them within a couple of seconds).
     fn focus_save_categories(&self, cats: &[config::FocusCategory]) -> Result<String, String> {
         let text = focus::text_or_empty(std::fs::read_to_string(config::path()))?;
@@ -1164,16 +1302,17 @@ impl Launcher {
         Ok(format!("Added {n} focus categor{}", if n == 1 { "y" } else { "ies" }))
     }
 
-    /// All the answers are in: start the session or save the categories. A refusal keeps the
-    /// last question open.
-    fn finish_focus_ask(&mut self, ask: focus::Ask, mut got: Vec<String>, cx: &mut Context<Self>) {
-        let done = match ask {
-            focus::Ask::Start | focus::Ask::Edit => focus::parse_start(&got, &self.cfg.focus_category, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, ask == focus::Ask::Edit)),
-            focus::Ask::Category => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
-            focus::Ask::Import => std::fs::read_to_string(got[0].trim().trim_matches('"'))
+    /// Enter with a Focus command's boxes: start (or edit) the session, or save the categories.
+    /// A refusal keeps the boxes and says why.
+    fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, cx: &mut Context<Self>) {
+        let done = match f {
+            FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &self.cfg.focus_category, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
+            FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
+            FocusCmd::ImportCategories => std::fs::read_to_string(got[0].trim().trim_matches('"'))
                 .map_err(|e| format!("Could not read the file: {e}"))
                 .and_then(|t| focus::import(&t))
                 .and_then(|c| self.focus_save_categories(&c)),
+            _ => return,
         };
         match done {
             Ok(text) => {
@@ -1181,24 +1320,26 @@ impl Launcher {
                 self.hide(true, cx);
             }
             Err(e) => {
-                got.pop();
-                self.pending = Some(Pending::Focus(ask, got));
                 self.status = Some((Tone::Error, e));
                 cx.notify();
             }
         }
     }
 
-    fn focus_cmd(&mut self, f: FocusCmd, cx: &mut Context<Self>) {
+    fn focus_cmd(&mut self, f: FocusCmd, window: &mut Window, cx: &mut Context<Self>) {
         let now = SystemTime::now();
         let needs_session = matches!(f, FocusCmd::Pause | FocusCmd::Resume | FocusCmd::Complete | FocusCmd::Cancel | FocusCmd::Restart | FocusCmd::Edit | FocusCmd::Snooze);
         if needs_session && self.focus.session.is_none() {
             return self.say(false, "No Focus session is running".into());
         }
         match f {
-            FocusCmd::Start => return self.ask_focus(focus::Ask::Start, cx),
+            // They take arguments: `run` asks for them (Mode::Args) before they get here.
+            FocusCmd::Start | FocusCmd::Edit | FocusCmd::CreateCategory | FocusCmd::ImportCategories => return,
             FocusCmd::Toggle if self.focus.session.is_none() => {
-                let Some(last) = self.focus.preset.clone() else { return self.ask_focus(focus::Ask::Start, cx) };
+                let Some(last) = self.focus.preset.clone() else {
+                    self.ask_args_for(&Act::Cmd(Cmd::Focus(FocusCmd::Start)), window, cx);
+                    return;
+                };
                 let text = self.focus_begin(last.start(), false);
                 self.say(true, text);
                 if self.visible {
@@ -1208,9 +1349,6 @@ impl Launcher {
             }
             FocusCmd::Toggle | FocusCmd::Complete => return self.focus_end(true, cx),
             FocusCmd::Cancel => return self.focus_end(false, cx),
-            FocusCmd::Edit => return self.ask_focus(focus::Ask::Edit, cx),
-            FocusCmd::CreateCategory => return self.ask_focus(focus::Ask::Category, cx),
-            FocusCmd::ImportCategories => return self.ask_focus(focus::Ask::Import, cx),
             FocusCmd::SearchCategories => return self.input.update(cx, |s, cx| s.emplace("focus ", cx)),
             FocusCmd::Pause => self.focus.update(|s| s.pause(now)),
             FocusCmd::Resume => {
@@ -1382,6 +1520,8 @@ impl Launcher {
         self.mode = mode;
         self.panel = None;
         self.menu = None;
+        self.arg_memory.clear();
+        self.args_for = None;
         if mode == Mode::Files
             && let Some(f) = &self.files
         {
@@ -1526,13 +1666,10 @@ impl Launcher {
     /// A snippet chosen in the launcher (`erase` 0) or typed in an app: asks for its
     /// arguments first if it has any, then goes into the app.
     fn start_snippet(&mut self, name: String, template: String, erase: usize, then: String, window: &mut Window, cx: &mut Context<Self>) {
-        let args = snippets::arguments(&template);
-        if !args.is_empty() {
-            self.pending = Some(Pending::Snippet { name, template, args, got: vec![], erase, then });
-            if !self.visible {
-                self.show(Mode::Args, window, cx);
-            }
-            return self.set_mode(Mode::Args, cx);
+        let key = format!("sn:{name}");
+        if let Some(it) = self.catalog.iter().find(|it| it.key.as_ref() == Some(&key) && !it.args.is_empty()).cloned() {
+            self.typed = (erase, then);
+            return self.ask_args(it, window, cx);
         }
         self.insert_snippet(template, vec![], erase, then, cx);
     }
@@ -2217,8 +2354,11 @@ impl Launcher {
     /// Enter on the selected row (or on the highlighted Ctrl+K action).
     fn launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((item, i)) = self.panel.take() {
-            let act = item.actions().swap_remove(i).1;
-            return self.run(act, item.key.clone(), window, cx);
+            // The primary action of a row with arguments goes through its boxes, like Enter.
+            if i > 0 || item.args.is_empty() {
+                let act = item.actions().swap_remove(i).1;
+                return self.run(act, item.key.clone(), window, cx);
+            }
         }
         if self.mode == Mode::Install {
             let what = self.query(cx).trim().to_string();
@@ -2250,10 +2390,21 @@ impl Launcher {
                 }
             }
         }
+        self.sync_args(cx);
         let Some(item) = self.items.get(self.selected).cloned() else { return };
-        if self.mode == Mode::Args {
-            return self.next_argument(cx);
-        }
+        let act = if item.args.is_empty() || !matches!(self.mode, Mode::Root | Mode::Args) {
+            item.act.clone()
+        } else {
+            match search::with_args(&item, &self.arg_values(cx)) {
+                Ok(act) => act,
+                Err((i, missing)) => {
+                    self.arg_missing = Some(i);
+                    self.status = Some((Tone::Error, missing));
+                    self.focus_arg(i, window, cx);
+                    return cx.notify();
+                }
+            }
+        };
         let needs_confirm = match item.act {
             Act::Cmd(cmd) => cmd.destructive(),
             Act::Script(i) => self.scripts[i].confirm,
@@ -2264,10 +2415,13 @@ impl Launcher {
             self.armed = Some(self.selected);
             return cx.notify();
         }
-        self.run(item.act, item.key, window, cx);
+        self.run(act, item.key, window, cx);
     }
 
     fn run(&mut self, act: Act, key: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ask_args_for(&act, window, cx) {
+            return;
+        }
         let housekeeping = matches!(act, Act::Favorite(..) | Act::Hide(_));
         if let Some(key) = key.as_ref().filter(|_| !housekeeping) {
             self.frec.record(key, search::now());
@@ -2313,7 +2467,8 @@ impl Launcher {
                 let text = self.focus_begin(start, false);
                 self.say(true, text);
             }
-            Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, cx),
+            Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, window, cx),
+            Act::With(act, got) => return self.run_with(*act, got, window, cx),
             Act::Open(url) if self.cfg.search.existing_tab && key.as_deref().is_some_and(|k| k.starts_with("ql:")) && url.starts_with("http") && self.browsers.any() => {
                 win::allow_foreground();
                 if !self.browsers.ask(None, json!({"t": "open", "url": url})) {
@@ -2359,13 +2514,7 @@ impl Launcher {
                 let name = key.as_deref().and_then(|k| k.strip_prefix("sn:")).unwrap_or("snippet").to_string();
                 return self.start_snippet(name, template, 0, String::new(), window, cx);
             }
-            Act::Script(i) => {
-                if self.scripts[i].args.is_empty() {
-                    return self.start_script(i, vec![], cx);
-                }
-                self.pending = Some(Pending::Script(i, vec![]));
-                return self.set_mode(Mode::Args, cx);
-            }
+            Act::Script(i) => return self.start_script(i, vec![], cx),
             Act::Fill(text) => return self.input.update(cx, |s, cx| s.emplace(&text, cx)),
             Act::ExtRun(e, c) => return self.start_ext(e, c, false, json!({}), cx),
             Act::ExtFn(f) => {
@@ -2442,20 +2591,17 @@ impl Launcher {
                 return;
             }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
-            Act::Cmd(Cmd::Translate) if self.cfg.translator.prefill_selection => {
-                let t = &self.cfg.translator;
-                return self.translate(translate::Job { text: String::new(), from: translate::language(&t.from), to: translate::languages(&t.to), all: false, after: translate::After::Open }, cx);
+            Act::Translate(mut job) => {
+                // Translate's boxes leave the languages empty: the configured ones.
+                if job.from.is_empty() {
+                    job.from = translate::language(&self.cfg.translator.from);
+                }
+                if job.to.is_empty() {
+                    job.to = translate::languages(&self.cfg.translator.to);
+                }
+                return self.translate(job, cx);
             }
-            Act::Cmd(Cmd::Translate) => return self.input.update(cx, |s, cx| s.emplace("translate ", cx)),
-            Act::Translate(job) => return self.translate(job, cx),
             Act::Define(word) => return self.define(word, cx),
-            Act::Cmd(Cmd::Define) => return self.input.update(cx, |s, cx| s.emplace("define ", cx)),
-            Act::Cmd(Cmd::StartTimer) => return self.input.update(cx, |s, cx| s.emplace("timer ", cx)),
-            Act::Cmd(Cmd::StartStopwatch) => {
-                self.timers.stopwatch();
-                self.watch_timers();
-                let _ = self.tx.unbounded_send(Msg::Toast(true, "Stopwatch started".into()));
-            }
             Act::StartTimer(secs, label) => {
                 self.timers.start(label.clone(), Duration::from_secs(secs));
                 self.watch_timers();
@@ -2472,10 +2618,6 @@ impl Launcher {
                 });
                 self.timers.cancel(id);
                 return self.refresh(cx);
-            }
-            Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
-                self.pending = Some(Pending::RenameDesktop);
-                return self.set_mode(Mode::Args, cx);
             }
             Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
@@ -2532,6 +2674,41 @@ impl Launcher {
         // Hand focus back even when launching: a cloaked launcher that stays foreground
         // would swallow keys typed before the new app's window appears.
         self.hide(true, cx);
+    }
+
+    /// Enter on a row whose act takes its boxes' values as they are (`Act::With`).
+    fn run_with(&mut self, act: Act, got: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        match act {
+            Act::Script(i) => self.start_script(i, got, cx),
+            Act::Snippet(template) => {
+                let (erase, then) = std::mem::take(&mut self.typed);
+                self.mode = Mode::Root;
+                self.insert_snippet(template, got, erase, then, cx);
+            }
+            Act::Cmd(Cmd::Focus(f)) => self.focus_args(f, got, cx),
+            Act::Cmd(Cmd::StartStopwatch) => {
+                self.timers.stopwatch(got[0].clone());
+                self.watch_timers();
+                self.say(true, "Stopwatch started".into());
+                self.hide(true, cx);
+            }
+            Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
+                self.hide(true, cx);
+                let (tx, name) = (self.tx.clone(), got[0].clone());
+                std::thread::spawn(move || {
+                    if let Err(e) = desktops::rename(&name) {
+                        let _ = tx.unbounded_send(Msg::Toast(false, e));
+                    }
+                });
+            }
+            Act::ExtRun(e, c) => {
+                // The extension gets its arguments by name; empty ones are left out.
+                let names = self.exts.get(e).and_then(|(x, _)| x.commands.get(c)).map(|c| c.args.iter().map(|a| a.name.to_string()).collect::<Vec<_>>()).unwrap_or_default();
+                let args: serde_json::Map<String, Value> = names.into_iter().zip(got).filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n, json!(v))).collect();
+                self.start_ext(e, c, false, Value::Object(args), cx);
+            }
+            act => self.run(act, None, window, cx),
+        }
     }
 
     /// Lists running apps in the background; icons come from the cache or are read once.
@@ -2704,64 +2881,6 @@ impl Launcher {
             let ok = child.wait().is_ok_and(|s| s.success());
             let _ = tx.unbounded_send(Msg::Install(if ok { format!("Installed {what}") } else { format!("Installing {what} failed") }, Some(ok)));
         });
-    }
-
-    fn next_argument(&mut self, cx: &mut Context<Self>) {
-        let value = self.query(cx).trim().to_string();
-        match self.pending.take() {
-            None => {}
-            Some(Pending::Script(i, mut got)) => {
-                let spec = &self.scripts[i].args[got.len()];
-                if value.is_empty() && !spec.optional {
-                    self.status = Some((Tone::Error, format!("{} is required", spec.placeholder)));
-                    self.pending = Some(Pending::Script(i, got));
-                    return cx.notify();
-                }
-                got.push(value);
-                if got.len() < self.scripts[i].args.len() {
-                    self.pending = Some(Pending::Script(i, got));
-                    self.status = None;
-                    self.input.update(cx, |s, cx| s.emplace("", cx));
-                    return self.refresh(cx);
-                }
-                self.start_script(i, got, cx);
-            }
-            Some(Pending::Snippet { name, template, args, mut got, erase, then }) => {
-                got.push(value);
-                if got.len() < args.len() {
-                    self.pending = Some(Pending::Snippet { name, template, args, got, erase, then });
-                    self.input.update(cx, |s, cx| s.emplace("", cx));
-                    return self.refresh(cx);
-                }
-                self.mode = Mode::Root;
-                self.insert_snippet(template, got, erase, then, cx);
-            }
-            Some(Pending::Focus(ask, mut got)) => {
-                got.push(value);
-                if got.len() < ask.count() {
-                    let fill = ask.prefill(got.len(), self.focus.session.as_ref());
-                    self.pending = Some(Pending::Focus(ask, got));
-                    self.status = None;
-                    self.input.update(cx, |s, cx| s.emplace(&fill, cx));
-                    return self.refresh(cx);
-                }
-                self.finish_focus_ask(ask, got, cx);
-            }
-            Some(Pending::RenameDesktop) => {
-                if value.is_empty() {
-                    self.status = Some((Tone::Error, "Name is required".into()));
-                    self.pending = Some(Pending::RenameDesktop);
-                    return cx.notify();
-                }
-                self.hide(true, cx);
-                let tx = self.tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = desktops::rename(&value) {
-                        let _ = tx.unbounded_send(Msg::Toast(false, e));
-                    }
-                });
-            }
-        }
     }
 
     fn start_script(&mut self, i: usize, args: Vec<String>, cx: &mut Context<Self>) {
@@ -3041,12 +3160,7 @@ impl Launcher {
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
             Mode::Tabs => Some("Browser Tabs".into()),
-            Mode::Args => self.pending.as_ref().map(|p| match p {
-                Pending::Script(i, _) => self.scripts[*i].title.clone(),
-                Pending::Snippet { name, .. } => name.clone(),
-                Pending::RenameDesktop => "Rename Desktop".into(),
-                Pending::Focus(ask, _) => ask.title().into(),
-            }),
+            Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate => Some("Translator".into()),
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
@@ -3071,23 +3185,7 @@ impl Launcher {
             Mode::Running => "Search running apps…".into(),
             Mode::Tabs => "Search open tabs…".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
-            Mode::Args => self
-                .pending
-                .as_ref()
-                .map(|p| match p {
-                    Pending::Script(i, got) => {
-                        let a = &self.scripts[*i].args[got.len()];
-                        if a.optional { format!("{} (optional)", a.placeholder) } else { a.placeholder.clone() }
-                    }
-                    Pending::Snippet { args, got, .. } => {
-                        let a = &args[got.len()];
-                        if a.default.is_empty() { format!("{}…", a.name) } else { format!("{} (empty: {})", a.name, a.default) }
-                    }
-                    Pending::RenameDesktop => "Desktop name…".into(),
-                    Pending::Focus(ask, got) => ask.placeholder(got.len(), self.cfg.focus.default_minutes),
-                })
-                .unwrap_or_default()
-                .into(),
+            Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()).unwrap_or_default().into(),
             Mode::Output => "Enter copies the output".into(),
             Mode::Define => "Enter copies the definition".into(),
             Mode::Shots => "Search screenshots by text or name…".into(),
@@ -3143,7 +3241,8 @@ impl Launcher {
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
             Mode::Tabs => Icon::Vector(g::GLOBE),
-            Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
+            Mode::Args => self.args_row.as_ref().map_or(Icon::Vector(g::TERMINAL), |it| it.icon.clone()),
+            Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
             Mode::Translate => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
@@ -3218,16 +3317,37 @@ impl Launcher {
         } else if self.mode == Mode::Root {
             self.hide(true, cx)
         } else if self.cfg.launcher.escape == "close" {
-            self.pending = None;
+            self.args_row = None;
             self.set_mode(Mode::Root, cx);
             self.hide(true, cx);
             // Popped to root: the next open starts fresh whatever pop_to_root says.
             self.hidden_at = None;
         } else {
-            self.pending = None;
+            self.args_row = None;
             self.set_mode(Mode::Root, cx);
             window.focus(&self.input.focus_handle(cx), cx);
         }
+    }
+
+    /// Esc while boxes show: from a box back to the query, then clears the boxes. False when
+    /// neither applies, for the usual Esc.
+    fn dismiss_args(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.panel.is_some() || self.arg_row().is_none() {
+            return false;
+        }
+        if self.arg_focused(window, cx).is_some() {
+            window.focus(&self.input.focus_handle(cx), cx);
+        } else if self.arg_values(cx).iter().any(|v| !v.is_empty()) {
+            self.arg_missing = None;
+            self.status = None;
+            for a in &self.args {
+                a.update(cx, |s, cx| s.emplace("", cx));
+            }
+        } else {
+            return false;
+        }
+        cx.notify();
+        true
     }
 
     fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
@@ -3615,6 +3735,11 @@ impl Render for Launcher {
                 window.focus(&self.input.focus_handle(cx), cx);
             }
         }
+        // The same for a box whose row is no longer selected.
+        let shown = self.arg_row().map_or(0, |it| it.args.len());
+        if self.args[shown..].iter().any(|a| a.focus_handle(cx).is_focused(window)) {
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
         // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.
@@ -3627,9 +3752,17 @@ impl Render for Launcher {
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
         let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());
+        let arg_row = self.arg_row().cloned();
+        let arg_values = self.arg_values(cx);
+        let arg_focus = self.arg_focused(window, cx);
+        // While boxes show: "Next Box" from the query, then the command's verb ("Start").
+        let arg_keys = arg_row.as_ref().filter(|_| self.panel.is_none() && self.armed != Some(self.selected)).map(|it| (arg_focus.is_none(), it.act.label().split(' ').next().unwrap_or_default().to_string()));
 
         // Footer right side, also dumped for tests.
-        let footer_action = match (&self.panel, selected_item) {
+        let footer_action = if let Some((next, verb)) = &arg_keys {
+            format!("{}{verb}  ↵", if *next { "Next Box  Tab    " } else { "" })
+        } else {
+            match (&self.panel, selected_item) {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
             (None, Some(it)) if self.armed == Some(self.selected) => match &it.act {
@@ -3642,6 +3775,7 @@ impl Render for Launcher {
                 None => String::new(),
             },
             (None, None) => String::new(),
+            }
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
         dump_ui(
@@ -3665,6 +3799,8 @@ impl Render for Launcher {
                 "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
                 "field": self.extv.as_ref().map(|e| e.field),
                 "trays": self.trays.keys().collect::<Vec<_>>(),
+                "args": arg_values,
+                "arg_missing": self.arg_missing,
             }),
         );
 
@@ -3691,15 +3827,19 @@ impl Render for Launcher {
                     Some(i) => {
                         let it = &self.items[*i];
                         let hotkey = it.key.as_ref().filter(|_| root).and_then(|k| self.cfg.launcher.hotkeys.get(k)).cloned().unwrap_or_default();
+                        // A row with arguments says how many until it is selected.
                         let accessory = if root {
-                            it.alias.clone()
+                            if it.alias.is_empty() && *i != self.selected { it.arg_count().unwrap_or_default() } else { it.alias.clone() }
                         } else if it.accessory == above {
                             String::new()
                         } else {
                             above = it.accessory.clone();
                             above.clone()
                         };
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory, hotkey, icon: it.icon.clone(), tint: it.tint });
+                        // Its subtitle repeats what its boxes hold.
+                        let mirrored = search::mirror(it, if *i == self.selected && arg_row.is_some() { &arg_values } else { &it.values });
+                        let subtitle = if mirrored.is_empty() { it.subtitle.clone() } else { mirrored };
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint });
                     }
                 }
             }
@@ -3851,21 +3991,55 @@ impl Render for Launcher {
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
-        let search_bar = design::search_bar(
-            leading,
-            text_input("query")
-                .state(self.input.downgrade())
-                .placeholder(self.placeholder())
-                .placeholder_color(t.text_faint)
-                .caret_color(t.accent)
-                .caret_blink_interval_500ms()
-                .flex_1()
-                .font_family(design::FONT_DISPLAY)
-                .text_size(px(design::ts::QUERY))
-                .whitespace_nowrap(),
-            hint.into_iter().chain(dropdown),
-            &t,
-        );
+        let query_input = text_input("query")
+            .state(self.input.downgrade())
+            .placeholder(self.placeholder())
+            .placeholder_color(t.text_faint)
+            .caret_color(t.accent)
+            .caret_blink_interval_500ms()
+            .font_family(design::FONT_DISPLAY)
+            .text_size(px(design::ts::QUERY))
+            .whitespace_nowrap();
+        // With boxes the query takes its own width (it gives way first), then the command's
+        // icon and the boxes, together at most 60% of the bar.
+        let (query, arg_group) = match &arg_row {
+            None => (query_input.flex_1().into_any_element(), None),
+            Some(it) => {
+                let q = Some(self.query(cx)).filter(|q| !q.is_empty()).unwrap_or_else(|| self.placeholder().to_string());
+                let w = design::text_width(&q, design::ts::QUERY, window) + px(design::sp::S4);
+                let query = div().flex_shrink(1.).min_w_0().w(w).overflow_hidden().child(query_input.w_full()).into_any_element();
+                let hue = it.tint.map_or(t.text_muted, |k| k.hue(&t));
+                let mark = match &it.icon {
+                    Icon::Vector(ch) => design::icon(ch, design::ic::LG, hue).into_any_element(),
+                    Icon::Image(image) => gpui::img(image.clone()).size(px(design::ic::LG)).flex_none().into_any_element(),
+                    Icon::Glyph(s) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::LG)).child(s.clone()).into_any_element(),
+                };
+                let boxes = it.args.iter().enumerate().map(|(i, a)| {
+                    let v = arg_values[i].as_str();
+                    let secret = a.kind == search::ArgKind::Secret;
+                    let dots = secret.then(|| "•".repeat(v.chars().count()));
+                    let tag = a.optional && v.is_empty();
+                    let help = (!a.help.is_empty()).then(|| SharedString::from(a.help.clone()));
+                    let measured = if v.is_empty() { a.placeholder.as_ref() } else { dots.as_deref().unwrap_or(v) };
+                    let width = design::arg_width(measured, tag, help.is_some(), window);
+                    let input = text_input(SharedString::from(format!("arg-{i}")))
+                        .state(self.args[i].downgrade())
+                        .placeholder(a.placeholder.clone())
+                        .placeholder_color(t.text_faint)
+                        .caret_color(t.accent)
+                        .w_full()
+                        .whitespace_nowrap()
+                        .when(secret, |e| e.text_color(gpui::transparent_black()));
+                    let left = self.arg_left.clone();
+                    let look = design::ArgBox { width, tag, help, dots, focused: arg_focus == Some(i), missing: self.arg_missing == Some(i) };
+                    let b = design::arg_box(i, input, look, &t).on_prepaint(move |p, _, _| left[i].set(p.bounds.origin.x));
+                    if matches!(a.kind, search::ArgKind::Choice(_)) { b.on_click(cx.listener(move |this, _, window, cx| this.open_choice(i, window, cx))).into_any_element() } else { b.into_any_element() }
+                });
+                let group = div().flex_none().max_w(gpui::relative(0.6)).ml(px(design::sp::S4)).flex().items_center().gap(px(design::sp::S8)).overflow_hidden().child(mark).children(boxes);
+                (query, Some(group.into_any_element()))
+            }
+        };
+        let search_bar = design::search_bar(leading, query, arg_group.into_iter().chain(hint).chain(dropdown), &t);
 
         // ---- action bar ----
         let tone = self.status.as_ref().map(|(tone, _)| match tone {
@@ -3876,7 +4050,7 @@ impl Render for Launcher {
         // A status shows its tone dot; in root search the selected row's own icon in its hue; else the view's icon.
         let mark = match tone {
             Some(c) => design::status_dot(c).into_any_element(),
-            None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.text_muted, |k| k.hue(&t)))) {
+            None => match selected_item.filter(|it| (at_root || self.mode == Mode::Args) && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.text_muted, |k| k.hue(&t)))) {
                 (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
                 (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
                 (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
@@ -3889,6 +4063,13 @@ impl Render for Launcher {
             vec![keys("Submit", &["Ctrl", "↵"]), design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]
         } else if self.armed == Some(self.selected) {
             vec![div().text_color(t.warning).child("Press ↵ again to confirm").into_any_element()]
+        } else if let Some((next, verb)) = &arg_keys {
+            let mut v = vec![];
+            if *next {
+                v.extend([keys("Next Box", &["Tab"]), design::vdivider(&t).into_any_element()]);
+            }
+            v.push(keys(verb, &["↵"]));
+            v
         } else if let Some(p) = &primary {
             let mut v = vec![keys(p, &["↵"])];
             if actions.len() > 1 {
@@ -3969,6 +4150,12 @@ impl Render for Launcher {
                 if this.menu_key(menu::Key::Down, window, cx) {
                     return;
                 }
+                // In a box Down opens a list's menu, and otherwise does nothing.
+                if this.panel.is_none()
+                    && let Some(i) = this.arg_focused(window, cx)
+                {
+                    return this.open_choice(i, window, cx);
+                }
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
                 }
@@ -3987,11 +4174,12 @@ impl Render for Launcher {
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
                 }
                 this.armed = None;
+                this.sync_args(cx);
                 this.scroll_to_selected();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
-                if this.menu_key(menu::Key::Up, window, cx) {
+                if this.menu_key(menu::Key::Up, window, cx) || (this.panel.is_none() && this.arg_focused(window, cx).is_some()) {
                     return;
                 }
                 if this.panel.is_none() && this.mode == Mode::Ai {
@@ -4011,6 +4199,7 @@ impl Render for Launcher {
                     None => this.selected = this.selected.saturating_sub(1),
                 }
                 this.armed = None;
+                this.sync_args(cx);
                 this.scroll_to_selected();
                 cx.notify();
             }))
@@ -4028,8 +4217,12 @@ impl Render for Launcher {
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
             // Left and Right move through the emoji grid instead of the search text.
             .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
+            // Tab and Shift+Tab move between the query and the boxes.
+            .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
+            .on_action(cx.listener(|this, _: &NextBox, window, cx| this.step_arg(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevBox, window, cx| this.step_arg(-1, window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
-                if !this.menu_key(menu::Key::Esc, window, cx) {
+                if !this.menu_key(menu::Key::Esc, window, cx) && !this.dismiss_args(window, cx) {
                     this.dismiss(window, cx)
                 }
             }))
@@ -4181,6 +4374,8 @@ fn main() {
             KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
             KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),

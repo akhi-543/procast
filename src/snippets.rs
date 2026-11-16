@@ -22,6 +22,14 @@ pub struct Arg {
     pub default: String,
 }
 
+impl Arg {
+    /// Its box in the search bar; one with a default may stay empty.
+    pub fn to_arg(&self) -> crate::search::Arg {
+        let help = if self.default.is_empty() { String::new() } else { format!("Empty: {}", self.default) };
+        crate::search::Arg { optional: !self.default.is_empty(), help, ..crate::search::Arg::new(self.name.clone()) }
+    }
+}
+
 /// `{word key="value" …}` -> (word, attributes); None for text that isn't a placeholder.
 fn placeholder(inner: &str) -> Option<(&str, Vec<(&str, String)>)> {
     let inner = inner.trim();
