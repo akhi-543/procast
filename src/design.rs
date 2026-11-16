@@ -134,6 +134,18 @@ pub mod ic {
     pub const XL: f32 = 40.;
 }
 
+/// The `--space-*` steps.
+pub mod sp {
+    pub const S2: f32 = 2.;
+    pub const S4: f32 = 4.;
+    pub const S8: f32 = 8.;
+    pub const S12: f32 = 12.;
+}
+
+/// `.pc-pop--right`: the menu under the bar's Dropdown.
+pub const POP_RIGHT_W: f32 = 290.;
+pub const POP_RIGHT_TOP: f32 = 50.;
+
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
 /// glance: window moves are teal, system actions amber, clipboard blue, and so on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1183,6 +1195,68 @@ pub fn dropdown(label: &str, t: &Tokens) -> Div {
         .child(icon(g::FILTER, ic::SM, t.text_muted))
         .child(div().max_w(px(180.)).truncate().child(label.to_string()))
         .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+}
+
+/// `.pc-pop__rule`: a hairline between groups of menu rows.
+pub fn pop_rule(t: &Tokens) -> Div {
+    div().flex_none().h(px(1.)).my(px(sp::S4)).bg(t.hairline)
+}
+
+/// One menu row (`.pc-pop .pc-sel`): icon, label (over a muted second line when `two_line`)
+/// and the faint `sub` on the right. An `off` row is faint.
+pub fn pop_row(e: &crate::menu::Entry, on: bool, t: &Tokens) -> Div {
+    let label = div().min_w_0().truncate().child(e.label.clone());
+    let text = match &e.two_line {
+        Some(line) => div().flex_1().min_w_0().flex().flex_col().gap(px(sp::S2)).child(label).child(div().min_w_0().truncate().text_size(px(ts::SMALL)).text_color(t.text_muted).child(line.clone())),
+        None => div().flex_1().min_w_0().flex().child(label),
+    };
+    selectable(CONTROL, on, t)
+        .flex_none()
+        .gap(px(sp::S8))
+        .when(e.two_line.is_some(), |d| d.h_auto().py(px(sp::S4)))
+        .when(e.off, |d| d.text_color(t.text_faint))
+        .children(e.icon.map(|g| icon(g, ic::MD, t.text_muted)))
+        .child(text)
+        .when(!e.sub.is_empty(), |d| d.child(div().flex_none().text_color(t.text_faint).child(e.sub.clone())))
+}
+
+/// The open Dropdown (`.pc-pop`) over the whole window: a transparent layer that takes clicks
+/// outside the menu (the host closes on `on_outside`), and the menu at `m.place`, capped at the
+/// room below its top so its list scrolls. `search` is the search input, drawn when
+/// `m.search` is set; `scroll` tracks the list (one child per `m.rows()`). `on_pick` gets the index into `m.entries` of a clicked row.
+pub fn pop_menu(
+    m: &crate::menu::Menu,
+    search: Option<AnyElement>,
+    scroll: &gpui::ScrollHandle,
+    on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_outside: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    t: &Tokens,
+) -> gpui::Stateful<Div> {
+    use crate::menu::{Place, Row};
+    let on_pick = std::rc::Rc::new(on_pick);
+    let rows = m.rows().into_iter().map(|r| match r {
+        Row::Header(s) => section_header(s, None, t).flex_none().px(px(sp::S8)).into_any_element(),
+        Row::Rule => pop_rule(t).into_any_element(),
+        Row::Item(i) => {
+            let e = &m.entries[i];
+            let row = pop_row(e, i == m.selected, t).id(("pop", i));
+            let pick = on_pick.clone();
+            if e.off { row.into_any_element() } else { row.on_click(move |_, window, cx| pick(i, window, cx)).into_any_element() }
+        }
+    });
+    let pop = elevated(t)
+        .rounded(px(r::MD))
+        .border_color(t.border)
+        .min_h_0()
+        .p(px(sp::S4))
+        .gap(px(sp::S2))
+        .occlude()
+        .children(search.filter(|_| m.search.is_some()).map(|f| field(true, t).flex_none().mb(px(sp::S4)).child(f)))
+        .child(div().id("pop-list").min_h_0().flex().flex_col().gap(px(sp::S2)).overflow_y_scroll().track_scroll(scroll).children(rows));
+    let layer = div().id("pop-layer").absolute().inset_0().flex().flex_col().pb(px(sp::S12)).occlude().on_mouse_down(gpui::MouseButton::Left, on_outside);
+    match m.place {
+        Place::Right => layer.items_end().pt(px(POP_RIGHT_TOP)).pr(px(sp::S12)).child(pop.w(px(POP_RIGHT_W))),
+    }
 }
 
 /// The bare compact bar's hint, "Recent" and a key cap: what the key does.

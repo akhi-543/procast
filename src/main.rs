@@ -15,6 +15,7 @@ mod focus;
 mod foreground;
 mod hdr;
 mod keys;
+mod menu;
 mod net;
 // Task 11 wires the notes window and commands to this; until then only the tests build it.
 #[cfg(test)]
@@ -289,6 +290,17 @@ struct Confirm {
     danger: bool,
 }
 
+/// What a menu's opener does with the picked `Entry.id`.
+type OnPick = Box<dyn Fn(&mut Launcher, String, &mut Window, &mut Context<Launcher>)>;
+
+/// An open Dropdown: the menu, its opener's `OnPick`, and the focus to return to when it closes.
+struct OpenMenu {
+    menu: menu::Menu,
+    on_pick: OnPick,
+    back: Option<gpui::FocusHandle>,
+    scroll: ScrollHandle,
+}
+
 struct Launcher {
     input: Entity<EditableTextState>,
     cfg: Config,
@@ -347,6 +359,9 @@ struct Launcher {
     scroll: UniformListScrollHandle,
     /// Ctrl+K: the selected item's actions and which one is highlighted.
     panel: Option<(Item, usize)>,
+    /// An open Dropdown; it takes the keys before anything else. Its search text is `menu_input`.
+    menu: Option<OpenMenu>,
+    menu_input: Entity<EditableTextState>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
     pending: Option<Pending>,
@@ -404,8 +419,15 @@ struct Launcher {
 impl Launcher {
     fn new(cfg: Config, notice: Option<String>, tx: UnboundedSender<Msg>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let subs = vec![
             cx.subscribe(&input, |this, _, _: &TextChanged, cx| this.query_changed(cx)),
+            cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
+                if let Some(open) = &mut this.menu {
+                    open.menu.set_filter(input.read(cx).as_str());
+                    cx.notify();
+                }
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if this.visible && !window.is_window_active() {
                     this.hide(false, cx);
@@ -468,6 +490,8 @@ impl Launcher {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             panel: None,
+            menu: None,
+            menu_input,
             armed: None,
             pending: None,
             clip_images: HashMap::new(),
@@ -1357,6 +1381,7 @@ impl Launcher {
         }
         self.mode = mode;
         self.panel = None;
+        self.menu = None;
         if mode == Mode::Files
             && let Some(f) = &self.files
         {
@@ -1436,6 +1461,7 @@ impl Launcher {
         self.visible = false;
         self.hidden_at = Some(Instant::now());
         self.panel = None;
+        self.menu = None;
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
         self.stop_ext_view();
         if self.mode == Mode::Ext {
@@ -1814,6 +1840,7 @@ impl Launcher {
             self.extv = Some(ExtView { run, ext: e, view: ext::View::default(), depth: 1, values: HashMap::new(), inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] });
             self.mode = Mode::Ext;
             self.panel = None;
+            self.menu = None;
             self.input.update(cx, |s, cx| s.emplace("", cx));
             self.selected = 0;
             self.refresh(cx);
@@ -3133,6 +3160,49 @@ impl Launcher {
         }
     }
 
+    /// Opens `menu` over the window. With a search field, typing goes to `menu_input`.
+    fn open_menu(&mut self, menu: menu::Menu, on_pick: impl Fn(&mut Launcher, String, &mut Window, &mut Context<Launcher>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
+        let back = window.focused(cx);
+        if menu.search.is_some() {
+            self.menu_input.update(cx, |s, cx| s.emplace("", cx));
+            window.focus(&self.menu_input.focus_handle(cx), cx);
+        }
+        self.menu = Some(OpenMenu { menu, on_pick: Box::new(on_pick), back, scroll: ScrollHandle::new() });
+        cx.notify();
+    }
+
+    /// Hands a key to the open menu; false when none is open.
+    fn menu_key(&mut self, key: menu::Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(open) = &mut self.menu else { return false };
+        match open.menu.key(key) {
+            menu::Event::Picked(i) => self.menu_pick(i, window, cx),
+            menu::Event::Closed => _ = self.close_menu(window, cx),
+            menu::Event::None => {
+                if let Some(k) = open.menu.selected_row() {
+                    open.scroll.scroll_to_item(k);
+                }
+                cx.notify()
+            }
+        }
+        true
+    }
+
+    /// Closes the menu and gives the opener the id of entry `i`.
+    fn menu_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = self.close_menu(window, cx) {
+            (open.on_pick)(self, open.menu.entries[i].id.clone(), window, cx);
+        }
+    }
+
+    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<OpenMenu> {
+        let open = self.menu.take()?;
+        if let Some(back) = &open.back {
+            window.focus(back, cx);
+        }
+        cx.notify();
+        Some(open)
+    }
+
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.panel.take().is_some() {
             cx.notify();
@@ -3578,6 +3648,7 @@ impl Render for Launcher {
                 },
                 "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
                 "panel": self.panel.is_some(),
+                "menu": self.menu.as_ref().map(|o| o.menu.visible().into_iter().map(|i| o.menu.entries[i].label.clone()).collect::<Vec<_>>()),
                 "footer": [self.footer_left(), footer_action.clone()],
                 "ai": self.ai.as_ref().map(|a| json!({"text": a.turns.last().map_or("", |t| t.text.as_str()), "busy": a.busy, "turns": a.turns.len()})),
                 "notice": self.notice,
@@ -3756,9 +3827,18 @@ impl Render for Launcher {
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
         let leading = if at_root { design::search_mark(&t).into_any_element() } else { design::back_tile(&t).id("back").on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element() };
-        let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
-            let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.as_str()).unwrap_or_default();
-            design::dropdown(title, &t).into_any_element()
+        let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.clone()).map(|(opts, cur, on_change)| {
+            let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
+            design::dropdown(&title, &t)
+                .id("dropdown")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let Some(f) = on_change.clone() else { return };
+                    let entries = opts.iter().map(|(v, title)| menu::Entry { id: v.clone(), label: title.clone(), ..Default::default() }).collect();
+                    let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+                    m.selected = opts.iter().position(|o| o.0 == cur).unwrap_or(m.selected);
+                    this.open_menu(m, move |this, v, window, cx| this.run(Act::ExtSet(f.clone(), v), None, window, cx), window, cx);
+                }))
+                .into_any_element()
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
@@ -3854,11 +3934,32 @@ impl Render for Launcher {
             design::dialog(c.danger, &c.title, &c.message, [button(0, &c.primary, primary), button(1, "Cancel", design::Button::Quiet)], &t)
         });
 
+        let pop = self.menu.as_ref().map(|open| {
+            let me = cx.weak_entity();
+            let pick = move |i: usize, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| this.menu_pick(i, window, cx));
+            let me = cx.weak_entity();
+            let outside = move |_: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| _ = this.close_menu(window, cx));
+            let field = open.menu.search.as_ref().map(|placeholder| {
+                text_input("menu-search")
+                    .state(self.menu_input.downgrade())
+                    .placeholder(placeholder.clone())
+                    .placeholder_color(t.text_faint)
+                    .caret_color(t.accent)
+                    .flex_1()
+                    .whitespace_nowrap()
+                    .into_any_element()
+            });
+            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
+        });
+
         design::glass_window(&t)
             .size_full()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                if this.menu_key(menu::Key::Down, window, cx) {
+                    return;
+                }
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
                 }
@@ -3881,6 +3982,9 @@ impl Render for Launcher {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
+                if this.menu_key(menu::Key::Up, window, cx) {
+                    return;
+                }
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(-ROW * 3., cx);
                 }
@@ -3902,6 +4006,9 @@ impl Render for Launcher {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleActions, _, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 this.panel = match this.panel.take() {
                     Some(_) => None,
                     None => this.items.get(this.selected).cloned().filter(|it| it.section.as_deref() != Some(EMPTY) || !it.extra.is_empty()).filter(|it| it.act != Act::None || !it.extra.is_empty()).map(|it| (it, 0)),
@@ -3911,16 +4018,27 @@ impl Render for Launcher {
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
             // Left and Right move through the emoji grid instead of the search text.
-            .when(self.grid() && self.panel.is_none(), |d| d.key_context("EmojiGrid"))
-            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                if !this.menu_key(menu::Key::Esc, window, cx) {
+                    this.dismiss(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &EmacsNext, window, cx| this.nav("emacs", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsPrev, window, cx| this.nav("emacs", Box::new(SelectPrev), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsBack, window, cx| this.nav("emacs", Box::new(Dismiss), window, cx)))
             .on_action(cx.listener(|this, _: &VimNext, window, cx| this.nav("vim", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &VimPrev, window, cx| this.nav("vim", Box::new(SelectPrev), window, cx)))
             .on_action(cx.listener(|this, _: &VimBack, window, cx| this.nav("vim", Box::new(Dismiss), window, cx)))
-            .on_action(cx.listener(|this, _: &Launch, window, cx| this.launch(window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| {
+                if !this.menu_key(menu::Key::Enter, window, cx) {
+                    this.launch(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 if this.is_form() && this.panel.is_none() {
                     this.submit_form(cx)
                 } else if this.panel.is_none()
@@ -3954,6 +4072,7 @@ impl Render for Launcher {
             .when(!collapsed, |d| d.child(body).child(footer))
             .children(popover.into_iter().flatten())
             .children(dialog)
+            .children(pop)
     }
 }
 
