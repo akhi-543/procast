@@ -19,7 +19,7 @@ use windows::Win32::{
             SendInput, ToUnicodeEx, VIRTUAL_KEY,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PostThreadMessageW,
+            CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
             SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
@@ -79,8 +79,10 @@ struct State {
     /// The tap modifier went down at, with no other key since.
     tap_down: Option<Instant>,
     last_tap: Option<Instant>,
-    /// A sticky toast is showing: the next Esc closes it.
+    /// A sticky toast is showing: the next bare Esc closes it.
     sticky: bool,
+    /// Ctrl, Alt, Shift or Win is held (the hook reads it just before an Esc).
+    mods: bool,
 }
 
 /// What the hook should do with one key event.
@@ -99,7 +101,7 @@ enum Out {
 
 impl State {
     fn key(&mut self, vk: u16, down: bool, now: Instant) -> Out {
-        if vk == ESC && down && self.sticky {
+        if vk == ESC && down && self.sticky && !self.mods && !self.holding {
             self.sticky = false;
             return Out::CloseToast;
         }
@@ -151,7 +153,7 @@ struct Shared {
 }
 
 static SHARED: Mutex<Shared> =
-    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None, sticky: false }, expander: None, window: 0, tx: None });
+    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None, sticky: false, mods: false }, expander: None, window: 0, tx: None });
 static THREAD: Mutex<u32> = Mutex::new(0);
 
 /// Applies the settings: starts the hook when any feature is on, stops it otherwise.
@@ -194,9 +196,12 @@ fn run(wanted: bool) {
     if wanted && *thread == 0 {
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
-            let _ = tid_tx.send(GetCurrentThreadId());
-            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else { return };
+            // The queue and the hook come first, so a WM_QUIT posted right after this start
+            // always lands (no hook left behind with THREAD at 0). On failure, the id is 0.
             let mut msg = MSG::default();
+            _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else { return };
+            let _ = tid_tx.send(GetCurrentThreadId());
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
             let _ = UnhookWindowsHookEx(hook);
         });
@@ -217,6 +222,10 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let (out, tx, hit) = {
                 let mut s = SHARED.lock().unwrap();
+                if k.vkCode as u16 == ESC {
+                    let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+                    s.state.mods = [0x10, 0x11, 0x12, LWIN, 0x5C].into_iter().any(held);
+                }
                 let out = if injected { Out::Pass } else { s.state.key(k.vkCode as u16, down, Instant::now()) };
                 let hit = if down && out == Out::Pass { typed(&mut s, k) } else { None };
                 (out, s.tx.clone(), hit)
@@ -358,5 +367,18 @@ mod tests {
         assert_eq!(s.key(ESC, true, now), Out::CloseToast);
         assert!(!s.sticky);
         assert_eq!(s.key(ESC, true, now), Out::Pass, "only the first Esc");
+
+        // A shortcut with Esc (Ctrl+Shift+Esc, Alt+Esc, Win+Esc, Hyper+Esc) is never taken.
+        s.sticky = true;
+        s.mods = true;
+        assert_eq!(s.key(ESC, true, now), Out::Pass, "Ctrl, Alt, Shift or Win held");
+        s.mods = false;
+        let mut h = State { hyper: hyper_vk("capslock"), sticky: true, ..Default::default() };
+        h.key(0x14, true, now);
+        assert_eq!(h.key(ESC, true, now), Out::Pass, "Hyper held");
+        assert_eq!(h.key(0x14, false, now), Out::Hyper { down: false, nothing: false }, "Hyper+Esc counts as using Hyper");
+        assert!(h.sticky, "the toast still waits for a bare Esc");
+        assert_eq!(h.key(ESC, true, now), Out::CloseToast);
+        assert_eq!(s.key(ESC, true, now), Out::CloseToast, "bare Esc again");
     }
 }

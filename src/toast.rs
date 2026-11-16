@@ -21,6 +21,8 @@ const IN: Duration = Duration::from_millis(150);
 /// How long an auto toast stays.
 const HOLD: Duration = Duration::from_secs(2);
 const OUT: Duration = Duration::from_millis(200);
+/// A few frames after `IN`, when the pill has been painted where it stays.
+const SETTLE: Duration = Duration::from_millis(50);
 /// Longest text, in characters (spec: Toast copy).
 const MAX: usize = 60;
 
@@ -62,12 +64,15 @@ pub struct Toast {
     id: u64,
     leaving: bool,
     hwnd: HWND,
+    /// Where the pill was last painted, physical px in the window: a sticky toast takes clicks only there.
+    pill: [i32; 4],
 }
 
 impl Render for Toast {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = design::Tokens::from_theme(&self.theme, window);
-        let pill = design::toast(&self.text, self.kind, &t);
+        // Only a sticky toast gets clicks, and only on the pill (`clickable`).
+        let pill = design::toast(&self.text, self.kind, &t).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| _ = this.dismiss(cx)));
         // ponytail: gpui ignores the Windows "show animations" setting, so the rise always runs;
         // read SPI_GETCLIENTAREAANIMATION into cx.set_reduce_motion if that matters.
         let pill = if self.leaving {
@@ -75,8 +80,12 @@ impl Render for Toast {
         } else {
             pill.with_animation(format!("toast-in-{}", self.id), Animation::new(IN), |p, d| p.opacity(d).mt(px(8. * (1. - d)))).into_any_element()
         };
-        // Only a sticky toast gets clicks (an auto one lets them through).
-        div().size_full().flex().justify_center().pt(px(TOP)).child(pill).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| _ = this.dismiss(cx)))
+        let this = cx.entity().downgrade();
+        div().size_full().flex().justify_center().pt(px(TOP)).child(pill).on_children_prepainted(move |b, window, cx| {
+            let (Some(b), s) = (b.first(), window.scale_factor()) else { return };
+            let at = |v: gpui::Pixels| (f32::from(v) * s).round() as i32;
+            _ = this.update(cx, |this, _| this.pill = [at(b.left()), at(b.top()), at(b.right()), at(b.bottom())]);
+        })
     }
 }
 
@@ -115,14 +124,13 @@ impl Toast {
 pub fn show(cx: &mut AsyncApp, slot: Option<WindowHandle<Toast>>, kind: Kind, stay: Stay, text: &str, theme: config::Theme) {
     let Some(handle) = slot else { return };
     let Ok(hwnd) = handle.update(cx, |this, _, _| this.hwnd) else { return };
+    win::clickable(hwnd, None);
     win::place_toast(hwnd, &win::screen("active"), W, H);
     let text = clip(text.lines().next().unwrap_or_default());
     let Ok(id) = handle.update(cx, |this, _, cx| {
         this.id += 1;
         (this.text, this.kind, this.stay, this.theme, this.leaving) = (text, kind, stay, theme, false);
-        let sticky = stay == Stay::Sticky;
-        keys::sticky(sticky);
-        win::click_through(this.hwnd, !sticky);
+        keys::sticky(stay == Stay::Sticky);
         win::cloak(this.hwnd, false);
         cx.notify();
         this.id
@@ -130,6 +138,14 @@ pub fn show(cx: &mut AsyncApp, slot: Option<WindowHandle<Toast>>, kind: Kind, st
         return;
     };
     if stay == Stay::Sticky {
+        // Once it has risen into place, the pill (only) takes clicks.
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(IN + SETTLE).await;
+            if let Ok(Some(pill)) = handle.update(cx, |this, _, _| (this.id == id && !this.leaving).then_some(this.pill)) {
+                win::clickable(hwnd, Some(pill));
+            }
+        })
+        .detach();
         return;
     }
     cx.spawn(async move |cx| {
@@ -156,7 +172,7 @@ pub fn open(cx: &mut AsyncApp) -> Option<WindowHandle<Toast>> {
         windows_window_background: gpui::WindowsWindowBackground::Transparent,
         ..Default::default()
     };
-    let handle = cx.open_window(options, |_, cx| cx.new(|_| Toast { text: String::new(), kind: Kind::Info, stay: Stay::Auto, theme: config::Theme::default(), id: 0, leaving: false, hwnd: HWND::default() })).ok()?;
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| Toast { text: String::new(), kind: Kind::Info, stay: Stay::Auto, theme: config::Theme::default(), id: 0, leaving: false, hwnd: HWND::default(), pill: [0; 4] })).ok()?;
     handle
         .update(cx, |this, window, _| {
             this.hwnd = win::hwnd(window);

@@ -14,7 +14,8 @@ use windows::{
             Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
-                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
+                CreateRoundRectRgn, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
+                SetWindowRgn,
             },
         },
         Storage::FileSystem::{
@@ -262,6 +263,18 @@ pub fn make_overlay(hwnd: HWND) {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOPMOST.0) as isize);
         _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     }
+}
+
+/// Where an overlay (`make_overlay`) takes clicks: only inside `pill` (physical px in the
+/// window, round ends), or nowhere (None). The region also clips what the window shows.
+/// Call between updates: it sends the window messages synchronously.
+pub fn clickable(hwnd: HWND, pill: Option<[i32; 4]>) {
+    unsafe {
+        // The system owns the region once set.
+        let rgn = pill.map(|[l, t, r, b]| CreateRoundRectRgn(l, t, r + 1, b + 1, b - t, b - t));
+        SetWindowRgn(hwnd, rgn, true);
+    }
+    click_through(hwnd, pill.is_none());
 }
 
 /// Whether clicks pass through an overlay (`make_overlay`) to what is beneath.

@@ -118,6 +118,16 @@ enum Tone {
     Error,
 }
 
+impl Tone {
+    fn of(kind: toast::Kind) -> Self {
+        match kind {
+            toast::Kind::Done => Tone::Ok,
+            toast::Kind::Error => Tone::Error,
+            toast::Kind::Info => Tone::Info,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Root,
@@ -1591,14 +1601,7 @@ impl Launcher {
             self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
         }
         // A sticky toast closes; its text shows once in the ActionBar instead.
-        self.status = self.toast.and_then(|t| t.update(cx, |t, _, cx| t.dismiss(cx)).ok().flatten()).map(|(kind, text)| {
-            let tone = match kind {
-                toast::Kind::Done => Tone::Ok,
-                toast::Kind::Error => Tone::Error,
-                toast::Kind::Info => Tone::Info,
-            };
-            (tone, text)
-        });
+        self.status = self.toast.and_then(|t| t.update(cx, |t, _, cx| t.dismiss(cx)).ok().flatten()).map(|(kind, text)| (Tone::of(kind), text));
         // Within the pop-to-root timeout the launcher reopens where it was.
         if mode == Mode::Root && self.keeps_state() {
             self.refresh(cx);
@@ -4510,8 +4513,18 @@ fn main() {
                     continue;
                 }
                 if let Msg::Toast(kind, stay, text) = msg {
-                    let theme = handle.update(cx, |this, _, _| this.cfg.theme.clone()).unwrap_or_default();
-                    toast::show(cx, toast, kind, stay, &text, theme);
+                    // A sticky toast would take the open launcher's Esc: it goes in the ActionBar instead.
+                    let theme = handle.update(cx, |this, _, cx| {
+                        if this.visible && stay == toast::Stay::Sticky {
+                            this.status = Some((Tone::of(kind), text.clone()));
+                            cx.notify();
+                            return None;
+                        }
+                        Some(this.cfg.theme.clone())
+                    });
+                    if let Ok(Some(theme)) = theme {
+                        toast::show(cx, toast, kind, stay, &text, theme);
+                    }
                     continue;
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
