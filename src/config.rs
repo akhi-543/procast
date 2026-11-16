@@ -607,22 +607,69 @@ impl Default for Dictionary {
 
 /// The translator (Google Translate, no key): `translate hola` in root search, and `[[translate]]` commands.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(from = "TranslatorFile")]
 pub struct Translator {
     /// Source language code, or "auto".
     pub from: String,
-    /// Target language codes (see `translate::LANGUAGES`); one code as a plain string also loads.
-    #[serde(deserialize_with = "one_or_many")]
-    pub to: Vec<String>,
-    /// What Enter does with a translation: copy | paste.
+    /// The first target (see `translate::LANGUAGES`), and the second; empty for none.
     pub primary: String,
-    /// "Translate" starts from the text selected in the app you came from.
-    pub prefill_selection: bool,
+    pub secondary: String,
+    /// What Enter does with a translation: copy | paste; Ctrl+Enter does the other.
+    pub action: String,
+    /// "Translate" opens with the text selected in the app you came from.
+    pub fill_selection: bool,
+    /// A target equal to the source language goes last.
+    pub cross_first: bool,
+    /// HTTP proxy for Google Translate; empty = none.
+    pub proxy: String,
 }
 
 impl Default for Translator {
     fn default() -> Self {
-        Self { from: "auto".into(), to: vec!["en".into()], primary: "copy".into(), prefill_selection: false }
+        Self { from: "auto".into(), primary: "en".into(), secondary: String::new(), action: "copy".into(), fill_selection: true, cross_first: true, proxy: String::new() }
+    }
+}
+
+impl Translator {
+    /// The language set these settings make: Translate from, then Primary and Secondary.
+    pub fn set(&self) -> crate::translate::LangSet {
+        crate::translate::LangSet::new(&self.from, &[self.primary.clone(), self.secondary.clone()])
+    }
+}
+
+/// `[translator]` as written, with the keys configs used before: `to` held the targets,
+/// `primary` was Enter's action and `prefill_selection` was `fill_selection`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TranslatorFile {
+    from: String,
+    primary: String,
+    secondary: String,
+    action: String,
+    fill_selection: Option<bool>,
+    cross_first: Option<bool>,
+    proxy: String,
+    #[serde(deserialize_with = "one_or_many")]
+    to: Vec<String>,
+    prefill_selection: Option<bool>,
+}
+
+impl From<TranslatorFile> for Translator {
+    fn from(f: TranslatorFile) -> Self {
+        let d = Self::default();
+        let or = |v: String, d: String| if v.is_empty() { d } else { v };
+        let (action, primary) = if matches!(f.primary.as_str(), "copy" | "paste") { (f.primary, String::new()) } else { (f.action, f.primary) };
+        let mut to = f.to.into_iter();
+        let primary = or(primary, to.next().unwrap_or(d.primary));
+        Self {
+            from: or(f.from, d.from),
+            primary,
+            secondary: or(f.secondary, to.next().unwrap_or_default()),
+            action: or(action, d.action),
+            fill_selection: f.fill_selection.or(f.prefill_selection).unwrap_or(d.fill_selection),
+            cross_first: f.cross_first.unwrap_or(d.cross_first),
+            proxy: f.proxy,
+        }
     }
 }
 
@@ -722,10 +769,13 @@ existing_tab = true           # quicklinks switch to a tab already showing the p
 model = "haiku"               # Ask AI, on your Claude Code login: haiku | sonnet | opus
 
 [translator]
-from = "auto"                 # source language, or "auto"; translate hola | tr de hola, no key needed (Google Translate)
-to = ["en"]                   # targets: de, es, fr, ja, zh-CN, …; with two, a text already in the first goes to the second
-primary = "copy"              # Enter on a translation: copy | paste
-prefill_selection = false     # "Translate" starts from the text selected in the app you came from
+from = "auto"            # source language code, or "auto"
+primary = "en"           # first target
+secondary = ""           # second target, empty for none
+action = "copy"          # Enter: "copy" or "paste"; Ctrl+Enter does the other
+fill_selection = true    # open Translate with the selected text
+cross_first = true       # a target equal to the source goes last
+proxy = ""               # HTTP proxy for Google Translate, e.g. http://127.0.0.1:8080
 
 # A command per language: translates the selected text. output: open (show it) | replace (paste over the selection).
 # [[translate]]
@@ -1149,12 +1199,15 @@ mod tests {
     }
 
     #[test]
-    fn translator_targets_load_as_a_list_or_a_single_string() {
-        assert_eq!(parse("").unwrap().translator.to, vec!["en".to_string()]);
-        assert_eq!(parse("[translator]
-to = [\"en\", \"de\"]").unwrap().translator.to, vec!["en".to_string(), "de".to_string()]);
-        assert_eq!(parse("[translator]
-to = \"DE\"").unwrap().translator.to, vec!["DE".to_string()]);
+    fn translator_reads_the_old_keys_too() {
+        assert_eq!(parse("").unwrap().translator, Translator::default());
+        assert_eq!(parse(TEMPLATE).unwrap().translator, Translator::default());
+        let t = |text: &str| parse(&format!("[translator]\n{text}")).unwrap().translator;
+        let old = t("to = [\"de\", \"fr\"]\nprimary = \"paste\"\nprefill_selection = false");
+        assert_eq!((old.primary.as_str(), old.secondary.as_str(), old.action.as_str(), old.fill_selection), ("de", "fr", "paste", false));
+        assert_eq!(t("to = \"DE\"").primary, "DE");
+        let new = t("primary = \"ja\"\nsecondary = \"es\"\naction = \"paste\"\ncross_first = false\nproxy = \"http://p:8080\"");
+        assert_eq!((new.primary.as_str(), new.secondary.as_str(), new.action.as_str(), new.cross_first, new.proxy.as_str()), ("ja", "es", "paste", false, "http://p:8080"));
         assert!(parse("[translator]
 to = 3").is_err());
     }
@@ -1169,7 +1222,7 @@ primary = \"paste\"
 
 [[translate]]
 to = \"PT-BR\"").unwrap();
-        assert_eq!((c.translator.to, c.translator.primary.as_str()), (vec!["EN-US".to_string()], "paste"));
+        assert_eq!((c.translator.primary.as_str(), c.translator.action.as_str()), ("EN-US", "paste"));
         assert_eq!(c.translate[0].to, "PT-BR");
         assert!(!TEMPLATE.to_lowercase().contains("deepl"));
     }

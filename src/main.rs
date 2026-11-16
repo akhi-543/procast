@@ -345,6 +345,58 @@ struct Confirm {
 /// What a menu's opener does with the picked `Entry.id`.
 type OnPick = Box<dyn Fn(&mut Launcher, String, &mut Window, &mut Context<Launcher>)>;
 
+/// The translator view: the newest request (its text is what the bar holds) and the answers
+/// shown, with the one picked on open. While `busy`, those are the previous answers, dimmed.
+struct TrView {
+    job: translate::Job,
+    rows: Vec<translate::Translation>,
+    first: usize,
+    busy: bool,
+}
+
+impl TrView {
+    /// The language the text is in: as Google recognised it, else as asked.
+    fn detected(&self) -> String {
+        self.rows.first().map(|t| t.detected.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| self.job.from.clone())
+    }
+}
+
+/// How long typing must pause before the translator asks again.
+const TYPING_QUIET: Duration = Duration::from_millis(300);
+
+/// The translator's list: a row per target (title the translation, accessory the language),
+/// then the pronunciation when Google gives one. Enter copies or pastes per `action`;
+/// Ctrl+Enter does the other.
+fn translation_rows(tr: &TrView, cfg: &config::Translator) -> Vec<Item> {
+    let source = &tr.job.text;
+    let detected = tr.detected();
+    let mut items: Vec<Item> = tr
+        .rows
+        .iter()
+        .map(|t| {
+            let copy = ("Copy Translation".to_string(), Act::Copy(t.text.clone()));
+            let paste = ("Paste to Active App".to_string(), Act::Paste(t.text.clone()));
+            let (enter, other) = if cfg.action == "paste" { (paste, copy) } else { (copy, paste) };
+            // The other way round, this once: the translation becomes the text.
+            let swap = translate::Job { text: t.text.clone(), from: t.to.clone(), to: vec![detected.clone()], ..tr.job.clone() };
+            let mut it = Item::new(t.text.replace('\n', " "), "", Icon::Vector(g::LANGUAGES), enter.1.clone()).acc(translate::language_name(&t.to)).tinted(design::Tint::Web);
+            it.extra = vec![
+                enter,
+                other,
+                ("Copy Source".into(), Act::Copy(source.clone())),
+                ("Swap Languages".into(), Act::Translate(swap)),
+                ("Open in Google Translate".into(), Act::Open(translate::google_url(&tr.job.from, &t.to, source))),
+                // ponytail: picks a language set once those exist (Task 9); does nothing until then.
+                ("Change Target".into(), Act::None),
+            ];
+            it
+        })
+        .collect();
+    let say = tr.rows.iter().find_map(|t| t.pronunciation.clone());
+    items.extend(say.map(|p| Item::new(&p, "Pronunciation", Icon::Vector(g::AUDIO_LINES), Act::Copy(p.clone())).acc(translate::language_name(&detected))));
+    items
+}
+
 /// An open Dropdown: the menu, its opener's `OnPick`, and the focus to return to when it closes.
 struct OpenMenu {
     menu: menu::Menu,
@@ -444,8 +496,8 @@ struct Launcher {
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     ai: Option<AiChat>,
-    /// The translation view: what was asked and the answers (None while they are on their way).
-    translation: Option<(translate::Job, Option<Vec<translate::Translation>>)>,
+    /// The translator view (None until it first opens).
+    translation: Option<TrView>,
     /// Number of the newest translation request; answers to older ones are dropped.
     translate_seq: u64,
     /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
@@ -694,6 +746,9 @@ impl Launcher {
         self.last_query = q.clone();
         self.panel = None;
         self.send_search(cx);
+        if self.mode == Mode::Translate {
+            self.translate_soon(cx);
+        }
         self.selected = 0;
         self.refresh(cx);
         if space_typed && self.arg_row().is_some_and(|it| search::named_in(it, q.trim_start(), &self.cfg) == Some("")) {
@@ -1055,24 +1110,8 @@ impl Launcher {
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Translate => match &self.translation {
-                Some((job, None)) => vec![empty_row(g::CLOCK, format!("Translating to {}…", translate::names(&job.to)), String::new(), vec![])],
-                Some((job, Some(all))) => all
-                    .iter()
-                    .flat_map(|t| {
-                        let act = if self.cfg.translator.primary == "paste" { Act::Paste(t.text.clone()) } else { Act::Copy(t.text.clone()) };
-                        let section = if t.detected.is_empty() { format!("To {}", translate::language_name(&t.to)) } else { format!("{} to {}", translate::language_name(&t.detected), translate::language_name(&t.to)) };
-                        let lines = t.text.lines().filter(|l| !l.trim().is_empty()).map(|l| Item::new(l, "", Icon::Vector(g::LANGUAGES), act.clone()).sec(section.clone()));
-                        let say = t.pronunciation.iter().map(|p| Item::new(p, "Pronunciation", Icon::Vector(g::LANGUAGES), Act::Copy(p.clone())).sec(section.clone()));
-                        // The corrected text, to translate instead of what was typed.
-                        let fix = t.suggestion.iter().map(|s| {
-                            let text = s.replace(['[', ']'], "");
-                            let again = translate::Job { text, after: translate::After::Open, ..job.clone() };
-                            let sec = if t.corrected { "Showing results for" } else { "Did you mean" };
-                            Item::new(s, "", Icon::Vector(g::SEARCH), Act::Translate(again)).sec(sec)
-                        });
-                        lines.chain(say).chain(fix).collect::<Vec<_>>()
-                    })
-                    .collect(),
+                _ if query.trim().is_empty() => vec![empty_row(g::LANGUAGES, "Type to translate".into(), "Or select text anywhere before opening Translate".into(), vec![])],
+                Some(tr) => translation_rows(tr, &self.cfg.translator),
                 None => vec![],
             },
             Mode::Define => match &self.define {
@@ -1204,6 +1243,8 @@ impl Launcher {
             self.selected.min(self.items.len().saturating_sub(1))
         } else if self.mode == Mode::Root {
             root_selection(&self.items, &query, &self.cfg)
+        } else if self.mode == Mode::Translate {
+            self.translation.as_ref().map_or(0, |tr| tr.first)
         } else {
             0
         };
@@ -1831,8 +1872,9 @@ impl Launcher {
 
     // ---- translator ------------------------------------------------------------------
 
-    /// Translates `job`. Typed text opens the translation view at once; the selection (or a
-    /// paste-over-selection job) hides the launcher first, so the app you came from has focus.
+    /// Translates `job`. Typed text opens the translator at once, its text in the bar, the last
+    /// answers kept (dimmed) until the new ones land; the selection (or a paste-over-selection
+    /// job) hides the launcher first, so the app you came from has focus.
     fn translate(&mut self, mut job: translate::Job, cx: &mut Context<Self>) {
         self.translate_seq += 1;
         let (seq, hidden) = (self.translate_seq, job.after != translate::After::Open || job.text.trim().is_empty());
@@ -1842,51 +1884,107 @@ impl Launcher {
             }
         } else {
             self.status = None;
-            self.translation = Some((job.clone(), None));
-            self.set_mode(Mode::Translate, cx);
+            if self.mode != Mode::Translate || self.translation.is_none() {
+                self.translation = Some(TrView { job: job.clone(), rows: vec![], first: 0, busy: true });
+                self.set_mode(Mode::Translate, cx);
+            }
+            if let Some(tr) = &mut self.translation {
+                tr.job = job.clone();
+                tr.busy = true;
+            }
+            self.fill_query(&job.text, cx);
         }
-        let (tx, owner) = (self.tx.clone(), self.hwnd.0 as isize);
+        let (tx, owner, proxy) = (self.tx.clone(), self.hwnd.0 as isize, self.cfg.translator.proxy.clone());
         std::thread::spawn(move || {
             if job.text.trim().is_empty() {
                 match snippets::grab_selection(HWND(owner as _)).filter(|s| !s.trim().is_empty()) {
                     Some(sel) => job.text = sel,
+                    // Nothing selected: the translator opens empty; Instant Translate says why.
+                    None if job.after == translate::After::Open => return drop(tx.unbounded_send(Msg::Translated { seq, job, hidden, result: Ok(vec![]) })),
                     None => return drop(tx.unbounded_send(Msg::error("Select some text first"))),
                 }
             }
-            let result = translate::run(&job);
+            let result = translate::run(&job, &proxy);
             let _ = tx.unbounded_send(Msg::Translated { seq, job, hidden, result });
         });
+    }
+
+    /// The bar's text, unless it already holds it (setting it fires `query_changed`).
+    fn fill_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.query(cx) != text {
+            self.input.update(cx, |s, cx| s.emplace(text, cx));
+        }
+        cx.notify();
+    }
+
+    /// Typing in the translator: asks again once typing pauses for `TYPING_QUIET`; the answers
+    /// shown stay, dimmed, until the new ones land. An empty bar shows the empty view.
+    fn translate_soon(&mut self, cx: &mut Context<Self>) {
+        let text = self.query(cx);
+        let Some(tr) = &mut self.translation else { return };
+        if text == tr.job.text {
+            return;
+        }
+        // Answers still on their way are for older text.
+        self.translate_seq += 1;
+        let seq = self.translate_seq;
+        tr.job.text = text.clone();
+        tr.busy = !text.trim().is_empty();
+        if !tr.busy {
+            tr.rows.clear();
+            self.status = None;
+            return;
+        }
+        let job = tr.job.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPING_QUIET).await;
+            _ = this.update(cx, |this, cx| {
+                if this.translate_seq == seq && this.mode == Mode::Translate {
+                    this.translate(job, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn on_translated(&mut self, seq: u64, job: translate::Job, hidden: bool, result: Result<Vec<translate::Translation>, String>, window: &mut Window, cx: &mut Context<Self>) {
         if seq != self.translate_seq {
             return;
         }
-        let translation = match result {
-            Ok(t) => t,
-            Err(e) if self.visible => {
-                self.translation = None;
+        let rows = match result {
+            Ok(rows) => rows,
+            // The last answers stay; the action bar says what went wrong.
+            Err(e) if self.visible && self.mode == Mode::Translate => {
+                if let Some(tr) = &mut self.translation {
+                    tr.busy = false;
+                }
                 self.status = Some((Tone::Error, e));
-                return self.refresh(cx);
+                return cx.notify();
             }
             Err(e) => return drop(self.tx.unbounded_send(Msg::error(e))),
         };
-        match job.after {
-            translate::After::Replace => {
+        if job.after != translate::After::Open {
+            let Some(t) = rows.first() else { return };
+            cx.write_to_clipboard(ClipboardItem::new_string(t.text.clone()));
+            let verb = if job.after == translate::After::Copy {
+                "Copied"
+            } else {
                 // Over the selection the launcher gave focus back to.
-                cx.write_to_clipboard(ClipboardItem::new_string(translation[0].text.clone()));
-                return clipboard::paste_soon();
-            }
-            translate::After::Copy => {
-                cx.write_to_clipboard(ClipboardItem::new_string(translation[0].text.clone()));
-                return drop(self.tx.unbounded_send(Msg::done("Copied translation")));
-            }
-            translate::After::Open => {}
+                clipboard::paste_soon();
+                "Pasted"
+            };
+            return drop(self.tx.unbounded_send(Msg::done(translate::instant_toast(verb, &t.detected, &t.to))));
         }
-        self.translation = Some((job, Some(translation)));
+        let detected = rows.first().map(|t| t.detected.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| job.from.clone());
+        let (rows, first) = translate::order(rows, &detected, self.cfg.translator.cross_first);
+        let text = job.text.clone();
+        self.translation = Some(TrView { job, rows, first, busy: false });
+        self.status = None;
         if hidden && !self.visible {
             self.show(Mode::Translate, window, cx);
-        } else if self.mode == Mode::Translate {
+        }
+        if self.mode == Mode::Translate {
+            self.fill_query(&text, cx);
             self.refresh(cx);
         }
     }
@@ -2628,7 +2726,6 @@ impl Launcher {
                 return self.start_snippet(name, template, 0, String::new(), window, cx);
             }
             Act::Script(i) => return self.start_script(i, vec![], cx),
-            Act::Fill(text) => return self.input.update(cx, |s, cx| s.emplace(&text, cx)),
             Act::ExtRun(e, c) => return self.start_ext(e, c, false, json!({}), cx),
             Act::ExtFn(f) => {
                 if let Some(ev) = &self.extv {
@@ -2707,13 +2804,20 @@ impl Launcher {
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
             Act::Translate(mut job) => {
                 // Translate's boxes leave the languages empty: the configured ones.
+                let set = self.cfg.translator.set();
                 if job.from.is_empty() {
-                    job.from = translate::language(&self.cfg.translator.from);
+                    job.from = set.from;
                 }
                 if job.to.is_empty() {
-                    job.to = translate::languages(&self.cfg.translator.to);
+                    job.to = set.to;
                 }
                 return self.translate(job, cx);
+            }
+            Act::Cmd(cmd @ (Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste)) => {
+                // Into the primary language, or the secondary when the text already is in it.
+                let after = if cmd == Cmd::InstantTranslateCopy { translate::After::Copy } else { translate::After::Replace };
+                let set = self.cfg.translator.set();
+                return self.translate(translate::Job { text: String::new(), from: set.from, to: set.to, all: false, after }, cx);
             }
             Act::Define(word) => return self.define(word, cx),
             Act::StartTimer(secs, label) => {
@@ -2898,7 +3002,7 @@ impl Launcher {
         match act {
             Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
-            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -3322,7 +3426,7 @@ impl Launcher {
             Mode::Tabs => Some("Browser Tabs".into()),
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
-            Mode::Translate => Some("Translator".into()),
+            Mode::Translate => Some("Translate".into()),
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
             Mode::Shots => Some("Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
@@ -3350,7 +3454,7 @@ impl Launcher {
             Mode::Define => "Enter copies the definition".into(),
             Mode::Shots => "Search screenshots by text or name…".into(),
             Mode::Schedule => "Search events…".into(),
-            Mode::Translate => if self.cfg.translator.primary == "paste" { "Enter pastes the translation" } else { "Enter copies the translation" }.into(),
+            Mode::Translate => "Text to translate…".into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
         }
@@ -3658,6 +3762,52 @@ impl Launcher {
             .into_any_element()
     }
 
+    /// The translator's right-hand pane: the selected translation, then under a hairline its
+    /// source and target languages as tags.
+    fn translate_detail(&self, t: &Tokens) -> gpui::AnyElement {
+        use design::sp;
+        let Some(tr) = &self.translation else { return div().flex_1().into_any_element() };
+        // The pronunciation row (last, past the translations) shows with the first one's languages.
+        let (text, row) = match tr.rows.get(self.selected) {
+            Some(r) => (r.text.clone(), r),
+            None => (self.items.get(self.selected).map(|it| it.title.clone()).unwrap_or_default(), &tr.rows[0]),
+        };
+        let meta = |key: &str, tags: Vec<gpui::Div>| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(sp::S8))
+                .child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(key.to_string()))
+                .child(div().flex().gap(px(sp::S4)).children(tags))
+        };
+        let mut source = vec![];
+        if tr.job.from == "auto" {
+            source.push(design::tag("Auto-Detect", design::Tint::System, t));
+        }
+        source.push(design::tag(&translate::language_name(&tr.detected()), design::Tint::Web, t));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().id("translation").flex_1().min_h_0().overflow_y_scroll().p(px(sp::S16)).text_color(t.text).child(text))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(sp::S16))
+                    .py(px(sp::S12))
+                    .flex()
+                    .flex_col()
+                    .gap(px(sp::S8))
+                    .border_t_1()
+                    .border_color(t.hairline)
+                    .child(meta("Source Language", source))
+                    .child(meta("Target Language", vec![design::tag(&translate::language_name(&row.to), design::Tint::Paste, t)])),
+            )
+            .into_any_element()
+    }
+
     /// File Search's right-hand pane: a preview, then the file's information.
     fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
         let path = match self.items.get(self.selected).map(|it| &it.act) {
@@ -3854,6 +4004,7 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
         Act::Confirm(false) => g::CANCEL,
+        Act::Translate(_) => g::LANGUAGES,
         _ => g::PLAY,
     }
 }
@@ -3906,9 +4057,12 @@ impl Render for Launcher {
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
         // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.
         let grid = self.grid().then(|| self.grid_view(&t, cx));
+        // The translator's previous answers, dimmed while the next ones are on their way.
+        let lt = if self.mode == Mode::Translate && self.translation.as_ref().is_some_and(|tr| tr.busy) { Tokens { text: t.text_faint, text_muted: t.text_faint, ..t } } else { t };
         let side = match self.mode {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
             Mode::Files | Mode::Shots if empty.is_none() => Some(self.file_detail(&t)),
+            Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
@@ -3975,7 +4129,8 @@ impl Render for Launcher {
             let count = |sec: &Option<String>| self.items.iter().filter(|it| &it.section == sec).count();
             // The right-hand column shows what tells rows apart. In root search that is a
             // row's own hotkey or alias (its kind is in the action bar); elsewhere it is the
-            // row's accessory, said once per run of rows that share it.
+            // row's accessory, said once per run of rows that share it (the translator names
+            // every row's language).
             let root = self.mode == Mode::Root;
             let mut above = String::new();
             for (k, r) in rows.iter().enumerate() {
@@ -3994,7 +4149,7 @@ impl Render for Launcher {
                             it.accessory.clone()
                         } else if root {
                             if it.alias.is_empty() && *i != self.selected { it.arg_count().unwrap_or_default() } else { it.alias.clone() }
-                        } else if it.accessory == above {
+                        } else if it.accessory == above && self.mode != Mode::Translate {
                             String::new()
                         } else {
                             above = it.accessory.clone();
@@ -4013,7 +4168,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Shots) { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Shots | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
         let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
@@ -4033,7 +4188,7 @@ impl Render for Launcher {
                             } else {
                                 None
                             };
-                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, acc_max, on, &t)
+                            design::list_row(design::icon_tile(icon, &lt, on, *tint), title, subtitle, accessory, acc_max, on, &lt)
                                 .id(k)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
@@ -4077,7 +4232,7 @@ impl Render for Launcher {
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .child(div().w(px(base_width(cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
+                .child(div().w(px(base_width(cfg) * design::SPLIT_LIST)).flex_none().flex().flex_col().min_h_0().child(list))
                 .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(detail))
                 .into_any_element()
         };
@@ -4155,6 +4310,11 @@ impl Render for Launcher {
                     this.open_menu(m, move |this, v, window, cx| this.run(Act::ExtSet(f.clone(), v), None, window, cx), window, cx);
                 }))
                 .into_any_element()
+        });
+        // The translator's language set. ponytail: Task 9 opens the set menu from it (and Ctrl+P).
+        let dropdown = dropdown.or_else(|| {
+            let tr = self.translation.as_ref().filter(|_| self.mode == Mode::Translate)?;
+            Some(design::dropdown(&translate::LangSet { from: tr.job.from.clone(), to: tr.job.to.clone() }.label(), &t).into_any_element())
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
@@ -4694,6 +4854,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translator_rows_copy_or_paste_per_action_and_end_with_the_pronunciation() {
+        let row = |text: &str, to: &str, say: Option<&str>| translate::Translation { text: text.into(), detected: "de".into(), to: to.into(), pronunciation: say.map(String::from) };
+        let job = translate::Job { text: "guten Morgen".into(), from: "auto".into(), to: vec!["en".into(), "es".into()], all: true, after: translate::After::Open };
+        let tr = TrView { job, rows: vec![row("good morning", "en", Some("ˈɡuːtn̩")), row("buenos días", "es", None)], first: 0, busy: false };
+        let rows = translation_rows(&tr, &config::Translator::default());
+        let shown: Vec<(&str, &str, &str)> = rows.iter().map(|it| (it.title.as_str(), it.subtitle.as_str(), it.accessory.as_str())).collect();
+        assert_eq!(shown, [("good morning", "", "English"), ("buenos días", "", "Spanish"), ("ˈɡuːtn̩", "Pronunciation", "German")]);
+        let labels: Vec<String> = rows[0].actions().into_iter().map(|a| a.0).collect();
+        assert_eq!(labels, ["Copy Translation", "Paste to Active App", "Copy Source", "Swap Languages", "Open in Google Translate", "Change Target"]);
+        assert_eq!(rows[0].act, Act::Copy("good morning".into()), "Enter");
+        let swap = &rows[0].actions()[3].1;
+        assert!(matches!(swap, Act::Translate(j) if j.text == "good morning" && j.from == "en" && j.to == ["de"]), "{swap:?}");
+        let paste = config::Translator { action: "paste".into(), ..Default::default() };
+        let rows = translation_rows(&tr, &paste);
+        assert_eq!((rows[0].act.clone(), rows[0].actions()[1].0.as_str()), (Act::Paste("good morning".into()), "Copy Translation"));
+    }
 
     #[test]
     fn emoji_grid_rows_break_at_sections_and_columns() {

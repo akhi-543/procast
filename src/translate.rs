@@ -137,10 +137,6 @@ pub struct Translation {
     /// The language it was translated into; `translate` fills this in.
     pub to: String,
     pub pronunciation: Option<String>,
-    /// A spelling correction of the input, the changed words in `[…]`.
-    pub suggestion: Option<String>,
-    /// Google translated the correction, not the input as typed.
-    pub corrected: bool,
 }
 
 /// What a translation is asked for: `text` empty means the selection in the app you came from.
@@ -187,9 +183,46 @@ pub fn language_name(code: &str) -> String {
     LANGUAGES.iter().find(|l| l.0 == c).map_or_else(|| code.to_string(), |l| l.1.to_string())
 }
 
-/// "German", or "English / German" for several targets.
-pub fn names(codes: &[String]) -> String {
-    codes.iter().map(|c| language_name(c)).collect::<Vec<_>>().join(" / ")
+/// A source language and up to two targets: what the translator's Dropdown shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LangSet {
+    pub from: String,
+    pub to: Vec<String>,
+}
+
+impl LangSet {
+    /// As codes; empty targets are left out, none at all means English.
+    pub fn new(from: &str, to: &[String]) -> Self {
+        LangSet { from: language(from), to: languages(to) }
+    }
+
+    /// "Auto-Detect → English, Spanish".
+    pub fn label(&self) -> String {
+        let from = if self.from == "auto" { "Auto-Detect".to_string() } else { language_name(&self.from) };
+        format!("{from} → {}", self.to.iter().map(|c| language_name(c)).collect::<Vec<_>>().join(", "))
+    }
+}
+
+/// The rows as shown, and the one selected on open: a row into the language the text is
+/// already in goes last when `cross_first`, and is never the first pick.
+pub fn order(mut rows: Vec<Translation>, detected: &str, cross_first: bool) -> (Vec<Translation>, usize) {
+    let same = |t: &Translation| !detected.is_empty() && base(&t.to) == base(detected);
+    if cross_first {
+        rows.sort_by_key(same);
+    }
+    let first = rows.iter().position(|t| !same(t)).unwrap_or(0);
+    (rows, first)
+}
+
+/// The text on translate.google.com.
+pub fn google_url(from: &str, to: &str, text: &str) -> String {
+    format!("https://translate.google.com/?sl={from}&tl={to}&text={}&op=translate", crate::search::url_encode(text))
+}
+
+/// "Copied translation · German → English", after an Instant Translate.
+pub fn instant_toast(verb: &str, from: &str, to: &str) -> String {
+    let langs = [from, to].iter().filter(|c| !c.is_empty()).map(|c| language_name(c)).collect::<Vec<_>>().join(" → ");
+    format!("{verb} translation · {langs}")
 }
 
 /// `en` for `en-GB`: regional variants count as one language.
@@ -233,8 +266,7 @@ pub fn parse_reply(json: &str) -> Option<Translation> {
     }
     // The segment without a translation carries the romanisation.
     let pronunciation = segments.iter().rev().find(|s| s[0].is_null()).and_then(|s| s[2].as_str().or_else(|| s[3].as_str())).filter(|p| !p.is_empty()).map(str::to_string);
-    let suggestion = r[7][0].as_str().map(|s| s.replace("<b><i>", "[").replace("</i></b>", "]"));
-    Some(Translation { text, detected: detected.to_string(), to: String::new(), pronunciation, suggestion, corrected: r[7][5].as_bool() == Some(true) })
+    Some(Translation { text, detected: detected.to_string(), to: String::new(), pronunciation })
 }
 
 pub fn error_text(status: u16) -> String {
@@ -247,37 +279,43 @@ pub fn error_text(status: u16) -> String {
 fn request_error(e: ureq::Error) -> String {
     match e {
         ureq::Error::StatusCode(code) => error_text(code),
-        _ => "Could not reach Google Translate".into(),
+        _ => UNREACHABLE.into(),
     }
 }
 
-/// One request. Blocks on the network: call from a worker thread.
-fn fetch(text: &str, from: &str, to: &str) -> Result<Translation, String> {
+const UNREACHABLE: &str = "Couldn't reach Google Translate";
+
+/// One request, through `proxy` when it is set. Blocks on the network: call from a worker thread.
+fn fetch(text: &str, from: &str, to: &str, proxy: &str) -> Result<Translation, String> {
     let (url, form) = build_url(text, from, to);
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+    let mut config = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15)));
+    if !proxy.trim().is_empty() {
+        config = config.proxy(Some(ureq::Proxy::new(proxy.trim()).map_err(|_| format!("The HTTP proxy {proxy} isn't a valid address"))?));
+    }
+    let agent: ureq::Agent = config.build().into();
     let mut resp = match form {
         None => agent.get(&url).call(),
         Some(body) => agent.post(&url).content_type("application/x-www-form-urlencoded;charset=UTF-8").send(body),
     }
     .map_err(request_error)?;
-    let body = resp.body_mut().read_to_string().map_err(|_| "Could not reach Google Translate".to_string())?;
+    let body = resp.body_mut().read_to_string().map_err(|_| UNREACHABLE.to_string())?;
     let mut t = parse_reply(&body).ok_or("Google Translate changed its reply")?;
     t.to = to.to_string();
     Ok(t)
 }
 
 /// Translates into the first target, or the second when the text turns out to be in the first.
-pub fn translate(text: &str, from: &str, targets: &[String]) -> Result<Translation, String> {
+pub fn translate(text: &str, from: &str, targets: &[String], proxy: &str) -> Result<Translation, String> {
     let first = pick_target(from, targets);
-    let t = fetch(text, from, first)?;
+    let t = fetch(text, from, first, proxy)?;
     match pick_target(&t.detected, targets) {
-        next if next != first => fetch(text, from, next),
+        next if next != first => fetch(text, from, next, proxy),
         _ => Ok(t),
     }
 }
 
 /// Into every target at once; the targets that failed are left out unless all did.
-fn translate_all(text: &str, from: &str, targets: &[String]) -> Result<Vec<Translation>, String> {
+fn translate_all(text: &str, from: &str, targets: &[String], proxy: &str) -> Result<Vec<Translation>, String> {
     let mut codes: Vec<&String> = vec![];
     for t in targets {
         if !codes.iter().any(|c| c.eq_ignore_ascii_case(t)) {
@@ -285,7 +323,7 @@ fn translate_all(text: &str, from: &str, targets: &[String]) -> Result<Vec<Trans
         }
     }
     let results: Vec<Result<Translation, String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = codes.iter().map(|to| s.spawn(move || fetch(text, from, to))).collect();
+        let handles: Vec<_> = codes.iter().map(|to| s.spawn(move || fetch(text, from, to, proxy))).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("Translation failed".into()))).collect()
     });
     let (ok, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
@@ -297,18 +335,9 @@ fn translate_all(text: &str, from: &str, targets: &[String]) -> Result<Vec<Trans
 }
 
 /// Runs a job; never panics out, so the worker thread always has an answer to send.
-pub fn run(job: &Job) -> Result<Vec<Translation>, String> {
-    std::panic::catch_unwind(|| if job.all { translate_all(&job.text, &job.from, &job.to) } else { translate(&job.text, &job.from, &job.to).map(|t| vec![t]) })
+pub fn run(job: &Job, proxy: &str) -> Result<Vec<Translation>, String> {
+    std::panic::catch_unwind(|| if job.all { translate_all(&job.text, &job.from, &job.to, proxy) } else { translate(&job.text, &job.from, &job.to, proxy).map(|t| vec![t]) })
         .unwrap_or_else(|_| Err("Translation failed".into()))
-}
-
-const QUICK: &str = "quick translate ";
-
-/// `quick translate hola`: the text, to be translated into every target.
-pub fn quick_query(q: &str) -> Option<String> {
-    let q = q.trim_start();
-    let head = q.get(..QUICK.len())?;
-    head.eq_ignore_ascii_case(QUICK).then(|| q[QUICK.len()..].trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// A `[[translate]]` command's title: its name, else "Translate to German".
@@ -353,13 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn recorded_reply_gives_text_pronunciation_and_suggestion() {
+    fn recorded_reply_gives_text_and_pronunciation() {
         let t = parse_reply(RECORDED).unwrap();
         assert_eq!(t.text, "Guten Morgen");
         assert_eq!(t.detected, "en");
         assert_eq!(t.pronunciation.as_deref(), Some("ˌɡo͝od ˈmôrniNG"));
-        assert_eq!(t.suggestion.as_deref(), Some("good [morning]"));
-        assert!(t.corrected);
     }
 
     #[test]
@@ -368,7 +395,6 @@ mod tests {
         let t = parse_reply(body).unwrap();
         assert_eq!((t.text.as_str(), t.detected.as_str()), ("Hallo Welt. Wie geht es dir?", "de"), "r[8][0][0] wins over r[2]");
         assert_eq!(t.pronunciation.as_deref(), Some("Hallo velt"));
-        assert_eq!((t.suggestion, t.corrected), (None, false));
         assert_eq!(parse_reply(r#"[[["x","y"]],null,"fr"]"#).unwrap().pronunciation, None);
     }
 
@@ -395,7 +421,7 @@ mod tests {
         assert_eq!(error_text(429), "Google Translate is rate limiting, try again later");
         assert_eq!(error_text(500), "Google Translate error 500");
         assert_eq!(request_error(ureq::Error::StatusCode(429)), "Google Translate is rate limiting, try again later");
-        assert_eq!(request_error(ureq::Error::HostNotFound), "Could not reach Google Translate");
+        assert_eq!(request_error(ureq::Error::HostNotFound), "Couldn't reach Google Translate");
     }
 
     #[test]
@@ -414,41 +440,56 @@ mod tests {
     }
 
     #[test]
-    fn command_titles_are_not_queries() {
-        for title in ["Quick Translate", "Instant Translate", "Translate"] {
-            assert_eq!(quick_query(title), None, "{title}");
-        }
-        assert_eq!(quick_query("Quick Translate hola mundo"), Some("hola mundo".into()));
-        assert_eq!(quick_query("quick translate  "), None);
-        assert_eq!(quick_query("quick tr hola"), None);
-        assert_eq!(quick_query("quick"), None);
-        assert_eq!(quick_query("ééééééééééééééééé"), None, "no slicing inside a character");
-    }
-
-    #[test]
     fn command_titles_name_the_language() {
         assert_eq!(command_title("", "DE"), "Translate to German");
         assert_eq!(command_title("", "zh-tw"), "Translate to Chinese (Traditional)");
         assert_eq!(command_title("Deutsch", "DE"), "Deutsch");
-        assert_eq!(names(&v(&["en", "de"])), "English / German");
     }
 
     #[test]
     #[ignore = "asks Google Translate over the network: cargo test live_ -- --ignored --nocapture"]
     fn live_translation_follows_the_two_target_rule_and_posts_long_text() {
-        let t = translate("good morning", "auto", &v(&["en", "de"])).unwrap();
+        let t = translate("good morning", "auto", &v(&["en", "de"]), "").unwrap();
         println!("{t:?}");
         assert_eq!((t.text.as_str(), t.to.as_str(), t.detected.as_str()), ("Guten Morgen", "de", "en"));
-        let t = translate("Guten Morgen", "auto", &v(&["en", "de"])).unwrap();
+        let t = translate("Guten Morgen", "auto", &v(&["en", "de"]), "").unwrap();
         assert_eq!((t.text.as_str(), t.to.as_str()), ("Good morning", "en"));
         let job = Job { text: "hello".into(), from: "auto".into(), to: v(&["de", "fr", "DE"]), all: true, after: After::Open };
-        let all = run(&job).unwrap();
+        let all = run(&job, "").unwrap();
         println!("{all:?}");
         assert_eq!(all.iter().map(|t| t.to.as_str()).collect::<Vec<_>>(), ["de", "fr"]);
         let long = "good morning. ".repeat(300);
         assert!(build_url(&long, "auto", "de").1.is_some());
-        let t = translate(&long, "auto", &v(&["de"])).unwrap();
+        let t = translate(&long, "auto", &v(&["de"]), "").unwrap();
         assert!(t.text.starts_with("Guten Morgen."), "{}", &t.text[..40]);
+    }
+
+    #[test]
+    fn a_language_set_reads_source_then_targets() {
+        assert_eq!(LangSet::new("auto", &v(&["en", "es"])).label(), "Auto-Detect → English, Spanish");
+        assert_eq!(LangSet::new("de", &v(&["en", ""])).label(), "German → English");
+    }
+
+    #[test]
+    fn the_same_language_row_goes_last_and_is_not_picked() {
+        let row = |to: &str| Translation { text: to.into(), detected: "en".into(), to: to.into(), ..Default::default() };
+        let (rows, first) = order(vec![row("en-GB"), row("es")], "en", true);
+        assert_eq!(rows.iter().map(|t| t.to.as_str()).collect::<Vec<_>>(), ["es", "en-GB"]);
+        assert_eq!(first, 0);
+        let (rows, first) = order(vec![row("en"), row("es")], "en", false);
+        assert_eq!((rows[0].to.as_str(), first), ("en", 1), "kept in place, still not picked");
+        assert_eq!(order(vec![row("en")], "en", true).1, 0, "the only row");
+    }
+
+    #[test]
+    fn google_url_encodes_the_text() {
+        assert_eq!(google_url("auto", "en", "guten Morgen & mehr"), "https://translate.google.com/?sl=auto&tl=en&text=guten%20Morgen%20%26%20mehr&op=translate");
+    }
+
+    #[test]
+    fn instant_toast_names_both_languages() {
+        assert_eq!(instant_toast("Copied", "de", "en"), "Copied translation · German → English");
+        assert_eq!(instant_toast("Pasted", "", "en"), "Pasted translation · English");
     }
 
     #[test]

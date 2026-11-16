@@ -53,8 +53,6 @@ pub enum Act {
     Layout(String),
     /// Ask Claude; the answer streams into its own view.
     Ask(String),
-    /// Put text in the search box (quicklink waiting for its argument).
-    Fill(String),
     /// Start extension command (extension index, command index).
     ExtRun(usize, usize),
     /// Call a handler in the running extension view.
@@ -134,7 +132,6 @@ impl Act {
             Act::Confirm(true) => "Confirm",
             Act::Confirm(false) => "Cancel",
             Act::UninstallExt(_) => "Uninstall Extension",
-            Act::Fill(_) => "Type Query",
             Act::Favorite(_, true) => "Add to Favorites",
             Act::Favorite(_, false) => "Remove from Favorites",
             Act::Hide(_) => "Hide from Root Search",
@@ -456,7 +453,7 @@ pub fn with_args(item: &Item, values: &[String]) -> Result<Act, (usize, String)>
     Ok(match &item.act {
         Act::Cmd(Cmd::StartTimer) => Act::StartTimer(crate::timers::parse_duration(&v[0]).ok_or_else(|| missing(0))?.as_secs(), v[1].clone()),
         // Empty from and to: the configured languages.
-        Act::Cmd(Cmd::Translate) => Act::Translate(Job { text: v[0].clone(), from: String::new(), to: v[1..].iter().filter(|l| !l.is_empty()).map(|l| translate::language(l)).collect(), all: false, after: After::Open }),
+        Act::Cmd(Cmd::Translate) => Act::Translate(Job { text: v[0].clone(), from: String::new(), to: v[1..].iter().filter(|l| !l.is_empty()).map(|l| translate::language(l)).collect(), all: true, after: After::Open }),
         Act::Cmd(Cmd::Define) => Act::Define(v[0].clone()),
         Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => {
             crate::focus::parse_start(&[String::new(), v[1].clone()], &[], 0).map_err(|e| (1, e))?;
@@ -487,7 +484,7 @@ fn command_args(cmd: Cmd, cfg: &Config) -> (Vec<Arg>, &'static [&'static str]) {
         Cmd::Translate => {
             let to = ArgKind::Choice(translate::LANGUAGES.iter().map(|(code, name)| (code.to_string(), name.to_string())).collect());
             // With the selection to fall back on, the text may stay empty.
-            let text = Arg { optional: cfg.translator.prefill_selection, missing: "Type the text to translate".into(), ..Arg::new("Text") };
+            let text = Arg { optional: cfg.translator.fill_selection, missing: "Type the text to translate".into(), ..Arg::new("Text") };
             (vec![text, Arg { kind: to, ..Arg::optional("To") }], &["translate", "tr"])
         }
         Cmd::Define => (vec![Arg { word: true, missing: "Type a word to define".into(), ..Arg::new("Word") }], &["define", "def"]),
@@ -612,12 +609,6 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         let job = Job { text: String::new(), from: translate::language(&t.from), to: vec![translate::language(&t.to)], all: false, after };
         items.push(Item::new(&title, "Translator", Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Command").keyed(format!("tr:{title}")).words("translate language selection").tinted(Tint::Web));
     }
-    // Titles no query form starts with: "Translate Selection" would parse as translating the word "Selection".
-    let t = &cfg.translator;
-    let after = if t.primary == "paste" { After::Replace } else { After::Copy };
-    let instant = Job { text: String::new(), from: translate::language(&t.from), to: translate::languages(&t.to), all: false, after };
-    items.push(Item::new("Instant Translate", "Translator", Icon::Vector(g::LANGUAGES), Act::Translate(instant)).acc("Command").keyed("tr:Instant Translate".into()).words("translate selection selected text copy paste language").tinted(Tint::Web));
-    items.push(Item::new("Quick Translate", "Translator", Icon::Vector(g::LANGUAGES), Act::Fill("quick translate ".into())).acc("Command").keyed("tr:Quick Translate".into()).words("translate all languages targets at once").tinted(Tint::Web));
     for s in &cfg.snippet {
         let args = crate::snippets::arguments(&s.text).iter().map(crate::snippets::Arg::to_arg).collect();
         items.push(Item::new(&s.name, &s.keyword, Icon::Vector(g::EDIT), Act::Snippet(s.text.clone())).acc("Snippet").keyed(format!("sn:{}", s.name)).words(&s.keyword).tinted(Tint::Paste).boxes(args, &[s.keyword.as_str()]));
@@ -743,11 +734,6 @@ pub fn root(query: &str, catalog: &[Item], cfg: &Config, frec: &Frecency, matche
             _ => it.subtitle.clone(),
         };
         top.push(Item { values, subtitle, ..it.clone() });
-    }
-    if let Some(text) = translate::quick_query(q) {
-        let to = translate::languages(&cfg.translator.to);
-        let job = Job { text: text.clone(), from: translate::language(&cfg.translator.from), to: to.clone(), all: true, after: After::Open };
-        top.push(Item::new(format!("Translate to {}", translate::names(&to)), text.as_str(), Icon::Vector(g::LANGUAGES), Act::Translate(job)).acc("Translator").tinted(Tint::Web));
     }
     if cfg.search.calculator
         && let Some(result) = calculate(q)
@@ -1016,7 +1002,7 @@ mod tests {
 to = \"FR\"").unwrap();
         let cat = catalog(&[], &[], &[], &cfg);
         let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        let job = |text: &str, to: &[&str]| Job { text: text.into(), from: String::new(), to: to.iter().map(|s| s.to_string()).collect(), all: false, after: After::Open };
+        let job = |text: &str, to: &[&str]| Job { text: text.into(), from: String::new(), to: to.iter().map(|s| s.to_string()).collect(), all: true, after: After::Open };
         let r = ask("tr de hola mundo");
         assert_eq!((r[0].act.clone(), r[0].values.clone()), (Act::Cmd(Cmd::Translate), vec!["hola mundo".to_string(), "German".into()]));
         assert_eq!(with_args(&r[0], &r[0].values), Ok(Act::Translate(job("hola mundo", &["de"]))));
@@ -1026,35 +1012,14 @@ to = \"FR\"").unwrap();
     }
 
     #[test]
-    fn quick_translate_query_asks_for_every_target() {
-        let cfg = crate::config::parse("[translator]
-to = [\"en\", \"de\"]").unwrap();
-        let cat = catalog(&[], &[], &[], &cfg);
-        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        let job = Job { text: "hola".into(), from: "auto".into(), to: vec!["en".into(), "de".into()], all: true, after: After::Open };
-        let r = ask("quick translate hola");
-        assert_eq!((r[0].act.clone(), r[0].title.as_str()), (Act::Translate(job), "Translate to English / German"));
-        assert_eq!(ask("tr hola")[0].values, ["hola"]);
-    }
-
-    #[test]
-    fn instant_and_quick_translate_commands_are_found_by_their_titles() {
-        let cfg = Config::default();
-        let ask = |cfg: &Config, q: &str| root(q, &catalog(&[], &[], &[], cfg), cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
-        for title in ["Instant Translate", "Quick Translate"] {
-            let r = ask(&cfg, title);
-            assert_eq!(r[0].title, title, "no query row in front of the command");
-            assert!(r.iter().all(|it| !matches!(&it.act, Act::Translate(j) if !j.text.is_empty())));
+    fn instant_translate_commands_replace_the_old_rows() {
+        let titles: Vec<String> = catalog(&[], &[], &[], &Config::default()).into_iter().map(|it| it.title).collect();
+        for gone in ["Instant Translate", "Quick Translate"] {
+            assert!(!titles.iter().any(|t| t == gone), "{gone}");
         }
-        let find = |cfg: &Config, title: &str| catalog(&[], &[], &[], cfg).into_iter().find(|it| it.title == title).unwrap();
-        assert_eq!(find(&cfg, "Quick Translate").act, Act::Fill("quick translate ".into()));
-        assert_eq!(find(&cfg, "Quick Translate").key.as_deref(), Some("tr:Quick Translate"));
-        let Act::Translate(copy) = find(&cfg, "Instant Translate").act else { panic!() };
-        assert_eq!((copy.text.as_str(), copy.after, copy.to.as_slice()), ("", After::Copy, &["en".to_string()][..]));
-        let paste = crate::config::parse("[translator]
-primary = \"paste\"").unwrap();
-        let Act::Translate(paste) = find(&paste, "Instant Translate").act else { panic!() };
-        assert_eq!(paste.after, After::Replace);
+        for new in ["Instant Translate Copy", "Instant Translate Paste"] {
+            assert!(titles.iter().any(|t| t == new), "{new}");
+        }
     }
 
     #[test]
@@ -1325,8 +1290,12 @@ fallbacks = [\"define\"]").unwrap();
         assert_eq!(with_args(timer, &[]), Err((0, "Type a time: 5m, 1h30m, 1:30".to_string())));
         assert_eq!(with_args(timer, &strings(["soon"])), Err((0, "Type a time: 5m, 1h30m, 1:30".to_string())), "not a time");
         assert_eq!(with_args(timer, &strings(["25m", "tea"])), Ok(Act::StartTimer(1500, "tea".into())));
-        let tr = cmd(Cmd::Translate);
+        let typed = crate::config::parse("[translator]\nfill_selection = false").unwrap();
+        let typed = catalog(&[], &[], &[], &typed);
+        let tr = typed.iter().find(|it| it.act == Act::Cmd(Cmd::Translate)).unwrap();
         assert_eq!(with_args(tr, &strings(["", "German"])), Err((0, "Type the text to translate".to_string())));
+        let tr = cmd(Cmd::Translate);
+        assert_eq!(with_args(tr, &strings(["", "German"])).map(|_| ()), Ok(()), "the selection fills it");
         let Ok(Act::Translate(job)) = with_args(tr, &strings(["hallo", "German"])) else { panic!("a translation") };
         assert_eq!((job.text.as_str(), job.to.as_slice()), ("hallo", &["de".to_string()][..]));
         let Ok(Act::Translate(job)) = with_args(tr, &strings(["hallo"])) else { panic!("a translation") };

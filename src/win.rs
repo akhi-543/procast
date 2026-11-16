@@ -86,7 +86,7 @@ pub enum Msg {
     TimerTick,
     /// A translation came back (or failed): the request number (older ones are dropped), what
     /// was asked, whether the launcher was hidden meanwhile, and Google's answer (one translation
-    /// per target for a quick translate).
+    /// per target for the translator view).
     Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<Vec<crate::translate::Translation>, String> },
     /// A calendar fetch finished: each feed's address and its events, or why it failed.
     Calendar(Vec<(String, Result<Vec<crate::calendar::Event>, String>)>),

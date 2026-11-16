@@ -87,6 +87,10 @@ pub const LIST_PAD: f32 = 4.;
 pub const ACCESSORY_MAX: f32 = 220.;
 /// The Settings sidebar's width.
 pub const SIDEBAR: f32 = 192.;
+/// `.pc-split`: the list's share of a split view's width; the detail takes the rest.
+pub const SPLIT_LIST: f32 = 0.4;
+/// `.pc-tag`: a small tinted label's height.
+pub const TAG: f32 = 20.;
 
 /// The type scale. Views use only these sizes for text.
 pub mod ts {
@@ -158,6 +162,9 @@ const RING: f32 = 2.;
 pub mod mix {
     /// `.pc-arg.is-missing`: the danger ring.
     pub const MISSING_RING: f32 = 0.32;
+    /// `.pc-tag`: the hue's share of its fill, and of its text (mixed into `text`).
+    pub const TAG_FILL: f32 = 0.18;
+    pub const TAG_TEXT: f32 = 0.72;
 }
 
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
@@ -287,6 +294,7 @@ names! {
     HARD_DRIVE = "hard-drive",
     HASH = "hash",
     LANGUAGES = "languages",
+    AUDIO_LINES = "audio-lines",
     MONITOR = "monitor",
     OCTAGON_X = "octagon-x",
     PACKAGE_PLUS = "package-plus",
@@ -1217,6 +1225,23 @@ pub fn dropdown(label: &str, t: &Tokens) -> Div {
         .child(icon(g::FILTER, ic::SM, t.text_muted))
         .child(div().max_w(px(180.)).truncate().child(label.to_string()))
         .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+}
+
+/// `.pc-tag`: a small label tinted with a kind's hue ("Auto-Detect", "German").
+pub fn tag(label: &str, hue: Tint, t: &Tokens) -> Div {
+    let h = hue.hue(t);
+    div()
+        .flex_none()
+        .h(px(TAG))
+        .px(px(sp::S8))
+        .flex()
+        .items_center()
+        .rounded(px(r::XS))
+        .bg(alpha(h, mix::TAG_FILL))
+        .text_size(px(ts::SMALL))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(over(alpha(h, mix::TAG_TEXT), t.text))
+        .child(label.to_string())
 }
 
 /// `.pc-pop__rule`: a hairline between groups of menu rows.
