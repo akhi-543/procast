@@ -229,15 +229,13 @@ const SECTION_ICONS: [&str; 19] = [
     design::g::WRENCH,
 ];
 
-/// A feature section's page header (`.pc-sett__head`): its command's tint for the sticker
-/// tile, and one line on what it does.
-fn head(section: &str) -> Option<(design::Tint, &'static str)> {
-    use design::Tint;
+/// A feature section's page header (`.pc-sett__head`): one line on what it does. Its sticker
+/// tile is monochrome: Settings never use kind tints.
+fn head(section: &str) -> Option<&'static str> {
     Some(match section {
-        "Translator" => (Tint::Web, ""),
-        "Screenshots" => (Tint::File, ""),
-        "Calendar" => (Tint::System, "Today's meetings in search, with a one-key join."),
-        "Focus" | "Notes" | "Games" => (Tint::System, ""),
+        "Translator" => "Translate text with Google Translate, from the launcher or the selection.",
+        "Calendar" => "Today's meetings in search, with a one-key join.",
+        "Screenshots" | "Focus" | "Notes" | "Games" => "",
         _ => return None,
     })
 }
@@ -264,11 +262,7 @@ fn language_label(lead: &[Opt], code: &str) -> String {
 
 /// A language row's dropdown: its leading options, a rule, every language; the current one selected.
 fn language_menu(lead: &[Opt], current: &str) -> menu::Menu {
-    let mut entries: Vec<menu::Entry> = lead.iter().map(|o| menu::Entry { id: o.1.text(), label: o.0.into(), ..Default::default() }).collect();
-    if let Some(last) = entries.last_mut() {
-        last.rule_after = true;
-    }
-    entries.extend(crate::translate::LANGUAGES.iter().map(|(code, name)| menu::Entry { id: (*code).into(), label: (*name).into(), ..Default::default() }));
+    let entries = crate::translate::language_entries(lead.iter().map(|o| (o.1.text(), o.0.to_string())));
     // ponytail: opens under the window's top-right corner, not under the row; place it at
     // the row once rows report their bounds.
     let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
@@ -546,6 +540,10 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Translate from", "translator.from", Kind::Language(&[("Auto-Detect", S("auto"))]), "The language you type in; Auto-Detect lets Google tell.").with_icon(g::LANGUAGES),
                 row("Primary language", "translator.primary", Kind::Language(&[]), "What Translate turns your text into.").with_icon(g::LANGUAGES),
                 row("Secondary language", "translator.secondary", Kind::Language(&[("None", S(""))]), "A second translation under the first.").with_icon(g::LANGUAGES),
+                row("Fill with selected text", "translator.fill_selection", Kind::Bool, "Translate opens with the text selected in the app you came from.").with_icon(g::TEXT_CURSOR_INPUT),
+                row("Default action", "translator.action", Kind::Choice(&[("Copy", S("copy")), ("Paste", S("paste"))]), "What Enter does with a translation; Ctrl+Enter does the other.").with_icon(g::CLIPBOARD_PASTE),
+                row("Cross-language results first", "translator.cross_first", Kind::Bool, "A translation into the language you typed in goes last.").with_icon(g::ARROW_UP_DOWN),
+                row("HTTP proxy", "translator.proxy", Kind::Text, "Reach Google Translate through this proxy, e.g. http://127.0.0.1:8080. Empty: none.").with_icon(g::NETWORK),
             ],
         )]),
         "Games" => groups(vec![(
@@ -706,7 +704,20 @@ impl Settings {
         if SECTIONS[self.section] == "Shortcuts" {
             return self.shortcut_rows();
         }
-        rows(self.section, &self.exts, &self.text)
+        let mut out = rows(self.section, &self.exts, &self.text);
+        if SECTIONS[self.section] != "Translator" {
+            return out;
+        }
+        // Then its commands, each with its alias and hotkey.
+        out.extend(self.items.iter().enumerate().filter(|(_, it)| it.subtitle == "Translator").map(|(i, it)| Row {
+            label: it.title.clone(),
+            help: String::new(),
+            path: vec!["launcher".into(), "aliases".into(), key_of(it)],
+            kind: Kind::Command(i),
+            group: "Commands".into(),
+            icon: "",
+        }));
+        out
     }
 
     /// The Shortcuts table: category and filter, then every matching item.
@@ -829,6 +840,7 @@ impl Settings {
         let (verb, removed) = match edit {
             config::TableEdit::Add(_) => ("added", None),
             config::TableEdit::Duplicate(_) => ("copied", None),
+            config::TableEdit::Replace(..) => ("saved", None),
             config::TableEdit::Remove(i) => ("deleted", Some(i)),
         };
         let text = match config::edit_table(&current, list, edit).and_then(|t| config::parse(&t).map(|_| t)) {
@@ -1420,12 +1432,12 @@ impl Render for Settings {
         });
         let heading = match head(SECTIONS[self.section]) {
             // `.pc-sett__head`: the sticker tile, the name, the line on what it does.
-            Some((tint, line)) => div()
+            Some(line) => div()
                 .flex()
                 .flex_none()
                 .items_center()
                 .gap(px(design::sp::S12))
-                .child(design::icon_tile(&Icon::Vector(SECTION_ICONS[self.section]), &t, false, Some(tint)))
+                .child(design::icon_tile(&Icon::Vector(SECTION_ICONS[self.section]), &t, false, Some(design::Tint::Accent)))
                 .child(
                     div()
                         .flex()
@@ -1691,6 +1703,26 @@ mod tests {
         }
         let launcher = rows(SECTIONS.iter().position(|x| *x == "Launcher").unwrap(), &[], "");
         assert!(!launcher.iter().any(|r| ["Games", "Focus", "Calendar"].contains(&r.group.as_str())));
+    }
+
+    #[test]
+    fn the_translator_page_lists_its_seven_settings() {
+        let s = SECTIONS.iter().position(|x| *x == "Translator").unwrap();
+        let shown: Vec<(String, &str)> = rows(s, &[], "").into_iter().map(|r| (r.label, r.icon)).collect();
+        let want = [
+            ("Translate from", g::LANGUAGES),
+            ("Primary language", g::LANGUAGES),
+            ("Secondary language", g::LANGUAGES),
+            ("Fill with selected text", g::TEXT_CURSOR_INPUT),
+            ("Default action", g::CLIPBOARD_PASTE),
+            ("Cross-language results first", g::ARROW_UP_DOWN),
+            ("HTTP proxy", g::NETWORK),
+        ];
+        assert_eq!(shown, want.map(|(l, i)| (l.to_string(), i)));
+        let action = rows(s, &[], "").into_iter().find(|r| r.label == "Default action").unwrap();
+        assert!(matches!(action.kind, Kind::Choice(o) if o.iter().map(|o| (o.0, o.1.text())).eq([("Copy", "copy".to_string()), ("Paste", "paste".to_string())])));
+        assert_eq!(head("Translator"), Some("Translate text with Google Translate, from the launcher or the selection."));
+        assert_eq!(head("General"), None);
     }
 
     #[test]

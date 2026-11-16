@@ -375,6 +375,9 @@ names! {
     NOTEBOOK_PEN = "notebook-pen",
     EYE = "eye",
     BAN = "ban",
+    PLUS = "plus",
+    ARROW_UP_DOWN = "arrow-up-down",
+    CLIPBOARD_PASTE = "clipboard-paste",
 }
 
 #[derive(Clone, Copy)]

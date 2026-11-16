@@ -78,6 +78,8 @@ use win::{BINDS, Bind, Msg, TrayCmd};
 actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
 // Left and Right in the emoji grid (the search bar keeps them elsewhere).
 actions!(procast, [SelectLeft, SelectRight]);
+// Ctrl+P: the search bar's Dropdown (the translator's language sets).
+actions!(procast, [OpenDropdown]);
 // Tab and Shift+Tab while argument boxes show.
 actions!(procast, [NextBox, PrevBox]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
@@ -161,11 +163,13 @@ enum Mode {
     Schedule,
     /// A native form (see `Launcher::form`).
     Form(FormKind),
+    /// Manage Language Sets: the translator's sets, to pick, add, edit or delete.
+    LanguageSets,
 }
 
 /// A native launcher form: what it is for, which names its title and primary action.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[expect(dead_code, reason = "opened by Tasks 9/12/15")]
+#[expect(dead_code, reason = "Focus and AddCalendar are opened by Tasks 12/15")]
 enum FormKind {
     Focus,
     AddCalendar,
@@ -179,7 +183,8 @@ impl FormKind {
         match self {
             FormKind::Focus => (g::SHIELD_CHECK, "Focus", "Start Focus Session"),
             FormKind::AddCalendar => (g::CALENDAR, "Add Calendar", "Add Calendar"),
-            FormKind::AddLanguageSet(_) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
+            FormKind::AddLanguageSet(None) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
+            FormKind::AddLanguageSet(Some(_)) => (g::LANGUAGES, "Edit Language Set", "Save Language Set"),
         }
     }
 }
@@ -217,7 +222,6 @@ impl FormField {
 }
 
 /// A native form's values by label: the text typed, or the picked id.
-#[cfg_attr(not(test), expect(dead_code, reason = "opened by Tasks 9/12/15"))]
 fn form_values(fields: &[FormField]) -> HashMap<&str, &str> {
     fields.iter().filter(|f| f.focusable()).map(|f| (f.label.as_ref(), f.value.as_str())).collect()
 }
@@ -446,6 +450,17 @@ struct Confirm {
     primary: String,
     /// The primary action destroys something (the extension says so).
     danger: bool,
+    /// A native confirm: what Confirm does. None: an extension's confirmAlert, answered by reply.
+    then: Option<OnConfirm>,
+}
+
+type OnConfirm = Box<dyn FnOnce(&mut Launcher, &mut Context<Launcher>)>;
+
+/// A confirm drawn as a dialog; these two rows only drive selection and Enter.
+fn confirm_rows(c: &Confirm) -> Vec<Item> {
+    let mut ok = Item::new(c.primary.clone(), "", Icon::Vector(g::CHECK), Act::Confirm(true));
+    ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
+    vec![ok, Item::new("Cancel", "", Icon::Vector(g::CANCEL), Act::Confirm(false))]
 }
 
 /// What a menu's opener does with the picked `Entry.id`.
@@ -492,8 +507,7 @@ fn translation_rows(tr: &TrView, cfg: &config::Translator) -> Vec<Item> {
                 ("Copy Source".into(), Act::Copy(source.clone())),
                 ("Swap Languages".into(), Act::Translate(swap)),
                 ("Open in Google Translate".into(), Act::Open(translate::google_url(&tr.job.from, &t.to, source))),
-                // ponytail: picks a language set once those exist (Task 9); does nothing until then.
-                ("Change Target".into(), Act::None),
+                ("Change Target".into(), Act::LangMenu),
             ];
             it
         })
@@ -501,6 +515,47 @@ fn translation_rows(tr: &TrView, cfg: &config::Translator) -> Vec<Item> {
     let say = tr.rows.iter().find_map(|t| t.pronunciation.clone());
     items.extend(say.map(|p| Item::new(&p, "Pronunciation", Icon::Vector(g::AUDIO_LINES), Act::Copy(p.clone())).acc(translate::language_name(&detected))));
     items
+}
+
+/// The translator bar's Dropdown menu: a search field, Manage Language Sets…, a rule, then
+/// every set with the current one selected. Ids: "manage", or the set's index.
+fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
+    let manage = menu::Entry { id: "manage".into(), label: "Manage Language Sets…".into(), icon: Some(g::EDIT), rule_after: true, ..Default::default() };
+    let sets = sets.iter().enumerate().map(|(i, s)| menu::Entry { id: i.to_string(), label: s.label(), icon: Some(g::LANGUAGES), ..Default::default() });
+    let mut m = menu::Menu::new(std::iter::once(manage).chain(sets).collect(), Some("Search…".into()), menu::Place::Right);
+    m.selected = current + 1;
+    m
+}
+
+/// Manage Language Sets: Add first, then every set, the current one ticked. Enter makes a set
+/// current; Ctrl+K also edits or deletes it (not the first: that one is Settings → Translator's).
+fn lang_set_rows(sets: &[translate::LangSet], current: usize) -> Vec<Item> {
+    let add = Item::new("Add Language Set…", "", Icon::Vector(g::PLUS), Act::EditLangSet(None));
+    let rows = sets.iter().enumerate().map(|(i, s)| {
+        let on = i == current;
+        let mut it = Item::new(s.label(), "", Icon::Vector(if on { g::CHECK } else { g::LANGUAGES }), Act::UseLangSet(i)).acc(if on { "Current" } else { "" });
+        let delete = (i > 0).then_some(Act::DeleteLangSet(i));
+        it.extra = [Act::UseLangSet(i), Act::EditLangSet(Some(i))].into_iter().chain(delete).map(|a| (a.label().to_string(), a)).collect();
+        it
+    });
+    std::iter::once(add).chain(rows).collect()
+}
+
+/// The Add (or Edit) Language Set form: three selects with search, on `set` or Auto-Detect → English.
+fn lang_set_form(set: Option<&translate::LangSet>) -> Vec<FormField> {
+    let select = |label: &str, lead: &[(&str, &str)], value: String| FormField {
+        label: label.to_string().into(),
+        ctl: Ctl::Select(translate::language_entries(lead.iter().map(|(id, l)| (id.to_string(), l.to_string()))), true),
+        value,
+        input: None,
+        error: None,
+    };
+    let to = |n: usize, or: &str| set.and_then(|s| s.to.get(n).cloned()).unwrap_or_else(|| or.into());
+    vec![
+        select("Source language", &[("auto", "Auto-Detect")], set.map_or_else(|| "auto".into(), |s| s.from.clone())),
+        select("Target language 1", &[], to(0, "en")),
+        select("Target language 2", &[("", "None")], to(1, "")),
+    ]
 }
 
 /// An open Dropdown: the menu, its opener's `OnPick`, and the focus to return to when it closes.
@@ -612,6 +667,8 @@ struct Launcher {
     translation: Option<TrView>,
     /// Number of the newest translation request; answers to older ones are dropped.
     translate_seq: u64,
+    /// The language set in use before the last switch, for Enter in the empty translator.
+    prev_set: Option<usize>,
     /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
     define: Option<(String, Option<Result<dict::Answer, String>>)>,
     define_seq: u64,
@@ -747,6 +804,7 @@ impl Launcher {
             output: None,
             translation: None,
             translate_seq: 0,
+            prev_set: None,
             define: None,
             define_seq: 0,
             shots: shots::ShotIndex::default(),
@@ -1116,12 +1174,6 @@ impl Launcher {
     }
 
     fn ext_rows(&mut self, query: &str) -> Vec<Item> {
-        if let Some(c) = &self.confirm {
-            // Drawn as a dialog; these two rows only drive selection and Enter.
-            let mut ok = Item::new(c.primary.clone(), "", Icon::Vector(g::CHECK), Act::Confirm(true));
-            ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
-            return vec![ok, Item::new("Cancel", "", Icon::Vector(g::CANCEL), Act::Confirm(false))];
-        }
         let Some(ev) = &self.extv else { return vec![] };
         let (ext, view) = (ev.ext, ev.view.clone());
         let view_actions: Vec<(String, Act)> =
@@ -1177,6 +1229,7 @@ impl Launcher {
         let keep_selection = self.mode == Mode::Ext;
         self.armed = None;
         self.items = match self.mode {
+            _ if let Some(c) = &self.confirm => confirm_rows(c),
             Mode::Root => {
                 // Matching files arrive later (Msg::Files) and slot in above the fallbacks.
                 if self.cfg.launcher.files
@@ -1227,10 +1280,14 @@ impl Launcher {
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
             Mode::Translate => match &self.translation {
-                _ if query.trim().is_empty() => vec![empty_row(g::LANGUAGES, "Type to translate".into(), "Or select text anywhere before opening Translate".into(), vec![])],
+                _ if query.trim().is_empty() => {
+                    let back = self.prev_set.filter(|&p| p < translate::sets(&self.cfg).len()).map(|p| ("Previous Language Set".to_string(), Act::UseLangSet(p)));
+                    vec![empty_row(g::LANGUAGES, "Type to translate".into(), "Or select text anywhere before opening Translate".into(), back.into_iter().collect())]
+                }
                 Some(tr) => translation_rows(tr, &self.cfg.translator),
                 None => vec![],
             },
+            Mode::LanguageSets => search::filter(&query, lang_set_rows(&translate::sets(&self.cfg), translate::current(&self.cfg)), &mut self.matcher),
             Mode::Define => match &self.define {
                 None => vec![],
                 Some((_, None)) => {
@@ -2109,6 +2166,90 @@ impl Launcher {
         }
     }
 
+    /// Writes a config.toml edit and takes its translator settings and language sets now (the
+    /// reload follows); false, with the error in the ActionBar, when it fails.
+    fn save_translator(&mut self, edit: impl FnOnce(&str) -> Result<String, String>) -> bool {
+        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
+        let saved = edit(&text)
+            .and_then(|t| Ok((config::parse(&t)?, t)))
+            .and_then(|(c, t)| std::fs::write(config::path(), t).map(|_| c).map_err(|e| format!("Could not write config.toml: {e}")));
+        match saved {
+            Ok(c) => {
+                self.cfg.translator = c.translator;
+                self.cfg.language_set = c.language_set;
+                true
+            }
+            Err(e) => {
+                self.status = Some((Tone::Error, e));
+                false
+            }
+        }
+    }
+
+    /// The bar's Dropdown: the language set menu over the translator.
+    fn open_lang_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let m = lang_set_menu(&translate::sets(&self.cfg), translate::current(&self.cfg));
+        let pick = |this: &mut Launcher, id: String, window: &mut Window, cx: &mut Context<Launcher>| match id.parse() {
+            Ok(i) => this.use_lang_set(i, window, cx),
+            Err(_) => this.set_mode(Mode::LanguageSets, cx),
+        };
+        self.open_menu(m, pick, window, cx);
+    }
+
+    /// Makes set `i` current (the one before becomes the previous set) and re-translates.
+    fn use_lang_set(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let was = translate::current(&self.cfg);
+        if i != was {
+            if !self.save_translator(|t| translate::set_current(t, i)) {
+                return cx.notify();
+            }
+            self.prev_set = Some(was);
+        }
+        self.retranslate(window, cx);
+    }
+
+    /// Ctrl+Enter in the language set form: adds the set and makes it current, or saves an
+    /// edit and goes back to the list.
+    fn save_lang_set(&mut self, edit: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.form else { return };
+        let v = form_values(&form.fields);
+        let set = translate::LangSet::new(v["Source language"], &[v["Target language 1"].to_string(), v["Target language 2"].to_string()]);
+        let was = translate::current(&self.cfg);
+        match edit {
+            None if self.save_translator(|t| translate::add_set(t, &set)) => {
+                self.prev_set = Some(was);
+                self.retranslate(window, cx);
+            }
+            Some(i) if self.save_translator(|t| translate::replace_set(t, i, &set)) => {
+                self.status = Some((Tone::Ok, "Language set saved".into()));
+                self.set_mode(Mode::LanguageSets, cx);
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    /// Back to the translator in the current language set; typed text translates again at
+    /// once, the last answers dimmed meanwhile.
+    fn retranslate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Translate {
+            let keep = self.translation.take();
+            self.set_mode(Mode::Translate, cx);
+            self.translation = keep;
+        }
+        window.focus(&self.input.focus_handle(cx), cx);
+        let set = translate::current_set(&self.cfg);
+        let job = match &self.translation {
+            Some(tr) => translate::Job { from: set.from, to: set.to, ..tr.job.clone() },
+            None => translate::Job { text: String::new(), from: set.from, to: set.to, all: true, after: translate::After::Open },
+        };
+        if job.text.trim().is_empty() {
+            self.translation = Some(TrView { job, rows: vec![], first: 0, busy: false });
+            return self.refresh(cx);
+        }
+        self.translate(job, cx);
+    }
+
     // ---- dictionary ------------------------------------------------------------------
 
     /// Looks `word` up off the UI thread; the first lookup also downloads the dictionary.
@@ -2483,6 +2624,7 @@ impl Launcher {
                             message: p["message"].as_str().unwrap_or_default().into(),
                             primary: p["primary"].as_str().unwrap_or("Confirm").into(),
                             danger: p["destructive"].as_bool().unwrap_or(false),
+                            then: None,
                         });
                         self.selected = 0;
                         self.refresh(cx);
@@ -2650,7 +2792,6 @@ impl Launcher {
     }
 
     /// Opens a native form on `fields` (text controls get their boxes here), the first control focused.
-    #[expect(dead_code, reason = "opened by Tasks 9/12/15")]
     fn open_form(&mut self, kind: FormKind, mut fields: Vec<FormField>, window: &mut Window, cx: &mut Context<Self>) {
         let mut subs = vec![];
         for (i, f) in fields.iter_mut().enumerate().filter(|(_, f)| matches!(f.ctl, Ctl::Text { .. })) {
@@ -2729,13 +2870,13 @@ impl Launcher {
         cx.notify();
     }
 
-    fn submit_form(&mut self, cx: &mut Context<Self>) {
+    fn submit_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Mode::Form(kind) = self.mode {
-            // Each form acts on `form_values`: Task 12 starts the session, Task 15 fetches the feed, Task 9 saves the set.
+            // Each form acts on `form_values`: Task 12 starts the session, Task 15 fetches the feed.
             match kind {
                 FormKind::Focus => {}
                 FormKind::AddCalendar => {}
-                FormKind::AddLanguageSet(_) => {}
+                FormKind::AddLanguageSet(edit) => self.save_lang_set(edit, window, cx),
             }
             return;
         }
@@ -2793,7 +2934,7 @@ impl Launcher {
             match fields.get(i).map(|f| &f.ctl) {
                 Some(Ctl::Select(..)) => _ = self.open_field_menu(window, cx),
                 Some(Ctl::Check) => self.toggle_check(cx),
-                _ if Some(i) == fields.iter().rposition(FormField::focusable) => self.submit_form(cx),
+                _ if Some(i) == fields.iter().rposition(FormField::focusable) => self.submit_form(window, cx),
                 _ => self.move_field(1, window, cx),
             }
             return;
@@ -2951,7 +3092,11 @@ impl Launcher {
             }
             Act::Confirm(ok) => {
                 if let Some(c) = self.confirm.take() {
-                    self.reply(c.run, c.id, Ok(json!(ok)));
+                    match c.then {
+                        Some(then) if ok => then(self, cx),
+                        Some(_) => {}
+                        None => self.reply(c.run, c.id, Ok(json!(ok))),
+                    }
                 }
                 return self.refresh(cx);
             }
@@ -3000,8 +3145,8 @@ impl Launcher {
             }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
             Act::Translate(mut job) => {
-                // Translate's boxes leave the languages empty: the configured ones.
-                let set = self.cfg.translator.set();
+                // Translate's boxes leave the languages empty: the current language set's.
+                let set = translate::current_set(&self.cfg);
                 if job.from.is_empty() {
                     job.from = set.from;
                 }
@@ -3017,6 +3162,25 @@ impl Launcher {
                 return self.translate(translate::Job { text: String::new(), from: set.from, to: set.to, all: false, after }, cx);
             }
             Act::Define(word) => return self.define(word, cx),
+            Act::LangMenu => return self.open_lang_menu(window, cx),
+            Act::UseLangSet(i) => return self.use_lang_set(i, window, cx),
+            Act::EditLangSet(i) => {
+                let set = i.and_then(|i| translate::sets(&self.cfg).get(i).cloned());
+                return self.open_form(FormKind::AddLanguageSet(i), lang_set_form(set.as_ref()), window, cx);
+            }
+            Act::DeleteLangSet(i) => {
+                let label = translate::sets(&self.cfg).get(i).map(translate::LangSet::label).unwrap_or_default();
+                let then = move |this: &mut Launcher, _: &mut Context<Launcher>| {
+                    if this.save_translator(|t| translate::delete_set(t, i)) {
+                        // The sets after it moved up one.
+                        this.prev_set = None;
+                        this.status = Some((Tone::Ok, "Language set deleted".into()));
+                    }
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Language Set?".into(), message: label, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
             Act::StartTimer(secs, label) => {
                 let d = Duration::from_secs(secs);
                 self.timers.start(label.clone(), d);
@@ -3623,7 +3787,7 @@ impl Launcher {
             Mode::Tabs => Some("Browser Tabs".into()),
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
-            Mode::Translate => Some("Translate".into()),
+            Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
             Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
             Mode::Shots => Some("Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
@@ -3654,6 +3818,7 @@ impl Launcher {
             Mode::Schedule => "Search events…".into(),
             Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
+            Mode::LanguageSets => "Search language sets…".into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
         }
@@ -3709,7 +3874,7 @@ impl Launcher {
             Mode::Args => self.args_row.as_ref().map_or(Icon::Vector(g::TERMINAL), |it| it.icon.clone()),
             Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
-            Mode::Translate => Icon::Vector(g::LANGUAGES),
+            Mode::Translate | Mode::LanguageSets => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
             Mode::Shots => Icon::Vector(g::PICTURE),
             Mode::Schedule => Icon::Vector(g::CALENDAR),
@@ -3775,7 +3940,9 @@ impl Launcher {
                 self.focus_field(window, cx);
             }
         } else if let Some(c) = self.confirm.take() {
-            self.reply(c.run, c.id, Ok(json!(false)));
+            if c.then.is_none() {
+                self.reply(c.run, c.id, Ok(json!(false)));
+            }
             self.refresh(cx);
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
@@ -3788,6 +3955,11 @@ impl Launcher {
             self.hide(true, cx);
             // Popped to root: the next open starts fresh whatever pop_to_root says.
             self.hidden_at = None;
+        } else if self.mode == Mode::LanguageSets {
+            self.retranslate(window, cx);
+        } else if let Mode::Form(FormKind::AddLanguageSet(_)) = self.mode {
+            self.set_mode(Mode::LanguageSets, cx);
+            window.focus(&self.input.focus_handle(cx), cx);
         } else {
             self.args_row = None;
             self.set_mode(Mode::Root, cx);
@@ -4194,7 +4366,10 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
         Act::Confirm(false) => g::CANCEL,
-        Act::Translate(_) => g::LANGUAGES,
+        Act::Translate(_) | Act::LangMenu => g::LANGUAGES,
+        Act::UseLangSet(_) => g::CHECK,
+        Act::EditLangSet(_) => g::EDIT,
+        Act::DeleteLangSet(_) => g::DELETE,
         _ => g::PLAY,
     }
 }
@@ -4503,10 +4678,11 @@ impl Render for Launcher {
                 }))
                 .into_any_element()
         });
-        // The translator's language set. ponytail: Task 9 opens the set menu from it (and Ctrl+P).
+        // The translator's languages; a click (or Ctrl+P) opens the language set menu.
         let dropdown = dropdown.or_else(|| {
             let tr = self.translation.as_ref().filter(|_| self.mode == Mode::Translate)?;
-            Some(design::dropdown(&translate::LangSet { from: tr.job.from.clone(), to: tr.job.to.clone() }.label(), &t).into_any_element())
+            let label = translate::LangSet { from: tr.job.from.clone(), to: tr.job.to.clone() }.label();
+            Some(design::dropdown(&label, &t).id("lang-set").on_click(cx.listener(|this, _, window, cx| this.open_lang_menu(window, cx))).into_any_element())
         });
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
@@ -4743,6 +4919,11 @@ impl Render for Launcher {
                 };
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenDropdown, window, cx| {
+                if this.mode == Mode::Translate && this.menu.is_none() && this.panel.is_none() {
+                    this.open_lang_menu(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
             // Left and Right move through the emoji grid instead of the search text.
@@ -4772,7 +4953,7 @@ impl Render for Launcher {
                     return;
                 }
                 if this.is_form() && this.panel.is_none() {
-                    this.submit_form(cx)
+                    this.submit_form(window, cx)
                 } else if this.panel.is_none()
                     && let Some(item) = this.items.get(this.selected).cloned()
                     && item.actions().len() > 1
@@ -4894,6 +5075,7 @@ fn main() {
             KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
+            KeyBinding::new("ctrl-p", OpenDropdown, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
@@ -5143,6 +5325,49 @@ mod tests {
         let paste = config::Translator { action: "paste".into(), ..Default::default() };
         let rows = translation_rows(&tr, &paste);
         assert_eq!((rows[0].act.clone(), rows[0].actions()[1].0.as_str()), (Act::Paste("good morning".into()), "Copy Translation"));
+        assert_eq!(rows[0].actions()[5].1, Act::LangMenu, "Change Target opens the language set menu");
+    }
+
+    fn two_sets() -> Vec<translate::LangSet> {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        vec![translate::LangSet::new("auto", &v(&["en", "es"])), translate::LangSet::new("de", &v(&["en"]))]
+    }
+
+    #[test]
+    fn the_language_set_menu_offers_manage_then_the_sets_with_the_current_one_selected() {
+        let m = lang_set_menu(&two_sets(), 1);
+        let shown: Vec<(&str, &str, Option<&str>)> = m.entries.iter().map(|e| (e.id.as_str(), e.label.as_str(), e.icon)).collect();
+        assert_eq!(shown, [("manage", "Manage Language Sets…", Some(g::EDIT)), ("0", "Auto-Detect → English, Spanish", Some(g::LANGUAGES)), ("1", "German → English", Some(g::LANGUAGES))]);
+        assert_eq!(m.rows()[1], menu::Row::Rule, "a rule under Manage");
+        assert_eq!(m.search.as_deref(), Some("Search…"));
+        assert!(matches!(m.place, menu::Place::Right));
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn manage_language_sets_lists_add_then_the_sets_the_current_one_ticked() {
+        let rows = lang_set_rows(&two_sets(), 0);
+        let shown: Vec<(&str, &str)> = rows.iter().map(|it| (it.title.as_str(), it.accessory.as_str())).collect();
+        assert_eq!(shown, [("Add Language Set…", ""), ("Auto-Detect → English, Spanish", "Current"), ("German → English", "")]);
+        assert!(matches!((&rows[0].icon, &rows[1].icon, &rows[2].icon), (Icon::Vector(g::PLUS), Icon::Vector(g::CHECK), Icon::Vector(g::LANGUAGES))));
+        assert_eq!((rows[0].act.clone(), rows[0].act.label()), (Act::EditLangSet(None), "Add Language Set"));
+        let acts = |i: usize| rows[i].actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        assert_eq!(acts(2), ["Make Current", "Edit", "Delete"]);
+        assert_eq!(acts(1), ["Make Current", "Edit"], "the first set is Settings': no Delete");
+        assert_eq!((rows[2].act.clone(), rows[2].actions()[2].1.destructive()), (Act::UseLangSet(1), true));
+    }
+
+    #[test]
+    fn the_language_set_form_reads_back_as_a_set() {
+        let fields = lang_set_form(None);
+        let v = form_values(&fields);
+        assert_eq!((v["Source language"], v["Target language 1"], v["Target language 2"]), ("auto", "en", ""));
+        let title = |f: &FormField| if let Ctl::Select(e, search) = &f.ctl { (e.iter().find(|e| e.id == f.value).map(|e| e.label.clone()), *search) } else { (None, false) };
+        assert_eq!(fields.iter().map(title).collect::<Vec<_>>(), [(Some("Auto-Detect".into()), true), (Some("English".into()), true), (Some("None".into()), true)]);
+        let set = &two_sets()[1];
+        let fields = lang_set_form(Some(set));
+        let v = form_values(&fields);
+        assert_eq!(translate::LangSet::new(v["Source language"], &[v["Target language 1"].into(), v["Target language 2"].into()]), *set, "Edit is prefilled");
     }
 
     #[test]

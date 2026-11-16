@@ -97,6 +97,12 @@ pub enum Act {
     Define(String),
     /// Translate with Google Translate; the result opens in its own view, is copied, or pastes over the selection.
     Translate(Job),
+    /// The translator's language sets, by index (0 is Settings → Translator's): open the bar's
+    /// menu, make one current, add one (None) or edit one, delete one (asks first).
+    LangMenu,
+    UseLangSet(usize),
+    EditLangSet(Option<usize>),
+    DeleteLangSet(usize),
     /// A row's own act with its argument boxes' values (`with_args`), for the acts that take them as they are.
     With(Box<Act>, Vec<String>),
     /// A row with nothing to do (loading, empty views).
@@ -150,13 +156,18 @@ impl Act {
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::Translate(_) => "Translate",
             Act::Define(_) => "Define",
+            Act::LangMenu => "Change Target",
+            Act::UseLangSet(_) => "Make Current",
+            Act::EditLangSet(None) => "Add Language Set",
+            Act::EditLangSet(Some(_)) => "Edit",
+            Act::DeleteLangSet(_) => "Delete",
             Act::None => "",
         }
     }
 
     /// Removes or ends something; the action panel draws these in `danger`.
     pub fn destructive(&self) -> bool {
-        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_)) || matches!(self, Act::Cmd(c) if c.destructive())
+        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_) | Act::DeleteLangSet(_)) || matches!(self, Act::Cmd(c) if c.destructive())
     }
 }
 

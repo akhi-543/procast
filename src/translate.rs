@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::{
+    config::{self, Config, TableEdit},
+    menu::Entry,
+};
+
 /// Google's language codes with English names, for `tr de …` and the language names in views.
 pub const LANGUAGES: &[(&str, &str)] = &[
     ("af", "Afrikaans"),
@@ -201,6 +206,72 @@ impl LangSet {
         let from = if self.from == "auto" { "Auto-Detect".to_string() } else { language_name(&self.from) };
         format!("{from} → {}", self.to.iter().map(|c| language_name(c)).collect::<Vec<_>>().join(", "))
     }
+}
+
+/// Every language set: 0 is the one Settings → Translator makes (Translate from, Primary,
+/// Secondary), i ≥ 1 is `[[language_set]]` entry i-1.
+pub fn sets(cfg: &Config) -> Vec<LangSet> {
+    std::iter::once(cfg.translator.set()).chain(cfg.language_set.iter().map(|s| LangSet::new(&s.from, &[s.to1.clone(), s.to2.clone()]))).collect()
+}
+
+/// The set in use: `[translator] current`, or the first when that set is gone.
+pub fn current(cfg: &Config) -> usize {
+    Some(cfg.translator.current).filter(|&i| i <= cfg.language_set.len()).unwrap_or(0)
+}
+
+pub fn current_set(cfg: &Config) -> LangSet {
+    sets(cfg).swap_remove(current(cfg))
+}
+
+/// config.toml with set `i` in use.
+pub fn set_current(text: &str, i: usize) -> Result<String, String> {
+    config::write_value(text, &["translator".into(), "current".into()], (i as i64).into())
+}
+
+/// A set as `[[language_set]]` fields.
+fn fields(set: &LangSet) -> [(&'static str, String); 3] {
+    [("from", set.from.clone()), ("to1", set.to.first().cloned().unwrap_or_default()), ("to2", set.to.get(1).cloned().unwrap_or_default())]
+}
+
+/// config.toml with `set` added last and in use.
+pub fn add_set(text: &str, set: &LangSet) -> Result<String, String> {
+    let f = fields(set);
+    let text = config::edit_table(text, "language_set", TableEdit::Add(&f.each_ref().map(|(k, v)| (*k, v.as_str()))))?;
+    set_current(&text, config::parse(&text)?.language_set.len())
+}
+
+/// config.toml with set `i` replaced by `set`; set 0 is the three Settings → Translator rows.
+pub fn replace_set(text: &str, i: usize, set: &LangSet) -> Result<String, String> {
+    let f = fields(set);
+    if i > 0 {
+        return config::edit_table(text, "language_set", TableEdit::Replace(i - 1, &f.each_ref().map(|(k, v)| (*k, v.as_str()))));
+    }
+    let mut text = text.to_string();
+    for ((_, v), key) in f.into_iter().zip(["from", "primary", "secondary"]) {
+        text = config::write_value(&text, &["translator".into(), key.into()], v.into())?;
+    }
+    Ok(text)
+}
+
+/// config.toml without set `i` (never the first); the current set stays current, or the
+/// first takes over when it was the one deleted.
+pub fn delete_set(text: &str, i: usize) -> Result<String, String> {
+    if i == 0 {
+        return Err("The first language set is Settings → Translator's".into());
+    }
+    let now = current(&config::parse(text)?);
+    let text = config::edit_table(text, "language_set", TableEdit::Remove(i - 1))?;
+    set_current(&text, if now == i { 0 } else if now > i { now - 1 } else { now })
+}
+
+/// A language picker's entries: `lead` (id, label) first with a rule under them, then every language.
+pub fn language_entries(lead: impl IntoIterator<Item = (String, String)>) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = lead.into_iter().map(|(id, label)| Entry { id, label, ..Default::default() }).collect();
+    if let Some(last) = entries.last_mut() {
+        last.rule_after = true;
+    }
+    entries.extend(LANGUAGES.iter().map(|(code, name)| Entry { id: (*code).into(), label: (*name).into(), ..Default::default() }));
+    entries
 }
 
 /// The rows as shown, and the one selected on open: a row into the language the text is
@@ -468,6 +539,53 @@ mod tests {
     fn a_language_set_reads_source_then_targets() {
         assert_eq!(LangSet::new("auto", &v(&["en", "es"])).label(), "Auto-Detect → English, Spanish");
         assert_eq!(LangSet::new("de", &v(&["en", ""])).label(), "German → English");
+    }
+
+    const TWO_SETS: &str = "[translator]\nfrom = \"de\"\nprimary = \"en\"\nsecondary = \"fr\"\ncurrent = 2\n\n[[language_set]]\nfrom = \"auto\"\nto1 = \"ja\"\nto2 = \"\"\n\n[[language_set]]\nto1 = \"es\"\n";
+
+    fn labels(text: &str) -> (Vec<String>, usize) {
+        let cfg = config::parse(text).unwrap();
+        (sets(&cfg).iter().map(LangSet::label).collect(), current(&cfg))
+    }
+
+    #[test]
+    fn set_zero_is_settings_then_each_language_set() {
+        assert_eq!(labels(TWO_SETS), (v(&["German → English, French", "Auto-Detect → Japanese", "Auto-Detect → Spanish"]), 2));
+        assert_eq!(current_set(&config::parse(TWO_SETS).unwrap()).label(), "Auto-Detect → Spanish");
+        assert_eq!(labels(""), (v(&["Auto-Detect → English"]), 0), "a fresh config has the one set");
+        assert_eq!(labels("[translator]\ncurrent = 5").1, 0, "a set that is gone counts as the first");
+    }
+
+    #[test]
+    fn adding_a_set_makes_it_current_and_edit_replaces_it() {
+        let text = add_set("", &LangSet::new("auto", &v(&["ja"]))).unwrap();
+        assert_eq!(labels(&text), (v(&["Auto-Detect → English", "Auto-Detect → Japanese"]), 1));
+        let text = add_set(&text, &LangSet::new("de", &v(&["en", "es"]))).unwrap();
+        assert_eq!(labels(&text).1, 2);
+        let text = replace_set(&text, 1, &LangSet::new("fr", &v(&["it", ""]))).unwrap();
+        assert_eq!(labels(&text), (v(&["Auto-Detect → English", "French → Italian", "German → English, Spanish"]), 2));
+        // Set 0 is Settings → Translator's three rows.
+        let text = replace_set(&text, 0, &LangSet::new("auto", &v(&["ko", "zh-CN"]))).unwrap();
+        let t = config::parse(&text).unwrap().translator;
+        assert_eq!((t.from.as_str(), t.primary.as_str(), t.secondary.as_str()), ("auto", "ko", "zh-CN"));
+    }
+
+    #[test]
+    fn deleting_the_current_set_falls_back_to_the_first() {
+        let text = delete_set(TWO_SETS, 2).unwrap();
+        assert_eq!(labels(&text), (v(&["German → English, French", "Auto-Detect → Japanese"]), 0));
+        let text = delete_set(TWO_SETS, 1).unwrap();
+        assert_eq!(labels(&text), (v(&["German → English, French", "Auto-Detect → Spanish"]), 1), "current follows its set");
+        assert!(delete_set(TWO_SETS, 0).is_err(), "the first set is Settings'");
+        assert_eq!(labels(&set_current(TWO_SETS, 1).unwrap()).1, 1);
+    }
+
+    #[test]
+    fn language_entries_lead_then_a_rule_then_every_language() {
+        let e = language_entries([("".to_string(), "None".to_string())]);
+        assert_eq!((e[0].id.as_str(), e[0].label.as_str(), e[0].rule_after), ("", "None", true));
+        assert_eq!(e.len(), 1 + LANGUAGES.len());
+        assert!(!language_entries([]).iter().any(|e| e.rule_after));
     }
 
     #[test]

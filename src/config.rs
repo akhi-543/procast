@@ -28,6 +28,8 @@ pub struct Config {
     pub screenshots: Screenshots,
     /// `[[translate]]`: commands that translate the selected text into one language.
     pub translate: Vec<TranslateCmd>,
+    /// `[[language_set]]`: the translator's language sets after the first (see `translate::sets`).
+    pub language_set: Vec<LanguageSet>,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
     pub files: Files,
@@ -532,6 +534,7 @@ impl Default for Config {
             dictionary: Dictionary::default(),
             screenshots: Screenshots::default(),
             translate: vec![],
+            language_set: vec![],
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
             files: Files::default(),
@@ -618,11 +621,13 @@ pub struct Translator {
     pub cross_first: bool,
     /// HTTP proxy for Google Translate; empty = none.
     pub proxy: String,
+    /// The language set in use: 0 is the one these settings make, i the i-th `[[language_set]]`.
+    pub current: usize,
 }
 
 impl Default for Translator {
     fn default() -> Self {
-        Self { from: "auto".into(), primary: "en".into(), secondary: String::new(), action: "copy".into(), fill_selection: true, cross_first: true, proxy: String::new() }
+        Self { from: "auto".into(), primary: "en".into(), secondary: String::new(), action: "copy".into(), fill_selection: true, cross_first: true, proxy: String::new(), current: 0 }
     }
 }
 
@@ -645,6 +650,7 @@ struct TranslatorFile {
     fill_selection: Option<bool>,
     cross_first: Option<bool>,
     proxy: String,
+    current: usize,
     #[serde(deserialize_with = "one_or_many")]
     to: Vec<String>,
     prefill_selection: Option<bool>,
@@ -665,8 +671,21 @@ impl From<TranslatorFile> for Translator {
             fill_selection: f.fill_selection.or(f.prefill_selection).unwrap_or(d.fill_selection),
             cross_first: f.cross_first.unwrap_or(d.cross_first),
             proxy: f.proxy,
+            current: f.current,
         }
     }
+}
+
+/// A `[[language_set]]`: a source language and one or two targets.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LanguageSet {
+    #[serde(default = "auto")]
+    pub from: String,
+    #[serde(default = "english")]
+    pub to1: String,
+    /// Empty for none.
+    #[serde(default)]
+    pub to2: String,
 }
 
 /// `to = "de"` (how older configs wrote it) or `to = ["en", "de"]`.
@@ -772,6 +791,13 @@ action = "copy"          # Enter: "copy" or "paste"; Ctrl+Enter does the other
 fill_selection = true    # open Translate with the selected text
 cross_first = true       # a target equal to the source goes last
 proxy = ""               # HTTP proxy for Google Translate, e.g. http://127.0.0.1:8080
+current = 0              # language set in use: 0 is the one above, 1 the first [[language_set]]
+
+# More language sets, picked from the translator's dropdown (Ctrl+P). to2 = "" for none.
+# [[language_set]]
+# from = "auto"
+# to1 = "ja"
+# to2 = ""
 
 # A command per language: translates the selected text. output: open (show it) | replace (paste over the selection).
 # [[translate]]
@@ -991,7 +1017,40 @@ pub fn removable_wanted(text: &str) -> bool {
 pub fn shown_value(text: &str, path: &[String]) -> String {
     // A snippet or quicklink field has no default: the template's own examples are not yours.
     let default = || if table_field(path).is_some() { None } else { read_opt(TEMPLATE, path) };
-    read_opt(text, path).or_else(default).unwrap_or_default()
+    let text = if is_translator(path) { migrate_translator(text) } else { text.to_string() };
+    read_opt(&text, path).or_else(default).unwrap_or_default()
+}
+
+fn is_translator(path: &[String]) -> bool {
+    path.first().is_some_and(|k| k == "translator")
+}
+
+/// `[translator]` in today's keys: older configs held the targets in `to`, Enter's action in
+/// `primary` ("copy" or "paste") and `fill_selection` in `prefill_selection`. Those are
+/// rewritten as `Translator` reads them, so a row shows and saves what is in effect; other
+/// text, or text that doesn't parse, comes back as it was.
+fn migrate_translator(text: &str) -> String {
+    let Ok(mut doc) = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>() else { return text.into() };
+    let Some(table) = doc.get_mut("translator").and_then(|t| t.as_table_mut()) else { return text.into() };
+    let old = table.contains_key("to") || table.contains_key("prefill_selection") || table.get("primary").and_then(|p| p.as_str()).is_some_and(|p| matches!(p, "copy" | "paste"));
+    let Some(t) = old.then(|| parse(text).ok()).flatten().map(|c| c.translator) else { return text.into() };
+    table.remove("to");
+    table.remove("prefill_selection");
+    for (key, value) in [("from", t.from.into()), ("primary", t.primary.into()), ("secondary", t.secondary.into()), ("action", t.action.into()), ("fill_selection", t.fill_selection.into())] {
+        set_keeping_decor(table, key, value);
+    }
+    doc.to_string()
+}
+
+/// Sets `key`; a value already there keeps its trailing comment, the key the comments above it.
+fn set_keeping_decor(table: &mut toml_edit::Table, key: &str, value: toml_edit::Value) {
+    if let Some(old) = table.get_mut(key).and_then(|i| i.as_value_mut()) {
+        let decor = old.decor().clone();
+        *old = value;
+        *old.decor_mut() = decor;
+    } else {
+        table.insert(key, toml_edit::Item::Value(value));
+    }
 }
 
 /// `snippet.2.name`: field `name` of the third `[[snippet]]`.
@@ -1029,19 +1088,14 @@ fn read_opt(text: &str, path: &[String]) -> Option<String> {
 /// Sets one setting in the config text, keeping every comment and the layout; missing
 /// tables (e.g. `[extension.youtube]`) are created.
 pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Result<String, String> {
+    // A language picked must not overwrite a legacy `primary = "paste"`.
+    let text = if is_translator(path) { migrate_translator(text) } else { text.to_string() };
     let mut doc = text.trim_start_matches('\u{feff}').parse::<toml_edit::DocumentMut>().map_err(|e| format!("config.toml: {e}"))?;
     if let Some((list, i, field)) = table_field(path)
         && let Some(tables) = doc.get_mut(list).and_then(|t| t.as_array_of_tables_mut())
     {
         let t = tables.get_mut(i).ok_or(format!("no {list} number {}", i + 1))?;
-        match t.get_mut(field).and_then(|v| v.as_value_mut()) {
-            Some(old) => {
-                let decor = old.decor().clone();
-                *old = value;
-                *old.decor_mut() = decor;
-            }
-            None => _ = t.insert(field, toml_edit::Item::Value(value)),
-        }
+        set_keeping_decor(t, field, value);
         return Ok(doc.to_string());
     }
     let (last, tables) = path.split_last().ok_or("empty setting path")?;
@@ -1054,21 +1108,17 @@ pub fn write_value(text: &str, path: &[String], value: toml_edit::Value) -> Resu
         }
         table = table[key.as_str()].as_table_mut().ok_or(format!("{key} is not a table in config.toml"))?;
     }
-    // Replace in place: the key keeps comments above it, the value its trailing comment.
-    if let Some(old) = table.get_mut(last).and_then(|i| i.as_value_mut()) {
-        let decor = old.decor().clone();
-        *old = value;
-        *old.decor_mut() = decor;
-    } else {
-        table.insert(last, toml_edit::Item::Value(value));
-    }
+    set_keeping_decor(table, last, value);
     Ok(doc.to_string())
 }
 
-/// Adds, copies or removes one `[[list]]` table (a snippet or quicklink); comments elsewhere stay.
+/// Adds, copies, rewrites or removes one `[[list]]` table (a snippet, quicklink or language
+/// set); comments elsewhere stay.
 pub enum TableEdit<'a> {
     Add(&'a [(&'a str, &'a str)]),
     Duplicate(usize),
+    /// Sets these fields of table i.
+    Replace(usize, &'a [(&'a str, &'a str)]),
     Remove(usize),
 }
 
@@ -1093,6 +1143,12 @@ pub fn edit_table(text: &str, list: &str, edit: TableEdit) -> Result<String, Str
                 t.insert("name", toml_edit::value(name));
             }
             tables.push(t);
+        }
+        TableEdit::Replace(i, fields) => {
+            let t = tables.get_mut(i).ok_or("already gone")?;
+            for (k, v) in fields {
+                set_keeping_decor(t, k, (*v).into());
+            }
         }
         TableEdit::Remove(i) if i < tables.len() => _ = tables.remove(i),
         TableEdit::Remove(_) => return Err("already gone".into()),
@@ -1206,6 +1262,21 @@ mod tests {
         assert_eq!((new.primary.as_str(), new.secondary.as_str(), new.action.as_str(), new.cross_first, new.proxy.as_str()), ("ja", "es", "paste", false, "http://p:8080"));
         assert!(parse("[translator]
 to = 3").is_err());
+    }
+
+    #[test]
+    fn translator_rows_read_and_write_what_is_in_effect() {
+        let p = |s: &str| s.split('.').map(String::from).collect::<Vec<_>>();
+        let old = "[translator]\nto = [\"de\", \"fr\"]  # targets\nprimary = \"paste\"\nprefill_selection = false\n";
+        assert_eq!(shown_value(old, &p("translator.primary")), "de", "not the default");
+        assert_eq!((shown_value(old, &p("translator.secondary")), shown_value(old, &p("translator.action"))), ("fr".into(), "paste".into()));
+        assert_eq!(shown_value(old, &p("translator.fill_selection")), "false");
+        let new = write_value(old, &p("translator.primary"), "ja".into()).unwrap();
+        let t = parse(&new).unwrap().translator;
+        assert_eq!((t.primary.as_str(), t.secondary.as_str(), t.action.as_str(), t.fill_selection), ("ja", "fr", "paste", false), "{new}");
+        assert!(!new.contains("to =") && !new.contains("prefill_selection"), "{new}");
+        let today = "[translator]\nprimary = \"ja\"   # first target\n";
+        assert_eq!(write_value(today, &p("translator.secondary"), "es".into()).unwrap(), "[translator]\nprimary = \"ja\"   # first target\nsecondary = \"es\"\n", "today's keys are left alone");
     }
 
     #[test]
