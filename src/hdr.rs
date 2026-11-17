@@ -9,14 +9,19 @@ use std::{
 
 use windows::Win32::{
     Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-        DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-        DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
-        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     },
     Foundation::{HWND, LUID},
     Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow},
+    UI::WindowsAndMessaging::GetWindowThreadProcessId,
 };
+
+use futures::channel::mpsc::UnboundedSender;
+
+use crate::win::Msg;
 
 /// One active display.
 #[derive(Clone, Debug)]
@@ -25,6 +30,8 @@ pub struct HdrDisplay {
     id: u32,
     /// Windows' name for the display ("\\.\DISPLAY1"): matches a window's monitor to it.
     gdi: String,
+    /// The monitor's own name ("DELL U2723QE"); empty if Windows won't say.
+    name: String,
     pub supported: bool,
     pub enabled: bool,
 }
@@ -69,8 +76,11 @@ pub fn displays() -> Vec<HdrDisplay> {
                 if DisplayConfigGetDeviceInfo(&mut source.header) != 0 {
                     return None;
                 }
+                let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+                target.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, size_of_val(&target), adapter, id);
+                let name = if DisplayConfigGetDeviceInfo(&mut target.header) == 0 { name_of(&target.monitorFriendlyDeviceName) } else { String::new() };
                 let (supported, enabled) = decode(color.Anonymous.value);
-                Some(HdrDisplay { adapter, id, gdi: name_of(&source.viewGdiDeviceName), supported, enabled })
+                Some(HdrDisplay { adapter, id, gdi: name_of(&source.viewGdiDeviceName), name, supported, enabled })
             })
             .collect()
     }
@@ -99,7 +109,7 @@ pub fn set(target: &HdrDisplay, on: bool) -> Result<(), String> {
 /// Toggle HDR: flips every HDR-capable display. Says the state of the first one afterwards.
 pub fn toggle() -> Result<String, String> {
     let all: Vec<HdrDisplay> = displays().into_iter().filter(|d| d.supported).collect();
-    let Some(first) = all.first() else { return Err("No HDR display".into()) };
+    let Some(first) = all.first() else { return Err(format!("{NONE} · connect an HDR monitor")) };
     let mut failed = None;
     for d in &all {
         if let Err(e) = set(d, !d.enabled) {
@@ -107,6 +117,40 @@ pub fn toggle() -> Result<String, String> {
         }
     }
     failed.map_or_else(|| Ok(format!("HDR {}", if first.enabled { "off" } else { "on" })), Err)
+}
+
+const NONE: &str = "No HDR display";
+
+/// Whether HDR is on, as Toggle HDR flips it and reports it: the first HDR-capable display's.
+fn first_on(displays: &[HdrDisplay]) -> Option<bool> {
+    displays.iter().find(|d| d.supported).map(|d| d.enabled)
+}
+
+/// Toggle HDR's subtitle: "On · DELL U2723QE", "Off · 2 displays" or "No HDR display".
+pub fn subtitle(displays: &[HdrDisplay]) -> String {
+    let hdr: Vec<&HdrDisplay> = displays.iter().filter(|d| d.supported).collect();
+    let Some(on) = first_on(displays) else { return NONE.into() };
+    let which = match hdr.as_slice() {
+        [one] if !one.name.is_empty() => one.name.clone(),
+        _ => format!("{} display{}", hdr.len(), if hdr.len() == 1 { "" } else { "s" }),
+    };
+    format!("{} · {which}", if on { "On" } else { "Off" })
+}
+
+/// What Enter on Toggle HDR will do, for the ActionBar.
+pub fn bar_label(displays: &[HdrDisplay]) -> &'static str {
+    if first_on(displays) == Some(true) { "Turn HDR Off" } else { "Turn HDR On" }
+}
+
+/// Auto HDR's toast: "HDR on for Elden Ring" (just "HDR on" when the app has no name).
+pub fn switch_text(on: bool, app: &str) -> String {
+    let state = if on { "on" } else { "off" };
+    if app.is_empty() { format!("HDR {state}") } else { format!("HDR {state} for {app}") }
+}
+
+/// Auto HDR says it switched once per game launch: `last` is the process it last told about.
+fn should_toast(last: Option<u32>, pid: u32) -> bool {
+    last != Some(pid)
 }
 
 /// What Auto HDR does on a focus change: `ours` is whether procast turned HDR on (and not
@@ -166,15 +210,18 @@ fn decide(auto: bool, game: bool, mine: bool, hdr_on: bool) -> Option<bool> {
 }
 
 /// Auto HDR runs on its own thread, one focus change at a time (display calls take a moment).
-pub struct Auto(Sender<(bool, bool, isize)>);
+pub struct Auto(Sender<(bool, bool, isize, String)>);
 
 impl Auto {
-    /// Starts the thread, first undoing what a previous run left on (see `recovery`).
-    pub fn start() -> Self {
-        let (tx, rx) = channel::<(bool, bool, isize)>();
+    /// Starts the thread, first undoing what a previous run left on (see `recovery`). Turning
+    /// HDR on for a game sends a toast on `toasts`.
+    pub fn start(toasts: UnboundedSender<Msg>) -> Self {
+        let (tx, rx) = channel::<(bool, bool, isize, String)>();
         let _ = thread::Builder::new().spawn(move || {
             // The display procast turned HDR on for.
             let mut ours: Option<String> = None;
+            // The game process the last toast was for.
+            let mut told: Option<u32> = None;
             if let Ok(saved) = std::fs::read_to_string(flag()) {
                 let all = displays();
                 let game_on = crate::foreground::game_in_front().then(|| display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone())).flatten();
@@ -190,7 +237,7 @@ impl Auto {
                 set_flag(None); // unreadable: nothing safe to undo
             }
             // ponytail: one owned display; a game moved to another HDR display leaves the first on.
-            for (auto, game, hwnd) in rx {
+            for (auto, game, hwnd, exe) in rx {
                 if !auto && ours.is_none() {
                     continue;
                 }
@@ -206,6 +253,14 @@ impl Auto {
                         let mine = ours.as_ref() == Some(&t.gdi);
                         let want = decide(auto, game, mine, t.enabled);
                         let done = want.filter(|&on| set(t, on).is_ok());
+                        if game && done == Some(true) {
+                            let mut pid = 0;
+                            unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
+                            if should_toast(told, pid) {
+                                told = Some(pid);
+                                let _ = toasts.unbounded_send(Msg::done(switch_text(true, &crate::focus::app_label(&exe))));
+                            }
+                        }
                         // Windows refused: ownership stays as it was, try again at the next change.
                         if want.is_none() || done.is_some() {
                             if owned(done, mine, t.enabled) {
@@ -224,9 +279,9 @@ impl Auto {
         Self(tx)
     }
 
-    /// The foreground window changed.
-    pub fn foreground(&self, auto: bool, game: bool, hwnd: isize) {
-        let _ = self.0.send((auto, game, hwnd));
+    /// The foreground window changed; `exe` is its program's file name (`Msg::Foreground`).
+    pub fn foreground(&self, auto: bool, game: bool, hwnd: isize, exe: String) {
+        let _ = self.0.send((auto, game, hwnd, exe));
     }
 }
 
@@ -280,7 +335,37 @@ mod tests {
     }
 
     fn display(gdi: &str, enabled: bool) -> HdrDisplay {
-        HdrDisplay { adapter: LUID::default(), id: 0, gdi: gdi.into(), supported: true, enabled }
+        HdrDisplay { adapter: LUID::default(), id: 0, gdi: gdi.into(), name: "DELL U2723QE".into(), supported: true, enabled }
+    }
+
+    #[test]
+    fn the_row_says_the_state_and_the_display() {
+        let sdr = HdrDisplay { supported: false, name: "Laptop".into(), ..display("c", false) };
+        assert_eq!(subtitle(&[display("a", true)]), "On · DELL U2723QE");
+        assert_eq!(subtitle(&[display("a", false), sdr.clone()]), "Off · DELL U2723QE");
+        // Only HDR-capable displays count.
+        assert_eq!(subtitle(&[display("a", false), sdr.clone(), display("b", false)]), "Off · 2 displays");
+        assert_eq!(subtitle(std::slice::from_ref(&sdr)), "No HDR display");
+        assert_eq!(subtitle(&[]), "No HDR display");
+        // A display Windows gives no name.
+        assert_eq!(subtitle(&[HdrDisplay { name: String::new(), ..display("a", true) }]), "On · 1 display");
+    }
+
+    #[test]
+    fn the_bar_says_what_enter_does() {
+        assert_eq!(bar_label(&[display("a", true)]), "Turn HDR Off");
+        assert_eq!(bar_label(&[display("a", false)]), "Turn HDR On");
+        assert_eq!(bar_label(&[]), "Turn HDR On");
+    }
+
+    #[test]
+    fn switch_toast_names_the_game_once_per_launch() {
+        assert_eq!(switch_text(true, "Elden Ring"), "HDR on for Elden Ring");
+        assert_eq!(switch_text(false, "Eldenring"), "HDR off for Eldenring");
+        assert_eq!(switch_text(true, ""), "HDR on");
+        assert!(should_toast(None, 42));
+        assert!(!should_toast(Some(42), 42)); // the same game again (alt-tab back): no second toast
+        assert!(should_toast(Some(42), 43)); // a new launch
     }
 
     #[test]

@@ -406,6 +406,29 @@ fn timer_id(it: &Item) -> Option<u64> {
     it.live.then(|| it.extra.iter().find_map(|(_, a)| if let Act::StopTimer(id) = a { Some(*id) } else { None })).flatten()
 }
 
+/// Toggle HDR says the state Enter would change, in its subtitle and its ActionBar label.
+fn hdr_state(items: &mut [Item], status: &[hdr::HdrDisplay]) {
+    for it in items.iter_mut().filter(|it| it.act == Act::Cmd(Cmd::ToggleHdr)) {
+        it.subtitle = hdr::subtitle(status);
+        it.extra = vec![(hdr::bar_label(status).into(), it.act.clone())];
+    }
+}
+
+/// Root search shows the Auto HDR row for a query with "hdr" in it (or a start of it: "hd").
+fn wants_auto_hdr(query: &str) -> bool {
+    query.split_whitespace().any(|w| {
+        let w = w.to_lowercase();
+        w.contains("hdr") || (w.len() > 1 && "hdr".starts_with(&w))
+    })
+}
+
+/// Root search's Auto HDR row: Enter flips `[games] auto_hdr`.
+fn auto_hdr_row(on: bool) -> Item {
+    let mut it = Item::new("Auto HDR for games", "On while a full-screen game is in front", Icon::Vector(g::SUN_MEDIUM), Act::SetAutoHdr(!on)).tinted(design::Tint::System).sec("Auto HDR");
+    it.toggle = Some(on);
+    it
+}
+
 fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
     let mut it = Item::new(title, hint, Icon::Vector(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
     it.extra = actions;
@@ -753,6 +776,8 @@ struct Launcher {
     tray_icon: Option<TrayIcon>,
     /// Auto HDR (own thread).
     hdr: hdr::Auto,
+    /// The displays' HDR state for Toggle HDR's row, read off the UI thread (`Msg::Hdr`).
+    hdr_status: Vec<hdr::HdrDisplay>,
     /// When the window last closed, for "pop to root" after a timeout.
     hidden_at: Option<Instant>,
     /// Earlier root searches (oldest first) and which one Up last restored.
@@ -797,6 +822,7 @@ impl Launcher {
         foreground::watch(tx.clone());
         std::thread::spawn(|| _ = browser::register());
         let browsers = browser::serve(tx.clone());
+        let auto_hdr = hdr::Auto::start(tx.clone());
         let mut this = Self {
             input,
             hotkeys: {
@@ -885,7 +911,8 @@ impl Launcher {
             visible: false,
             toast: None,
             tray_icon: None,
-            hdr: hdr::Auto::start(),
+            hdr: auto_hdr,
+            hdr_status: vec![],
             hidden_at: None,
             searches: std::fs::read_to_string(config::dir().join("search-history.txt")).unwrap_or_default().lines().map(String::from).collect(),
             search_pos: None,
@@ -1313,7 +1340,14 @@ impl Launcher {
                     rows.extend(self.schedule_now());
                 }
                 let found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
-                head_rows(rows, found, &query, &self.cfg)
+                let mut rows = head_rows(rows, found, &query, &self.cfg);
+                hdr_state(&mut rows, &self.hdr_status);
+                if wants_auto_hdr(&query) {
+                    // Under the results, above the "Use … with" fallbacks.
+                    let at = rows.iter().position(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use \""))).unwrap_or(rows.len());
+                    rows.insert(at, auto_hdr_row(self.cfg.games.auto_hdr));
+                }
+                rows
             }
             Mode::Clipboard => {
                 if self.clip_images.len() > 300 {
@@ -1973,6 +2007,8 @@ impl Launcher {
             let tx = self.tx.clone();
             std::thread::spawn(move || drop(tx.unbounded_send(Msg::DictReady(dict::installed().is_some()))));
         }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || drop(tx.unbounded_send(Msg::Hdr(hdr::displays()))));
         // The window was placed before this view existed (a notice, a kept search or a
         // query can each change its height), so size it to what it shows now. Without this,
         // `height` could claim a size the window doesn't have, and typing in compact mode
@@ -3295,6 +3331,19 @@ impl Launcher {
             Act::SimilarWords(words) => return self.open_similar(words, window, cx),
             Act::LangMenu => return self.open_lang_menu(window, cx),
             Act::UseLangSet(i) => return self.use_lang_set(i, window, cx),
+            Act::SetAutoHdr(on) => {
+                match config::edit_file(&config::path(), |t| config::write_value(t, &["games".into(), "auto_hdr".into()], on.into())) {
+                    Ok((c, _)) => {
+                        self.cfg.games.auto_hdr = c.games.auto_hdr;
+                        // Redrawn in place: the selection stays on the row.
+                        for it in self.items.iter_mut().filter(|it| matches!(it.act, Act::SetAutoHdr(_))) {
+                            *it = auto_hdr_row(c.games.auto_hdr);
+                        }
+                    }
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return cx.notify();
+            }
             Act::EditLangSet(i) => {
                 let set = i.and_then(|i| translate::sets(&self.cfg).get(i).cloned());
                 return self.open_form(FormKind::AddLanguageSet(i), lang_set_form(set.as_ref()), window, cx);
@@ -3406,6 +3455,9 @@ impl Launcher {
                     };
                     if let Some(toast) = said {
                         let _ = tx.unbounded_send(toast);
+                    }
+                    if cmd == Cmd::ToggleHdr {
+                        let _ = tx.unbounded_send(Msg::Hdr(hdr::displays()));
                     }
                 });
                 return;
@@ -3795,8 +3847,13 @@ impl Launcher {
             }
             Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
+            Msg::Hdr(status) => {
+                self.hdr_status = status;
+                hdr_state(&mut self.items, &self.hdr_status);
+                cx.notify();
+            }
             Msg::Foreground { hwnd, game, exe } => {
-                self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd);
+                self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd, exe.clone());
                 self.focus_front(hwnd, &exe);
             }
             Msg::Notice(e) => {
@@ -4560,7 +4617,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool, toggle: Option<bool> },
 }
 
 impl Render for Launcher {
@@ -4698,7 +4755,7 @@ impl Render for Launcher {
                             None if mirrored.is_empty() => it.subtitle.clone(),
                             None => mirrored,
                         };
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live });
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live, toggle: it.toggle });
                     }
                 }
             }
@@ -4716,10 +4773,12 @@ impl Render for Launcher {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live } => {
+                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live, toggle } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
-                            let accessory = if !hotkey.is_empty() {
+                            let accessory = if let Some(state) = toggle {
+                                Some(design::toggle(*state, &lt).into_any_element())
+                            } else if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
                             } else if *live {
                                 Some(design::live(accessory, live_w, if accessory == timers::DONE { t.success } else { t.text_muted }).into_any_element())
@@ -5421,6 +5480,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_rows_in_root_search() {
+        // Toggle HDR stays with no HDR display, and says so; other rows are left alone.
+        let mut rows = vec![Item::new("Toggle HDR", "System", Icon::Vector(g::SUN_MEDIUM), Act::Cmd(Cmd::ToggleHdr)), Item::new("Lock Screen", "System", Icon::Vector(g::LOCK), Act::Cmd(Cmd::Lock))];
+        hdr_state(&mut rows, &[]);
+        assert_eq!((rows[0].subtitle.as_str(), rows[0].actions()[0].0.as_str()), ("No HDR display", "Turn HDR On"));
+        assert_eq!((rows[1].subtitle.as_str(), rows[1].extra.len()), ("System", 0));
+        // The Auto HDR row shows for "hdr", and Enter flips what its switch shows.
+        for q in ["hdr", "HD", "toggle hdr", "auto hdr"] {
+            assert!(wants_auto_hdr(q), "{q}");
+        }
+        for q in ["", "h", "hello", "dark"] {
+            assert!(!wants_auto_hdr(q), "{q}");
+        }
+        let on = auto_hdr_row(true);
+        assert_eq!((on.toggle, on.act.clone(), on.section.as_deref()), (Some(true), Act::SetAutoHdr(false), Some("Auto HDR")));
+        assert_eq!(auto_hdr_row(false).act.label(), "Turn Auto HDR On");
+    }
 
     fn field(label: &'static str, ctl: Ctl, value: &str) -> FormField {
         FormField { label: label.into(), ctl, value: value.into(), input: None, error: None }

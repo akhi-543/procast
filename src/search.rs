@@ -109,6 +109,8 @@ pub enum Act {
     DeleteLangSet(usize),
     /// A row's own act with its argument boxes' values (`with_args`), for the acts that take them as they are.
     With(Box<Act>, Vec<String>),
+    /// Write `[games] auto_hdr` (root search's Auto HDR row).
+    SetAutoHdr(bool),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -167,6 +169,8 @@ impl Act {
             Act::EditLangSet(None) => "Add Language Set",
             Act::EditLangSet(Some(_)) => "Edit",
             Act::DeleteLangSet(_) => "Delete",
+            Act::SetAutoHdr(true) => "Turn Auto HDR On",
+            Act::SetAutoHdr(false) => "Turn Auto HDR Off",
             Act::None => "",
         }
     }
@@ -266,6 +270,8 @@ pub struct Item {
     pub keywords: Vec<String>,
     /// The accessory ticks (a timer's time left): tabular figures at a fixed width, shown in root too.
     pub live: bool,
+    /// The accessory is a switch, on or off (Auto HDR in root search).
+    pub toggle: Option<bool>,
 }
 
 impl Item {
@@ -289,6 +295,7 @@ impl Item {
             values: vec![],
             keywords: vec![],
             live: false,
+            toggle: None,
         }
     }
 

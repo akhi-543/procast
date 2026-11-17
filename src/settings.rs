@@ -235,7 +235,8 @@ fn head(section: &str) -> Option<&'static str> {
     Some(match section {
         "Translator" => "Translate text with Google Translate, from the launcher or the selection.",
         "Calendar" => "Today's meetings in search, with a one-key join.",
-        "Screenshots" | "Focus" | "Notes" | "Games" => "",
+        "Games" => "Turn HDR on by itself while you play.",
+        "Screenshots" | "Focus" | "Notes" => "",
         _ => return None,
     })
 }
@@ -549,7 +550,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
         "Games" => groups(vec![(
             "Games",
             vec![
-                row("Auto HDR", "games.auto_hdr", Kind::Bool, "Turn HDR on while a game has focus and off again after. HDR you turned on yourself stays on.").with_icon(g::SUN_MEDIUM),
+                row("Auto HDR for games", "games.auto_hdr", Kind::Bool, "On while a full-screen game is in front").with_icon(g::SUN_MEDIUM),
                 row("Games", "games.list", Kind::List, "Program file names that always count as games, e.g. eldenring.exe. Full-screen D3D apps and borderless Steam, Epic, Xbox and Riot games are found by themselves.").with_icon(g::GAMEPAD_2),
             ],
         )]),
@@ -1688,7 +1689,7 @@ mod tests {
             }
         }
         // Not vacuous: the moved groups landed in their sections.
-        for (name, label) in [("Games", "Auto HDR"), ("Focus", "Reopen closed apps"), ("Calendar", "Confirm before joining"), ("Translator", "Primary language")] {
+        for (name, label) in [("Games", "Auto HDR for games"), ("Focus", "Reopen closed apps"), ("Calendar", "Confirm before joining"), ("Translator", "Primary language")] {
             let s = SECTIONS.iter().position(|x| *x == name).unwrap();
             assert!(rows(s, &[], "").iter().any(|r| r.label == label), "{label} in {name}");
         }
