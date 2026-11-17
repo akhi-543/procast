@@ -62,9 +62,16 @@ pub fn message(id: &str) -> Option<Msg> {
     Action::parse(id).map(|_| Msg::TrayMusic(id.to_string()))
 }
 
-/// Takes the menu clicks when no other tray icon of procast is there to.
+/// Takes the menu clicks when no other tray icon of procast is there to. Routes YouTube Music
+/// items and the menu-bar extension trays that share this global handler.
 pub fn listen(tx: UnboundedSender<Msg>) {
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        if let Some((run, f)) = e.id.0.strip_prefix("ext|").and_then(|r| r.split_once('|'))
+            && let Ok(run) = run.parse()
+        {
+            let _ = tx.unbounded_send(Msg::TrayExt(run, f.to_string()));
+            return;
+        }
         if let Some(msg) = message(&e.id.0) {
             let _ = tx.unbounded_send(msg);
         }

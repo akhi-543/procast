@@ -698,7 +698,10 @@ impl Launcher {
             self.music_tray_refresh();
         }
         if self.visible && self.mode == Mode::Music && self.music.screen == Screen::NowPlaying {
+            let selected = self.selected;
             self.refresh(cx);
+            self.selected = selected.min(self.items.len().saturating_sub(1));
+            self.scroll_to_selected();
         }
     }
 
@@ -709,11 +712,16 @@ impl Launcher {
             self.media();
             let playlists = self.tray_playlists();
             self.music.tray = music_tray::create(self.music.now.as_ref(), &playlists);
-            if self.music.tray.is_some() && self.tray_icon.is_none() {
-                music_tray::listen(self.tx.clone());
-            }
+            self.music_tray_listen();
         } else if !wanted {
             self.music.tray = None;
+        }
+    }
+
+    /// Installs the music tray's menu handler when it is the only tray that needs one.
+    pub fn music_tray_listen(&self) {
+        if self.music.tray.is_some() && self.tray_icon.is_none() {
+            music_tray::listen(self.tx.clone());
         }
     }
 

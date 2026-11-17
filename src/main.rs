@@ -2143,6 +2143,10 @@ impl Launcher {
                 }
                 if cfg.tray != self.cfg.tray {
                     self.tray_icon = if cfg.tray { tray(self.tx.clone()) } else { None };
+                    // The music tray's own handler takes over when the main one is gone.
+                    if self.tray_icon.is_none() {
+                        self.music_tray_listen();
+                    }
                 }
                 design::set_size(&cfg.size);
                 if cfg.window.auto_close_empty_desktops != self.cfg.window.auto_close_empty_desktops {
