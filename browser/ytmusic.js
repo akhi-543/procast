@@ -7,6 +7,7 @@
   const ORIGIN = "https://music.youtube.com";
   const RULE_ID = 1;
   const NO_TAB = "Open music.youtube.com in this browser first";
+  const NOT_READY = "YouTube Music isn't ready in the tab yet";
   const SIGN_IN = "Sign in to music.youtube.com in this browser to see your library";
   const CONTEXT = { client: { clientName: "WEB_REMIX", clientVersion: "1.20241111.01.00", hl: "en" } };
   const FILTERS = {
@@ -55,7 +56,7 @@
   function fields(r) {
     if (!r.flexColumns) return { titleRun: runsOf(r.title)[0], columns: [runsOf(r.subtitle)] };
     const columns = r.flexColumns.map((c) => runsOf(c.musicResponsiveListItemFlexColumnRenderer?.text));
-    return { titleRun: columns[0][0], columns: columns.slice(1) };
+    return { titleRun: columns[0]?.[0], columns: columns.slice(1) };
   }
 
   function duration(r, columns) {
@@ -86,7 +87,7 @@
     const who = title && identity(r, titleRun);
     if (!who) return null;
     const subtitle = columns.map(joined).filter(Boolean).join(" · ").replaceAll(" • ", " · ").trim();
-    return { ...who, title, subtitle, thumb: lastThumb(r.thumbnail ?? r.thumbnailRenderer), duration: duration(r, columns) };
+    return { ...who, title, subtitle, thumb: lastThumb(r.thumbnail) || lastThumb(r.thumbnailRenderer), duration: duration(r, columns) };
   }
 
   function items(json) {
@@ -105,7 +106,7 @@
     let found;
     walk(json, (k, v) => {
       if (found || k.endsWith("ShelfRenderer")) return false;
-      if (k.endsWith("HeaderRenderer")) found = v;
+      if (k.endsWith("HeaderRenderer") && runsOf(v?.title).length) found = v;
     });
     return found;
   }
@@ -152,18 +153,22 @@
   }
 
   // fetch can't set Origin, and InnerTube wants it.
-  function setup() {
-    return chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [RULE_ID],
-      addRules: [
-        {
-          id: RULE_ID,
-          priority: 1,
-          action: { type: "modifyHeaders", requestHeaders: [{ header: "Origin", operation: "set", value: ORIGIN }] },
-          condition: { urlFilter: `|${ORIGIN}/youtubei/`, initiatorDomains: [chrome.runtime.id], resourceTypes: ["xmlhttprequest", "other"] },
-        },
-      ],
-    });
+  async function setup() {
+    try {
+      await chrome.declarativeNetRequest?.updateSessionRules({
+        removeRuleIds: [RULE_ID],
+        addRules: [
+          {
+            id: RULE_ID,
+            priority: 1,
+            action: { type: "modifyHeaders", requestHeaders: [{ header: "Origin", operation: "set", value: ORIGIN }] },
+            condition: { urlFilter: `|${ORIGIN}/youtubei/`, initiatorDomains: [chrome.runtime.id], resourceTypes: ["xmlhttprequest", "other"] },
+          },
+        ],
+      });
+    } catch (e) {
+      console.warn("procast: couldn't set the Origin rule", e);
+    }
   }
 
   // ---- the music.youtube.com tab -----------------------------------------------------
@@ -201,6 +206,7 @@
 
   function applyControl(action, value) {
     const player = document.getElementById("movie_player");
+    if (!player?.getVideoData) return false;
     const click = (selector) => document.querySelector(selector)?.click();
     const step = (sign) => Math.max(0, Math.min(100, player.getVolume() + sign * value));
     switch (action) {
@@ -227,16 +233,23 @@
         click("ytmusic-player-bar .repeat");
         break;
     }
+    return true;
+  }
+
+  async function readCurrent(tab) {
+    const current = await inTab(tab, readPlayer);
+    if (!current) throw new Error(NOT_READY);
+    return current;
   }
 
   async function currentTrack() {
-    return inTab(await requireTab(), readPlayer);
+    return readCurrent(await requireTab());
   }
 
   async function videoIdOf(req) {
     if (req.videoId) return req.videoId;
     const current = await currentTrack();
-    if (!current?.videoId) throw new Error("Nothing is playing in YouTube Music");
+    if (!current.videoId) throw new Error("Nothing is playing in YouTube Music");
     return current.videoId;
   }
 
@@ -262,6 +275,15 @@
     return { title, items };
   }
 
+  async function addToPlaylist(req) {
+    const edit = await call("browse/edit_playlist", {
+      playlistId: req.playlistId,
+      actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: await videoIdOf(req) }],
+    });
+    if (edit.status !== "STATUS_SUCCEEDED") throw new Error("Couldn't add to the playlist");
+    return {};
+  }
+
   async function play(req) {
     const videoId = req.videoId || (req.radio ? await videoIdOf(req) : "");
     const url = watchUrl({ videoId, playlistId: req.playlistId, radio: req.radio });
@@ -273,9 +295,10 @@
 
   async function control({ action, value }) {
     if (!CONTROLS.includes(action)) throw new Error(`Unknown control: ${action}`);
+    if (action === "volume" && typeof value !== "number") throw new Error("Missing volume");
     const tab = await requireTab();
-    await inTab(tab, applyControl, action, value);
-    return { current: await inTab(tab, readPlayer) };
+    if (!(await inTab(tab, applyControl, action, value))) throw new Error(NOT_READY);
+    return { current: await readCurrent(tab) };
   }
 
   async function run(req) {
@@ -290,11 +313,7 @@
         await call(LIKES[req.op], { target: { videoId: await videoIdOf(req) } });
         return {};
       case "addToPlaylist":
-        await call("browse/edit_playlist", {
-          playlistId: req.playlistId,
-          actions: [{ action: "ACTION_ADD_VIDEO", addedVideoId: await videoIdOf(req) }],
-        });
-        return {};
+        return addToPlaylist(req);
       case "play":
         return play(req);
       case "control":

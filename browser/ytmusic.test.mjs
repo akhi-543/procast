@@ -8,7 +8,7 @@ const here = (name) => new URL(name, import.meta.url);
 const fixture = (name) => JSON.parse(readFileSync(here(`test-fixtures/${name}.json`), "utf8"));
 
 function load(chrome = {}, fetch) {
-  const sandbox = { crypto: webcrypto, TextEncoder, URL, URLSearchParams, chrome, fetch };
+  const sandbox = { crypto: webcrypto, TextEncoder, URL, URLSearchParams, console: { warn() {} }, chrome, fetch };
   vm.runInNewContext(readFileSync(here("ytmusic.js"), "utf8"), sandbox);
   return sandbox.ytm;
 }
@@ -91,4 +91,81 @@ test("a signed-out library asks to sign in", async () => {
   const signedOut = load({ cookies: { get: async () => null } }, async () => ({ ok: true, json: async () => ({}) }));
   const reply = await signedOut.handle({ t: "ytm", req: 1, op: "browse", id: "FEmusic_liked_albums" });
   assert.match(reply.error, /^Sign in to music.youtube.com/);
+});
+
+test("an owned playlist's wrapped header is found", () => {
+  const thumbnail = { musicThumbnailRenderer: { thumbnail: { thumbnails: [{ url: "https://t/small" }, { url: "https://t/big" }] } } };
+  const real = { title: { runs: [{ text: "Mine" }] }, thumbnail, buttons: [{ watchPlaylistEndpoint: { playlistId: "PL1" } }] };
+  const page = ytm.page({ header: { musicEditablePlaylistDetailHeaderRenderer: { header: { musicResponsiveHeaderRenderer: real } } } });
+  assert.deepEqual([page.title, page.thumb, page.playlistId], ["Mine", "https://t/big", "PL1"]);
+});
+
+test("a malformed renderer is skipped", () => {
+  assert.equal(ytm.items({ musicResponsiveListItemRenderer: { flexColumns: [] } }).length, 0);
+});
+
+test("thumbnailRenderer is used when thumbnail has no thumbnails", () => {
+  const run = { text: "Album", navigationEndpoint: { browseEndpoint: { browseId: "MPREb_x" } } };
+  const thumbnailRenderer = { musicThumbnailRenderer: { thumbnail: { thumbnails: [{ url: "https://t/a" }] } } };
+  const [it] = ytm.items({ musicTwoRowItemRenderer: { title: { runs: [run] }, thumbnail: {}, thumbnailRenderer } });
+  assert.equal(it.thumb, "https://t/a");
+});
+
+function recording(cookies, respond) {
+  const calls = [];
+  const fetch = async (url, init) => {
+    calls.push({ url, headers: init.headers });
+    return respond;
+  };
+  const chrome = { cookies: { get: async ({ name }) => (name in cookies ? { value: cookies[name] } : null) } };
+  return { ytm: load(chrome, fetch), calls };
+}
+
+const ok = (body) => ({ ok: true, json: async () => body });
+
+test("a non-2xx answer is reported with its status", async () => {
+  const { ytm } = recording({}, { ok: false, status: 403 });
+  assert.equal((await ytm.handle({ t: "ytm", req: 1, op: "search", query: "x", filter: "songs" })).error, "YouTube Music answered 403");
+});
+
+test("__Secure-3PAPISID is used when SAPISID is missing", async () => {
+  const { ytm, calls } = recording({ "__Secure-3PAPISID": "fallback" }, ok({}));
+  await ytm.handle({ t: "ytm", req: 1, op: "search", query: "x", filter: "songs" });
+  assert.match(calls[0].headers.Authorization, /^SAPISIDHASH \d+_[0-9a-f]{40}$/);
+});
+
+test("no Authorization header when signed out", async () => {
+  const { ytm, calls } = recording({}, ok({}));
+  await ytm.handle({ t: "ytm", req: 1, op: "search", query: "x", filter: "songs" });
+  assert.equal(calls.length, 1);
+  assert.ok(!("Authorization" in calls[0].headers));
+});
+
+test("a failed playlist edit is an error", async () => {
+  const { ytm } = recording({}, ok({ status: "STATUS_FAILED" }));
+  const reply = await ytm.handle({ t: "ytm", req: 1, op: "addToPlaylist", playlistId: "PL1", videoId: "abc" });
+  assert.equal(reply.error, "Couldn't add to the playlist");
+  const done = recording({}, ok({ status: "STATUS_SUCCEEDED" }));
+  assert.equal((await done.ytm.handle({ t: "ytm", req: 1, op: "addToPlaylist", playlistId: "PL1", videoId: "abc" })).error, undefined);
+});
+
+function tabWith(result) {
+  const chrome = { tabs: { query: async () => [{ id: 3 }] }, scripting: { executeScript: async () => [{ result }] } };
+  return load(chrome);
+}
+
+test("a tab without a player isn't ready", async () => {
+  const notReady = "YouTube Music isn't ready in the tab yet";
+  assert.equal((await tabWith(null).handle({ t: "ytm", req: 1, op: "current" })).error, notReady);
+  assert.equal((await tabWith(false).handle({ t: "ytm", req: 1, op: "control", action: "mute" })).error, notReady);
+});
+
+test("volume needs a value", async () => {
+  assert.equal((await tabWith(true).handle({ t: "ytm", req: 1, op: "control", action: "volume" })).error, "Missing volume");
+});
+
+test("setup never throws", async () => {
+  await load({}).setup();
+  const rejecting = { runtime: { id: "x" }, declarativeNetRequest: { updateSessionRules: async () => Promise.reject(new Error("no")) } };
+  await load(rejecting).setup();
 });
