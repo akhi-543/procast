@@ -112,14 +112,10 @@ impl Session {
         self.minutes == 0
     }
 
-    /// Counting (not paused). A timed session may be over; see `expired`.
+    /// Counting (not paused), and so blocking. A timed session whose time is up (`expired`)
+    /// keeps blocking until it is completed or extended.
     pub fn running(&self) -> bool {
         self.until.is_some() || self.since.is_some()
-    }
-
-    /// Running: not paused and not over.
-    pub fn active(&self, now: SystemTime) -> bool {
-        self.since.is_some() || self.until.is_some_and(|u| now < u)
     }
 
     pub fn expired(&self, now: SystemTime) -> bool {
@@ -197,7 +193,7 @@ impl Session {
     /// blocks nothing.
     pub fn blocked_app(&self, exe: &str, now: SystemTime) -> bool {
         let exe = exe.to_lowercase();
-        if !self.active(now) || exe.is_empty() || NEVER.contains(&exe.as_str()) || self.snoozed.get(&exe).is_some_and(|&t| now < t) {
+        if !self.running() || exe.is_empty() || NEVER.contains(&exe.as_str()) || self.snoozed.get(&exe).is_some_and(|&t| now < t) {
             return false;
         }
         let listed = self.apps.contains(&exe);
@@ -208,16 +204,16 @@ impl Session {
     }
 
     /// The website filter the browser applies right now, if any.
-    fn site_rule(&self, now: SystemTime) -> Option<(Mode, &[String])> {
+    fn site_rule(&self) -> Option<(Mode, &[String])> {
         let nothing = self.sites.is_empty() && (self.mode == Mode::Block || self.allow_empty_sites);
-        (self.active(now) && !nothing).then_some((self.mode, &self.sites[..]))
+        (self.running() && !nothing).then_some((self.mode, &self.sites[..]))
     }
 
     /// Whether `host` is off limits: a listed domain (or a subdomain of it) in block mode,
     /// anything else in allow mode. Allow mode with no sites blocks every site unless
     /// `allow_empty_sites`.
-    pub fn blocked_site(&self, host: &str, now: SystemTime) -> bool {
-        let Some((mode, sites)) = self.site_rule(now) else { return false };
+    pub fn blocked_site(&self, host: &str) -> bool {
+        let Some((mode, sites)) = self.site_rule() else { return false };
         let host = host.to_lowercase();
         (mode == Mode::Block) == sites.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
     }
@@ -249,9 +245,17 @@ impl Preset {
     }
 }
 
-/// The minutes Snooze allows: 0 in `[focus] snooze_minutes` turns it off.
-pub fn snooze_for(configured: u8) -> Option<u8> {
-    (configured > 0).then_some(configured)
+/// The minutes Snooze allows: `[focus] snooze_minutes` when it is one of Settings' 1, 3, 5
+/// or 10; anything else (0, the old "no snooze", included) is the default 3.
+pub fn snooze_for(configured: u8) -> u8 {
+    if [1, 3, 5, 10].contains(&configured) { configured } else { 3 }
+}
+
+/// The pill's time: "23:10", "00:57", "1:02:03". Minutes keep two digits, so the pill only
+/// changes width when an hour comes or goes.
+pub fn pill_text(d: Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{:02}:{:02}", s / 60, s % 60) }
 }
 
 /// Whether the browser is due the site filter again: a session counts down and the last push
@@ -278,11 +282,12 @@ pub fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, path))
 }
 
-/// The message that gives the browser companion the site filter (or switches it off).
-pub fn sites_message(session: Option<&Session>, now: SystemTime) -> Value {
-    match session.and_then(|s| s.site_rule(now)) {
-        Some((mode, sites)) => json!({"t": "focusSites", "mode": if mode == Mode::Block { "block" } else { "allow" }, "sites": sites}),
-        None => json!({"t": "focusSites", "mode": "off", "sites": []}),
+/// The message that gives the browser companion the site filter (or switches it off), and
+/// the minutes its blocked page's Snooze lets a site through.
+pub fn sites_message(session: Option<&Session>, snooze: u8) -> Value {
+    match session.and_then(Session::site_rule) {
+        Some((mode, sites)) => json!({"t": "focusSites", "mode": if mode == Mode::Block { "block" } else { "allow" }, "sites": sites, "snooze": snooze}),
+        None => json!({"t": "focusSites", "mode": "off", "sites": [], "snooze": snooze}),
     }
 }
 
@@ -316,12 +321,7 @@ pub fn app_label(exe: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
-/// Whole minutes left, rounded up, at least 1 (for "blocked for 25 min").
-pub fn minutes_left(d: Duration) -> u64 {
-    d.as_secs().div_ceil(60).max(1)
-}
-
-/// The system "ding" that ends a session.
+/// The system "ding" when a session's time is up.
 pub fn beep() {
     crate::timers::beep();
 }
@@ -357,6 +357,8 @@ pub struct Focus {
     pushed: Option<Instant>,
     /// The last app Focus closed: file name, full path, when.
     last: Option<(String, String, Instant)>,
+    /// The session's time was up at the last `time_up`.
+    up: bool,
 }
 
 impl Focus {
@@ -396,6 +398,15 @@ impl Focus {
         self.session.as_ref().is_some_and(Session::running)
     }
 
+    /// True once when the session's time runs out: the moment for the notice's sound. The
+    /// session stays, still blocking, until it is completed or extended.
+    pub fn time_up(&mut self, now: SystemTime) -> bool {
+        let up = self.session.as_ref().is_some_and(|s| s.expired(now));
+        let first = up && !self.up;
+        self.up = up;
+        first
+    }
+
     pub fn push_due(&self, now: Instant) -> bool {
         resend_due(self.ticking(), self.pushed, now)
     }
@@ -428,9 +439,9 @@ impl Focus {
     }
 
     /// The domain of `url` if the session keeps it out now.
-    pub fn blocked_url(&self, url: &str, now: SystemTime) -> Option<String> {
+    pub fn blocked_url(&self, url: &str) -> Option<String> {
         let host = host_of(url)?;
-        self.session.as_ref().is_some_and(|s| s.blocked_site(&host, now)).then_some(host)
+        self.session.as_ref().is_some_and(|s| s.blocked_site(&host)).then_some(host)
     }
 }
 
@@ -464,6 +475,11 @@ pub fn categories(own: &[FocusCategory]) -> Vec<FocusCategory> {
     let built = BUILT_IN.iter().map(|&(name, _, apps, sites)| category(own, name).cloned().unwrap_or_else(|| FocusCategory { name: name.into(), apps: strings(apps), sites: strings(sites) }));
     let rest = own.iter().filter(|c| !BUILT_IN.iter().any(|b| b.0.eq_ignore_ascii_case(&c.name)));
     built.chain(rest.cloned()).collect()
+}
+
+/// A category's lists, counted: "5 apps · 5 websites".
+pub fn category_line(c: &FocusCategory) -> String {
+    format!("{} apps · {} websites", c.apps.len(), c.sites.len())
 }
 
 /// A category's icon: the built-in one by name, `list-checks` for the user's own.
@@ -714,7 +730,7 @@ mod tests {
         assert!(s.blocked_app("notepad.exe", now));
         assert!(s.blocked_app("NOTEPAD.EXE", now), "case does not matter");
         assert!(!s.blocked_app("code.exe", now), "unlisted apps are fine");
-        assert!(!s.blocked_app("notepad.exe", now + mins(26)), "not after the end");
+        assert!(s.blocked_app("notepad.exe", now + mins(26)), "still blocking after the time is up, until Complete");
         s.pause(now + mins(5));
         assert!(!s.blocked_app("notepad.exe", now + mins(6)), "not while paused");
         s.resume(now + mins(10));
@@ -766,50 +782,49 @@ mod tests {
         let now = SystemTime::now();
         let s = session(Mode::Block, &[], &["https://www.reddit.com/r/rust"], now);
         assert_eq!(s.sites, ["reddit.com"]);
-        assert!(s.blocked_site("www.reddit.com", now));
-        assert!(s.blocked_site("reddit.com", now));
-        assert!(s.blocked_site("Old.Reddit.com", now));
-        assert!(!s.blocked_site("notreddit.com", now));
-        assert!(!s.blocked_site("reddit.com.evil.org", now));
-        assert!(!s.blocked_site("reddit.com", now + mins(30)), "not after the end");
+        assert!(s.blocked_site("www.reddit.com"));
+        assert!(s.blocked_site("reddit.com"));
+        assert!(s.blocked_site("Old.Reddit.com"));
+        assert!(!s.blocked_site("notreddit.com"));
+        assert!(!s.blocked_site("reddit.com.evil.org"));
         let allow = session(Mode::Allow, &[], &["docs.rs"], now);
-        assert!(!allow.blocked_site("docs.rs", now) && !allow.blocked_site("a.docs.rs", now));
-        assert!(allow.blocked_site("reddit.com", now));
+        assert!(!allow.blocked_site("docs.rs") && !allow.blocked_site("a.docs.rs"));
+        assert!(allow.blocked_site("reddit.com"));
     }
 
     #[test]
     fn allow_mode_with_no_sites_blocks_every_site_unless_told_otherwise() {
         let now = SystemTime::now();
         let strict = session(Mode::Allow, &["code.exe"], &[], now);
-        assert!(strict.blocked_site("example.com", now));
-        assert_eq!(sites_message(Some(&strict), now)["mode"], "allow");
+        assert!(strict.blocked_site("example.com"));
+        assert_eq!(sites_message(Some(&strict), 3)["mode"], "allow");
         let mut open = strict.clone();
         open.allow_empty_sites = true;
-        assert!(!open.blocked_site("example.com", now));
-        assert_eq!(sites_message(Some(&open), now)["mode"], "off");
+        assert!(!open.blocked_site("example.com"));
+        assert_eq!(sites_message(Some(&open), 3)["mode"], "off");
         let none = session(Mode::Block, &["a.exe"], &[], now);
-        assert!(!none.blocked_site("example.com", now), "block mode with nothing listed blocks nothing");
+        assert!(!none.blocked_site("example.com"), "block mode with nothing listed blocks nothing");
     }
 
     #[test]
     fn the_browser_message_follows_the_session() {
         let now = SystemTime::now();
         let mut s = session(Mode::Block, &[], &["x.com", "reddit.com"], now);
-        assert_eq!(sites_message(Some(&s), now), json!({"t": "focusSites", "mode": "block", "sites": ["x.com", "reddit.com"]}));
+        assert_eq!(sites_message(Some(&s), 3), json!({"t": "focusSites", "mode": "block", "sites": ["x.com", "reddit.com"], "snooze": 3}));
         s.pause(now);
-        assert_eq!(sites_message(Some(&s), now)["mode"], "off", "paused: sites are free");
-        assert_eq!(sites_message(None, now)["mode"], "off");
+        assert_eq!(sites_message(Some(&s), 3)["mode"], "off", "paused: sites are free");
+        assert_eq!(sites_message(None, 5)["snooze"], 5);
     }
 
     #[test]
     fn links_are_judged_by_their_domain() {
         let now = SystemTime::now();
         let f = Focus { session: Some(session(Mode::Block, &[], &["reddit.com"], now)), ..Default::default() };
-        assert_eq!(f.blocked_url("https://www.reddit.com/r/rust?x=1", now), Some("reddit.com".into()));
-        assert_eq!(f.blocked_url("https://user@old.reddit.com:443/", now), Some("old.reddit.com".into()));
-        assert_eq!(f.blocked_url("https://example.com/reddit.com", now), None);
-        assert_eq!(f.blocked_url("mailto:a@reddit.com", now), None);
-        assert_eq!(f.blocked_url("C:\\reddit.com", now), None);
+        assert_eq!(f.blocked_url("https://www.reddit.com/r/rust?x=1"), Some("reddit.com".into()));
+        assert_eq!(f.blocked_url("https://user@old.reddit.com:443/"), Some("old.reddit.com".into()));
+        assert_eq!(f.blocked_url("https://example.com/reddit.com"), None);
+        assert_eq!(f.blocked_url("mailto:a@reddit.com"), None);
+        assert_eq!(f.blocked_url("C:\\reddit.com"), None);
     }
 
     #[test]
@@ -823,7 +838,6 @@ mod tests {
         assert_eq!(norm_site("ünï.example"), "ünï.example", "no byte slicing");
         assert_eq!(app_label("notepad.exe"), "Notepad");
         assert_eq!(app_label("éa.exe"), "Éa");
-        assert_eq!((minutes_left(Duration::from_secs(1)), minutes_left(mins(25)), minutes_left(Duration::from_secs(1501))), (1, 25, 26));
     }
 
     #[test]
@@ -940,7 +954,7 @@ mod tests {
         s = Session::new("Open", s.mode, &s.apps, &s.sites, 0, false, now);
         assert!(s.unlimited() && s.running() && s.until.is_none());
         let later = now + mins(60 * 24);
-        assert!(s.active(later) && !s.expired(later) && s.blocked_app("notepad.exe", later));
+        assert!(s.running() && !s.expired(later) && s.blocked_app("notepad.exe", later));
         assert_eq!(s.row(now + mins(3)), ("Open".into(), "3:00".into()), "the time run, like a stopwatch");
         s.pause(now + mins(5));
         assert!(!s.running() && !s.blocked_app("notepad.exe", later), "paused: not blocking");
@@ -950,12 +964,37 @@ mod tests {
         assert!(s.blocked_app("notepad.exe", now + mins(12)));
         s.restart(now + mins(20));
         assert_eq!(s.elapsed(now + mins(21)), mins(1));
-        assert_eq!(sites_message(Some(&s), now + mins(21))["mode"], "off", "nothing listed, nothing to filter");
+        assert_eq!(sites_message(Some(&s), 3)["mode"], "off", "nothing listed, nothing to filter");
     }
 
     #[test]
-    fn snooze_can_be_turned_off() {
-        assert_eq!((snooze_for(0), snooze_for(1), snooze_for(3), snooze_for(10)), (None, Some(1), Some(3), Some(10)));
+    fn snooze_is_one_of_its_four_lengths_and_anything_else_reads_as_3() {
+        assert_eq!([1, 3, 5, 10].map(snooze_for), [1, 3, 5, 10]);
+        assert_eq!((snooze_for(0), snooze_for(7)), (3, 3), "no Off: 0 (the old \"no snooze\") and unknown lengths are the default");
+    }
+
+    #[test]
+    fn the_pill_shows_the_time_as_a_clock() {
+        assert_eq!(pill_text(Duration::from_secs(23 * 60 + 10)), "23:10");
+        assert_eq!(pill_text(Duration::from_secs(57)), "00:57", "two digits of minutes, so the pill keeps its width");
+        assert_eq!(pill_text(Duration::from_secs(3723)), "1:02:03");
+    }
+
+    #[test]
+    fn time_up_keeps_the_session_blocking_until_it_is_completed() {
+        let now = SystemTime::now();
+        let mut f = Focus { session: Some(session(Mode::Block, &["notepad.exe"], &["x.com"], now)), ..Default::default() };
+        assert!(!f.time_up(now + mins(24)), "not yet");
+        let late = now + mins(26);
+        assert!(f.time_up(late), "the notice (and its sound) once");
+        assert!(!f.time_up(late + mins(1)), "only once");
+        let s = f.session.as_ref().expect("the session stays until Complete, Extend or the notice's close");
+        assert!(s.expired(late) && f.ticking());
+        assert!(s.blocked_app("notepad.exe", late) && s.blocked_site("x.com"));
+        assert_eq!(sites_message(Some(s), 3)["mode"], "block");
+        f.update(|s| s.extend(late));
+        assert!(!f.time_up(late), "extended: running again");
+        assert!(f.time_up(late + mins(6)), "and up again five minutes on");
     }
 
     #[test]

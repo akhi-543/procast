@@ -3,8 +3,9 @@
 //   {t: "tabs"}                      -> {t: "tabs", browser, tabs: [{id, window, title, url, icon}]}
 //   {t: "activate", id, window}      -> {t: "activate", ok}
 //   {t: "open", url}                 -> {t: "open", ok, existing}: the tab already showing url, else a new one
-//   {t: "focusSites", mode, sites}   -> {t: "focusSites", ok}: Focus. mode "block" sends tabs on those domains (and
-//                                       their subdomains) to blocked.html, "allow" sends every other tab there, "off" stops
+//   {t: "focusSites", mode, sites, snooze} -> {t: "focusSites", ok}: Focus. mode "block" sends tabs on those domains
+//                                       (and their subdomains) to blocked.html, "allow" sends every other tab there, "off"
+//                                       stops. The page's Snooze lets its site through for `snooze` minutes.
 
 const HOST = "com.procast.browser";
 let port = null;
@@ -30,7 +31,10 @@ async function focus(tab) {
 }
 
 // Focus: the host a tab is on if the filter keeps it out, else null. Only web pages count.
-let focusRule = { mode: "off", sites: [] };
+let focusRule = { mode: "off", sites: [], snooze: 0 };
+// Hosts the blocked page's Snooze let through, and until when (ms). procast repeats the rule
+// every 15 s, which blocks them again once that has passed.
+const snoozed = new Map();
 
 function blockedHost(url) {
   if (focusRule.mode === "off") return null;
@@ -42,14 +46,25 @@ function blockedHost(url) {
   } catch (e) {
     return null;
   }
+  if ((snoozed.get(host) || 0) > Date.now()) return null;
   const listed = focusRule.sites.some((s) => host === s || host.endsWith("." + s));
   return (focusRule.mode === "block") === listed ? host : null;
 }
 
 function redirect(tab, url) {
   const host = blockedHost(url);
-  if (host) chrome.tabs.update(tab, { url: chrome.runtime.getURL("blocked.html") + "?site=" + encodeURIComponent(host) });
+  if (!host) return;
+  const page = new URLSearchParams({ site: host, snooze: focusRule.snooze, url });
+  chrome.tabs.update(tab, { url: chrome.runtime.getURL("blocked.html") + "?" + page });
 }
+
+// The blocked page's Snooze: its site is let through for a while, and the tab goes back to it.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg.type !== "snooze" || !sender.tab || !(focusRule.snooze > 0)) return;
+  snoozed.set(msg.site, Date.now() + focusRule.snooze * 60000);
+  const back = /^https?:\/\//.test(msg.url) ? msg.url : "https://" + msg.site;
+  chrome.tabs.update(sender.tab.id, { url: back });
+});
 
 // A tab that navigates while Focus runs.
 chrome.tabs.onUpdated.addListener((id, change) => {
@@ -82,7 +97,7 @@ async function handle(req) {
       return { t: "open", ok: true, existing: !!same };
     }
     case "focusSites": {
-      focusRule = { mode: req.mode, sites: req.sites || [] };
+      focusRule = { mode: req.mode, sites: req.sites || [], snooze: req.snooze || 0 };
       for (const t of await chrome.tabs.query({})) redirect(t.id, t.url);
       return { t: "focusSites", ok: true };
     }

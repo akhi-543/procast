@@ -181,7 +181,17 @@ pub mod mix {
     /// `.pc-tag`: the hue's share of its fill, and of its text (mixed into `text`).
     pub const TAG_FILL: f32 = 0.18;
     pub const TAG_TEXT: f32 = 0.72;
+    /// `.pc-hud__time`: the hue's share of the Focus pill's time capsule.
+    pub const HUD_FILL: f32 = 0.3;
 }
+
+/// `.pc-hud`: the Focus timer pill's height, and its time capsule's.
+pub const HUD: f32 = 32.;
+const HUD_TIME: f32 = 24.;
+/// The widest the pill's goal grows before an ellipsis cuts it.
+const HUD_GOAL_MAX: f32 = 320.;
+/// `.pc-notice`: the time-up notice's width.
+pub const NOTICE_W: f32 = 440.;
 
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
 /// glance: window moves are teal, system actions amber, clipboard blue, and so on.
@@ -1266,6 +1276,29 @@ pub fn toast(text: &str, kind: crate::toast::Kind, t: &Tokens) -> Div {
         .text_color(t.text)
         .child(svg().path(format!("icons/{glyph}.svg")).size(p(ic::MD)).flex_none().text_color(tint))
         .child(div().min_w_0().truncate().child(text.to_string()))
+}
+
+/// The Focus timer pill (`.pc-hud`): the time in a System-tinted capsule (tabular figures, so
+/// it never jitters), then the goal. On `bg_elevated` like the toast: it floats on the desktop.
+pub fn hud(time: &str, goal: &str, t: &Tokens) -> Div {
+    let capsule = div().h(px(HUD_TIME)).px(px(sp::S8)).flex().items_center().rounded(px(r::SM)).bg(alpha(Tint::System.hue(t), mix::HUD_FILL)).font_features(tabular()).child(time.to_string());
+    div()
+        .h(px(HUD))
+        .pl(px(sp::S4))
+        .pr(px(sp::S12))
+        .flex()
+        .items_center()
+        .gap(px(sp::S8))
+        .rounded(px(r::MD))
+        .bg(t.bg_elevated)
+        .border_1()
+        .border_color(rim_border(t))
+        .shadow([rim(t), float(t)].concat())
+        .text_size(px(ts::BODY_SM))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(t.text)
+        .child(capsule)
+        .child(div().max_w(px(HUD_GOAL_MAX)).truncate().child(goal.to_string()))
 }
 
 /// An ActionPanel or Dialog surface: `bg_elevated`, `r::LG`, the rim border, `rim` and `float`

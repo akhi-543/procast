@@ -61,6 +61,8 @@ enum Live {
     Index,
     /// Whether the foreground hook runs, in the row's label.
     Foreground,
+    /// Just the label and help: a name to read (Focus categories).
+    Nothing,
 }
 
 /// What a `Choice` option writes: a string, or a whole number (minutes, days).
@@ -236,7 +238,8 @@ fn head(section: &str) -> Option<&'static str> {
         "Translator" => "Translate text with Google Translate, from the launcher or the selection.",
         "Calendar" => "Today's meetings in search, with a one-key join.",
         "Games" => "Turn HDR on by itself while you play.",
-        "Screenshots" | "Focus" | "Notes" => "",
+        "Focus" => "Block distracting apps and websites while you work.",
+        "Screenshots" | "Notes" => "",
         _ => return None,
     })
 }
@@ -248,6 +251,27 @@ fn row(label: &str, path: &str, kind: Kind, help: &str) -> Row {
 /// Rows under card headings.
 fn groups(list: Vec<(&'static str, Vec<Row>)>) -> Vec<Row> {
     list.into_iter().flat_map(|(g, rows)| rows.into_iter().map(move |r| Row { group: g.into(), ..r })).collect()
+}
+
+/// Settings → Focus, after its commands: the categories by name, to read. The built-in ones
+/// (a `[[focus_category]]` of the same name gives its lists), then "Your categories".
+fn focus_categories(text: &str) -> Vec<Row> {
+    let own = config::parse(text).map(|c| c.focus_category).unwrap_or_default();
+    crate::focus::categories(&own)
+        .into_iter()
+        .map(|c| {
+            let group = if crate::focus::BUILT_IN.iter().any(|b| b.0.eq_ignore_ascii_case(&c.name)) { "Focus categories" } else { "Your categories" };
+            let help = crate::focus::category_line(&c);
+            Row { icon: crate::focus::category_icon(&c.name), label: c.name, help, path: vec![], kind: Kind::Status(Live::Nothing), group: group.into() }
+        })
+        .collect()
+}
+
+/// The option a Choice row shows as picked: the stored value's or, for a value it does not
+/// offer (a hand-typed 0 Snooze), the default's.
+fn choice_at(opts: &[Opt], value: &str, path: &[String]) -> Option<usize> {
+    let at = |v: &str| opts.iter().position(|o| o.1.text() == v);
+    at(value).or_else(|| at(&config::shown_value("", path)))
 }
 
 /// "snippet" -> "Snippet".
@@ -557,17 +581,10 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
         "Focus" => groups(vec![(
             "Sessions",
             vec![
-                row("Default length", "focus.default_minutes", Kind::Number, "Minutes offered when you start a Focus session. 0 means no limit.").with_icon(g::TIMER),
-                row(
-                    "Snooze duration",
-                    "focus.snooze_minutes",
-                    Kind::Choice(&[("1 min", N(1)), ("3 min", N(3)), ("5 min", N(5)), ("10 min", N(10))]),
-                    "How long Snooze Focus Session lets you use the app Focus just closed.",
-                )
-                .with_icon(g::COFFEE),
-                row("Allow all websites", "focus.allow_all_on_empty_sites", Kind::Bool, "Allow mode with no websites listed: let every site through. Off blocks every site.").with_icon(g::GLOBE),
-                row("Reopen closed apps", "focus.restore_apps", Kind::Bool, "When a session ends, start again the apps Focus closed.").with_icon(g::ROTATE_CCW),
-                row("Play sound", "focus.sound", Kind::Bool, "Play a sound when a session ends.").with_icon(g::VOLUME_2),
+                row("Snooze duration", "focus.snooze_minutes", Kind::Choice(&[("1 min", N(1)), ("3 min", N(3)), ("5 min", N(5)), ("10 min", N(10))]), "").with_icon(g::COFFEE),
+                row("Allow all websites", "focus.allow_all_on_empty_sites", Kind::Bool, "When a browser is allowed but no sites are listed").with_icon(g::GLOBE),
+                row("Reopen closed apps", "focus.restore_apps", Kind::Bool, "When the session ends").with_icon(g::ROTATE_CCW),
+                row("Play sound", "focus.sound", Kind::Bool, "").with_icon(g::VOLUME_2),
             ],
         )]),
         "Calendar" => groups(vec![(
@@ -705,12 +722,13 @@ impl Settings {
         if SECTIONS[self.section] == "Shortcuts" {
             return self.shortcut_rows();
         }
+        let section = SECTIONS[self.section];
         let mut out = rows(self.section, &self.exts, &self.text);
-        if SECTIONS[self.section] != "Translator" {
+        if !matches!(section, "Translator" | "Focus") {
             return out;
         }
-        // Then its commands, each with its alias and hotkey.
-        out.extend(self.items.iter().enumerate().filter(|(_, it)| it.subtitle == "Translator").map(|(i, it)| Row {
+        // Then its commands (their subtitle is the section's name), each with its alias and hotkey.
+        out.extend(self.items.iter().enumerate().filter(|(_, it)| it.subtitle == section).map(|(i, it)| Row {
             label: it.title.clone(),
             help: String::new(),
             path: vec!["launcher".into(), "aliases".into(), key_of(it)],
@@ -718,6 +736,9 @@ impl Settings {
             group: "Commands".into(),
             icon: "",
         }));
+        if section == "Focus" {
+            out.extend(focus_categories(&self.text));
+        }
         out
     }
 
@@ -924,7 +945,7 @@ impl Settings {
                 self.save(&r.path, (!on).into(), cx);
             }
             Kind::Choice(opts) => {
-                let i = opts.iter().position(|o| o.1.text() == current).map_or(0, |i| (i + 1) % opts.len());
+                let i = choice_at(opts, &current, &r.path).map_or(0, |i| (i + 1) % opts.len());
                 self.save(&r.path, opts[i].1.value(), cx);
             }
             Kind::Language(lead) => {
@@ -1169,7 +1190,7 @@ impl Settings {
             &Kind::Choice(opts) => {
                 let me = me.clone();
                 let path = r.path.clone();
-                let on = opts.iter().position(|o| o.1.text() == value);
+                let on = choice_at(opts, &value, &r.path);
                 choices(opts.iter().map(|o| o.0), on, stacked(&r.kind), t, &r.path.join("."), move |k, cx| {
                     drop(me.update(cx, |this, cx| this.save(&path, opts[k].1.value(), cx)));
                 })
@@ -1179,7 +1200,7 @@ impl Settings {
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Action(_) => design::button("Rebuild", design::Button::Quiet, on, t).into_any_element(),
             Kind::Status(Live::Index) => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(self.index_status.read().unwrap().clone()).into_any_element(),
-            Kind::Status(Live::Foreground) => div().into_any_element(),
+            Kind::Status(Live::Foreground | Live::Nothing) => div().into_any_element(),
             Kind::TableAdd(_) => design::button("Add", design::Button::Quiet, on, t).into_any_element(),
             &Kind::TableItem(list, i) => {
                 let (copy, delete) = (me.clone(), me.clone());
@@ -1715,6 +1736,46 @@ mod tests {
         assert!(matches!(action.kind, Kind::Choice(o) if o.iter().map(|o| (o.0, o.1.text())).eq([("Copy", "copy".to_string()), ("Paste", "paste".to_string())])));
         assert_eq!(head("Translator"), Some("Translate text with Google Translate, from the launcher or the selection."));
         assert_eq!(head("General"), None);
+    }
+
+    #[test]
+    fn the_focus_page_lists_its_four_settings_then_the_categories() {
+        let s = SECTIONS.iter().position(|x| *x == "Focus").unwrap();
+        let shown: Vec<(String, String, &str)> = rows(s, &[], "").into_iter().map(|r| (r.label, r.help, r.icon)).collect();
+        let want = [
+            ("Snooze duration", "", g::COFFEE),
+            ("Allow all websites", "When a browser is allowed but no sites are listed", g::GLOBE),
+            ("Reopen closed apps", "When the session ends", g::ROTATE_CCW),
+            ("Play sound", "", g::VOLUME_2),
+        ];
+        assert_eq!(shown, want.map(|(l, h, i)| (l.to_string(), h.to_string(), i)), "default_minutes stays a config key without a row");
+        assert_eq!(head("Focus"), Some("Block distracting apps and websites while you work."));
+        let cats = focus_categories("[[focus_category]]\nname = \"Work\"\napps = []\nsites = [\"jira.com\"]\n");
+        let shown: Vec<(&str, &str, &str)> = cats.iter().map(|r| (r.group.as_str(), r.label.as_str(), r.icon)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("Focus categories", "Messaging", g::MESSAGE_CIRCLE),
+                ("Focus categories", "Social", g::USERS),
+                ("Focus categories", "Streaming", g::CIRCLE_PLAY),
+                ("Focus categories", "Travel", g::PLANE),
+                ("Focus categories", "News", g::NEWSPAPER),
+                ("Focus categories", "Shopping", g::SHOPPING_CART),
+                ("Focus categories", "Gaming", g::GAMEPAD_2),
+                ("Your categories", "Work", g::LIST_CHECKS),
+            ]
+        );
+        assert_eq!(cats[7].help, "0 apps · 1 websites");
+        assert!(cats.iter().all(|r| r.kind == Kind::Status(Live::Nothing) && r.path.is_empty()), "names to read, nothing to edit");
+    }
+
+    #[test]
+    fn a_choice_the_options_do_not_offer_shows_the_default() {
+        let path = ["focus".to_string(), "snooze_minutes".into()];
+        let Kind::Choice(opts) = rows(SECTIONS.iter().position(|x| *x == "Focus").unwrap(), &[], "")[0].kind else { panic!("Snooze is a Choice") };
+        assert_eq!(choice_at(opts, "5", &path), Some(2));
+        assert_eq!(choice_at(opts, "0", &path), Some(1), "the old \"no snooze\" 0 reads as 3, as Focus uses it");
+        assert_eq!(choice_at(opts, "7", &path), Some(1));
     }
 
     #[test]

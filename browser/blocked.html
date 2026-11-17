@@ -1,5 +1,43 @@
 <!doctype html>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blocked</title>
-<body>
+<style>
+  /* Copied from the design system's tokens.json, by name: the extension cannot read design.rs.
+     The font is the system's: Space Grotesk would have to be bundled. */
+  :root {
+    --bg_solid: #f7f8fa;    /* bg_solid */
+    --text: #17181c;        /* text */
+    --text_muted: #484a53;  /* text_muted */
+    --accent: #17181c;      /* accent */
+    --accent_text: #ffffff; /* accent_text */
+    --space-12: 12px;       /* space-12 */
+    --space-16: 16px;       /* space-16 */
+    --space-24: 24px;       /* space-24 */
+    --r-sm: 6px;            /* r-sm */
+    --control: 32px;        /* control */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg_solid: #131417;    /* bg_solid */
+      --text: #f4f5f7;        /* text */
+      --text_muted: #c6c8d0;  /* text_muted */
+      --accent: #f4f5f7;      /* accent */
+      --accent_text: #131417; /* accent_text */
+    }
+  }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg_solid); color: var(--text); font: 14px system-ui, sans-serif; }
+  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--space-16); padding: var(--space-24); text-align: center; }
+  svg { width: 40px; height: 40px; color: var(--text_muted); }
+  h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  button { height: var(--control); padding: 0 var(--space-12); border: 1px solid var(--accent); border-radius: var(--r-sm); background: var(--accent); color: var(--accent_text); font: inherit; font-size: 13px; cursor: pointer; }
+  footer { padding: var(--space-24); text-align: center; color: var(--text_muted); font-size: 13px; }
+</style>
+<main>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" /><path d="m9 12 2 2 4-4" /></svg>
+  <h1 id="title"></h1>
+  <button id="snooze" type="button" hidden></button>
+</main>
+<footer>End your focus session to open this page.</footer>
 <script src="blocked.js"></script>

@@ -81,19 +81,22 @@ impl Default for Calendar {
 pub struct Focus {
     /// Length offered when a session starts, in minutes; 0 = no limit.
     pub default_minutes: u32,
-    /// How long Snooze lets you use the app Focus just closed; 0 turns Snooze off.
+    /// How long Snooze lets you use the app Focus just closed, or a blocked website: 1, 3, 5 or
+    /// 10 minutes (anything else reads as 3, `focus::snooze_for`).
     pub snooze_minutes: u8,
-    /// A sound when a session ends.
+    /// A sound when a session's time is up.
     pub sound: bool,
     /// Reopen the apps Focus closed when the session ends.
     pub restore_apps: bool,
     /// Allow mode with no websites listed: allow every site (false: block every site).
     pub allow_all_on_empty_sites: bool,
+    /// The floating timer pill while a session runs.
+    pub pill: bool,
 }
 
 impl Default for Focus {
     fn default() -> Self {
-        Self { default_minutes: 25, snooze_minutes: 3, sound: true, restore_apps: false, allow_all_on_empty_sites: false }
+        Self { default_minutes: 25, snooze_minutes: 3, sound: true, restore_apps: false, allow_all_on_empty_sites: false, pill: true }
     }
 }
 
@@ -836,10 +839,11 @@ list = []                     # program names that always count as games, e.g. [
 
 [focus]
 default_minutes = 25          # length offered when you start a Focus session; 0 = no limit
-snooze_minutes = 3            # how long Snooze Focus Session lets you use the app Focus just closed; 0 = no snooze
-sound = true                  # a sound when a session ends
+snooze_minutes = 3            # how long Snooze lets you use the app Focus just closed, or a blocked website: 1, 3, 5 or 10
+sound = true                  # a sound when a session's time is up
 restore_apps = false          # reopen the apps Focus closed when the session ends
 allow_all_on_empty_sites = false  # allow mode with no websites listed: allow every site (false: block every site)
+pill = true                   # false hides the floating Focus timer
 # Categories: lists to block (or to allow only) in a session. Apps are program file names; sites match their subdomains too.
 # [[focus_category]]
 # name = "Social"

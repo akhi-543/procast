@@ -167,7 +167,9 @@ pub fn open(cx: &mut AsyncApp) -> Option<WindowHandle<Toast>> {
         window_bounds: Some(WindowBounds::Windowed(Bounds { origin: point(px(0.), px(0.)), size: size(px(W), px(H)) })),
         titlebar: None,
         kind: WindowKind::PopUp,
-        show: false,
+        // Shown at once, cloaked straight after: gpui shows it with SW_SHOWNOACTIVATE only
+        // here. `show: false` then `set_visible` replays a placement that activates it.
+        show: true,
         focus: false,
         windows_window_background: gpui::WindowsWindowBackground::Transparent,
         ..Default::default()
@@ -179,7 +181,6 @@ pub fn open(cx: &mut AsyncApp) -> Option<WindowHandle<Toast>> {
             win::make_tool_window(this.hwnd);
             win::make_overlay(this.hwnd);
             win::cloak(this.hwnd, true);
-            window.set_visible(true);
         })
         .ok()?;
     Some(handle)

@@ -268,10 +268,11 @@ mod tests {
     }
 
     #[test]
-    fn the_blocked_page_is_plain_text_from_its_own_script() {
-        assert!(BLOCKED_PAGE.contains(r#"src="blocked.js""#) && !BLOCKED_PAGE.contains("<style"), "no inline script (manifest v3), no styling");
-        assert!(BLOCKED_SCRIPT.contains("is blocked by procast Focus"));
-        assert!(SCRIPT.contains("blocked.html") && SCRIPT.contains(r#"case "focusSites""#));
+    fn the_blocked_page_says_what_is_blocked_and_offers_snooze() {
+        assert!(BLOCKED_PAGE.contains(r#"src="blocked.js""#) && !BLOCKED_PAGE.contains("<script>"), "no inline script (manifest v3); inline style is allowed");
+        assert!(BLOCKED_PAGE.contains("End your focus session to open this page.") && BLOCKED_PAGE.contains("/* bg_solid */"));
+        assert!(BLOCKED_SCRIPT.contains("is blocked by procast`") && BLOCKED_SCRIPT.contains("Snooze for ") && BLOCKED_SCRIPT.contains(r#"type: "snooze""#));
+        assert!(SCRIPT.contains("blocked.html") && SCRIPT.contains(r#"case "focusSites""#) && SCRIPT.contains(r#"msg.type !== "snooze""#));
     }
 
     #[test]

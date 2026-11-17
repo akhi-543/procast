@@ -9,7 +9,7 @@ use futures::channel::mpsc::UnboundedSender;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
+        Foundation::{COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
             Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
@@ -34,14 +34,14 @@ use windows::{
             Shell::{
                 BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory, KF_FLAG_DEFAULT,
                 SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
-                SIIGBF_ICONONLY, ShellExecuteW,
+                DefSubclassProc, SIIGBF_ICONONLY, SetWindowSubclass, ShellExecuteW,
             },
             WindowsAndMessaging::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
                 GWL_STYLE, GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
                 SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_CAPTION,
                 WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+                MA_NOACTIVATE, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
             },
         },
     },
@@ -123,6 +123,8 @@ pub enum Msg {
     Toast(crate::toast::Kind, crate::toast::Stay, String),
     /// Esc was pressed while a sticky toast showed (keys.rs).
     ToastClose,
+    /// The Focus pill or notice was clicked (hud.rs).
+    Hud(crate::hud::Click),
 }
 
 impl Msg {
@@ -262,12 +264,27 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
-/// A toast's window: never activated, and clicks fall through to whatever is beneath
-/// (layered + transparent; fully opaque as a layer, gpui's own alpha does the see-through).
-pub fn make_overlay(hwnd: HWND) {
+/// A window on top that never takes focus, even when clicked. WS_EX_NOACTIVATE alone is not
+/// enough: gpui answers WM_MOUSEACTIVATE with MA_ACTIVATE, so that one message is answered here
+/// first. Call on the window's own (UI) thread.
+pub fn make_hud(hwnd: HWND) {
+    unsafe extern "system" fn no_activate(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _: usize, _: usize) -> LRESULT {
+        if msg == WM_MOUSEACTIVATE { LRESULT(MA_NOACTIVATE as isize) } else { unsafe { DefSubclassProc(hwnd, msg, w, l) } }
+    }
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOPMOST.0) as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0) as isize);
+        _ = SetWindowSubclass(hwnd, Some(no_activate), 1, 0);
+    }
+}
+
+/// A toast's window: a HUD window (`make_hud`) that clicks fall through to whatever is beneath
+/// (layered + transparent; fully opaque as a layer, gpui's own alpha does the see-through).
+pub fn make_overlay(hwnd: HWND) {
+    make_hud(hwnd);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as isize);
         _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     }
 }
@@ -392,6 +409,19 @@ pub fn place_toast(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
     let (w, h) = ((width * screen.dpi) as i32, (height * screen.dpi) as i32);
     let RECT { left, right, bottom, .. } = screen.work;
     unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), left + (right - left - w) / 2, bottom - h, w, h, SWP_NOACTIVATE) };
+}
+
+/// The window's place on the screen, physical px.
+pub fn rect(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    unsafe { _ = GetWindowRect(hwnd, &mut r) };
+    r
+}
+
+/// Moves and sizes a HUD window (physical px), on top of everything, without activating it.
+/// Call between updates (see `place`).
+pub fn set_rect(hwnd: HWND, r: RECT) {
+    unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE) };
 }
 
 /// Changes only the window's height (logical px), keeping its top-left corner.

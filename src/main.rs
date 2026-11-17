@@ -14,6 +14,7 @@ mod files;
 mod focus;
 mod foreground;
 mod hdr;
+mod hud;
 mod keys;
 mod menu;
 mod net;
@@ -1759,7 +1760,7 @@ impl Launcher {
     /// Gives the browser companion the site filter (or switches it off).
     fn focus_push(&mut self) {
         self.focus.pushed(Instant::now());
-        self.browsers.ask_all(focus::sites_message(self.focus.session.as_ref(), SystemTime::now()));
+        self.browsers.ask_all(focus::sites_message(self.focus.session.as_ref(), focus::snooze_for(self.cfg.focus.snooze_minutes)));
     }
 
     /// The session as a root row with its actions, and the categories in a `focus …` search.
@@ -1774,7 +1775,7 @@ impl Launcher {
         if let Some(rest) = q.strip_prefix("focus ") {
             for c in focus::categories(&self.cfg.focus_category).into_iter().filter(|c| c.name.to_lowercase().contains(rest.trim())) {
                 let start = |m| Act::FocusStart(c.name.clone(), m);
-                let sub = format!("{} apps · {} websites", c.apps.len(), c.sites.len());
+                let sub = focus::category_line(&c);
                 let mut row = Item::new(c.name.clone(), sub, Icon::Vector(focus::category_icon(&c.name)), start(focus::Mode::Block)).acc("Focus category").sec("Focus Categories");
                 row.extra = [focus::Mode::Block, focus::Mode::Allow].map(|m| (start(m).label().to_string(), start(m))).to_vec();
                 rows.push(row);
@@ -1986,9 +1987,7 @@ impl Launcher {
                 self.watch_timers();
             }
             FocusCmd::Snooze => {
-                let Some(mins) = focus::snooze_for(self.cfg.focus.snooze_minutes) else {
-                    return self.say(Msg::error("Snooze is off: set snooze_minutes in config.toml"));
-                };
+                let mins = focus::snooze_for(self.cfg.focus.snooze_minutes);
                 let Some((exe, path)) = self.focus.last_closed() else { return self.say(Msg::info("Focus has not closed an app yet")) };
                 self.focus.update(|s| {
                     s.snooze(&exe, mins);
@@ -2012,15 +2011,19 @@ impl Launcher {
         }
     }
 
-    /// Ends the session: done (completed, or the time ran out) or cancelled.
+    /// Five more minutes (the notice goes: the time is no longer up).
+    fn focus_extend(&mut self) {
+        self.focus.update(|s| s.extend(SystemTime::now()));
+        self.focus_push();
+        self.say(Msg::done("Focus extended by 5 min"));
+    }
+
+    /// Ends the session: done (completed) or cancelled.
     fn focus_end(&mut self, done: bool, cx: &mut Context<Self>) {
         let Some(s) = self.focus.session.clone() else { return };
         self.focus.set(None);
         for path in &s.closed {
             win::launch_app(path);
-        }
-        if done && self.cfg.focus.sound {
-            focus::beep();
         }
         self.say(Msg::done(format!("Focus {}: {}", if done { "done" } else { "cancelled" }, s.title)));
         self.focus_push();
@@ -2029,19 +2032,20 @@ impl Launcher {
         }
     }
 
-    /// Once a second while a session counts down: ends it on time, repeats the site filter now
-    /// and then (the browser forgets it when its extension restarts), keeps the row's time current.
+    /// Once a second while a session counts down: sounds when the time is up (the notice shows
+    /// then, `hud`, and the session keeps blocking until Complete or Extend), repeats the site
+    /// filter now and then (the browser forgets it when its extension restarts), keeps the
+    /// row's time current.
     fn on_focus_tick(&mut self, cx: &mut Context<Self>) {
         let now = SystemTime::now();
-        let Some(s) = &self.focus.session else { return };
         // A paused session has nothing to count, repeat or redraw (a timer may keep the tick alive).
-        if !s.running() {
+        if !self.focus.session.as_ref().is_some_and(focus::Session::running) {
             return;
         }
-        if s.expired(now) {
-            return self.focus_end(true, cx);
+        if self.focus.time_up(now) && self.cfg.focus.sound {
+            focus::beep();
         }
-        let left = s.row(now).1;
+        let left = self.focus.session.as_ref().map(|s| s.row(now).1).unwrap_or_default();
         if self.focus.push_due(Instant::now()) {
             self.focus_push();
         }
@@ -2062,11 +2066,19 @@ impl Launcher {
         if !s.blocked_app(exe, now) || !self.focus.fresh(exe, Instant::now()) {
             return;
         }
-        let left = (!s.unlimited()).then(|| focus::minutes_left(s.left(now)));
+        let text = format!("{} is blocked · {}", focus::app_label(exe), s.title);
         let path = focus::close_window(hwnd);
         self.focus.closed_app(exe, path, self.cfg.focus.restore_apps, Instant::now());
-        let app = focus::app_label(exe);
-        self.say(Msg::done(left.map_or_else(|| format!("Focus: {app} blocked"), |m| format!("Focus: {app} blocked for {m} min"))));
+        self.say(Msg::done(text));
+    }
+
+    /// What the Focus HUD shows now: the pill while a session exists (unless `[focus] pill` is
+    /// off), the notice while its time is up.
+    fn hud(&self) -> hud::State {
+        let now = SystemTime::now();
+        let s = self.focus.session.as_ref();
+        let time = |s: &focus::Session| focus::pill_text(if s.unlimited() { s.elapsed(now) } else { s.left(now) });
+        hud::State { pill: s.filter(|_| self.cfg.focus.pill).map(|s| (time(s), s.title.clone())), notice: s.is_some_and(|s| s.expired(now)), theme: self.cfg.theme.clone() }
     }
 
     /// Scrolls the selected row into view (section headers take list slots too).
@@ -3397,7 +3409,7 @@ impl Launcher {
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
             // A quicklink switches to a tab already showing it, when a browser is connected.
             // The browser companion can't see a link procast opens itself, so check it here.
-            Act::Open(url) if self.focus.blocked_url(&url, SystemTime::now()).is_some() => {
+            Act::Open(url) if self.focus.blocked_url(&url).is_some() => {
                 self.say(Msg::error(format!("{} is blocked until Focus ends", focus::host_of(&url).unwrap_or_default())));
             }
             Act::FocusStart(name, mode) => {
@@ -3409,9 +3421,7 @@ impl Launcher {
             }
             Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, window, cx),
             Act::FocusExtend => {
-                self.focus.update(|s| s.extend(SystemTime::now()));
-                self.focus_push();
-                self.say(Msg::done("Focus extended by 5 min"));
+                self.focus_extend();
                 return self.refresh(cx);
             }
             Act::With(act, got) => return self.run_with(*act, got, window, cx),
@@ -3995,6 +4005,20 @@ impl Launcher {
             Msg::Hotkey(i) if self.visible && self.mode == Mode::of(BINDS[i]) => self.hide(true, cx),
             Msg::Hotkey(i) => self.show(Mode::of(BINDS[i]), window, cx),
             Msg::Tray(TrayCmd::Open) => self.show(Mode::Root, window, cx),
+            // A fresh root search, list showing: its top row is the session's.
+            Msg::Hud(hud::Click::Open) => {
+                self.hidden_at = None;
+                self.show(Mode::Root, window, cx);
+                self.peek = true;
+                self.refresh(cx);
+            }
+            Msg::Hud(hud::Click::Extend) => {
+                self.focus_extend();
+                if self.visible && self.mode == Mode::Root {
+                    self.refresh(cx);
+                }
+            }
+            Msg::Hud(hud::Click::Complete) => self.focus_end(true, cx),
             Msg::Tray(TrayCmd::Settings) => self.open_settings(cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Msg::Tray(TrayCmd::Quit) => cx.quit(),
@@ -5678,7 +5702,13 @@ fn main() {
         cx.spawn(async move |cx| {
             let toast = toast::open(cx);
             _ = handle.update(cx, |this, _, _| this.toast = toast);
+            let mut hud = handle.update(cx, |this, _, _| this.tx.clone()).map(|tx| hud::Hud::open(cx, tx)).unwrap_or_default();
             while let Some(msg) = rx.next().await {
+                // Between updates (it moves windows): what the action that sent this message
+                // did to the session (and, after `on_msg` below, what the message did).
+                if let Ok(state) = handle.update(cx, |this, _, _| this.hud()) {
+                    hud.sync(cx, state);
+                }
                 if let Msg::Resize = msg {
                     if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
                         win::resize(hwnd, h * design::launcher_scale());
@@ -5705,17 +5735,19 @@ fn main() {
                 let opens = match msg {
                     Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && foreground::full_screen_app())).unwrap_or(false),
                     Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
-                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
+                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::Hud(hud::Click::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
                 };
                 let opens = opens || match &msg {
                     // The launcher was hidden to read the selection: the answer brings it back.
                     Msg::Translated { hidden: true, job, result: Ok(_), .. } => job.after == translate::After::Open,
                     _ => false,
                 };
-                let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
+                let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open) | Msg::Hud(hud::Click::Open));
+                // The pill opens on the session's row, so with the list even in compact mode.
+                let pill = matches!(msg, Msg::Hud(hud::Click::Open));
                 let geometry = handle.update(cx, |this, _, cx| {
                     // Opening compact root search: just the bar, unless the last search is kept.
-                    let compact = opens_root && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
+                    let compact = opens_root && !pill && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
                     let height = if compact { BAR + if this.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&this.cfg) };
                     (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width, base_width(&this.cfg), height))
                 });
@@ -5726,6 +5758,9 @@ fn main() {
                     win::place(hwnd, &screen, base * s, height * s);
                 }
                 let _ = handle.update(cx, |this, window, cx| this.on_msg(msg, window, cx));
+                if let Ok(state) = handle.update(cx, |this, _, _| this.hud()) {
+                    hud.sync(cx, state);
+                }
             }
         })
         .detach();
