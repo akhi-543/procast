@@ -916,8 +916,9 @@ struct Launcher {
     typed: (usize, String),
     /// The query before its last change: a space typed after a command's name jumps into its boxes.
     last_query: String,
-    /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
-    clip_images: HashMap<String, Option<Arc<RenderImage>>>,
+    /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`), each with its last
+    /// use (`file_tick`) for `evict`.
+    clip_images: HashMap<String, (Option<Arc<RenderImage>>, u64)>,
     /// File Search detail pane: the selected file's information (read when the selection
     /// changes), and its decoded pictures (`p:`), shell icons (`i:`) and Search Screenshots'
     /// thumbnails (`t:`) by path, each with its last use (`file_tick`) for `evict`.
@@ -1584,12 +1585,12 @@ impl Launcher {
                 rows
             }
             Mode::Clipboard => {
-                if self.clip_images.len() > 300 {
-                    self.clip_images.clear();
-                }
-                let (history, cache) = (&self.history, &mut self.clip_images);
-                let mut thumb = |id: &str| cache.entry(format!("t:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 64))).clone();
-                search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
+                let (history, cache, tick) = (&self.history, &mut self.clip_images, &mut self.file_tick);
+                let mut thumb = |id: &str| used(cache, tick, format!("t:{id}"), || history.png(id).and_then(|p| clipboard::render_image(&p, 64)));
+                let rows = search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb);
+                // After the rows took theirs, so the ones on screen are the newest used.
+                release(evict(&mut self.clip_images, FILE_IMAGES_MAX, FILE_IMAGES_KEEP), cx);
+                rows
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
             Mode::Shots => {
@@ -2590,7 +2591,7 @@ impl Launcher {
     /// A clipboard image fitted for the detail pane, cached.
     fn clip_preview(&mut self, id: &str) -> Option<Arc<RenderImage>> {
         let history = &self.history;
-        self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
+        used(&mut self.clip_images, &mut self.file_tick, format!("p:{id}"), || history.png(id).and_then(|p| clipboard::render_image(&p, 640)))
     }
 
     /// `file_images[key]`, marked as just used; None when it was never asked for.
@@ -5675,6 +5676,14 @@ fn evict<V>(cache: &mut HashMap<String, (Option<V>, u64)>, max: usize, keep: usi
     old.into_iter().filter_map(|(_, k)| cache.remove(&k)?.0).collect()
 }
 
+/// `cache[key]`, made by `make` the first time, marked as just used for `evict`.
+fn used<V: Clone>(cache: &mut HashMap<String, (Option<V>, u64)>, tick: &mut u64, key: String, make: impl FnOnce() -> Option<V>) -> Option<V> {
+    *tick += 1;
+    let entry = cache.entry(key).or_insert_with(|| (make(), 0));
+    entry.1 = *tick;
+    entry.0.clone()
+}
+
 /// Frees images' GPU textures (gpui keeps an image's atlas entry until `drop_image`). Deferred
 /// until no window is being drawn, so every window lets go of them.
 fn release(images: Vec<Arc<RenderImage>>, cx: &mut App) {
@@ -6633,7 +6642,7 @@ fn main() {
         net::load_rates();
         design::set_size(&cfg.size);
         // Before the first render, so the body is not drawn as glass on a machine with transparency off.
-        let glass = design::refresh_glass();
+        design::refresh_glass();
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
         let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
@@ -6643,20 +6652,27 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
             kind: WindowKind::PopUp,
-            show: false,
+            // Shown at once and cloaked before its view is built: gpui shows it with
+            // SW_SHOWNOACTIVATE only here. `show: false` then `set_visible` replays a placement
+            // that activates it, taking the foreground (and the user's typing) at startup.
+            show: true,
             focus: false,
-            windows_window_background: backdrop(glass),
+            // No backdrop to draw before the cloak; `show` sets the real one before un-cloaking.
+            windows_window_background: gpui::WindowsWindowBackground::Transparent,
             ..Default::default()
         };
-        let handle = cx.open_window(options, |window, cx| cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))).unwrap();
+        let handle = cx
+            .open_window(options, |window, cx| {
+                win::cloak(win::hwnd(window), true);
+                cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))
+            })
+            .unwrap();
 
         // Shown once, cloaked: from now on hotkey -> un-cloak -> next frame.
         let _ = handle.update(cx, |this, window, _| {
             this.hwnd = win::hwnd(window);
             win::make_tool_window(this.hwnd);
             win::round_corners(this.hwnd);
-            win::cloak(this.hwnd, true);
-            window.set_visible(true);
             this.tray_icon = tray;
             this.scan_apps(true, false);
             // For screenshots and checks of the settings window without clicking through.
@@ -6978,6 +6994,20 @@ mod tests {
         let mut kept: Vec<&String> = cache.keys().collect();
         kept.sort();
         assert_eq!(kept, ["t:7", "t:8", "t:9", "t:new"]);
+    }
+
+    #[test]
+    fn clipboard_images_are_made_once_and_the_unused_ones_freed() {
+        let (mut cache, mut tick, mut made) = (HashMap::new(), 0, 0);
+        for i in 0..12u32 {
+            used(&mut cache, &mut tick, format!("t:{i}"), || Some(i));
+        }
+        assert_eq!(used(&mut cache, &mut tick, "t:0".into(), || { made += 1; Some(0) }), Some(0), "cached");
+        assert_eq!(made, 0, "not made again");
+        let mut gone = evict(&mut cache, 10, 4);
+        gone.sort_unstable();
+        assert_eq!(gone, (1..=8).collect::<Vec<_>>(), "the ones not used lately come back to be freed");
+        assert!(cache.contains_key("t:0"), "used last, kept");
     }
 
     #[test]

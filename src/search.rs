@@ -739,7 +739,14 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
             Some((s as f64 + in_title + 25. * boost, it))
         })
         .collect();
-    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.title.len().cmp(&b.1.title.len())));
+    // A Windows Settings page never outranks a procast command whose title meets the query
+    // ("focus": the Focus page goes below every Focus Session command). It scores at most what
+    // the weakest such command does, and at a tie the command goes first.
+    let page = |it: &Item| it.key.as_deref().is_some_and(|k| k.starts_with("ms:"));
+    if let Some(floor) = hits.iter().filter(|(_, it)| matches!(it.act, Act::Cmd(_)) && tier(&it.title, q) > 0.).map(|h| h.0).reduce(f64::min) {
+        hits.iter_mut().filter(|h| page(h.1)).for_each(|h| h.0 = h.0.min(floor));
+    }
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| page(a.1).cmp(&page(b.1))).then_with(|| a.1.title.len().cmp(&b.1.title.len())));
     hits
 }
 
@@ -1128,7 +1135,11 @@ fallbacks = [\"define\", \"web\"]").unwrap();
         let tail: Vec<_> = ask(&cfg, "dog").into_iter().filter(|it| it.section.as_deref() == Some("Use \"dog\" with")).map(|it| it.act).collect();
         assert_eq!(tail[0], Act::Define("dog".into()), "first, in the configured order");
         assert!(ask(&cfg, "dog food").iter().all(|it| !matches!(it.act, Act::Define(_))), "one word only");
-        assert!(ask(&Config::default(), "dog").iter().any(|it| it.act == Act::Define("dog".into())), "on by default");
+        assert!(ask(&Config::default(), "dog").iter().all(|it| !matches!(it.act, Act::Define(_))), "off by default");
+        assert_eq!(Config::default().search.fallbacks, ["web", "chatgpt", "ai"]);
+        let listed = crate::config::parse("[search]\nfallbacks = [\"web\", \"define\"]").unwrap();
+        assert!(ask(&listed, "serendipity").iter().any(|it| it.act == Act::Define("serendipity".into())), "still offered when listed");
+        assert!(ask(&listed, "timer").iter().all(|it| !matches!(it.act, Act::Define(_))), "never for a command's name");
         let unlisted = crate::config::parse("[search]\nfallbacks = [\"web\"]").unwrap();
         assert!(ask(&unlisted, "dog").iter().all(|it| !matches!(it.act, Act::Define(_))), "off when not listed");
         assert!(catalog(&[], &[], &[], &cfg).iter().any(|it| it.act == Act::Cmd(Cmd::Define)));
@@ -1208,8 +1219,7 @@ fallbacks = [\"define\"]").unwrap();
 
         let r = root("vsc", &cat, &cfg, &frec, &mut m);
         assert_eq!(r[0].title, "Visual Studio Code");
-        assert_eq!(r.last().unwrap().accessory, "Dictionary", "the last fallback");
-        assert!(r.iter().any(|h| h.accessory == "AI"));
+        assert_eq!(r.last().unwrap().accessory, "AI", "the last fallback: Define is not one by default");
         assert_eq!(r[0].section.as_deref(), Some("Results"));
         assert_eq!(r.last().unwrap().section.as_deref(), Some("Use \"vsc\" with"));
         assert!(r.len() <= 5);
@@ -1349,7 +1359,7 @@ fallbacks = [\"define\"]").unwrap();
     #[test]
     fn word_starts_beat_scattered_letters() {
         let apps: Vec<App> = ["Clock", "Claude"].iter().map(|n| App { name: n.to_string(), id: format!("app:{n}"), icon: None }).collect();
-        // Room for the results next to the four fallback rows.
+        // Room for the results next to the three fallback rows.
         let cfg = crate::config::parse("max_results = 12").unwrap();
         let cat = catalog(&apps, &[], &[], &cfg);
         let mut m = Matcher::new(nucleo_matcher::Config::DEFAULT);
@@ -1468,6 +1478,22 @@ fallbacks = [\"define\", \"web\"]").unwrap();
         let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
         assert!(ask("focus wor").iter().all(|it| it.values.is_empty()), "no Goal pre-filled from a category search");
         assert_eq!(ask("focus deep work")[0].values, strings(["deep work"]));
+    }
+
+    #[test]
+    fn procast_commands_rank_above_the_windows_settings_page_they_share_a_name_with() {
+        let cfg = Config::default();
+        let cat = catalog(&[], &[], &[], &cfg);
+        let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert_eq!(ask("focus")[0].act, Act::Cmd(Cmd::Focus(FocusCmd::Start)));
+        for q in ["focus", "foc", "Focus"] {
+            let r = ask(q);
+            let page = r.iter().position(|it| it.key.as_deref() == Some("ms:quiethours"));
+            let last = r.iter().rposition(|it| matches!(it.act, Act::Cmd(Cmd::Focus(_)))).unwrap();
+            assert!(page.is_none_or(|p| p > last), "{q}: {:?}", r.iter().map(|it| &it.title).collect::<Vec<_>>());
+        }
+        // With no command named, the page still leads.
+        assert_eq!(ask("do not disturb")[0].key.as_deref(), Some("ms:quiethours"));
     }
 
     #[test]

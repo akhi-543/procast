@@ -529,7 +529,7 @@ pub struct Search {
     pub calculator: bool,
     /// `{query}` is replaced with the URL-encoded query. Empty disables the web row.
     pub fallback: String,
-    /// Rows offered for any query, in order: "web" (the URL above), "chatgpt", "ai", or a quicklink's name.
+    /// Rows offered for any query, in order: "web" (the URL above), "chatgpt", "ai", "define" (one-word queries), or a quicklink's name.
     pub fallbacks: Vec<String>,
     /// What runs a `>` command line: run (Windows Run) | cmd | powershell | pwsh.
     pub shell: String,
@@ -782,7 +782,7 @@ fn open() -> String {
 
 impl Default for Search {
     fn default() -> Self {
-        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai", "define"].map(String::from).to_vec(), shell: "run".into(), terminal: false, existing_tab: true }
+        Self { calculator: true, fallback: "https://www.google.com/search?q={query}".into(), fallbacks: ["web", "chatgpt", "ai"].map(String::from).to_vec(), shell: "run".into(), terminal: false, existing_tab: true }
     }
 }
 
@@ -826,7 +826,7 @@ auto_quit_minutes = 60
 [search]
 calculator = true
 fallback = "https://www.google.com/search?q={query}"
-fallbacks = ["web", "chatgpt", "ai", "define"]  # rows for any query, in order: "web", "chatgpt", "ai", "define" (one word), or a quicklink name with {query}
+fallbacks = ["web", "chatgpt", "ai"]  # rows for any query, in order: "web", "chatgpt", "ai", "define" (one-word queries), or a quicklink name with {query}
 shell = "run"                 # what runs "> command": run (like Win+R) | cmd | powershell | pwsh
 terminal = false              # open that shell in Windows Terminal
 existing_tab = true           # quicklinks switch to a tab already showing the page (with the procast browser extension)
@@ -1405,6 +1405,7 @@ to = \"PT-BR\"").unwrap();
         assert_eq!(c.quicklink.len(), 2);
         assert_eq!(c.snippet.len(), 1);
         assert_eq!(c.clipboard.hotkey, "Ctrl+Shift+V");
+        assert_eq!(c.search.fallbacks, Search::default().fallbacks, "Define is offered only when listed");
         // Phase 1 `[[alias]]` configs keep working; sections for later phases are ignored.
         let old = parse("[[alias]]\nkeyword = \"gh\"\nurl = \"u\"\n[extensions]\nnode = \"auto\"").unwrap();
         assert_eq!(old.quicklink[0].title(), "gh");
