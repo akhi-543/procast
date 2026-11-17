@@ -924,6 +924,8 @@ struct Launcher {
     menu_input: Entity<EditableTextState>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
+    /// A timer rebuild skipped while a panel or armed row waited; done on the next free tick.
+    timers_stale: bool,
     /// The selected row's argument boxes (`arg_row`, at most `MAX_ARGS` show), and that row's key.
     args: Vec<Entity<EditableTextState>>,
     args_for: Option<String>,
@@ -1128,6 +1130,7 @@ impl Launcher {
             form_focus: cx.focus_handle(),
             form_at: Rc::new(Cell::new(gpui::Point::default())),
             armed: None,
+            timers_stale: false,
             args,
             args_for: None,
             arg_missing: None,
@@ -1849,7 +1852,9 @@ impl Launcher {
         // change. An open panel or an armed row (Join's second Enter) waits, as in `calendar_tick`:
         // a rebuild would close the question; the times still tick in place.
         let waits = self.panel.is_some() || self.armed.is_some();
-        if !waits && (!due.is_empty() || timers::rows_changed(&shown, &rows)) {
+        let changed = !due.is_empty() || timers::rows_changed(&shown, &rows) || self.timers_stale;
+        self.timers_stale = waits && changed;
+        if !waits && changed {
             return self.refresh_keeping(cx);
         }
         for it in &mut self.items {
@@ -2167,7 +2172,10 @@ impl Launcher {
         match done {
             Ok(text) => {
                 self.say(Msg::done(text));
-                self.hide(true, cx);
+                // A late answer (Import reads off the UI thread) never takes focus back.
+                if self.visible {
+                    self.hide(true, cx);
+                }
             }
             Err(e) => self.focus_refused(e, cx),
         }

@@ -315,7 +315,6 @@ fn base36(mut n: u64) -> String {
     out.iter().rev().collect()
 }
 
-/// First line with something in it, without the markdown around it; "Untitled" for an empty note.
 /// Text as the editor keeps it: `\n` line ends and no byte-order mark (a note saved by another
 /// editor; pasted text).
 pub fn normalized(text: &str) -> String {
@@ -327,6 +326,7 @@ fn read_note(path: &Path) -> io::Result<String> {
     fs::read_to_string(path).map(|t| normalized(&t))
 }
 
+/// First line with something in it, without the markdown around it; "Untitled" for an empty note.
 pub fn title_of(text: &str) -> String {
     text.lines().map(strip_line).find(|l| !l.is_empty()).unwrap_or_else(|| "Untitled".into())
 }
