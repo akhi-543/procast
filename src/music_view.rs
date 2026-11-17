@@ -71,7 +71,12 @@ impl Launcher {
 
     pub fn music_open(&mut self, screen: Screen, cx: &mut Context<Self>) {
         self.media();
-        self.music.screen = screen;
+        let music = &mut self.music;
+        music.screen = screen;
+        music.pending = None;
+        music.loading = false;
+        music.items.clear();
+        music.error = None;
         self.set_mode(Mode::Music, cx);
     }
 
@@ -98,10 +103,10 @@ impl Launcher {
             Screen::QuickActions => vec![],
             Screen::Search | Screen::Library => return vec![],
         };
-        if self.browsers.any() {
-            let controls = control_rows(self.cfg.ytmusic.volume_step);
-            rows.extend(search::filter(query, controls, &mut self.matcher));
-        } else {
+        let connected = self.browsers.any();
+        let controls = control_rows(self.cfg.ytmusic.volume_step).into_iter().filter(|row| connected || matches!(row.act, Act::Music(MusicAct::Control(c)) if transport(c).is_some())).collect();
+        rows.extend(search::filter(query, controls, &mut self.matcher));
+        if !connected {
             rows.push(empty_row(g::GLOBE, "No browser connected".into(), "Run Set Up Browser Extension, then load the extension in Chrome, Edge or Brave".into(), vec![]));
         }
         rows
@@ -135,7 +140,6 @@ impl Launcher {
     }
 
     fn music_control(&mut self, control: Control, cx: &mut Context<Self>) {
-        self.media();
         let step = self.cfg.ytmusic.volume_step;
         let sent = match transport(control) {
             Some(transport) => {
@@ -143,6 +147,7 @@ impl Launcher {
                 true
             }
             None => {
+                self.media();
                 let sent = self.music_ask(|req| ytmusic::control(req, control, step));
                 if sent && announces_volume(control) {
                     self.music.volume_reqs.insert(self.music.req);

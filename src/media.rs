@@ -125,7 +125,10 @@ impl Worker {
     }
 
     fn transport(&self, transport: Transport) {
-        let Some(tracked) = &self.tracked else { return };
+        let Some(tracked) = &self.tracked else {
+            let _ = self.out.unbounded_send(Msg::Toast(false, "Nothing is playing in a browser".into()));
+            return;
+        };
         let session = &tracked.session;
         let _ = match transport {
             Transport::PlayPause => session.TryTogglePlayPauseAsync(),

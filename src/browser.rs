@@ -182,6 +182,15 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
                         {
                             crate::win::open(url);
                         }
+                        if req["t"] == "ytm" {
+                            let reply = crate::ytmusic::Reply {
+                                req: req["req"].as_u64().unwrap_or_default(),
+                                op: req["op"].as_str().unwrap_or_default().to_string(),
+                                error: Some("The browser closed: open YouTube Music and try again".into()),
+                                ..Default::default()
+                            };
+                            let _ = tx.unbounded_send(Msg::Browser(id, Reply::Music(reply)));
+                        }
                         break;
                     };
                     let reply = parse_reply(&answer);
