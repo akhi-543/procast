@@ -86,16 +86,15 @@ impl Screen {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Filter {
+    #[default]
     Songs,
     Albums,
     Artists,
     Playlists,
 }
 
-#[allow(dead_code)]
 impl Filter {
     pub fn next(self) -> Self {
         match self {
@@ -123,19 +122,22 @@ impl Filter {
             Self::Playlists => "Playlists",
         }
     }
+
+    pub fn placeholder(self) -> String {
+        format!("Search {}…", self.label().to_lowercase())
+    }
 }
 
 /// A part of the user's library.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Shelf {
+    #[default]
     Albums,
     Playlists,
     Artists,
     Liked,
 }
 
-#[allow(dead_code)]
 impl Shelf {
     pub fn next(self) -> Self {
         match self {
@@ -153,6 +155,10 @@ impl Shelf {
             Self::Artists => "Artists",
             Self::Liked => "Liked Songs",
         }
+    }
+
+    pub fn placeholder(self) -> String {
+        format!("Search your {}…", self.label().to_lowercase())
     }
 
     pub fn browse_id(self) -> &'static str {
@@ -254,12 +260,10 @@ impl Control {
     }
 }
 
-#[allow(dead_code)]
 pub fn search(req: u64, query: &str, filter: Filter) -> Value {
     json!({"t": "ytm", "req": req, "op": "search", "query": query, "filter": filter.name()})
 }
 
-#[allow(dead_code)]
 pub fn browse(req: u64, id: &str) -> Value {
     json!({"t": "ytm", "req": req, "op": "browse", "id": id})
 }
@@ -347,7 +351,6 @@ impl MusicItem {
 }
 
 /// Library lists older than this are fetched again.
-#[allow(dead_code)]
 pub const STALE: Duration = Duration::from_secs(600);
 
 #[derive(Serialize, Deserialize)]
@@ -356,18 +359,15 @@ struct Saved {
     items: Vec<MusicItem>,
 }
 
-#[allow(dead_code)]
 pub fn cache_path() -> PathBuf {
     config::dir().join("ytmusic").join("library.json")
 }
 
 /// The saved list of browse id `id` and how long ago it was saved.
-#[allow(dead_code)]
 pub fn load_cached(id: &str) -> Option<(Vec<MusicItem>, Duration)> {
     load_from(&cache_path(), id)
 }
 
-#[allow(dead_code)]
 pub fn save_cached(id: &str, items: &[MusicItem]) {
     let _ = save_to(&cache_path(), id, items);
 }
@@ -450,6 +450,13 @@ mod tests {
         let ids: Vec<_> = shelves.take(5).map(Shelf::browse_id).collect();
         assert_eq!(ids, ["FEmusic_liked_albums", "FEmusic_liked_playlists", "FEmusic_library_corpus_track_artists", "VLLM", "FEmusic_liked_albums"]);
         assert_eq!(Shelf::Liked.label(), "Liked Songs");
+    }
+
+    #[test]
+    fn placeholders_name_what_is_searched() {
+        assert_eq!((Filter::Songs.placeholder().as_str(), Filter::Playlists.placeholder().as_str()), ("Search songs…", "Search playlists…"));
+        assert_eq!((Shelf::Albums.placeholder().as_str(), Shelf::Liked.placeholder().as_str()), ("Search your albums…", "Search your liked songs…"));
+        assert_eq!((Filter::default(), Shelf::default()), (Filter::Songs, Shelf::Albums));
     }
 
     #[test]

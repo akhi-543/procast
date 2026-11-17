@@ -66,8 +66,8 @@ use search::{Act, Frecency, Icon, Item};
 use win::{BINDS, Bind, Msg, TrayCmd};
 
 actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
-// Left and Right in the emoji grid (the search bar keeps them elsewhere).
-actions!(procast, [SelectLeft, SelectRight]);
+// Left and Right in a grid (the search bar keeps them elsewhere), and Tab in YouTube Music's Search and Library.
+actions!(procast, [SelectLeft, SelectRight, NextFilter]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
@@ -543,6 +543,7 @@ impl Launcher {
         self.send_search(cx);
         self.selected = 0;
         self.refresh(cx);
+        self.music_typed(cx);
     }
 
     /// Passes the search text to an extension that filters itself, once per change. Also
@@ -688,7 +689,7 @@ impl Launcher {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let query = self.query(cx);
         let max = self.cfg.max_results.max(1);
-        let keep_selection = self.mode == Mode::Ext;
+        let keep_selection = matches!(self.mode, Mode::Ext | Mode::Music);
         self.armed = None;
         self.items = match self.mode {
             Mode::Root => {
@@ -834,8 +835,13 @@ impl Launcher {
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
         }
-        if self.mode == Mode::Emoji {
-            self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
+        if self.grid() {
+            let rows = grid_rows(&self.items, self.grid_cols()).len();
+            if keep_selection && self.selected > 0 {
+                self.grid_list.splice(0..self.grid_list.item_count(), rows);
+            } else {
+                self.grid_list.reset(rows);
+            }
         }
         let _ = max;
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
@@ -2268,6 +2274,7 @@ impl Launcher {
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
+                self.music.drop_cover(&path);
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
@@ -2413,6 +2420,9 @@ impl Launcher {
             return if f.indexing.load(std::sync::atomic::Ordering::SeqCst) { format!("Indexing… {n} so far") } else { format!("{n} files indexed{scope}") };
         }
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
+            return "Loading…".into();
+        }
+        if self.mode == Mode::Music && self.music_loading() {
             return "Loading…".into();
         }
         // The grid shows no names: the selected emoji's is here.
@@ -2671,9 +2681,9 @@ impl Launcher {
         pane.child(top).children(info_rows(&meta, t)).into_any_element()
     }
 
-    /// Emoji picker: moves the selection by `dx` cells or `dy` grid rows.
+    /// Grid: moves the selection by `dx` cells or `dy` grid rows.
     fn grid_move(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
-        let rows = grid_rows(&self.items, self.cfg.emoji.columns);
+        let rows = grid_rows(&self.items, self.grid_cols());
         let cells: Vec<&Vec<usize>> = rows.iter().filter_map(|r| if let GridRow::Cells(c) = r { Some(c) } else { None }).collect();
         let Some((r, c)) = cells.iter().enumerate().find_map(|(r, row)| row.iter().position(|&i| i == self.selected).map(|c| (r, c))) else { return };
         self.selected = if dy != 0 {
@@ -2682,50 +2692,76 @@ impl Launcher {
         } else {
             (self.selected as isize + dx).clamp(0, self.items.len() as isize - 1) as usize
         };
-        if let Some(at) = rows.iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
-            self.grid_list.scroll_to_reveal_item(at);
-        }
+        self.grid_reveal();
         cx.notify();
     }
 
-    /// The emoji picker shows a grid (it falls back to the list for its empty state).
+    fn grid_reveal(&self) {
+        let rows = grid_rows(&self.items, self.grid_cols());
+        if let Some(at) = rows.iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
+            self.grid_list.scroll_to_reveal_item(at);
+        }
+    }
+
+    /// The emoji picker and YouTube Music's albums show a grid (it falls back to the list for an empty state).
     fn grid(&self) -> bool {
-        self.mode == Mode::Emoji && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+        (self.mode == Mode::Emoji || self.music_grid()) && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    fn grid_cols(&self) -> usize {
+        if self.mode == Mode::Music { self.cfg.ytmusic.columns.clamp(3, 8) } else { self.cfg.emoji.columns.clamp(4, 16) }
+    }
+
+    /// Where Left and Right move through a grid, and what Tab does in YouTube Music.
+    fn key_context(&self) -> Option<&'static str> {
+        if self.panel.is_some() {
+            return None;
+        }
+        match (self.grid(), self.music_tabs()) {
+            (true, true) => Some("EmojiGrid Music"),
+            (true, false) => Some("EmojiGrid"),
+            (false, true) => Some("Music"),
+            (false, false) => None,
+        }
     }
 
     fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let cols = self.cfg.emoji.columns.clamp(4, 16);
+        let cols = self.grid_cols();
+        let cover_width = music_view::cell_width(base_width(&self.cfg), cols);
         let me = cx.weak_entity();
         let (selected, t) = (self.selected, *t);
-        let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
+        let cells: Rc<Vec<Cell>> = Rc::new(
+            self.items
+                .iter()
+                .map(|it| match &it.icon {
+                    _ if self.mode == Mode::Music => Cell::Cover(it.icon.clone(), it.title.clone(), it.subtitle.clone()),
+                    Icon::Glyph(s) => Cell::Emoji(s.clone()),
+                    _ => Cell::Emoji(SharedString::default()),
+                })
+                .collect(),
+        );
         let rows = Rc::new(grid_rows(&self.items, cols));
         // ponytail: rows are laid out only while on screen; 400 emoji cells per keystroke made typing lag.
         let list = gpui::list(self.grid_list.clone(), move |k, _, _| match &rows[k] {
                 GridRow::Header(s) => design::section_header(s, None, &t).into_any_element(),
-                GridRow::Cells(cells) => {
-                    let pad = cols - cells.len();
+                GridRow::Cells(row) => {
+                    let pad = cols - row.len();
                     div()
                         .flex()
                         .w_full()
                         .gap(px(4.))
-                        .children(cells.iter().map(|&i| {
+                        .children(row.iter().map(|&i| {
                             let on = i == selected;
                             let me = me.clone();
-                            let glyph = glyphs[i].clone();
                             let t = &t;
                             let hover = t.hover;
-                            div()
-                                .id(("emoji", i))
-                                .flex_1()
-                                .h(px(EMOJI_CELL))
-                                .flex()
-                                .items_center()
-                                .justify_center()
+                            let cell = match &cells[i] {
+                                Cell::Emoji(glyph) => div().flex_1().h(px(EMOJI_CELL)).flex().items_center().justify_center().font_family(design::FONT_EMOJI).text_size(px(30.)).child(glyph.clone()),
+                                Cell::Cover(icon, title, subtitle) => music_view::cover_cell(icon, title, subtitle, cover_width, t),
+                            };
+                            cell.id(("emoji", i))
                                 .rounded(px(design::r::MD))
                                 .map(|d| if on { design::lozenge(d, t) } else { d.hover(move |s| s.bg(hover)) })
-                                .font_family(design::FONT_EMOJI)
-                                .text_size(px(30.))
-                                .child(glyph)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
                                         this.selected = i;
@@ -2746,15 +2782,21 @@ impl Launcher {
 /// An emoji cell's height.
 const EMOJI_CELL: f32 = 56.;
 
+/// What a grid cell draws.
+enum Cell {
+    Emoji(SharedString),
+    /// An album or playlist: cover, title, subtitle.
+    Cover(Icon, String, String),
+}
+
 enum GridRow {
     Header(String),
     /// Item indices, at most `columns`.
     Cells(Vec<usize>),
 }
 
-/// The emoji picker's layout: each section's header, then its emoji in rows of `cols`.
+/// A grid's layout: each section's header, then its items in rows of `cols`.
 fn grid_rows(items: &[Item], cols: usize) -> Vec<GridRow> {
-    let cols = cols.clamp(4, 16);
     let mut out = vec![];
     let mut last: Option<&str> = None;
     for (i, it) in items.iter().enumerate() {
@@ -3231,8 +3273,9 @@ impl Render for Launcher {
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
             .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
-            // Left and Right move through the emoji grid instead of the search text.
-            .when(self.grid() && self.panel.is_none(), |d| d.key_context("EmojiGrid"))
+            .on_action(cx.listener(|this, _: &NextFilter, _, cx| this.music_cycle(cx)))
+            // Left and Right move through a grid instead of the search text; Tab cycles in YouTube Music.
+            .when_some(self.key_context(), |d, context| d.key_context(context))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
             .on_action(cx.listener(|this, _: &EmacsNext, window, cx| this.nav("emacs", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsPrev, window, cx| this.nav("emacs", Box::new(SelectPrev), window, cx)))
@@ -3374,6 +3417,7 @@ fn main() {
             KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
             KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("tab", NextFilter, Some(&format!("Music > {DEFAULT_INPUT_CONTEXT}"))),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),
@@ -3519,6 +3563,14 @@ mod tests {
         assert_eq!(shape, ["Smileys", "[0, 1, 2, 3]", "[4, 5]", "People", "[6, 7]"]);
         let searched: Vec<Item> = (0..5).map(|_| Item::new("x", "", Icon::glyph("x"), Act::None)).collect();
         assert_eq!(grid_rows(&searched, 4).len(), 2, "no sections: just rows");
+    }
+
+    #[test]
+    fn album_grid_rows_follow_the_column_count() {
+        let albums: Vec<Item> = (0..7).map(|_| Item::new("x", "", Icon::Vector(g::AUDIO), Act::None).sec("Albums")).collect();
+        let shape = |cols| grid_rows(&albums, cols).iter().map(|r| match r { GridRow::Header(h) => h.clone(), GridRow::Cells(c) => c.len().to_string() }).collect::<Vec<_>>();
+        assert_eq!(shape(3), ["Albums", "3", "3", "1"]);
+        assert_eq!(shape(8), ["Albums", "7"]);
     }
 
     #[test]

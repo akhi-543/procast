@@ -619,9 +619,20 @@ pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
 
 /// A PNG asset as a GPUI image (BGRA), shrunk to icon size.
 pub fn load_image(path: &Path) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    load_image_sized(path, 64)
+}
+
+/// Like `load_image`, with the longest side at most `max` px (the aspect ratio stays).
+pub fn load_image_sized(path: &Path, max: u32) -> Option<std::sync::Arc<gpui::RenderImage>> {
     // Format from the bytes: cached web images have no extension.
     let img = image::load_from_memory(&std::fs::read(path).ok()?).ok()?.to_rgba8();
-    let img = if img.width() > 64 || img.height() > 64 { image::imageops::thumbnail(&img, 64, 64) } else { img };
+    let longest = img.width().max(img.height());
+    let img = if longest > max {
+        let scaled = |side: u32| (side as u64 * max as u64 / longest as u64).max(1) as u32;
+        image::imageops::thumbnail(&img, scaled(img.width()), scaled(img.height()))
+    } else {
+        img
+    };
     let (w, h) = img.dimensions();
     let mut buf = img.into_raw();
     for p in buf.chunks_exact_mut(4) {
@@ -775,5 +786,20 @@ mod tests {
 
         let md = markdown_lines("# Title\nSee [docs](https://x.y) and **bold**\n![img](a.png)\n- item\n```\ncode\n```");
         assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (0, "".into()), (0, "• item".into()), (9, "code".into())]);
+    }
+
+    #[test]
+    fn images_are_capped_on_their_longest_side() {
+        let dir = std::env::temp_dir().join(format!("procast-image-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.png");
+        image::RgbaImage::new(400, 200).save(&path).unwrap();
+        let size = |max| {
+            let size = load_image_sized(&path, max).unwrap().size(0);
+            (size.width.0, size.height.0)
+        };
+        assert_eq!((size(160), size(64), size(800)), ((160, 80), (64, 32), (400, 200)));
+        assert_eq!(load_image(&path).unwrap().size(0).width.0, 64);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
