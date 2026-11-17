@@ -407,11 +407,23 @@ fn timer_id(it: &Item) -> Option<u64> {
 }
 
 /// Toggle HDR says the state Enter would change, in its subtitle and its ActionBar label.
-fn hdr_state(items: &mut [Item], status: &[hdr::HdrDisplay]) {
+/// Until the first read is in (`None`), it keeps its plain subtitle and label.
+fn hdr_state(items: &mut [Item], status: Option<&[hdr::HdrDisplay]>) {
+    let Some(status) = status else { return };
     for it in items.iter_mut().filter(|it| it.act == Act::Cmd(Cmd::ToggleHdr)) {
         it.subtitle = hdr::subtitle(status);
         it.extra = vec![(hdr::bar_label(status).into(), it.act.clone())];
     }
+}
+
+/// Takes an HDR read into `cache` unless a newer one was asked for since (`asked`, the last
+/// read's number); false when it is dropped.
+fn take_hdr_read(cache: &mut Option<Vec<hdr::HdrDisplay>>, asked: u64, seq: u64, status: Vec<hdr::HdrDisplay>) -> bool {
+    if seq != asked {
+        return false;
+    }
+    *cache = Some(status);
+    true
 }
 
 /// Root search shows the Auto HDR row for a query with "hdr" in it (or a start of it: "hd").
@@ -776,8 +788,11 @@ struct Launcher {
     tray_icon: Option<TrayIcon>,
     /// Auto HDR (own thread).
     hdr: hdr::Auto,
-    /// The displays' HDR state for Toggle HDR's row, read off the UI thread (`Msg::Hdr`).
-    hdr_status: Vec<hdr::HdrDisplay>,
+    /// The displays' HDR state for Toggle HDR's row, read off the UI thread (`Msg::Hdr`);
+    /// None until the first read is in.
+    hdr_status: Option<Vec<hdr::HdrDisplay>>,
+    /// The number of the last HDR read asked for (`hdr_read`).
+    hdr_seq: u64,
     /// When the window last closed, for "pop to root" after a timeout.
     hidden_at: Option<Instant>,
     /// Earlier root searches (oldest first) and which one Up last restored.
@@ -912,7 +927,8 @@ impl Launcher {
             toast: None,
             tray_icon: None,
             hdr: auto_hdr,
-            hdr_status: vec![],
+            hdr_status: None,
+            hdr_seq: 0,
             hidden_at: None,
             searches: std::fs::read_to_string(config::dir().join("search-history.txt")).unwrap_or_default().lines().map(String::from).collect(),
             search_pos: None,
@@ -1341,7 +1357,7 @@ impl Launcher {
                 }
                 let found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
                 let mut rows = head_rows(rows, found, &query, &self.cfg);
-                hdr_state(&mut rows, &self.hdr_status);
+                hdr_state(&mut rows, self.hdr_status.as_deref());
                 if wants_auto_hdr(&query) {
                     // Under the results, above the "Use … with" fallbacks.
                     let at = rows.iter().position(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use \""))).unwrap_or(rows.len());
@@ -1642,6 +1658,12 @@ impl Launcher {
     }
 
     // ---- Focus sessions (the decisions are in focus.rs) -----------------------------
+
+    /// The number for a new HDR read (`Msg::Hdr`): only the last one asked for is taken.
+    fn hdr_read(&mut self) -> u64 {
+        self.hdr_seq += 1;
+        self.hdr_seq
+    }
 
     /// Shows a toast (`Msg::done`, `Msg::error`, …).
     fn say(&self, toast: Msg) {
@@ -2007,8 +2029,8 @@ impl Launcher {
             let tx = self.tx.clone();
             std::thread::spawn(move || drop(tx.unbounded_send(Msg::DictReady(dict::installed().is_some()))));
         }
-        let tx = self.tx.clone();
-        std::thread::spawn(move || drop(tx.unbounded_send(Msg::Hdr(hdr::displays()))));
+        let (seq, tx) = (self.hdr_read(), self.tx.clone());
+        std::thread::spawn(move || drop(tx.unbounded_send(Msg::Hdr(seq, hdr::displays()))));
         // The window was placed before this view existed (a notice, a kept search or a
         // query can each change its height), so size it to what it shows now. Without this,
         // `height` could claim a size the window doesn't have, and typing in compact mode
@@ -3448,6 +3470,7 @@ impl Launcher {
                 let target = self.prev.0 as isize;
                 let w = self.cfg.window.clone();
                 let tx = self.tx.clone();
+                let hdr_seq = (cmd == Cmd::ToggleHdr).then(|| self.hdr_read());
                 std::thread::spawn(move || {
                     let said = match commands::run(cmd, HWND(target as _), &w) {
                         Ok(done) => done.map(Msg::done),
@@ -3456,8 +3479,8 @@ impl Launcher {
                     if let Some(toast) = said {
                         let _ = tx.unbounded_send(toast);
                     }
-                    if cmd == Cmd::ToggleHdr {
-                        let _ = tx.unbounded_send(Msg::Hdr(hdr::displays()));
+                    if let Some(seq) = hdr_seq {
+                        let _ = tx.unbounded_send(Msg::Hdr(seq, hdr::displays()));
                     }
                 });
                 return;
@@ -3847,10 +3870,11 @@ impl Launcher {
             }
             Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
-            Msg::Hdr(status) => {
-                self.hdr_status = status;
-                hdr_state(&mut self.items, &self.hdr_status);
-                cx.notify();
+            Msg::Hdr(seq, status) => {
+                if take_hdr_read(&mut self.hdr_status, self.hdr_seq, seq, status) {
+                    hdr_state(&mut self.items, self.hdr_status.as_deref());
+                    cx.notify();
+                }
             }
             Msg::Foreground { hwnd, game, exe } => {
                 self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd, exe.clone());
@@ -5482,10 +5506,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_older_hdr_read_never_replaces_a_newer_one() {
+        // Read 1 (the launcher showed), then read 2 (after Toggle HDR); 1 lands last.
+        let mut cache = None;
+        assert!(take_hdr_read(&mut cache, 2, 2, vec![]));
+        assert!(cache.is_some());
+        cache = None;
+        assert!(!take_hdr_read(&mut cache, 2, 1, vec![]));
+        assert!(cache.is_none());
+    }
+
+    #[test]
     fn hdr_rows_in_root_search() {
         // Toggle HDR stays with no HDR display, and says so; other rows are left alone.
         let mut rows = vec![Item::new("Toggle HDR", "System", Icon::Vector(g::SUN_MEDIUM), Act::Cmd(Cmd::ToggleHdr)), Item::new("Lock Screen", "System", Icon::Vector(g::LOCK), Act::Cmd(Cmd::Lock))];
-        hdr_state(&mut rows, &[]);
+        // Before the first read: the plain subtitle and label, no claim either way.
+        hdr_state(&mut rows, None);
+        assert_eq!((rows[0].subtitle.as_str(), rows[0].actions()[0].0.as_str()), ("System", "Run Command"));
+        hdr_state(&mut rows, Some(&[]));
         assert_eq!((rows[0].subtitle.as_str(), rows[0].actions()[0].0.as_str()), ("No HDR display", "Turn HDR On"));
         assert_eq!((rows[1].subtitle.as_str(), rows[1].extra.len()), ("System", 0));
         // The Auto HDR row shows for "hdr", and Enter flips what its switch shows.

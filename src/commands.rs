@@ -314,6 +314,7 @@ impl Cmd {
             Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste => "Translator",
             Cmd::Define => "Dictionary",
             Cmd::MySchedule => "Calendar",
+            Cmd::HdrSettings => "Windows Settings",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
@@ -883,6 +884,11 @@ mod tests {
         assert_eq!((titles[0], titles[9], titles[10], titles[19]), ("Open Desktop 1", "Open Desktop 10", "Move to Desktop 1", "Move to Desktop 10"));
         assert!(ALL.iter().any(|&(c, t, ..)| c == Cmd::Desktop(Desk::Rename) && t == "Rename Desktop"));
         assert!(ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).all(|&(c, ..)| c.subtitle() == "Window"));
+    }
+
+    #[test]
+    fn hdr_settings_says_where_it_goes() {
+        assert_eq!(Cmd::HdrSettings.subtitle(), "Windows Settings");
     }
 
     #[test]

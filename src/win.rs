@@ -94,8 +94,9 @@ pub enum Msg {
     Defined { seq: u64, word: String, result: Result<Option<crate::dict::Answer>, String> },
     /// Whether the dictionary is downloaded, checked each time the launcher shows.
     DictReady(bool),
-    /// The displays' HDR state, read each time the launcher shows and after Toggle HDR.
-    Hdr(Vec<crate::hdr::HdrDisplay>),
+    /// The displays' HDR state, read each time the launcher shows and after Toggle HDR: the
+    /// read's number (older ones are dropped) and what it found.
+    Hdr(u64, Vec<crate::hdr::HdrDisplay>),
     /// A root Define row's subtitle: the request number, the word (lowercase), its first short sense.
     Sense { seq: u64, word: String, sense: Option<String> },
     /// Screenshot search: the scan's number and the index so far, or None when the scan is over.
