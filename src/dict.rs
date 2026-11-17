@@ -8,6 +8,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -17,6 +18,8 @@ use crate::config;
 const URL: &str = "https://wordnetcode.princeton.edu/wn3.1.dict.tar.gz";
 /// Senses shown per part of speech (the common ones come first).
 const MAX_SENSES: usize = 6;
+/// The root Define row's subtitle is at most this many characters.
+const SHORT_GLOSS: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pos {
@@ -292,16 +295,23 @@ pub fn looks_like_word(q: &str) -> bool {
     q.chars().any(char::is_alphabetic) && q.chars().all(|c| c.is_alphabetic() || c == '\'' || c == '-')
 }
 
-/// What a lookup found: senses, or (nothing found) spellings that might be what was meant.
-pub enum Answer {
-    Found(Vec<Sense>),
-    Missing(Vec<String>),
+/// What a lookup found: the senses (none when the word is not in the dictionary), and other
+/// spellings the spell checker offers that the dictionary has, each with its first part of speech.
+pub struct Answer {
+    pub senses: Vec<Sense>,
+    pub maybe: Vec<(String, Pos)>,
 }
 
-/// Looks `word` up, downloading the dictionary first when it is not there yet. Never panics:
-/// the caller is waiting for an answer.
-pub fn define(word: &str) -> Result<Answer, String> {
-    guarded(|| lookup_word(word))
+/// Looks `word` up; None when the dictionary is not downloaded yet and `fetch` is false, else
+/// it is downloaded first. Never panics: the caller is waiting for an answer.
+pub fn define(word: &str, fetch: bool) -> Result<Option<Answer>, String> {
+    guarded(|| lookup_word(word, fetch))
+}
+
+/// The first sense of `word`, short (`short_gloss`), when the dictionary is installed and has it.
+/// For a worker thread: it may read the index files.
+pub fn first_sense(word: &str) -> Option<String> {
+    guarded(|| Ok(installed().and_then(|d| wordnet(&d).ok()).and_then(|wn| wn.lookup(word).first().map(|s| short_gloss(&s.gloss))))).ok().flatten()
 }
 
 /// A panic in `f` becomes an error.
@@ -309,19 +319,73 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("The dictionary lookup failed".into()))
 }
 
-fn lookup_word(word: &str) -> Result<Answer, String> {
+/// The dictionary in `dir`, read once: its index files are a few MB, and root search asks per keystroke.
+fn wordnet(dir: &Path) -> Result<Arc<WordNet>, String> {
+    static OPEN: Mutex<Option<Arc<WordNet>>> = Mutex::new(None);
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(wn) = open.as_ref().filter(|wn| wn.dir == dir) {
+        return Ok(wn.clone());
+    }
+    let wn = Arc::new(WordNet::open(dir)?);
+    *open = Some(wn.clone());
+    Ok(wn)
+}
+
+fn lookup_word(word: &str, fetch: bool) -> Result<Option<Answer>, String> {
     // One download at a time: a lookup that arrives meanwhile waits, then finds it installed.
-    static DOWNLOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DOWNLOADING: Mutex<()> = Mutex::new(());
     let dir = {
         let _one = DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner());
         match installed() {
             Some(d) => d,
-            None => download()?,
+            None if fetch => download()?,
+            None => return Ok(None),
         }
     };
-    let wn = WordNet::open(&dir)?;
-    let senses = wn.lookup(word);
-    Ok(if senses.is_empty() { Answer::Missing(wn.only_known(spelling(word)).into_iter().take(5).collect()) } else { Answer::Found(senses) })
+    let wn = wordnet(&dir)?;
+    Ok(Some(Answer { senses: wn.lookup(word), maybe: suggestions(&wn, word, spelling(word)) }))
+}
+
+/// The first five spellings in `said` that the dictionary has and that are not `word` itself,
+/// nor an inflection of it ("serendipities" defines just what "serendipity" does).
+fn suggestions(wn: &WordNet, word: &str, said: Vec<String>) -> Vec<(String, Pos)> {
+    let own = wn.lookup(word);
+    let other = |w: &String| Some(wn.lookup(w)).filter(|s| *s != own).and_then(|s| Some((w.clone(), s.first()?.pos)));
+    wn.only_known(said).iter().filter_map(other).take(5).collect()
+}
+
+/// Senses by part of speech, in `Pos::ALL` order: (pos, its senses); a pos without senses is left out.
+pub fn group(senses: &[Sense]) -> Vec<(Pos, Vec<&Sense>)> {
+    Pos::ALL.iter().map(|&p| (p, senses.iter().filter(|s| s.pos == p).collect::<Vec<_>>())).filter(|(_, v)| !v.is_empty()).collect()
+}
+
+/// A gloss up to its first `;`, cut to `SHORT_GLOSS` characters (the last one an ellipsis).
+pub fn short_gloss(gloss: &str) -> String {
+    let first = gloss.split(';').next().unwrap_or_default().trim();
+    if first.chars().count() <= SHORT_GLOSS {
+        return first.to_string();
+    }
+    format!("{}…", first.chars().take(SHORT_GLOSS - 1).collect::<String>().trim_end())
+}
+
+/// The detail pane's meta line: "noun · 1 sense · WordNet", `n` the senses of that part of speech.
+pub fn meta_line(pos: Pos, n: usize) -> String {
+    format!("{} · {n} {} · WordNet", pos.name().to_lowercase(), if n == 1 { "sense" } else { "senses" })
+}
+
+/// "Similar: fluke, luck"; None without synonyms.
+pub fn similar_line(synonyms: &[String]) -> Option<String> {
+    (!synonyms.is_empty()).then(|| format!("Similar: {}", synonyms.join(", ")))
+}
+
+/// The empty view's title when nothing at all is found.
+pub fn missing_title(word: &str) -> String {
+    format!("No definition for '{word}'")
+}
+
+/// The word's Wiktionary page (free, no key).
+pub fn wiktionary(word: &str) -> String {
+    format!("https://en.wiktionary.org/wiki/{}", crate::search::url_encode(word.trim()))
 }
 
 /// Windows' own spell checker (English): spellings for a misspelled word. Empty when the
@@ -518,6 +582,40 @@ mod tests {
     fn single_words_get_a_define_row() {
         assert!(looks_like_word("dog") && looks_like_word("don't") && looks_like_word("well-known"));
         assert!(!looks_like_word("dog food") && !looks_like_word("2+2") && !looks_like_word("") && !looks_like_word("c++"));
+    }
+
+    #[test]
+    fn short_gloss_stops_at_the_first_semicolon_and_60_characters() {
+        assert_eq!(short_gloss("a member of the genus Canis; has been domesticated"), "a member of the genus Canis");
+        let long = short_gloss(&"word ".repeat(30));
+        assert_eq!(long.chars().count(), 60);
+        assert!(long.ends_with('…'));
+        assert_eq!(short_gloss("short"), "short");
+    }
+
+    #[test]
+    fn the_detail_lines_say_what_they_show() {
+        assert_eq!(meta_line(Pos::Noun, 1), "noun · 1 sense · WordNet");
+        assert_eq!(meta_line(Pos::Adj, 2), "adjective · 2 senses · WordNet");
+        assert_eq!(similar_line(&["fluke".into(), "luck".into()]).as_deref(), Some("Similar: fluke, luck"));
+        assert_eq!(similar_line(&[]), None);
+        assert_eq!(missing_title("xyz"), "No definition for 'xyz'");
+        assert_eq!(wiktionary("dog"), "https://en.wiktionary.org/wiki/dog");
+    }
+
+    #[test]
+    fn group_orders_senses_by_part_of_speech_with_counts() {
+        let s = |pos, gloss: &str| Sense { pos, gloss: gloss.into(), examples: vec![], synonyms: vec![] };
+        let senses = [s(Pos::Adj, "a1"), s(Pos::Noun, "n1"), s(Pos::Adj, "a2"), s(Pos::Adv, "r1")];
+        let got: Vec<(Pos, Vec<&str>)> = group(&senses).into_iter().map(|(p, v)| (p, v.iter().map(|s| s.gloss.as_str()).collect())).collect();
+        assert_eq!(got, [(Pos::Noun, vec!["n1"]), (Pos::Adj, vec!["a1", "a2"]), (Pos::Adv, vec!["r1"])]);
+    }
+
+    #[test]
+    fn suggestions_leave_out_the_word_itself_and_say_their_part_of_speech() {
+        let wn = WordNet::open(&fixture("maybe")).unwrap();
+        let said = ["Dog", "dgo", "dogs", "run", "cats"].map(String::from).to_vec();
+        assert_eq!(suggestions(&wn, "dog", said), [("run".to_string(), Pos::Verb), ("cats".to_string(), Pos::Noun)]);
     }
 
     /// Needs the Windows spelling service and an English dictionary.

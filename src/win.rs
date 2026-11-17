@@ -91,7 +91,11 @@ pub enum Msg {
     /// A calendar fetch finished: each feed's address and its events, or why it failed.
     Calendar(Vec<(String, Result<Vec<crate::calendar::Event>, String>)>),
     /// A word was looked up (or the dictionary could not be fetched): the request number, the word, the answer.
-    Defined { seq: u64, word: String, result: Result<crate::dict::Answer, String> },
+    Defined { seq: u64, word: String, result: Result<Option<crate::dict::Answer>, String> },
+    /// Whether the dictionary is downloaded, checked each time the launcher shows.
+    DictReady(bool),
+    /// A root Define row's subtitle: the request number, the word (lowercase), its first short sense.
+    Sense { seq: u64, word: String, sense: Option<String> },
     /// Screenshot search: the scan's number and the index so far, or None when the scan is over.
     Shots(u64, Option<crate::shots::ShotIndex>),
     /// A web image finished downloading into the cache.

@@ -337,14 +337,15 @@ fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
     // A header says something only when there is more than one section (Running, with its
-    // count, always heads its rows), and "Results" right under the search field says nothing.
+    // count, and Did you mean always head their rows), and "Results" right under the search
+    // field says nothing.
     let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
         if is_answer(items, i) {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last && (!one || sec == Some(RUNNING)) && !(sec == Some("Results") && out.is_empty()) {
+        if sec.is_some() && sec != last && (!one || sec == Some(RUNNING) || sec == Some(DID_YOU_MEAN)) && !(sec == Some("Results") && out.is_empty()) {
             out.push(None);
         }
         last = sec;
@@ -484,6 +485,50 @@ impl TrView {
 
 /// How long typing must pause before the translator asks again.
 const TYPING_QUIET: Duration = Duration::from_millis(300);
+
+/// The section of other spellings in the define view; headed even when it is the only one.
+const DID_YOU_MEAN: &str = "Did you mean";
+
+/// The define view: the word shown, whether its lookup downloads the dictionary first, and the
+/// answer (None while the lookup runs; Ok(None): the dictionary is not downloaded yet).
+struct DefView {
+    word: String,
+    fetch: bool,
+    answer: Option<Result<Option<dict::Answer>, String>>,
+}
+
+/// The define view's list: senses by part of speech (Enter copies the gloss), then Did you
+/// mean; or an empty view that says what to do. `web` is the web search URL with `{query}`.
+fn define_rows(v: &DefView, web: &str) -> Vec<Item> {
+    let word = &v.word;
+    match &v.answer {
+        None => {
+            let title = if v.fetch { "Downloading the dictionary (16 MB, once)…" } else { "Looking it up…" };
+            vec![empty_row(g::CLOCK, title.into(), String::new(), vec![])]
+        }
+        Some(Err(e)) => vec![empty_row(g::WARNING, e.clone(), String::new(), vec![])],
+        Some(Ok(None)) => vec![empty_row(g::DOWNLOAD, "Download Dictionary".into(), "WordNet, 16 MB, downloaded once".into(), vec![("Download Dictionary".into(), Act::DownloadDictionary(word.clone()))])],
+        Some(Ok(Some(a))) if a.senses.is_empty() && a.maybe.is_empty() => {
+            let search = ("Search the Web".to_string(), Act::Open(web.replace("{query}", &search::url_encode(word))));
+            vec![empty_row(g::BOOK_OPEN, dict::missing_title(word), "Check the spelling, or search the web".into(), vec![search])]
+        }
+        Some(Ok(Some(a))) => {
+            let senses = dict::group(&a.senses).into_iter().flat_map(|(_, s)| s).map(|s| {
+                let mut it = Item::new(&s.gloss, "", Icon::Vector(g::BOOK_OPEN), Act::Copy(s.gloss.clone())).sec(s.pos.name()).tinted(design::Tint::Web);
+                let similar = (!s.synonyms.is_empty()).then(|| ("Define Similar Word".to_string(), Act::SimilarWords(s.synonyms.clone())));
+                it.extra = [Some(("Copy Definition".to_string(), it.act.clone())), Some(("Copy Word".into(), Act::Copy(word.clone()))), similar, Some(("Open in Browser".into(), Act::Open(dict::wiktionary(word))))].into_iter().flatten().collect();
+                it
+            });
+            let maybe = a.maybe.iter().map(|(w, pos)| Item::new(w, pos.name(), Icon::Vector(g::SEARCH), Act::Define(w.clone())).sec(DID_YOU_MEAN));
+            senses.chain(maybe).collect()
+        }
+    }
+}
+
+/// The word a root Define row's box holds, given the box values shown for it.
+fn define_word<'a>(it: &Item, values: &'a [String]) -> Option<&'a str> {
+    values.first().map(|v| v.trim()).filter(|v| it.act == Act::Cmd(Cmd::Define) && !v.is_empty())
+}
 
 /// The translator's list: a row per target (title the translation, accessory the language),
 /// then the pronunciation when Google gives one. Enter copies or pastes per `action`;
@@ -669,9 +714,17 @@ struct Launcher {
     translate_seq: u64,
     /// The language set in use before the last switch, for Enter in the empty translator.
     prev_set: Option<usize>,
-    /// The define view: the word and the answer (None while the lookup, or the one-time download, runs).
-    define: Option<(String, Option<Result<dict::Answer, String>>)>,
+    /// The define view (None until it first opens).
+    define: Option<DefView>,
+    /// Number of the newest lookup; answers to older ones are dropped.
     define_seq: u64,
+    /// Whether the dictionary is downloaded, checked off the UI thread each time the launcher
+    /// shows (None until that check answers).
+    dict_ready: Option<bool>,
+    /// The root Define row's subtitles: each word's first short sense (None: not in the
+    /// dictionary), and the newest request's number.
+    senses: HashMap<String, Option<String>>,
+    sense_seq: u64,
     /// Screenshot search: the index as last scanned, the newest scan's number (older scans' answers are dropped) and whether it is still reading pictures.
     shots: shots::ShotIndex,
     shots_seq: u64,
@@ -807,6 +860,9 @@ impl Launcher {
             prev_set: None,
             define: None,
             define_seq: 0,
+            dict_ready: None,
+            senses: HashMap::new(),
+            sense_seq: 0,
             shots: shots::ShotIndex::default(),
             shots_seq: 0,
             shots_busy: false,
@@ -921,6 +977,9 @@ impl Launcher {
         if self.mode == Mode::Translate {
             self.translate_soon(cx);
         }
+        if self.mode == Mode::Define {
+            self.define_soon(cx);
+        }
         self.selected = 0;
         self.refresh(cx);
         if space_typed && self.arg_row().is_some_and(|it| search::named_in(it, q.trim_start(), &self.cfg) == Some("")) {
@@ -1006,6 +1065,7 @@ impl Launcher {
         if let Some(m) = self.args_for.as_ref().and_then(|k| self.arg_memory.get_mut(k)) {
             m.1 = values;
         }
+        self.ask_sense(cx);
         cx.notify();
     }
 
@@ -1288,23 +1348,9 @@ impl Launcher {
             },
             Mode::LanguageSets => search::filter(&query, lang_set_rows(&translate::sets(&self.cfg), translate::current(&self.cfg)), &mut self.matcher),
             Mode::Define => match &self.define {
+                _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
+                Some(v) => define_rows(v, &self.cfg.search.fallback),
                 None => vec![],
-                Some((_, None)) => {
-                    let title = if dict::installed().is_some() { "Looking it up…" } else { "Downloading the dictionary (16 MB, once)…" };
-                    vec![empty_row(g::CLOCK, title.into(), String::new(), vec![])]
-                }
-                Some((_, Some(Err(e)))) => vec![empty_row(g::WARNING, e.clone(), String::new(), vec![])],
-                Some((word, Some(Ok(dict::Answer::Missing(maybe))))) if maybe.is_empty() => vec![empty_row(g::SEARCH, format!("No definition for \"{word}\""), String::new(), vec![])],
-                Some((_, Some(Ok(dict::Answer::Missing(maybe))))) => maybe.iter().map(|w| Item::new(w, "", Icon::Vector(g::SEARCH), Act::Define(w.clone())).sec("Did you mean")).collect(),
-                Some((_, Some(Ok(dict::Answer::Found(senses))))) => senses
-                    .iter()
-                    .map(|s| {
-                        let example = s.examples.first().map(|e| format!("\"{e}\""));
-                        let synonyms = (!s.synonyms.is_empty()).then(|| s.synonyms.join(", "));
-                        let sub = [example, synonyms].into_iter().flatten().collect::<Vec<_>>().join("  ·  ");
-                        Item::new(&s.gloss, sub, Icon::Vector(g::BOOK_OPEN), Act::Copy(s.gloss.clone())).sec(s.pos.name())
-                    })
-                    .collect(),
             },
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
@@ -1422,6 +1468,7 @@ impl Launcher {
             0
         };
         self.sync_args(cx);
+        self.ask_sense(cx);
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
@@ -1913,6 +1960,10 @@ impl Launcher {
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
         self.scan_apps(false, false);
+        if self.cfg.dictionary.enabled {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || drop(tx.unbounded_send(Msg::DictReady(dict::installed().is_some()))));
+        }
         // The window was placed before this view existed (a notice, a kept search or a
         // query can each change its height), so size it to what it shows now. Without this,
         // `height` could claim a size the window doesn't have, and typing in compact mode
@@ -2247,27 +2298,104 @@ impl Launcher {
 
     // ---- dictionary ------------------------------------------------------------------
 
-    /// Looks `word` up off the UI thread; the first lookup also downloads the dictionary.
-    fn define(&mut self, word: String, cx: &mut Context<Self>) {
+    /// Looks `word` up off the UI thread, opening the define view with the word in the bar;
+    /// `fetch` downloads the dictionary first when it is not there. Within the view, the
+    /// answer shown stays until the next one lands.
+    fn define(&mut self, word: String, fetch: bool, cx: &mut Context<Self>) {
         self.define_seq += 1;
         let (seq, tx) = (self.define_seq, self.tx.clone());
         self.status = None;
-        self.define = Some((word.clone(), None));
-        self.set_mode(Mode::Define, cx);
+        let keep = self.mode == Mode::Define && !fetch;
+        let answer = self.define.take().and_then(|v| v.answer).filter(|_| keep);
+        if self.mode != Mode::Define {
+            self.set_mode(Mode::Define, cx);
+        }
+        // Not downloaded (as checked on show): say so without asking the worker.
+        let missing = !fetch && self.dict_ready == Some(false);
+        self.define = Some(DefView { word: word.clone(), fetch, answer: if missing { Some(Ok(None)) } else { answer } });
+        self.fill_query(&word, cx);
+        self.refresh(cx);
+        if missing {
+            return;
+        }
         std::thread::spawn(move || {
-            let result = dict::define(&word);
+            let result = dict::define(&word, fetch);
             let _ = tx.unbounded_send(Msg::Defined { seq, word, result });
         });
     }
 
-    fn on_defined(&mut self, seq: u64, word: String, result: Result<dict::Answer, String>, cx: &mut Context<Self>) {
+    /// Typing in the define view: looks the word up again once typing pauses for `TYPING_QUIET`.
+    fn define_soon(&mut self, cx: &mut Context<Self>) {
+        let word = self.query(cx).trim().to_string();
+        if self.define.as_ref().is_none_or(|v| v.word == word) {
+            return;
+        }
+        // Answers still on their way are for older text.
+        self.define_seq += 1;
+        let seq = self.define_seq;
+        if word.is_empty() {
+            // So the word typed again is looked up again (its answer may just have been dropped).
+            return self.define.iter_mut().for_each(|v| v.word.clear());
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPING_QUIET).await;
+            _ = this.update(cx, |this, cx| {
+                if this.define_seq == seq && this.mode == Mode::Define {
+                    this.define(word, false, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn on_defined(&mut self, seq: u64, word: String, result: Result<Option<dict::Answer>, String>, cx: &mut Context<Self>) {
         if seq != self.define_seq {
             return;
         }
-        self.define = Some((word, Some(result)));
+        if let Ok(a) = &result {
+            self.dict_ready = Some(a.is_some());
+        }
+        self.define = Some(DefView { word, fetch: false, answer: Some(result) });
         if self.mode == Mode::Define {
             self.refresh(cx);
         }
+    }
+
+    /// Define Similar Word: a menu of the synonyms; the pick is defined.
+    fn open_similar(&mut self, words: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = words.into_iter().map(|w| menu::Entry { id: w.clone(), label: w, icon: Some(g::BOOK_OPEN), ..Default::default() }).collect();
+        let m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+        self.open_menu(m, |this, word, _, cx| this.define(word, false, cx), window, cx);
+    }
+
+    /// Root search's Define row with a word in its box: asks a worker for that word's first
+    /// sense (its subtitle), unless it is known already or the dictionary is not downloaded.
+    fn ask_sense(&mut self, cx: &App) {
+        if self.mode != Mode::Root || self.dict_ready != Some(true) {
+            return;
+        }
+        let shown = self.arg_values(cx);
+        let boxed = self.arg_row().is_some();
+        let word = self.items.iter().enumerate().find_map(|(i, it)| define_word(it, if i == self.selected && boxed { &shown } else { &it.values })).map(str::to_lowercase);
+        let Some(word) = word.filter(|w| !self.senses.contains_key(w)) else { return };
+        self.sense_seq += 1;
+        let (seq, tx) = (self.sense_seq, self.tx.clone());
+        std::thread::spawn(move || {
+            let sense = dict::first_sense(&word);
+            let _ = tx.unbounded_send(Msg::Sense { seq, word, sense });
+        });
+    }
+
+    fn on_sense(&mut self, seq: u64, word: String, sense: Option<String>, cx: &mut Context<Self>) {
+        if seq != self.sense_seq {
+            return;
+        }
+        // ponytail: forgets everything past 256 words; an LRU if that ever shows.
+        if self.senses.len() > 256 {
+            self.senses.clear();
+        }
+        self.senses.insert(word, sense);
+        cx.notify();
     }
 
     // ---- screenshots -----------------------------------------------------------------
@@ -3156,7 +3284,9 @@ impl Launcher {
                 let set = self.cfg.translator.set();
                 return self.translate(translate::Job { text: String::new(), from: set.from, to: set.to, all: false, after }, cx);
             }
-            Act::Define(word) => return self.define(word, cx),
+            Act::Define(word) => return self.define(word, false, cx),
+            Act::DownloadDictionary(word) => return self.define(word, true, cx),
+            Act::SimilarWords(words) => return self.open_similar(words, window, cx),
             Act::LangMenu => return self.open_lang_menu(window, cx),
             Act::UseLangSet(i) => return self.use_lang_set(i, window, cx),
             Act::EditLangSet(i) => {
@@ -3653,6 +3783,11 @@ impl Launcher {
             Msg::TimerTick => self.on_timer_tick(cx),
             Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
             Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
+            Msg::DictReady(ready) => {
+                self.dict_ready = Some(ready);
+                self.ask_sense(cx);
+            }
+            Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
             Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
             Msg::Foreground { hwnd, game, exe } => {
                 self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd);
@@ -3783,7 +3918,7 @@ impl Launcher {
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
-            Mode::Define => self.define.as_ref().map(|(w, _)| format!("Define {w}")),
+            Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word).trim_end().to_string()),
             Mode::Shots => Some("Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
@@ -3808,7 +3943,7 @@ impl Launcher {
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()).unwrap_or_default().into(),
             Mode::Output => "Enter copies the output".into(),
-            Mode::Define => "Enter copies the definition".into(),
+            Mode::Define => "Word to define…".into(),
             Mode::Shots => "Search screenshots by text or name…".into(),
             Mode::Schedule => "Search events…".into(),
             Mode::Form(_) => "".into(),
@@ -4165,6 +4300,34 @@ impl Launcher {
             .into_any_element()
     }
 
+    /// The define view's right-hand pane: the word, "noun · 1 sense · WordNet", the selected
+    /// sense's gloss, its examples and its synonyms; for a Did you mean row, that word and its
+    /// part of speech.
+    fn define_detail(&self, t: &Tokens) -> gpui::AnyElement {
+        use design::{sp, ts};
+        let pane = div().id("define").flex_1().min_h_0().overflow_y_scroll().p(px(sp::S16)).flex().flex_col().gap(px(sp::S8));
+        let Some((v, Some(Ok(Some(a))))) = self.define.as_ref().map(|v| (v, v.answer.as_ref())) else { return pane.into_any_element() };
+        let big = |w: &str| div().font_family(design::FONT_DISPLAY).text_size(px(ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(w.to_string());
+        let meta = |m: String| div().font_family(design::FONT_SMALL).text_size(px(ts::SMALL)).text_color(t.text_faint).child(m);
+        let muted = |m: String| div().text_size(px(ts::BODY)).text_color(t.text_muted).child(m);
+        let groups = dict::group(&a.senses);
+        match groups.iter().flat_map(|(_, s)| s).nth(self.selected) {
+            Some(s) => {
+                let n = groups.iter().find(|(p, _)| *p == s.pos).map_or(1, |(_, g)| g.len());
+                pane.child(big(&v.word))
+                    .child(meta(dict::meta_line(s.pos, n)))
+                    .child(muted(s.gloss.clone()))
+                    .children(s.examples.iter().map(|e| muted(format!("\"{e}\""))))
+                    .children(dict::similar_line(&s.synonyms).map(muted))
+            }
+            None => match a.maybe.get(self.selected.saturating_sub(a.senses.len())) {
+                Some((w, pos)) => pane.child(big(w)).child(meta(pos.name().to_lowercase())),
+                None => pane,
+            },
+        }
+        .into_any_element()
+    }
+
     /// File Search's right-hand pane: a preview, then the file's information.
     fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
         let path = match self.items.get(self.selected).map(|it| &it.act) {
@@ -4356,7 +4519,8 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::Reveal(_) => g::FOLDER,
         Act::RunAsAdmin(_) => g::SHIELD,
         Act::DeleteClip(_) | Act::UninstallExt(_) => g::DELETE,
-        Act::Install(_) => g::DOWNLOAD,
+        Act::Install(_) | Act::DownloadDictionary(_) => g::DOWNLOAD,
+        Act::Define(_) | Act::SimilarWords(_) => g::BOOK_OPEN,
         Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::Layout(_) | Act::ExtRun(..) => g::PLAY,
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
@@ -4424,6 +4588,7 @@ impl Render for Launcher {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
             Mode::Files | Mode::Shots if empty.is_none() => Some(self.file_detail(&t)),
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
+            Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
@@ -4501,7 +4666,8 @@ impl Render for Launcher {
                         let it = &self.items[rows[k + 1].unwrap_or(0)];
                         let sec = it.section.clone();
                         above.clear();
-                        out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root || sec.as_deref() == Some(RUNNING)).then(|| count(&sec))));
+                        let counted = (self.mode != Mode::Root || sec.as_deref() == Some(RUNNING)) && sec.as_deref() != Some(DID_YOU_MEAN);
+                        out.push(Slot::Header(sec.clone().unwrap_or_default(), counted.then(|| count(&sec))));
                     }
                     Some(i) => {
                         let it = &self.items[*i];
@@ -4518,8 +4684,14 @@ impl Render for Launcher {
                             above.clone()
                         };
                         // Its subtitle repeats what its boxes hold.
-                        let mirrored = search::mirror(it, if *i == self.selected && arg_row.is_some() { &arg_values } else { &it.values });
-                        let subtitle = if mirrored.is_empty() { it.subtitle.clone() } else { mirrored };
+                        let values = if *i == self.selected && arg_row.is_some() { &arg_values } else { &it.values };
+                        let mirrored = search::mirror(it, values);
+                        // Define's subtitle is the word's first sense, once known.
+                        let subtitle = match define_word(it, values) {
+                            Some(w) => self.senses.get(&w.to_lowercase()).cloned().flatten().unwrap_or_default(),
+                            None if mirrored.is_empty() => it.subtitle.clone(),
+                            None => mirrored,
+                        };
                         out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live });
                     }
                 }
@@ -5381,6 +5553,49 @@ mod tests {
         assert_eq!(display_rows(&[it("Running")]), [None, Some(0)], "alone, still headed");
         assert_eq!(display_rows(&[it("Results"), it("Running"), it("Results")]), [Some(0), None, Some(1), None, Some(2)]);
         assert_eq!(display_rows(&[it("Results"), it("Results")]), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn define_view_groups_senses_offers_spellings_and_says_when_nothing_is_found() {
+        let sense = |pos, gloss: &str, synonyms: &[&str]| dict::Sense { pos, gloss: gloss.into(), examples: vec![], synonyms: synonyms.iter().map(|s| s.to_string()).collect() };
+        let view = |word: &str, answer| DefView { word: word.into(), fetch: false, answer: Some(Ok(answer)) };
+        let web = "https://www.google.com/search?q={query}";
+
+        let found = dict::Answer { senses: vec![sense(dict::Pos::Adj, "lucky", &[]), sense(dict::Pos::Noun, "good luck", &["fluke", "luck"])], maybe: vec![("serendipitous".into(), dict::Pos::Adj)] };
+        let rows = define_rows(&view("serendipity", Some(found)), web);
+        let shape: Vec<(&str, Option<&str>)> = rows.iter().map(|it| (it.title.as_str(), it.section.as_deref())).collect();
+        assert_eq!(shape, [("good luck", Some("Noun")), ("lucky", Some("Adjective")), ("serendipitous", Some(DID_YOU_MEAN))]);
+        assert_eq!(rows[0].tint, Some(design::Tint::Web));
+        let labels: Vec<String> = rows[0].actions().into_iter().map(|a| a.0).collect();
+        assert_eq!(labels, ["Copy Definition", "Copy Word", "Define Similar Word", "Open in Browser"]);
+        assert_eq!(rows[0].act, Act::Copy("good luck".into()), "Enter copies the gloss");
+        assert_eq!(rows[0].actions()[2].1, Act::SimilarWords(vec!["fluke".into(), "luck".into()]));
+        assert_eq!(rows[0].actions()[3].1, Act::Open("https://en.wiktionary.org/wiki/serendipity".into()));
+        assert!(!rows[1].actions().iter().any(|a| a.0 == "Define Similar Word"), "no synonyms, no menu");
+        assert_eq!(rows[2].act, Act::Define("serendipitous".into()));
+
+        // Misspelled: Did you mean alone, still headed; its first row (the closest match) is where the selection starts.
+        let rows = define_rows(&view("serendipty", Some(dict::Answer { senses: vec![], maybe: vec![("serendipity".into(), dict::Pos::Noun)] })), web);
+        assert_eq!(display_rows(&rows), [None, Some(0)]);
+        assert_eq!((rows[0].title.as_str(), rows[0].subtitle.as_str()), ("serendipity", "Noun"));
+
+        // Unknown: the empty view, Enter searches the web.
+        let rows = define_rows(&view("xyzq", Some(dict::Answer { senses: vec![], maybe: vec![] })), web);
+        assert_eq!((rows[0].title.as_str(), rows[0].subtitle.as_str(), rows[0].section.as_deref()), ("No definition for 'xyzq'", "Check the spelling, or search the web", Some(EMPTY)));
+        assert_eq!(rows[0].actions()[0], ("Search the Web".to_string(), Act::Open("https://www.google.com/search?q=xyzq".into())));
+
+        // Not downloaded: the empty view's Enter downloads it.
+        let rows = define_rows(&view("dog", None), web);
+        assert_eq!((rows[0].title.as_str(), rows[0].act.clone()), ("Download Dictionary", Act::DownloadDictionary("dog".into())));
+    }
+
+    #[test]
+    fn the_root_define_row_names_its_word_only_with_one_typed() {
+        let define = Item::new("Define", "", Icon::glyph("x"), Act::Cmd(Cmd::Define));
+        assert_eq!(define_word(&define, &[" Dog ".into()]), Some("Dog"));
+        assert_eq!(define_word(&define, &["  ".into()]), None);
+        assert_eq!(define_word(&define, &[]), None);
+        assert_eq!(define_word(&Item::new("Start Timer", "", Icon::glyph("x"), Act::Cmd(Cmd::StartTimer)), &["dog".into()]), None);
     }
 
     #[test]

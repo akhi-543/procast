@@ -95,6 +95,10 @@ pub enum Act {
     PasteShot(String),
     /// Look a word up in the offline dictionary; the answer opens in its own view.
     Define(String),
+    /// The define view's Download Dictionary, then the word's lookup.
+    DownloadDictionary(String),
+    /// Define Similar Word: a menu of these synonyms; the pick is looked up.
+    SimilarWords(Vec<String>),
     /// Translate with Google Translate; the result opens in its own view, is copied, or pastes over the selection.
     Translate(Job),
     /// The translator's language sets, by index (0 is Settings → Translator's): open the bar's
@@ -156,6 +160,8 @@ impl Act {
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::Translate(_) => "Translate",
             Act::Define(_) => "Define",
+            Act::DownloadDictionary(_) => "Download Dictionary",
+            Act::SimilarWords(_) => "Define Similar Word",
             Act::LangMenu => "Change Target",
             Act::UseLangSet(_) => "Make Current",
             Act::EditLangSet(None) => "Add Language Set",
