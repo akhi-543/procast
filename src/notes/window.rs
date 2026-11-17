@@ -46,8 +46,12 @@ impl Notes {
         let (tx, mut rx) = mpsc::unbounded::<Job>();
         cx.background_executor()
             .spawn(async move {
-                let mut store = Store::open(root);
+                let mut store = Store::open(root.clone());
                 while let Some(job) = rx.next().await {
+                    // A transient failure (a lock at startup) is retried; a damaged index stays an error.
+                    if store.as_ref().is_err_and(|e| e.kind() != io::ErrorKind::InvalidData) {
+                        store = Store::open(root.clone());
+                    }
                     // A panicking job only drops its answer.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut store)));
                 }
@@ -154,9 +158,9 @@ impl Doc {
 
 /// Whether a read of note `id` replaces the doc on screen. Another note does. The same note keeps
 /// its buffer, since the read may be older than it, unless the reader itself just wrote that
-/// text (`wrote`: Create Note's title) and the buffer has nothing unsaved.
+/// text (`wrote`: Create Note's title into the empty note) and the buffer is empty and saved.
 fn replaces(doc: Option<&Doc>, id: &str, wrote: bool) -> bool {
-    doc.is_none_or(|d| d.id != id || (wrote && d.unsaved().is_none()))
+    doc.is_none_or(|d| d.id != id || (wrote && d.unsaved().is_none() && d.buffer.text().trim().is_empty()))
 }
 
 /// Writing `text` to note `id` failed. If that note is still on screen it is marked unsaved (its
@@ -456,7 +460,8 @@ mod tests {
         assert!(replaces(None, "a", false), "nothing on screen");
         assert!(replaces(Some(&doc), "b", false), "another note");
         assert!(!replaces(Some(&doc), "a", false), "the same note, saved: the read may be older");
-        assert!(replaces(Some(&doc), "a", true), "the reader wrote it (Create Note's title)");
+        assert!(!replaces(Some(&doc), "a", true), "a saved note with text is never replaced");
+        assert!(replaces(Some(&Doc::new("a".into(), String::new())), "a", true), "the reader wrote the empty note (Create Note's title)");
         doc.buffer.insert(" typed");
         assert!(!replaces(Some(&doc), "a", false));
         assert!(!replaces(Some(&doc), "a", true), "unsaved keys always stay");
