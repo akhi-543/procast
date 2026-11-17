@@ -4,6 +4,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -347,10 +348,14 @@ pub fn join_link(text: &str) -> Option<String> {
 
 // ---- state ----------------------------------------------------------------------------
 
+/// When each feed (by address) last brought events: shared with Settings → Calendar.
+pub type FeedStatus = Arc<RwLock<HashMap<String, Instant>>>;
+
 /// The fetched feeds, and what has been announced.
 #[derive(Default)]
 pub struct Calendar {
     feeds: HashMap<String, Vec<Event>>,
+    pub status: FeedStatus,
     fetched: Option<Instant>,
     fetching: bool,
     /// When a fetch last brought events (Unix seconds): "Updated 5 min ago" while the next one runs.
@@ -387,6 +392,7 @@ impl Calendar {
     pub fn reset(&mut self, urls: &[String]) {
         self.feeds.retain(|u, _| urls.contains(u));
         self.failed.retain(|u| urls.contains(u));
+        self.status.write().unwrap().retain(|u, _| urls.contains(u));
         self.fetched = None;
     }
 
@@ -398,6 +404,7 @@ impl Calendar {
             match r {
                 Ok(events) => {
                     self.failed.remove(&url);
+                    self.status.write().unwrap().insert(url.clone(), Instant::now());
                     self.feeds.insert(url, events);
                     self.updated = Some(now);
                 }
@@ -409,6 +416,12 @@ impl Calendar {
             }
         }
         say
+    }
+
+    /// A feed Add Calendar just fetched: its events show at once, and the next fetch is as due.
+    pub fn added(&mut self, url: String, events: Vec<Event>) {
+        self.status.write().unwrap().insert(url.clone(), Instant::now());
+        self.feeds.insert(url, events);
     }
 
     /// Every event of the feeds now configured (`urls`, in `[[calendar_feed]]` order), without
@@ -587,6 +600,43 @@ pub fn row(e: &Event, feed: (&str, &str), accessory: String) -> Item {
     it.extra = acts;
     it.live = true;
     it
+}
+
+// ---- feeds ----------------------------------------------------------------------------
+
+/// Add Calendar's five colours, as `[[calendar_feed]] colour` names them: the kind tints.
+pub const COLOURS: [(&str, Tint); 5] = [("system", Tint::System), ("window", Tint::Window), ("paste", Tint::Paste), ("web", Tint::Web), ("calc", Tint::Calc)];
+
+/// A feed's colour by name; System for one it does not know.
+pub fn tint(colour: &str) -> Tint {
+    COLOURS.iter().find(|(n, _)| n.eq_ignore_ascii_case(colour.trim())).map_or(Tint::System, |c| c.1)
+}
+
+/// The swatch Left (`d` -1) or Right (1) moves to from `colour`, stopping at either end.
+pub fn step_colour(colour: &str, d: isize) -> &'static str {
+    let i = COLOURS.iter().position(|(n, _)| *n == colour).unwrap_or(0) as isize;
+    COLOURS[(i + d).clamp(0, COLOURS.len() as isize - 1) as usize].0
+}
+
+/// Who serves a feed, for Settings → Calendar: Google, Outlook, iCloud, else its host.
+pub fn provider(url: &str) -> String {
+    let Some(host) = feed_host(&url_of(url)) else { return String::new() };
+    let is = |d: &str| host == d || host.ends_with(&format!(".{d}"));
+    let name = if is("google.com") {
+        "Google"
+    } else if ["outlook.com", "live.com", "office365.com", "office.com"].iter().any(|d| is(d)) {
+        "Outlook"
+    } else if is("icloud.com") {
+        "iCloud"
+    } else {
+        return host;
+    };
+    name.into()
+}
+
+/// How long ago a feed last brought events: "updated 5 min ago", or "not fetched yet".
+pub fn updated_text(ago: Option<Duration>) -> String {
+    ago.map_or_else(|| "not fetched yet".into(), |d| format!("updated {}", crate::timers::ago(d.as_secs())))
 }
 
 // ---- fetching -------------------------------------------------------------------------
@@ -992,6 +1042,34 @@ mod tests {
         c.done(vec![("u".into(), Err("down".into()))], 1300);
         c.fetching(Instant::now());
         assert_eq!(c.updated_line(1600).as_deref(), Some("Updated 10 min ago"));
+    }
+
+    #[test]
+    fn settings_names_the_provider_and_when_each_feed_came() {
+        assert_eq!(provider("https://calendar.google.com/calendar/ical/x/private-k/basic.ics"), "Google");
+        assert_eq!(provider("https://outlook.office365.com/owa/calendar/a/b/calendar.ics"), "Outlook");
+        assert_eq!(provider("https://outlook.live.com/owa/calendar/a/calendar.ics"), "Outlook");
+        assert_eq!(provider("webcal://p01-caldav.icloud.com/published/2/x"), "iCloud");
+        assert_eq!(provider("https://cal.example.com/a.ics?u=https://calendar.google.com"), "cal.example.com", "the host, never the query");
+        assert_eq!(updated_text(Some(Duration::from_secs(300))), "updated 5 min ago");
+        assert_eq!(updated_text(None), "not fetched yet");
+        let mut c = Calendar::default();
+        c.fetching(Instant::now());
+        c.done(vec![("a".into(), Ok(vec![])), ("b".into(), Err("down".into()))], 1000);
+        let status = c.status.clone();
+        assert!(status.read().unwrap().contains_key("a") && !status.read().unwrap().contains_key("b"), "a failed fetch is no update");
+        c.reset(&["b".into()]);
+        assert!(status.read().unwrap().is_empty(), "a removed feed is forgotten");
+        c.added("b".into(), vec![ev(1, 2, "B")]);
+        assert!(status.read().unwrap().contains_key("b") && c.pending(), "an added feed shows at once; the fetch still runs");
+        assert_eq!(c.events(&["b".into()], &[], &HashSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn the_swatches_are_five_kind_tints_and_arrows_stop_at_the_ends() {
+        assert_eq!(COLOURS.map(|c| c.1), [Tint::System, Tint::Window, Tint::Paste, Tint::Web, Tint::Calc]);
+        assert_eq!((tint("web"), tint("Calc"), tint("purple")), (Tint::Web, Tint::Calc, Tint::System));
+        assert_eq!((step_colour("system", 1), step_colour("system", -1), step_colour("calc", 1), step_colour("paste", -1)), ("window", "system", "calc", "window"));
     }
 
     #[test]

@@ -160,6 +160,14 @@ pub const FORM_LABEL: f32 = 120.;
 /// `.pc-form__note`: a form note lines up with the controls (label column plus the row gap).
 pub const FORM_NOTE_INDENT: f32 = 132.;
 
+/// `.pc-swatch`: a colour to pick (Add Calendar's Colour); the picked one has a `bg_solid` gap
+/// ring inside an `accent` ring.
+pub const SWATCH: f32 = 20.;
+const SWATCH_GAP: f32 = 2.;
+const SWATCH_RING: f32 = 4.;
+/// `.pc-feed__dot`: a calendar's colour in Settings → Calendar.
+pub const FEED_DOT: f32 = 10.;
+
 /// `.pc-field--tokens`: the token field's least height, and its chevron's drop to line up with
 /// the first row of tokens.
 pub const TOKEN_FIELD_MIN: f32 = 52.;
@@ -1365,6 +1373,35 @@ pub fn set_row(glyph: &'static str, title: &str, desc: &str, t: &Tokens) -> Div 
                 .child(div().child(title.to_string()))
                 .when(!desc.is_empty(), |d| d.child(div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(desc.to_string()))),
         )
+}
+
+/// `.pc-swatch`: a round colour, inset with a hairline; `on` rings it (`.is-on`).
+pub fn swatch(tint: Tint, on: bool, t: &Tokens) -> Div {
+    // Later shadows paint on top: the gap ring covers the accent ring's inner part.
+    let ring = |w: f32, color: Hsla| BoxShadow::new(px(0.), px(0.), color).spread_radius(px(w));
+    let shadows = if on { vec![ring(SWATCH_RING, t.accent), ring(SWATCH_GAP, t.bg_solid)] } else { vec![inset_ring(t.hairline)] };
+    div().size(px(SWATCH)).flex_none().rounded_full().bg(tint.hue(t)).shadow(shadows)
+}
+
+/// `.pc-feed`: a row of Settings → Calendar's Calendars list (the host adds the hairline).
+fn feed(t: &Tokens) -> Div {
+    div().h(px(ROW)).px(px(sp::S16)).flex().items_center().gap(px(sp::S12)).text_color(t.text)
+}
+
+/// A calendar: its colour dot, its name, "Google · updated 5 min ago", then `delete` in
+/// text_faint (the host makes it clickable), shown on hover or when `on`.
+pub fn feed_row(colour: Hsla, name: &str, sub: &str, on: bool, delete: impl IntoElement, t: &Tokens) -> Div {
+    feed(t)
+        .group("feed")
+        .child(div().size(px(FEED_DOT)).flex_none().rounded_full().bg(colour))
+        .child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(name.to_string()))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(sub.to_string()))
+        .child(div().flex().when(!on, |d| d.invisible().group_hover("feed", |s| s.visible())).child(delete))
+}
+
+/// `.pc-feed--add`: the list's last row, Add Calendar….
+pub fn feed_add(t: &Tokens) -> Div {
+    feed(t).text_color(t.text_muted).child(icon(g::PLUS, ic::MD, t.text_muted)).child("Add Calendar…")
 }
 
 /// `.pc-tag`: a small label tinted with a kind's hue ("Auto-Detect", "German").

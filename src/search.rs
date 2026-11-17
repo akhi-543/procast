@@ -94,8 +94,8 @@ pub enum Act {
     Join(String, String),
     /// Leave a calendar event out of My Schedule and root search, by `calendar::hidden_key`.
     HideEvent(String),
-    /// Open a Settings page by name.
-    OpenSettings(&'static str),
+    /// Open the Add Calendar form.
+    AddCalendar,
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
@@ -165,7 +165,7 @@ impl Act {
             Act::RenameTimer(_) => "Rename",
             Act::Join(..) => "Join Meeting",
             Act::HideEvent(_) => "Hide This Event",
-            Act::OpenSettings(_) => "Open Settings",
+            Act::AddCalendar => "Add Calendar",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::FocusExtend => "Extend",

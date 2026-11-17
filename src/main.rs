@@ -172,7 +172,6 @@ enum Mode {
 
 /// A native launcher form: what it is for, which names its title and primary action.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[expect(dead_code, reason = "AddCalendar is opened by Task 15")]
 enum FormKind {
     Focus,
     AddCalendar,
@@ -185,7 +184,7 @@ impl FormKind {
     fn bar(self) -> (&'static str, &'static str, &'static str) {
         match self {
             FormKind::Focus => (g::SHIELD_CHECK, "Focus", "Start Focus Session"),
-            FormKind::AddCalendar => (g::CALENDAR, "Add Calendar", "Add Calendar"),
+            FormKind::AddCalendar => (g::CALENDAR_CLOCK, "Add Calendar", "Add Calendar"),
             FormKind::AddLanguageSet(None) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
             FormKind::AddLanguageSet(Some(_)) => (g::LANGUAGES, "Edit Language Set", "Save Language Set"),
         }
@@ -204,6 +203,9 @@ enum Ctl {
     Check,
     /// A token field (Focus's Block): the value is the picked `focus::Picks`, one id a line.
     Tokens,
+    /// Add Calendar's colours (`calendar::COLOURS`): the value is the picked one's name; Left
+    /// and Right move.
+    Swatches,
     /// Muted text (the value); with no label it is a `form_note`.
     Note,
     Rule,
@@ -300,6 +302,18 @@ fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], pick
     let cats = cats.iter().map(|c| menu::Entry { id: format!("cat:{}", c.name), label: c.name.clone(), icon: Some(focus::category_icon(&c.name)), section: Some("Focus Categories".into()), ..Default::default() });
     let apps = apps.iter().map(|(exe, name)| menu::Entry { id: format!("app:{exe}"), label: name.clone(), icon: Some(g::APP), section: Some("Applications".into()), ..Default::default() });
     cats.chain(apps).filter(|e| !picks.0.contains(&e.id)).collect()
+}
+
+/// The Add Calendar form: ICS address (focused), Name, Colour, and where to find the address.
+fn calendar_form() -> Vec<FormField> {
+    let field = |label: &str, ctl: Ctl, value: &str| FormField { label: label.to_string().into(), ctl, value: value.into(), input: None, error: None };
+    let text = |placeholder: &'static str, icon: Option<&'static str>| Ctl::Text { placeholder: placeholder.into(), icon, tall: false, presets: &[] };
+    vec![
+        field("ICS address", text("https://calendar.google.com/…/basic.ics", Some(g::LINK)), ""),
+        field("Name", text("Work", None), ""),
+        field("Colour", Ctl::Swatches, calendar::COLOURS[0].0),
+        field("", Ctl::Note, "Google: Settings → your calendar → Secret address in iCal format. Outlook: Settings → Shared calendars → Publish → ICS."),
+    ]
 }
 
 /// Typed text that looks like a website or names a program puts "Block x.com" / "Block
@@ -403,8 +417,6 @@ const RUNNING: &str = "Running";
 const FOCUS: &str = "Focus";
 /// The next meeting's section, under Running.
 const NEXT: &str = "Next";
-/// The Settings page My Schedule's empty state opens.
-const SETTINGS_CALENDAR: &str = "Calendar";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
 /// with the same section share one header; `headed` heads a section even when it is the only
@@ -804,6 +816,8 @@ struct Launcher {
     hidden_events: HashSet<String>,
     /// A meeting reminder went out: the next open selects root's Next row, so Enter joins.
     pick_next: bool,
+    /// Add Calendar's fetch is on its way: Ctrl+Enter waits for it.
+    adding_calendar: bool,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -973,6 +987,7 @@ impl Launcher {
             calendar: calendar::Calendar::default(),
             hidden_events: calendar::load_hidden(&config::dir().join(CALENDAR_HIDDEN)),
             pick_next: false,
+            adding_calendar: false,
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -1733,15 +1748,14 @@ impl Launcher {
     /// My Schedule: Now, Today and Tomorrow, or why there is nothing.
     fn schedule_rows(&self) -> Vec<Item> {
         if self.cfg.calendar_feed.iter().all(|f| f.url.trim().is_empty()) {
-            // ponytail: opens Settings → Calendar until Task 15's Add Calendar form.
-            let add = vec![("Add Calendar".to_string(), Act::OpenSettings(SETTINGS_CALENDAR))];
+            let add = vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)];
             return vec![empty_row(g::CALENDAR_CLOCK, "No calendar connected".into(), "Paste your calendar's ICS address to see today's meetings here".into(), add)];
         }
         let now = search::now() as i64;
         let sections = calendar::sections(&self.calendar_events(), now);
         if sections.is_empty() {
             let text = if self.calendar.pending() { "Fetching your calendar…" } else { "Nothing on today or tomorrow" };
-            return vec![empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![])];
+            return vec![empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)])];
         }
         let mut rows = vec![];
         for (name, events) in sections {
@@ -1749,6 +1763,7 @@ impl Launcher {
                 let on = name == "Now";
                 let mut it = self.event_row(&e, if on { calendar::until(&e) } else { calendar::span(&e) }).sec(name);
                 it.now = on;
+                it.extra.push((Act::AddCalendar.label().to_string(), Act::AddCalendar));
                 rows.push(it);
             }
         }
@@ -1779,6 +1794,70 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Ctrl+Enter on Add Calendar: fetches the address once on the background executor; the
+    /// answer comes back as `Msg::CalendarAdded`.
+    fn add_calendar(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref().filter(|_| !self.adding_calendar) else { return };
+        let v = form_values(&form.fields);
+        let url = v["ICS address"].trim().to_string();
+        let name = match v["Name"].trim() {
+            "" => calendar::provider(&url),
+            n => n.to_string(),
+        };
+        let feed = config::CalendarFeed { name, colour: v["Colour"].to_string(), url };
+        self.adding_calendar = true;
+        self.status = Some((Tone::Info, "Reading the calendar…".into()));
+        let tx = self.tx.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let r = std::panic::catch_unwind(|| calendar::fetch(&feed.url)).unwrap_or_else(|_| Err("the fetch failed".into()));
+                let _ = tx.unbounded_send(Msg::CalendarAdded(feed, r));
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Add Calendar's fetch came back: a calendar that reads is added and My Schedule opens on
+    /// it ("Added Work"); one that does not keeps the form, the ActionBar saying so.
+    fn calendar_added(&mut self, feed: config::CalendarFeed, result: Result<Vec<calendar::Event>, String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding_calendar = false;
+        let here = self.mode == Mode::Form(FormKind::AddCalendar);
+        let fields = [("url", feed.url.as_str()), ("name", feed.name.as_str()), ("colour", feed.colour.as_str())];
+        let added = result
+            .map_err(|_| "Couldn't read this calendar".to_string())
+            .and_then(|events| config::edit_file(&config::path(), |t| config::edit_table(t, "calendar_feed", config::TableEdit::Add(&fields))).map(|(c, _)| (c, events)));
+        let (c, events) = match added {
+            Ok(v) => v,
+            Err(e) if here => {
+                self.status = Some((Tone::Error, e));
+                return cx.notify();
+            }
+            Err(e) => return self.say(Msg::error(e)),
+        };
+        self.cfg.calendar_feed = c.calendar_feed;
+        self.say(Msg::done(format!("Added {}", feed.name)));
+        self.calendar.added(feed.url, events);
+        if let Some(h) = self.settings_window {
+            drop(h.update(cx, |s, _, cx| s.reread(cx)));
+        }
+        if here {
+            self.status = None;
+            self.set_mode(Mode::Schedule, cx);
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
+    }
+
+    /// Left or Right on Add Calendar's Colour: the next swatch. False elsewhere.
+    fn step_swatch(&mut self, d: isize, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.mode, Mode::Form(_)) || self.panel.is_some() || self.menu.is_some() {
+            return false;
+        }
+        let Some(f) = self.form.as_mut().and_then(|f| f.fields.get_mut(f.field)).filter(|f| matches!(f.ctl, Ctl::Swatches)) else { return false };
+        f.value = calendar::step_colour(&f.value, d).into();
+        cx.notify();
+        true
+    }
+
     /// Every 10 s: fetches the feeds when due (off the UI thread), reminds of meetings about to
     /// start, and keeps root's Next row current.
     fn calendar_tick(&mut self, cx: &mut Context<Self>) {
@@ -1804,7 +1883,8 @@ impl Launcher {
             self.say(Msg::sticky(toast::Kind::Info, text));
             self.pick_next = true;
         }
-        if !self.visible || self.mode != Mode::Root || self.panel.is_some() || !self.query(cx).trim().is_empty() {
+        // An armed row waits for its second Enter: a refresh would move it.
+        if !self.visible || self.mode != Mode::Root || self.panel.is_some() || self.armed.is_some() || !self.query(cx).trim().is_empty() {
             return;
         }
         let next = self.next_rows();
@@ -3349,10 +3429,10 @@ impl Launcher {
 
     fn submit_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Mode::Form(kind) = self.mode {
-            // Each form acts on `form_values`: Task 15 fetches the feed.
+            // Each form acts on `form_values`.
             match kind {
                 FormKind::Focus => self.submit_focus(window, cx),
-                FormKind::AddCalendar => {}
+                FormKind::AddCalendar => self.add_calendar(cx),
                 FormKind::AddLanguageSet(edit) => self.save_lang_set(edit, window, cx),
             }
             return;
@@ -3610,14 +3690,7 @@ impl Launcher {
                 }
                 return self.refresh(cx);
             }
-            Act::OpenSettings(page) => {
-                self.hide(false, cx);
-                self.open_settings(cx);
-                if let Some(h) = self.settings_window {
-                    drop(h.update(cx, |s, window, cx| s.open_section(page, window, cx)));
-                }
-                return;
-            }
+            Act::AddCalendar => return self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
             Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
             Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
@@ -3954,8 +4027,8 @@ impl Launcher {
         };
         design::refresh_glass();
         self.refresh_index_status(cx);
-        let (tx, status) = (self.tx.clone(), self.index_status.clone());
-        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, window, cx))).ok();
+        let (tx, status, feeds) = (self.tx.clone(), self.index_status.clone(), self.calendar.status.clone());
+        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, feeds, window, cx))).ok();
     }
 
     /// Rewrites the Settings index line from the live index and repaints Settings.
@@ -4156,6 +4229,8 @@ impl Launcher {
             }
             // The old index is dropped; a new one re-crawls the folders (never the saved copy)
             // and reconnects the helper, which scans every drive's MFT afresh.
+            Msg::AddCalendar => self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
+            Msg::CalendarAdded(feed, result) => self.calendar_added(feed, result, window, cx),
             Msg::RebuildIndex => {
                 self.files = start_files(&self.cfg, &self.tx);
                 self.refresh_index_status(cx);
@@ -4248,6 +4323,10 @@ impl Launcher {
             Msg::Calendar(results) => {
                 for text in self.calendar.done(results, search::now()) {
                     self.say(Msg::error(text));
+                }
+                // Settings → Calendar says when each feed came.
+                if let Some(h) = self.settings_window {
+                    drop(h.update(cx, |_, _, cx| cx.notify()));
                 }
                 if self.visible && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
                     self.refresh(cx);
@@ -4598,6 +4677,25 @@ impl Launcher {
                     });
                     design::token_field(on, tokens, t).into_any_element()
                 }
+                // A click picks a swatch.
+                Ctl::Swatches => div()
+                    .h(px(design::CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(design::sp::S8))
+                    .children(calendar::COLOURS.iter().map(|&(name, tint)| {
+                        let me = me.clone();
+                        design::swatch(tint, f.value == name, t).id(SharedString::from(format!("swatch-{name}"))).on_click(move |_, _, cx| {
+                            me.update(cx, |this, cx| {
+                                if let Some(f) = this.form.as_mut().and_then(|f| f.fields.get_mut(i)) {
+                                    f.value = name.into();
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                    }))
+                    .into_any_element(),
                 Ctl::Note if f.label.is_empty() => return design::form_note(f.value.clone(), t).into_any_element(),
                 Ctl::Note => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(f.value.clone()).into_any_element(),
                 Ctl::Rule => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
@@ -4974,6 +5072,7 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::Translate(_) | Act::LangMenu => g::LANGUAGES,
         Act::UseLangSet(_) => g::CHECK,
         Act::EditLangSet(_) => g::EDIT,
+        Act::AddCalendar => g::PLUS,
         Act::DeleteLangSet(_) => g::DELETE,
         _ => g::PLAY,
     }
@@ -5540,8 +5639,16 @@ impl Render for Launcher {
                     this.open_lang_menu(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
-            .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                if !this.step_swatch(-1, cx) {
+                    this.grid_move(-1, 0, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                if !this.step_swatch(1, cx) {
+                    this.grid_move(1, 0, cx)
+                }
+            }))
             // Left and Right move through the emoji grid instead of the search text.
             .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
             // Tab and Shift+Tab move between the query and the boxes.
@@ -5661,6 +5768,9 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", Dismiss, Some("Form")),
         KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
         KeyBinding::new("backspace", PopToken, Some("Form")),
+        // Add Calendar's swatches; a text box keeps its own Left and Right.
+        KeyBinding::new("left", SelectLeft, Some("Form")),
+        KeyBinding::new("right", SelectRight, Some("Form")),
         KeyBinding::new("backspace", PopToken, Some(&format!("TokenMenu > {DEFAULT_INPUT_CONTEXT}"))),
         // The settings window when no text field has focus.
         KeyBinding::new("up", SelectPrev, Some("Settings")),
@@ -6280,6 +6390,22 @@ mod tests {
         assert_eq!(actions("backspace", &["Form", "TokenMenu", input])[..2], ["PopToken", "DeleteLeft"], "the token first, then (propagated) the text");
         assert_eq!(first("backspace", &["Form", input]), "DeleteLeft", "Goal's Backspace edits Goal");
         assert_eq!(first("backspace", &["Form"]), "PopToken", "on the token field itself");
+        assert_eq!((first("left", &["Form"]), first("right", &["Form"])), ("SelectLeft".into(), "SelectRight".into()), "Left and Right move between swatches");
+        assert_ne!(first("left", &["Form", input]), "SelectLeft", "a text box keeps its caret keys");
+    }
+
+    #[test]
+    fn add_calendar_asks_for_the_address_first_then_a_name_and_a_colour() {
+        let f = calendar_form();
+        assert_eq!(f.iter().position(FormField::focusable), Some(0), "the address is focused first");
+        assert!(matches!(&f[0].ctl, Ctl::Text { placeholder, icon: Some(g::LINK), .. } if placeholder.as_ref() == "https://calendar.google.com/…/basic.ics"));
+        assert!(matches!(&f[1].ctl, Ctl::Text { placeholder, icon: None, .. } if placeholder.as_ref() == "Work"));
+        assert!(matches!(f[2].ctl, Ctl::Swatches) && f[2].value == "system" && f[2].label.as_ref() == "Colour");
+        assert!(matches!(f[3].ctl, Ctl::Note) && f[3].label.is_empty());
+        assert_eq!(f[3].value, "Google: Settings → your calendar → Secret address in iCal format. Outlook: Settings → Shared calendars → Publish → ICS.");
+        assert_eq!(form_values(&f).get("Colour"), Some(&"system"));
+        assert_eq!(FormKind::AddCalendar.bar(), (g::CALENDAR_CLOCK, "Add Calendar", "Add Calendar"));
+        assert_eq!(Act::AddCalendar.label(), "Add Calendar");
     }
 
     #[test]

@@ -70,6 +70,10 @@ pub enum Msg {
     FilePreviewDropped(String),
     /// Settings → Files → Rebuild: start the file index over.
     RebuildIndex,
+    /// Settings → Calendar → Add Calendar…: open the launcher's Add Calendar form.
+    AddCalendar,
+    /// Add Calendar's one fetch finished: the feed to add, and its events or why it failed.
+    CalendarAdded(crate::config::CalendarFeed, Result<Vec<crate::calendar::Event>, String>),
     /// The window's content height changed (compact mode); resize between updates.
     Resize,
     /// Something was installed or removed: the app list should be rescanned.

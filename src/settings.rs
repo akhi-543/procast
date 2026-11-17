@@ -21,7 +21,7 @@ use crate::{
     win::Msg,
 };
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum Kind {
     Text,
     Number,
@@ -34,6 +34,10 @@ enum Kind {
     Language(&'static [Opt]),
     /// A list of strings: removable chips plus an Add field.
     List,
+    /// A list of strings typed as one comma-separated field ("lunch, focus time").
+    Csv,
+    /// Settings → Calendar: `[[calendar_feed]]` i (Delete removes it), or None for Add Calendar….
+    Feed(Option<usize>),
     /// A list of launcher item keys, shown by item name; entries can only be removed here.
     Keys,
     /// Opens a file.
@@ -272,6 +276,16 @@ fn focus_categories(text: &str) -> Vec<Row> {
 fn choice_at(opts: &[Opt], value: &str, path: &[String]) -> Option<usize> {
     let at = |v: &str| opts.iter().position(|o| o.1.text() == v);
     at(value).or_else(|| at(&config::shown_value("", path)))
+}
+
+/// A `Kind::Csv` field's text as the list it saves: "lunch, focus time" -> ["lunch", "focus time"].
+fn csv_list(typed: &str) -> Vec<String> {
+    typed.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
+/// A list as `config::shown_value` reads it ("a; b") in a `Kind::Csv` field: "a, b".
+fn csv_text(shown: &str) -> String {
+    shown.split("; ").filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
 }
 
 /// "snippet" -> "Snippet".
@@ -587,14 +601,31 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Play sound", "focus.sound", Kind::Bool, "").with_icon(g::VOLUME_2),
             ],
         )]),
-        "Calendar" => groups(vec![(
-            "Meetings",
-            vec![
-                row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask \"Join <title>?\" before opening a meeting link.").with_icon(g::VIDEO),
-                row("Remind before", "calendar.remind_minutes", Kind::Number, "Minutes before an event to show a reminder. 0 turns reminders off.").with_icon(g::BELL),
-                row("Ignore events", "calendar.ignore", Kind::List, "Events whose title contains one of these words are left out.").with_icon(g::BAN),
-            ],
-        )]),
+        "Calendar" => {
+            let feeds = config::parse(text).map(|c| c.calendar_feed).unwrap_or_default();
+            let feed = |i: Option<usize>| {
+                let (label, path) = match i {
+                    Some(i) => {
+                        let f = &feeds[i];
+                        (if f.name.trim().is_empty() { crate::calendar::provider(&f.url) } else { f.name.clone() }, vec!["calendar_feed".into(), i.to_string(), "name".into()])
+                    }
+                    None => ("Add Calendar…".into(), vec![]),
+                };
+                Row { label, help: String::new(), path, kind: Kind::Feed(i), group: "Calendars".into(), icon: g::CALENDAR_CLOCK }
+            };
+            let mut out: Vec<Row> = (0..feeds.len()).map(Some).chain([None]).map(feed).collect();
+            out.extend(groups(vec![(
+                "",
+                vec![
+                    row("Refresh every", "calendar.refresh_minutes", Kind::Choice(&[("5 min", N(5)), ("15 min", N(15)), ("30 min", N(30)), ("60 min", N(60))]), "How often the ICS feeds are fetched").with_icon(g::REFRESH),
+                    row("Remind me before", "calendar.remind_minutes", Kind::Choice(&[("Off", N(0)), ("2 min", N(2)), ("5 min", N(5)), ("10 min", N(10)), ("15 min", N(15)), ("30 min", N(30))]), "A notice with Join, before each meeting with a link").with_icon(g::BELL),
+                    row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask before opening the meeting link").with_icon(g::VIDEO),
+                    row("Next meeting in search", "calendar.next_in_search", Kind::Bool, "Show the next meeting within 15 minutes at the top of search").with_icon(g::CALENDAR_CLOCK),
+                    row("Ignore events with", "calendar.ignore", Kind::Csv, "Comma-separated words; matching events are hidden").with_icon(g::BAN),
+                ],
+            )]));
+            out
+        }
         "Shortcuts" | "Screenshots" | "Notes" => vec![],
         _ => {
             let watcher = if crate::foreground::RUNNING.load(std::sync::atomic::Ordering::Relaxed) { "Foreground watcher: running" } else { "Foreground watcher: stopped" };
@@ -641,6 +672,8 @@ pub struct Settings {
     tx: UnboundedSender<Msg>,
     /// The file index line, kept current by the launcher.
     index_status: Arc<RwLock<String>>,
+    /// When each calendar feed last came, kept current by the launcher.
+    feeds: crate::calendar::FeedStatus,
     /// `[launcher]` as last saved: the Shortcuts table reads hotkeys and on/off from here
     /// instead of re-parsing the file for every row.
     launcher: config::Launcher,
@@ -670,7 +703,7 @@ struct OpenMenu {
 }
 
 impl Settings {
-    pub fn new(items: Vec<Item>, tx: UnboundedSender<Msg>, index_status: Arc<RwLock<String>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(items: Vec<Item>, tx: UnboundedSender<Msg>, index_status: Arc<RwLock<String>>, feeds: crate::calendar::FeedStatus, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let _menu_filter = cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
             if let Some(open) = &mut this.menu {
@@ -685,6 +718,7 @@ impl Settings {
             text: std::fs::read_to_string(config::path()).unwrap_or_default(),
             tx,
             index_status,
+            feeds,
             launcher: config::load().map(|c| c.launcher).unwrap_or_default(),
             exts: ext::scan(),
             items,
@@ -716,11 +750,13 @@ impl Settings {
         }
     }
 
-    /// Shows page `name` (Settings → Calendar from My Schedule's empty state).
-    pub fn open_section(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(s) = SECTIONS.iter().position(|x| *x == name) {
-            self.set_section(s, window, cx);
+    /// The launcher wrote config.toml (Add Calendar): the Calendars list shows the new feed.
+    /// Every save here reads the file afresh, so this copy only draws rows.
+    pub fn reread(&mut self, cx: &mut Context<Self>) {
+        if let Ok(text) = crate::focus::text_or_empty(std::fs::read_to_string(config::path())) {
+            self.text = text;
         }
+        cx.notify();
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -769,11 +805,12 @@ impl Settings {
         self.inputs.clear();
         self._subs.clear();
         for r in self.rows() {
-            if matches!(r.kind, Kind::Text | Kind::Number | Kind::List | Kind::Command(_)) {
+            if matches!(r.kind, Kind::Text | Kind::Number | Kind::List | Kind::Csv | Kind::Command(_)) {
                 let value = match r.kind {
                     Kind::Command(i) => self.launcher.aliases.get(&key_of(&self.items[i])).cloned().unwrap_or_default(),
                     // A list's input is its Add field.
                     Kind::List => String::new(),
+                    Kind::Csv => csv_text(&config::shown_value(&self.text, &r.path)),
                     _ if multiline(&r.path) => config::shown_value(&self.text, &r.path).replace('\n', "\\n"),
                     _ => config::shown_value(&self.text, &r.path),
                 };
@@ -838,6 +875,13 @@ impl Settings {
             input.update(cx, |s, cx| s.emplace("", cx));
             return self.save_list(&r.path, list, cx);
         }
+        if r.kind == Kind::Csv {
+            let list = csv_list(&typed);
+            if list != self.list(&r.path) {
+                self.save_list(&r.path, list, cx);
+            }
+            return;
+        }
         if typed == config::shown_value(&self.text, &r.path) {
             return;
         }
@@ -882,7 +926,8 @@ impl Settings {
             Some(i) => name_rows.get(i).or(name_rows.last()),
         };
         self.selected = at.copied().unwrap_or(0);
-        self.status = Some((false, format!("{} {verb}", capital(list))));
+        let what = if list == "calendar_feed" { "Calendar".to_string() } else { capital(list) };
+        self.status = Some((false, format!("{what} {verb}")));
         self.focus_row(window, cx);
     }
 
@@ -967,7 +1012,9 @@ impl Settings {
                 cx.notify();
             }
             Kind::Open(file) => crate::win::open(&config::dir().join(file).to_string_lossy()),
-            Kind::Text | Kind::Number | Kind::List => self.commit(cx),
+            Kind::Text | Kind::Number | Kind::List | Kind::Csv => self.commit(cx),
+            Kind::Feed(None) => drop(self.tx.unbounded_send(Msg::AddCalendar)),
+            Kind::Feed(Some(_)) => {}
             Kind::Category => {
                 self.category = (self.category + 1) % CATEGORIES.len();
                 cx.notify();
@@ -1061,6 +1108,7 @@ impl Settings {
                 Kind::Command(i) if k.modifiers.control && k.key == "d" => self.toggle_enabled(i, cx),
                 Kind::TableItem(list, i) if k.modifiers.control && k.key == "d" => self.edit_table(list, config::TableEdit::Duplicate(i), window, cx),
                 Kind::TableItem(list, i) if k.key == "delete" && !k.modifiers.modified() => self.edit_table(list, config::TableEdit::Remove(i), window, cx),
+                Kind::Feed(Some(i)) if k.key == "delete" && !k.modifiers.modified() => self.edit_table("calendar_feed", config::TableEdit::Remove(i), window, cx),
                 _ => return,
             }
             return cx.stop_propagation();
@@ -1106,7 +1154,7 @@ impl Settings {
         let Some(input) = self.inputs.get(&r.path.join(".")) else { return div().into_any_element() };
         let width = match r.kind {
             Kind::Number => 120.,
-            Kind::List => 240.,
+            Kind::List | Kind::Csv => 240.,
             Kind::Filter => 320.,
             Kind::Command(_) => 110.,
             _ => 440.,
@@ -1120,6 +1168,7 @@ impl Settings {
                     .state(input.downgrade())
                     .placeholder(match r.kind {
                         Kind::List => "Add an entry…",
+                        Kind::Csv => "lunch, focus time",
                         Kind::Filter => "Filter by name or alias…",
                         Kind::Command(_) => "Alias…",
                         _ => "",
@@ -1135,7 +1184,9 @@ impl Settings {
     fn input_control(&self, r: &Row, on: bool, t: &design::Tokens, me: &gpui::WeakEntity<Self>) -> AnyElement {
         let value = config::shown_value(&self.text, &r.path);
         match &r.kind {
-            Kind::Text | Kind::Number | Kind::Filter | Kind::Command(_) => self.text_box(r, on, t),
+            Kind::Text | Kind::Number | Kind::Csv | Kind::Filter | Kind::Command(_) => self.text_box(r, on, t),
+            // Drawn whole by `row_view`.
+            Kind::Feed(_) => div().into_any_element(),
             Kind::List | Kind::Keys => {
                 let entries = self.list(&r.path);
                 let kind = r.kind.clone();
@@ -1353,12 +1404,25 @@ impl Settings {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
                     this.select(i, window, cx);
-                    let typed = matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List | Kind::Keys | Kind::Filter | Kind::Command(_) | Kind::Choice(_) | Kind::Category);
+                    let typed = matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List | Kind::Csv | Kind::Feed(Some(_)) | Kind::Keys | Kind::Filter | Kind::Command(_) | Kind::Choice(_) | Kind::Category);
                     if again && matches!(this.rows()[i].kind, Kind::Command(_)) || !typed {
                         this.activate(window, cx);
                     }
                 }))
             });
+        if let Kind::Feed(feed) = r.kind {
+            let Some(i) = feed else { return base.child(design::feed_add(t)).into_any_element() };
+            let field = |f: &str| config::shown_value(&self.text, &["calendar_feed".into(), i.to_string(), f.into()]);
+            let url = field("url");
+            let ago = self.feeds.read().unwrap().get(&url).map(|at| at.elapsed());
+            let sub = [crate::calendar::provider(&url), crate::calendar::updated_text(ago)].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            let me = me.clone();
+            let delete = div().id(("feed-delete", i)).flex().child(design::icon(g::DELETE, design::ic::MD, t.text_faint)).on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                drop(me.update(cx, |this, cx| this.edit_table("calendar_feed", config::TableEdit::Remove(i), window, cx)));
+            });
+            return base.child(design::feed_row(crate::calendar::tint(&field("colour")).hue(t), &r.label, &sub, on, delete, t)).into_any_element();
+        }
         if recipe {
             // A control too wide for the right edge (lists, long segments) wraps under the title.
             let wide = stack || matches!(r.kind, Kind::List | Kind::Keys);
@@ -1693,7 +1757,7 @@ mod tests {
     #[test]
     fn long_choice_rows_stack() {
         let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[], "")).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
-        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone"]);
+        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone", "Remind me before"]);
         assert!(stacked(&Kind::Category));
     }
 
@@ -1772,6 +1836,41 @@ mod tests {
         );
         assert_eq!(cats[7].help, "0 apps · 1 websites");
         assert!(cats.iter().all(|r| r.kind == Kind::Status(Live::Nothing) && r.path.is_empty()), "names to read, nothing to edit");
+    }
+
+    #[test]
+    fn the_calendar_page_lists_the_calendars_then_its_five_settings() {
+        let s = SECTIONS.iter().position(|x| *x == "Calendar").unwrap();
+        let text = "[[calendar_feed]]\nurl = \"https://calendar.google.com/a/basic.ics\"\nname = \"Work\"\ncolour = \"paste\"\n";
+        let page = rows(s, &[], text);
+        let shown: Vec<(&str, &str, &str, &str)> = page.iter().map(|r| (r.group.as_str(), r.label.as_str(), r.help.as_str(), r.icon)).collect();
+        let want = [
+            ("Calendars", "Work", "", g::CALENDAR_CLOCK),
+            ("Calendars", "Add Calendar…", "", g::CALENDAR_CLOCK),
+            ("", "Refresh every", "How often the ICS feeds are fetched", g::REFRESH),
+            ("", "Remind me before", "A notice with Join, before each meeting with a link", g::BELL),
+            ("", "Confirm before joining", "Ask before opening the meeting link", g::VIDEO),
+            ("", "Next meeting in search", "Show the next meeting within 15 minutes at the top of search", g::CALENDAR_CLOCK),
+            ("", "Ignore events with", "Comma-separated words; matching events are hidden", g::BAN),
+        ];
+        assert_eq!(shown, want);
+        assert_eq!((&page[0].kind, &page[0].path[..]), (&Kind::Feed(Some(0)), &["calendar_feed".to_string(), "0".into(), "name".into()][..]));
+        assert_eq!(page[1].kind, Kind::Feed(None));
+        let opts = |k: &Kind| if let Kind::Choice(o) = k { o.iter().map(|o| (o.0, o.1.text())).collect::<Vec<_>>() } else { vec![] };
+        assert_eq!(opts(&page[2].kind), [("5 min", "5"), ("15 min", "15"), ("30 min", "30"), ("60 min", "60")].map(|(l, v)| (l, v.to_string())));
+        assert_eq!(opts(&page[3].kind), [("Off", "0"), ("2 min", "2"), ("5 min", "5"), ("10 min", "10"), ("15 min", "15"), ("30 min", "30")].map(|(l, v)| (l, v.to_string())));
+        assert_eq!((&page[4].kind, &page[5].kind, &page[6].kind), (&Kind::Bool, &Kind::Bool, &Kind::Csv));
+        assert_eq!(rows(s, &[], "").iter().filter(|r| matches!(r.kind, Kind::Feed(_))).count(), 1, "no calendars: only Add Calendar…");
+    }
+
+    #[test]
+    fn a_comma_separated_row_saves_a_list() {
+        assert_eq!(csv_list("lunch, focus time"), ["lunch", "focus time"]);
+        assert_eq!(csv_list(" , lunch,, "), ["lunch"]);
+        let path = ["calendar".to_string(), "ignore".into()];
+        let text = config::write_value("", &path, csv_list("lunch, focus time").iter().map(String::as_str).collect::<toml_edit::Array>().into()).unwrap();
+        assert_eq!(config::parse(&text).unwrap().calendar.ignore, ["lunch", "focus time"]);
+        assert_eq!(csv_text(&config::shown_value(&text, &path)), "lunch, focus time");
     }
 
     #[test]
