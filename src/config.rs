@@ -225,11 +225,19 @@ pub struct YtMusic {
     pub columns: usize,
     /// Percent that Volume Up and Volume Down change the volume by.
     pub volume_step: u32,
+    /// YouTube Music Desktop App companion (ytmdesktop, port 9863).
+    pub desktop_url: String,
 }
 
 impl Default for YtMusic {
     fn default() -> Self {
-        Self { enabled: true, tray: false, columns: 5, volume_step: 10 }
+        Self {
+            enabled: true,
+            tray: false,
+            columns: 5,
+            volume_step: 10,
+            desktop_url: "http://127.0.0.1:9863".into(),
+        }
     }
 }
 
@@ -590,6 +598,7 @@ enabled = true                # search, library and playback controls for music.
 tray = false                  # a tray icon with the current track and playback controls
 columns = 5                   # albums per row in the grid
 volume_step = 10              # percent that Volume Up and Volume Down change the volume by
+desktop_url = "http://127.0.0.1:9863"  # YouTube Music Desktop App companion server
 
 [files]
 enabled = true

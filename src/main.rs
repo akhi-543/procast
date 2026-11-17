@@ -22,6 +22,7 @@ mod snippets;
 mod system;
 mod toast;
 mod win;
+mod ytmdesktop;
 mod ytmusic;
 
 use std::{
