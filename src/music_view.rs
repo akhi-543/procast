@@ -167,12 +167,12 @@ fn playlists_from_desktop(list: Vec<(String, String)>) -> Vec<MusicItem> {
         .collect()
 }
 
+fn playlists_need_desktop(reply: &Reply) -> bool {
+    reply.error.as_deref() == Some(ytmusic_api::SIGN_IN) || reply.items.is_empty()
+}
+
 fn apply_desktop_playlists(shelf: Shelf, mut reply: Reply, desktop: Option<Vec<(String, String)>>) -> Reply {
-    if shelf != Shelf::Playlists {
-        return reply;
-    }
-    let needs = reply.error.as_deref() == Some(ytmusic_api::SIGN_IN) || reply.items.is_empty();
-    if !needs {
+    if shelf != Shelf::Playlists || !playlists_need_desktop(&reply) {
         return reply;
     }
     let Some(list) = desktop else { return reply };
@@ -650,9 +650,11 @@ impl Launcher {
             };
             let mut reply = catalog_reply(&ask, result);
             if let Ask::Shelf(Shelf::Playlists) = &ask {
-                let desktop = ytmdesktop::Desktop::new(&base);
-                let list = ytmdesktop::ensure_token(&desktop).and_then(|token| ytmdesktop::playlists(&token, &desktop.base)).ok();
-                reply = apply_desktop_playlists(Shelf::Playlists, reply, list);
+                if playlists_need_desktop(&reply) {
+                    let desktop = ytmdesktop::Desktop::new(&base);
+                    let list = ytmdesktop::ensure_token(&desktop).and_then(|token| ytmdesktop::playlists(&token, &desktop.base)).ok();
+                    reply = apply_desktop_playlists(Shelf::Playlists, reply, list);
+                }
             }
             reply.req = req;
             let _ = tx.unbounded_send(Msg::Music(reply));
@@ -1330,6 +1332,10 @@ mod tests {
         assert_eq!(filled.items, items);
         let from_empty = apply_desktop_playlists(Shelf::Playlists, empty, Some(rows.clone()));
         assert_eq!(from_empty.items, items);
+        let loaded = Reply { op: "browse".into(), items: vec![MusicItem { title: "Mine".into(), ..Default::default() }], ..Default::default() };
+        assert!(!playlists_need_desktop(&loaded));
+        assert!(playlists_need_desktop(&unsigned));
+        assert_eq!(apply_desktop_playlists(Shelf::Playlists, loaded.clone(), Some(rows.clone())).items[0].title, "Mine");
         let albums = apply_desktop_playlists(Shelf::Albums, unsigned.clone(), Some(rows));
         assert_eq!(albums.error.as_deref(), sign_in);
         assert!(albums.items.is_empty());
