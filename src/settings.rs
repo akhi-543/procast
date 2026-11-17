@@ -248,7 +248,7 @@ fn head(section: &str) -> Option<&'static str> {
         "Games" => "Turn HDR on by itself while you play.",
         "Focus" => "Block distracting apps and websites while you work.",
         "Screenshots" => "Find screenshots by the words in them.",
-        "Notes" => "",
+        "Notes" => "Quick notes in a floating window.",
         _ => return None,
     })
 }
@@ -643,7 +643,14 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Keep screenshots for", "screenshots.keep", Kind::Choice(&CLIPBOARD_KEEP[1..]), "Pinned screenshots are kept").with_icon(g::CLOCK),
             ],
         )]),
-        "Shortcuts" | "Notes" => vec![],
+        "Notes" => groups(vec![(
+            "",
+            vec![
+                row("Notes folder", "notes.folder", Kind::Text, "One markdown file per note. Empty: %APPDATA%\\procast\\notes").with_icon(g::FOLDER),
+                row("Keep deleted notes for", "notes.keep_deleted_days", Kind::Choice(&[("7 days", N(7)), ("30 days", N(30)), ("90 days", N(90))]), "Then Recently Deleted Notes removes them").with_icon(g::ARCHIVE_RESTORE),
+            ],
+        )]),
+        "Shortcuts" => vec![],
         _ => {
             let watcher = if crate::foreground::RUNNING.load(std::sync::atomic::Ordering::Relaxed) { "Foreground watcher: running" } else { "Foreground watcher: stopped" };
             vec![
@@ -782,7 +789,7 @@ impl Settings {
         }
         let section = SECTIONS[self.section];
         let mut out = rows(self.section, &self.exts, &self.text);
-        if !matches!(section, "Translator" | "Screenshots" | "Focus") {
+        if !matches!(section, "Translator" | "Screenshots" | "Focus" | "Notes") {
             return out;
         }
         // Then its commands (their subtitle is the section's name), each with its alias and hotkey.
@@ -1567,7 +1574,7 @@ impl Render for Settings {
                     .whitespace_nowrap()
                     .into_any_element()
             });
-            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
+            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, |_, _| None, &t)
         });
         let heading = match head(SECTIONS[self.section]) {
             // `.pc-sett__head`: the sticker tile, the name, the line on what it does.
@@ -1937,6 +1944,25 @@ mod tests {
         assert_eq!(opts(&page[3].kind), [("Off", "0"), ("2 min", "2"), ("5 min", "5"), ("10 min", "10"), ("15 min", "15"), ("30 min", "30")].map(|(l, v)| (l, v.to_string())));
         assert_eq!((&page[4].kind, &page[5].kind, &page[6].kind), (&Kind::Bool, &Kind::Bool, &Kind::Csv));
         assert_eq!(rows(s, &[], "").iter().filter(|r| matches!(r.kind, Kind::Feed(_))).count(), 1, "no calendars: only Add Calendar…");
+    }
+
+    #[test]
+    fn the_notes_page_lists_its_two_settings() {
+        let s = SECTIONS.iter().position(|x| *x == "Notes").unwrap();
+        let page = rows(s, &[], "");
+        let shown: Vec<(&str, &[String], &str)> = page.iter().map(|r| (r.label.as_str(), r.path.as_slice(), r.icon)).collect();
+        let path = |p: &str| p.split('.').map(String::from).collect::<Vec<_>>();
+        assert_eq!(shown, [("Notes folder", path("notes.folder").as_slice(), g::FOLDER), ("Keep deleted notes for", path("notes.keep_deleted_days").as_slice(), g::ARCHIVE_RESTORE)]);
+        assert_eq!(head("Notes"), Some("Quick notes in a floating window."));
+        assert_eq!(page[0].kind, Kind::Text);
+        let Kind::Choice(keep) = page[1].kind else { panic!("Keep is a Choice") };
+        assert_eq!(keep.iter().map(|o| (o.0, o.1.text())).collect::<Vec<_>>(), [("7 days", "7"), ("30 days", "30"), ("90 days", "90")].map(|(l, v)| (l, v.to_string())));
+        assert_eq!(choice_at(keep, &config::shown_value("", &page[1].path), &page[1].path), Some(1), "30 days by default");
+        // both keys save and read back
+        let text = config::write_value("", &page[1].path, keep[0].1.value()).unwrap();
+        let text = config::write_value(&text, &page[0].path, "D:\\Notes".into()).unwrap();
+        let cfg = config::parse(&text).unwrap();
+        assert_eq!((cfg.notes.keep_deleted_days, cfg.notes.folder.as_str()), (7, "D:\\Notes"));
     }
 
     #[test]

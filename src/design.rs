@@ -130,6 +130,8 @@ pub mod r {
 
 /// Glyph sizes.
 pub mod ic {
+    /// The ▾ beside a Notes formatting bar item.
+    pub const XS: f32 = 10.;
     /// Inside key caps, chips and dropdowns.
     pub const SM: f32 = 12.;
     /// The action bar, action-panel rows, notices.
@@ -153,6 +155,11 @@ pub mod sp {
 /// `.pc-pop--right`: the menu under the bar's Dropdown.
 pub const POP_RIGHT_W: f32 = 290.;
 pub const POP_RIGHT_TOP: f32 = 50.;
+/// `.pc-pop--center`: the Notes action list over the note, and `.pc-pop--top`: Browse Notes
+/// just under the header.
+pub const POP_CENTER_W: f32 = 320.;
+pub const POP_CENTER_TOP: f32 = 64.;
+pub const POP_CENTER_TOP_HEAD: f32 = 36.;
 
 /// The Notes window's first size (`.pc-notes`).
 pub const NOTES_W: f32 = 560.;
@@ -421,6 +428,9 @@ names! {
     SQUARE_MENU = "square-menu",
     ARCHIVE_RESTORE = "archive-restore",
     TYPE = "type",
+    HEADING = "heading",
+    QUOTE = "quote",
+    LIST_ORDERED = "list-ordered",
     EYE = "eye",
     BAN = "ban",
     PLUS = "plus",
@@ -1506,10 +1516,11 @@ pub fn pop_rule(t: &Tokens) -> Div {
     div().flex_none().h(px(1.)).my(px(sp::S4)).bg(t.hairline)
 }
 
-/// One menu row (`.pc-pop .pc-sel`): icon, label (over a muted second line when `two_line`)
-/// and the faint `sub` on the right. An `off` row is faint.
+/// One menu row (`.pc-pop .pc-sel`): icon, label (over a muted second line when `two_line`),
+/// the faint `sub` and the `keys` as caps on the right. An `off` row is faint; a `danger` one
+/// is in `danger` like `panel_row`.
 pub fn pop_row(e: &crate::menu::Entry, on: bool, t: &Tokens) -> Div {
-    let label = div().min_w_0().truncate().child(e.label.clone());
+    let label = div().min_w_0().truncate().when(e.danger && !on, |d| d.text_color(t.danger)).child(e.label.clone());
     let text = match &e.two_line {
         Some(line) => div().flex_1().min_w_0().flex().flex_col().gap(px(sp::S2)).child(label).child(div().min_w_0().truncate().text_size(px(ts::SMALL)).text_color(t.text_muted).child(line.clone())),
         None => div().flex_1().min_w_0().flex().child(label),
@@ -1519,21 +1530,25 @@ pub fn pop_row(e: &crate::menu::Entry, on: bool, t: &Tokens) -> Div {
         .gap(px(sp::S8))
         .when(e.two_line.is_some(), |d| d.h_auto().py(px(sp::S4)))
         .when(e.off, |d| d.text_color(t.text_faint))
-        .children(e.icon.map(|g| icon(g, ic::MD, t.text_muted)))
+        .children(e.icon.map(|g| icon(g, ic::MD, if e.danger { t.danger } else { t.text_muted })))
         .child(text)
         .when(!e.sub.is_empty(), |d| d.child(div().flex_none().text_color(t.text_faint).child(e.sub.clone())))
+        .when(!e.keys.is_empty(), |d| d.child(key_caps(e.keys, t)))
 }
 
 /// The open Dropdown (`.pc-pop`) over the whole window: a transparent layer that takes clicks
 /// outside the menu (the host closes on `on_outside`), and the menu at `m.place`, capped at the
 /// room below its top so its list scrolls. `search` is the search input, drawn when
 /// `m.search` is set; `scroll` tracks the list (one child per `m.rows()`). `on_pick` gets the index into `m.entries` of a clicked row.
+/// `trail(i, selected)` may end entry `i`'s row with the host's buttons (Browse Notes' Pin and
+/// Delete); a row is the group "pop-row", so they can show on hover.
 pub fn pop_menu(
     m: &crate::menu::Menu,
     search: Option<AnyElement>,
     scroll: &gpui::ScrollHandle,
     on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
     on_outside: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    trail: impl Fn(usize, bool) -> Option<AnyElement>,
     t: &Tokens,
 ) -> gpui::Stateful<Div> {
     use crate::menu::{Place, Row};
@@ -1543,7 +1558,7 @@ pub fn pop_menu(
         Row::Rule => pop_rule(t).into_any_element(),
         Row::Item(i) => {
             let e = &m.entries[i];
-            let row = pop_row(e, i == m.selected, t).id(("pop", i));
+            let row = pop_row(e, i == m.selected, t).group("pop-row").children(trail(i, i == m.selected)).id(("pop", i));
             let pick = on_pick.clone();
             if e.off { row.into_any_element() } else { row.on_click(move |_, window, cx| pick(i, window, cx)).into_any_element() }
         }
@@ -1562,6 +1577,8 @@ pub fn pop_menu(
         Place::Right => layer.items_end().pt(px(POP_RIGHT_TOP)).pr(px(sp::S12)).child(pop.w(px(POP_RIGHT_W))),
         Place::Under(left) => layer.items_start().pt(px(POP_RIGHT_TOP)).pl(left).child(pop.w(px(POP_RIGHT_W))),
         Place::At(at) => layer.items_start().pt(at.y).pl(at.x).child(pop.w(px(POP_RIGHT_W))),
+        Place::Center(top) => layer.items_center().pt(top).child(pop.w(px(POP_CENTER_W))),
+        Place::Above(bottom) => layer.items_center().justify_end().pb(bottom).child(pop.w(px(POP_CENTER_W))),
     }
 }
 

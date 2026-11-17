@@ -752,20 +752,16 @@ fn note_rows(list: NotesList, rows: &[(NoteMeta, usize)], current: Option<(Strin
     let items: Vec<Item> = rows
         .iter()
         .map(|(m, n)| {
-            let count = notes::window::char_count_text(*n);
-            let cur = current.as_ref().filter(|(id, _)| *id == m.id).map(|(_, n)| *n);
             let it = match (list, m.deleted_at) {
                 (NotesList::Deleted, Some(at)) => {
-                    let mut it = Item::new(&m.title, format!("Deleted {} · {count}", ago(at)), Icon::Vector(g::ARCHIVE_RESTORE), Act::RestoreNote(m.id.clone())).sec("Recently Deleted");
+                    let mut it = Item::new(&m.title, format!("Deleted {} · {}", ago(at), notes::window::char_count_text(*n)), Icon::Vector(g::ARCHIVE_RESTORE), Act::RestoreNote(m.id.clone())).sec("Recently Deleted");
                     it.extra = [Act::RestoreNote(m.id.clone()), Act::PurgeNote(m.id.clone())].map(|a| (a.label().to_string(), a)).to_vec();
                     it
                 }
-                (NotesList::All, _) if cur.is_some() => {
-                    let n = notes::window::char_count_text(cur.unwrap_or(*n));
-                    Item::new(&m.title, format!("● Current · {n}"), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes")
+                _ => {
+                    let cur = current.as_ref().filter(|(id, _)| list == NotesList::All && *id == m.id).map(|(_, n)| *n);
+                    Item::new(&m.title, notes::window::note_line(m, *n, cur, now), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes")
                 }
-                _ if m.opened > 0 => Item::new(&m.title, format!("Opened {} · {count}", ago(m.opened)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
-                _ => Item::new(&m.title, format!("Edited {} · {count}", ago(m.modified)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
             };
             it.tinted(design::Tint::Paste)
         })
@@ -4752,6 +4748,10 @@ impl Launcher {
             // The old index is dropped; a new one re-crawls the folders (never the saved copy)
             // and reconnects the helper, which scans every drive's MFT afresh.
             Msg::AddCalendar => self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
+            Msg::RecentlyDeletedNotes => {
+                let mode = Mode::Notes(NotesList::Deleted);
+                if self.visible { self.set_mode(mode, cx) } else { self.show(mode, window, cx) }
+            }
             Msg::CalendarAdded(generation, feed, result) => self.calendar_added(generation, feed, result, window, cx),
             Msg::RebuildIndex => {
                 self.files = start_files(&self.cfg, &self.tx);
@@ -6295,7 +6295,7 @@ impl Render for Launcher {
                 // In the Block menu, Backspace in the empty search takes the last token.
                 div().flex_1().min_w_0().when(open.site.is_some(), |d| d.key_context("TokenMenu")).child(input).into_any_element()
             });
-            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
+            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, |_, _| None, &t)
         });
 
         // A form's keys live on the root, which stays drawn while Ctrl+K or a confirm covers

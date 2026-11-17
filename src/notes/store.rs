@@ -126,7 +126,6 @@ impl Store {
         self.add("", now).map(Ok)
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Duplicate Note"))]
     pub fn duplicate(&mut self, id: &str, now: i64) -> io::Result<Id> {
         self.index(id)?;
         let text = self.text(id)?;
@@ -143,7 +142,6 @@ impl Store {
         self.persist()
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Pin Note"))]
     pub fn pin(&mut self, id: &str, pinned: bool) -> io::Result<()> {
         let i = self.index(id)?;
         self.metas[i].pinned = pinned;
@@ -151,7 +149,6 @@ impl Store {
     }
 
     /// Soft delete: the note moves to `deleted()` until restored or purged.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Delete Note"))]
     pub fn delete(&mut self, id: &str, now: i64) -> io::Result<()> {
         let i = self.index(id)?;
         self.metas[i].deleted_at = Some(now);

@@ -3,7 +3,8 @@
 
 /// One row. `section` groups consecutive entries under a header; `rule_after` draws a rule
 /// below it; `off` shows it faint and skips it; `two_line` adds a second line under the label;
-/// `always` shows it whatever the search says (a row made from the typed text).
+/// `always` shows it whatever the search says (a row made from the typed text); `keys` are
+/// KeyCaps on the right ("Ctrl+Shift+P"); `danger` draws it in `danger` (Delete Note).
 #[derive(Clone, Default)]
 pub struct Entry {
     pub id: String,
@@ -16,6 +17,8 @@ pub struct Entry {
     pub off: bool,
     pub two_line: Option<String>,
     pub always: bool,
+    pub keys: &'static str,
+    pub danger: bool,
 }
 
 /// Where the menu sits in its window.
@@ -26,6 +29,11 @@ pub enum Place {
     Under(gpui::Pixels),
     /// `POP_RIGHT_W` wide, its top-left corner here: under a form field.
     At(gpui::Point<gpui::Pixels>),
+    /// `POP_CENTER_W` wide, centred, its top this far down: over the note (`.pc-pop--center`).
+    Center(gpui::Pixels),
+    /// `POP_CENTER_W` wide, centred, its bottom this far up from the window's: over the Notes
+    /// formatting bar.
+    Above(gpui::Pixels),
 }
 
 pub struct Menu {

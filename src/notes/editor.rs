@@ -465,6 +465,16 @@ impl Buffer {
         }
     }
 
+    /// Link (`image`: an image): the selection becomes `[text]()` (`![text]()`), the caret
+    /// between the parentheses for the address.
+    pub fn link(&mut self, image: bool) {
+        let (a, b) = self.selection();
+        self.record(false);
+        let wrapped = format!("{}[{}]()", if image { "!" } else { "" }, &self.text[a..b]);
+        self.text.replace_range(a..b, &wrapped);
+        self.collapse(a + wrapped.len() - 1);
+    }
+
     /// Gives every line of the selection the block's prefix, replacing any other block prefix;
     /// when they all have it already, removes it. Code wraps the lines in fences instead.
     pub fn set_block(&mut self, block: Block) {
@@ -1186,6 +1196,21 @@ mod tests {
         let mut b = Buffer::new("* a");
         b.set_block(Block::Bullet);
         assert_eq!(b.text(), "a");
+    }
+
+    #[test]
+    fn link_and_image_wrap_the_selection_with_the_caret_in_the_address() {
+        let mut b = sel("see docs", 4, 8);
+        b.link(false);
+        assert_eq!((b.text(), b.cursor(), b.anchor()), ("see [docs]()", 11, 11));
+        b.insert("x");
+        assert_eq!(b.text(), "see [docs](x)");
+        b.undo();
+        b.undo();
+        assert_eq!(b.text(), "see docs", "one undo step each");
+        let mut b = Buffer::new("é");
+        b.link(true);
+        assert_eq!((b.text(), b.cursor()), ("é![]()", "é![](".len()));
     }
 
     #[test]

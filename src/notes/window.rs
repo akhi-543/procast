@@ -17,20 +17,22 @@ use futures::{
     },
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, DispatchPhase, FocusHandle, FontStyle, FontWeight, HighlightStyle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle, StyledText, Subscription, TextLayout, UnderlineStyle, Window, WindowControlArea,
-    PaintQuad, canvas, div, point, prelude::*, size,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle, StyledText, Subscription,
+    TextLayout, UnderlineStyle, Window, WindowControlArea, PaintQuad, canvas, div, point, prelude::*, size,
 };
-use gpui_ce_elements::editable_text::BLINK_INTERVAL_500MS;
+use gpui_ce_elements::editable_text::{BLINK_INTERVAL_500MS, EditableTextState, StringStorage, TextChanged, text_input};
 use serde::{Deserialize, Serialize};
 
 use super::{
     editor::{self, Block, Buffer, Mark, Span, SpanCache, Style},
-    store::{Exists, Id, Store, title_of},
+    store::{Exists, Id, NoteMeta, Store, title_of},
 };
 use crate::{
-    config,
+    Dismiss, Launch, OpenDropdown, SelectNext, SelectPrev, ToggleActions, config,
     design::{self, Tint, Tokens, g, ic, mix, px, r, sp, ts},
     focus,
+    menu::{self, Entry, Menu},
+    timers,
     win::{self, Msg},
 };
 
@@ -105,8 +107,199 @@ pub fn char_count_text(n: usize) -> String {
     if n == 1 { "1 character".into() } else { format!("{} characters", design::thousands(n)) }
 }
 
+/// A note's second line in Browse Notes and Search Notes: "● Current · 186 characters" for the
+/// note on screen (`current`: its length with its edits), else "Opened 2 days ago · 397
+/// characters" ("Edited …" for a note never opened).
+pub fn note_line(m: &NoteMeta, n: usize, current: Option<usize>, now: i64) -> String {
+    let ago = |t: i64| timers::ago(now.saturating_sub(t).max(0) as u64);
+    match current {
+        Some(n) => format!("● Current · {}", char_count_text(n)),
+        None if m.opened > 0 => format!("Opened {} · {}", ago(m.opened), char_count_text(n)),
+        None => format!("Edited {} · {}", ago(m.modified), char_count_text(n)),
+    }
+}
+
 fn now() -> i64 {
     crate::search::now() as i64
+}
+
+/// How the window came to the note it shows, for its history.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Nav {
+    Visit,
+    Back,
+    Forward,
+    /// The note that was on screen was deleted.
+    Gone,
+}
+
+/// Go Back and Go Forward: the notes this window showed before and after the one on screen.
+/// No step ever leads to the note on screen, and no two steps in a row lead to the same note.
+#[derive(Default)]
+struct History {
+    back: Vec<Id>,
+    forward: Vec<Id>,
+}
+
+impl History {
+    /// The window went from note `from` to `to`. A visit starts a new way forward; Back and
+    /// Forward step along the way; after `Gone` the deleted `from` is forgotten.
+    fn went(&mut self, from: Option<Id>, to: &str, nav: Nav) {
+        let Some(from) = from.filter(|f| f != to) else { return };
+        let (taken, other) = match nav {
+            Nav::Visit => {
+                self.forward.clear();
+                return self.back.push(from);
+            }
+            Nav::Gone => return self.forget(&from, to),
+            Nav::Back => (&mut self.back, &mut self.forward),
+            Nav::Forward => (&mut self.forward, &mut self.back),
+        };
+        if taken.last().is_some_and(|l| l == to) {
+            taken.pop();
+        }
+        other.push(from);
+    }
+
+    /// Where Go Back (`Nav::Back`) or Go Forward leads; None: that action is off.
+    fn next(&self, nav: Nav) -> Option<&Id> {
+        match nav {
+            Nav::Back => self.back.last(),
+            Nav::Forward => self.forward.last(),
+            _ => None,
+        }
+    }
+
+    /// Note `gone` was deleted: it leaves both ways, as does every step to `current`.
+    fn forget(&mut self, gone: &str, current: &str) {
+        for way in [&mut self.back, &mut self.forward] {
+            way.retain(|id| id != gone && id != current);
+            way.dedup();
+        }
+    }
+}
+
+/// The Ctrl+K list (also the header's Actions); its ids are `NotesWindow::act`'s.
+fn actions(pinned: bool, h: &History) -> Vec<Entry> {
+    let e = |id: &str, label: &str, icon: &'static str, keys: &'static str| Entry { id: id.into(), label: label.into(), icon: Some(icon), keys, ..Default::default() };
+    vec![
+        e("new", "New Note", g::PLUS, "Ctrl+N"),
+        e("duplicate", "Duplicate Note", g::COPY, ""),
+        e("pin", if pinned { "Unpin Note" } else { "Pin Note" }, g::PIN, "Ctrl+Shift+P"),
+        e("browse", "Browse Notes", g::NOTEBOOK_TABS, "Ctrl+P"),
+        Entry { off: h.next(Nav::Back).is_none(), ..e("back", "Go Back", g::BACK, "Ctrl+[") },
+        Entry { off: h.next(Nav::Forward).is_none(), ..e("forward", "Go Forward", g::FORWARD, "Ctrl+]") },
+        e("copy", "Copy as Markdown", g::COPY, ""),
+        Entry { danger: true, ..e("delete", "Delete Note", g::DELETE, "") },
+    ]
+}
+
+/// Browse Notes' last row: the launcher's Recently Deleted Notes.
+const DELETED: &str = "recently-deleted";
+
+/// Browse Notes' rows in the store's order (pinned first, then last opened), each note on two
+/// lines, then Recently Deleted. `current`: the note on screen, its title and length counted
+/// with its edits. The store has searched them (their text too), so each shows whatever is typed.
+fn browse_entries(rows: &[(NoteMeta, usize)], current: Option<(&str, String, usize)>, now: i64) -> Vec<Entry> {
+    let mut v: Vec<Entry> = rows
+        .iter()
+        .map(|(m, n)| {
+            let cur = current.as_ref().filter(|c| c.0 == m.id);
+            Entry {
+                id: m.id.clone(),
+                label: cur.map_or_else(|| m.title.clone(), |c| c.1.clone()),
+                section: Some("Notes".into()),
+                two_line: Some(note_line(m, *n, cur.map(|c| c.2), now)),
+                always: true,
+                ..Default::default()
+            }
+        })
+        .collect();
+    if let Some(last) = v.last_mut() {
+        last.rule_after = true;
+    }
+    v.push(Entry { id: DELETED.into(), label: "Recently Deleted".into(), icon: Some(g::ARCHIVE_RESTORE), always: true, ..Default::default() });
+    v
+}
+
+/// The window's own keys, wherever the keys are (a menu's search field too): an `act` id.
+fn shortcut(k: &Keystroke) -> Option<&'static str> {
+    let m = k.modifiers;
+    if !m.control || m.alt || m.platform {
+        return None;
+    }
+    Some(match (k.key.as_str(), m.shift) {
+        ("k", false) => "actions",
+        ("p", false) => "browse",
+        ("n", false) => "new",
+        ("p", true) => "pin",
+        ("[", false) => "back",
+        ("]", false) => "forward",
+        _ => return None,
+    })
+}
+
+/// A formatting bar item, or an entry of its menus, applied to the note; false for an unknown id.
+fn restyle(b: &mut Buffer, id: &str) -> bool {
+    match id {
+        "h1" => b.set_block(Block::H1),
+        "h2" => b.set_block(Block::H2),
+        "h3" => b.set_block(Block::H3),
+        "p" => b.set_block(Block::Paragraph),
+        "quote" => b.set_block(Block::Quote),
+        "task" => b.set_block(Block::Task),
+        "bullet" => b.set_block(Block::Bullet),
+        "numbered" => b.set_block(Block::Numbered),
+        "bold" => b.toggle_mark(Mark::Bold),
+        "italic" => b.toggle_mark(Mark::Italic),
+        "underline" => b.toggle_mark(Mark::Underline),
+        "strike" => b.toggle_mark(Mark::Strike),
+        "highlight" => b.toggle_mark(Mark::Highlight),
+        "code" => b.toggle_mark(Mark::Code),
+        "link" => b.link(false),
+        "image" => b.link(true),
+        _ => return false,
+    }
+    true
+}
+
+/// A formatting bar menu: (id, label, icon, keys) per entry.
+fn bar_menu(items: &[(&str, &str, Option<&'static str>, &'static str)]) -> Vec<Entry> {
+    items.iter().map(|&(id, label, icon, keys)| Entry { id: id.into(), label: label.into(), icon, keys, ..Default::default() }).collect()
+}
+
+fn heading_menu() -> Vec<Entry> {
+    bar_menu(&[("h1", "Heading 1", None, "Ctrl+Alt+1"), ("h2", "Heading 2", None, "Ctrl+Alt+2"), ("h3", "Heading 3", None, "Ctrl+Alt+3"), ("p", "Paragraph", None, "Ctrl+Alt+0")])
+}
+
+fn style_menu() -> Vec<Entry> {
+    bar_menu(&[
+        ("bold", "Bold", None, "Ctrl+B"),
+        ("italic", "Italic", None, "Ctrl+I"),
+        ("underline", "Underline", None, "Ctrl+U"),
+        ("strike", "Strikethrough", None, "Ctrl+Shift+S"),
+        ("highlight", "Highlight", None, "Ctrl+Shift+M"),
+    ])
+}
+
+fn list_menu() -> Vec<Entry> {
+    bar_menu(&[("bullet", "Bulleted List", Some(g::BULLETS), ""), ("numbered", "Numbered List", Some(g::LIST_ORDERED), "")])
+}
+
+/// The menus the window opens.
+#[derive(Clone, Copy, PartialEq)]
+enum Pop {
+    Actions,
+    Browse,
+    Heading,
+    Style,
+    List,
+}
+
+struct OpenMenu {
+    pop: Pop,
+    menu: Menu,
+    scroll: ScrollHandle,
 }
 
 /// Where the window was, logical px: saved to `notes-window.json` on move, resize and hide.
@@ -148,11 +341,13 @@ struct Doc {
     id: Id,
     buffer: Buffer,
     saved: Option<String>,
+    /// Pinned in the store (asked for once it shows; Pin Note keeps it).
+    pinned: bool,
 }
 
 impl Doc {
     fn new(id: Id, text: String) -> Doc {
-        Doc { id, buffer: Buffer::new(&text), saved: Some(text) }
+        Doc { id, buffer: Buffer::new(&text), saved: Some(text), pinned: false }
     }
 
     /// The note and its text, when the file doesn't hold that text yet.
@@ -318,13 +513,33 @@ pub struct NotesWindow {
     /// The caret's blink phase, and the blink loop's generation (bumping it stops the loop).
     caret_on: bool,
     blink: u64,
+    history: History,
+    /// An open menu; it takes Up, Down, Enter and Esc. Its search text is `menu_input`.
+    menu: Option<OpenMenu>,
+    menu_input: Entity<EditableTextState>,
+    /// Browse Notes' search generation: an answer is shown only if nothing newer was asked.
+    browse_gen: u64,
+    /// The footer's Text style toggle is on: the formatting bar shows instead.
+    bar: bool,
+    /// Delete Note asks first: the note and its title.
+    confirm: Option<(Id, String)>,
     _subs: Vec<Subscription>,
 }
 
 impl NotesWindow {
     pub fn new(notes: Notes, tx: UnboundedSender<Msg>, theme: config::Theme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         win::round_corners(win::hwnd(window));
+        let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let subs = vec![
+            cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
+                let q = input.read(cx).as_str().to_owned();
+                let Some(open) = &mut this.menu else { return };
+                open.menu.set_filter(&q);
+                if open.pop == Pop::Browse {
+                    this.browse(false, cx);
+                }
+                cx.notify();
+            }),
             cx.observe_window_bounds(window, |this, window, cx| this.moved(window, cx)),
             // The caret blinks only while the window is active.
             cx.observe_window_activation(window, |this, window, cx| if window.is_window_active() { this.wake(cx) } else { this.blink += 1 }),
@@ -358,6 +573,12 @@ impl NotesWindow {
             selecting: false,
             caret_on: true,
             blink: 0,
+            history: History::default(),
+            menu: None,
+            menu_input,
+            browse_gen: 0,
+            bar: false,
+            confirm: None,
             _subs: subs,
         }
     }
@@ -374,11 +595,261 @@ impl NotesWindow {
     /// Shows note `id` with `text` as the store had it (see `replaces`), saving the note on
     /// screen first.
     pub fn show(&mut self, id: Id, text: String, wrote: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch(id, text, wrote, Nav::Visit, cx);
+        self.reveal(window, cx);
+    }
+
+    /// Note `id` with `text` from the store goes on screen unless `replaces` keeps the buffer;
+    /// the note there is written first and `nav` is the step history records. Its pin is asked
+    /// for, and an open Browse Notes lists it as Current.
+    fn switch(&mut self, id: Id, text: String, wrote: bool, nav: Nav, cx: &mut Context<Self>) {
         if replaces(self.doc.as_ref(), &id, wrote) {
             self.save(cx);
-            self.doc = Some(Doc::new(id, text));
+            self.history.went(self.doc.as_ref().map(|d| d.id.clone()), &id, nav);
+            self.doc = Some(Doc::new(id.clone(), text));
+            let ask = id.clone();
+            self.notes.run(cx, move |s| Ok(s.list().iter().any(|m| m.id == ask && m.pinned)), move |this, r, cx| {
+                if let (Ok(p), Some(d)) = (r, this.doc.as_mut().filter(|d| d.id == id)) {
+                    d.pinned = p;
+                    cx.notify();
+                }
+            });
+            self.browse(true, cx);
         }
-        self.reveal(window, cx);
+        cx.notify();
+    }
+
+    /// Writes the note on screen, then `pick`s a note on the store's worker, marks it opened and
+    /// shows it (`nav`: the step history records). `failed` starts the error toast.
+    fn go(&mut self, pick: impl FnOnce(&mut Store, i64) -> io::Result<Id> + Send + 'static, nav: Nav, failed: &'static str, cx: &mut Context<Self>) {
+        self.save(cx);
+        let at = now();
+        self.notes.run(
+            cx,
+            move |s| {
+                let id = pick(s, at)?;
+                s.open_note(&id, at)?;
+                Ok((s.text(&id)?, id))
+            },
+            move |this, r, cx| match r {
+                // Keys typed while the store worked are written before another note shows.
+                Ok((text, id)) => this.switch(id, text, false, nav, cx),
+                Err(e) => _ = this.tx.unbounded_send(Msg::error(format!("{failed}: {e}"))),
+            },
+        );
+    }
+
+    /// An action by id: the Ctrl+K list's, a window shortcut's, a header button's.
+    fn act(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match id {
+            "actions" => return self.toggle_pop(Pop::Actions, window, cx),
+            "browse" => return self.toggle_pop(Pop::Browse, window, cx),
+            _ => self.close_menu(window, cx),
+        }
+        let current = self.doc.as_ref().map(|d| d.id.clone());
+        match (id, current) {
+            ("new", _) => self.new_note(cx),
+            ("duplicate", Some(id)) => self.go(move |s, at| s.duplicate(&id, at), Nav::Visit, "Couldn't duplicate the note", cx),
+            ("pin", Some(id)) => self.toggle_pin(id, cx),
+            ("back" | "forward", Some(_)) => {
+                let nav = if id == "back" { Nav::Back } else { Nav::Forward };
+                if let Some(to) = self.history.next(nav).cloned() {
+                    self.go(move |_, _| Ok(to), nav, "Couldn't open the note", cx);
+                }
+            }
+            ("copy", Some(_)) => {
+                let text = self.doc.as_ref().map_or_else(String::new, |d| d.buffer.text().to_owned());
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                _ = self.tx.unbounded_send(Msg::done("Copied as Markdown"));
+            }
+            ("delete", Some(id)) => {
+                let title = self.doc.as_ref().map_or_else(String::new, |d| title_of(d.buffer.text()));
+                self.ask_delete(id, title, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens menu `pop`, or closes it when it is the one open.
+    fn toggle_pop(&mut self, pop: Pop, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.as_ref().is_some_and(|o| o.pop == pop) {
+            return self.close_menu(window, cx);
+        }
+        let pinned = self.doc.as_ref().is_some_and(|d| d.pinned);
+        let above = menu::Place::Above(px(design::CONTROL + sp::S4));
+        let (entries, search, place) = match pop {
+            Pop::Actions => (actions(pinned, &self.history), Some("Search for actions…"), menu::Place::Center(px(design::POP_CENTER_TOP))),
+            Pop::Browse => (vec![], Some("Search notes…"), menu::Place::Center(px(design::POP_CENTER_TOP_HEAD))),
+            Pop::Heading => (heading_menu(), None, above),
+            Pop::Style => (style_menu(), None, above),
+            Pop::List => (list_menu(), None, above),
+        };
+        self.confirm = None;
+        self.menu = Some(OpenMenu { pop, menu: Menu::new(entries, search.map(Into::into), place), scroll: ScrollHandle::new() });
+        if search.is_some() {
+            self.menu_input.update(cx, |s, cx| s.emplace("", cx));
+            window.focus(&self.menu_input.focus_handle(cx), cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        self.browse(false, cx);
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Up, Down, Enter and Esc while the delete confirm or a menu is open.
+    fn key(&mut self, k: menu::Key, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((id, _)) = &self.confirm {
+            let id = id.clone();
+            match k {
+                menu::Key::Enter => {
+                    self.close_confirm(window, cx);
+                    self.delete(id, cx);
+                }
+                menu::Key::Esc => self.close_confirm(window, cx),
+                _ => {}
+            }
+            return;
+        }
+        let Some(open) = &mut self.menu else { return };
+        match open.menu.key(k) {
+            menu::Event::Picked(i) => self.pick(i, window, cx),
+            menu::Event::Closed => self.close_menu(window, cx),
+            menu::Event::None => {
+                if let Some(r) = open.menu.selected_row() {
+                    open.scroll.scroll_to_item(r);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Entry `i` of the open menu was chosen: the menu closes and the entry acts.
+    fn pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.menu.take() else { return };
+        let Some(id) = open.menu.entries.get(i).map(|e| e.id.clone()) else { return };
+        window.focus(&self.focus, cx);
+        cx.notify();
+        match open.pop {
+            Pop::Actions => self.act(&id, window, cx),
+            Pop::Browse if id == DELETED => {
+                self.hide(window, cx);
+                _ = self.tx.unbounded_send(Msg::RecentlyDeletedNotes);
+            }
+            Pop::Browse => self.go(move |_, _| Ok(id), Nav::Visit, "Couldn't open the note", cx),
+            Pop::Heading | Pop::Style | Pop::List => self.restyle_note(&id, cx),
+        }
+    }
+
+    /// A formatting bar item or one of its menus' entries, on the note.
+    fn restyle_note(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        if restyle(&mut doc.buffer, id) {
+            self.changed(true, cx);
+        }
+    }
+
+    /// Runs Browse Notes' search on the store's worker when it is open; the answer fills it if
+    /// nothing newer was asked (`keep`: the selected note stays selected).
+    fn browse(&mut self, keep: bool, cx: &mut Context<Self>) {
+        if !self.menu.as_ref().is_some_and(|o| o.pop == Pop::Browse) {
+            return;
+        }
+        self.browse_gen += 1;
+        let (generation, q) = (self.browse_gen, self.menu_input.read(cx).as_str().to_owned());
+        self.notes.run(cx, move |s| Ok(s.browse(false, &q)), move |this, r, cx| {
+            if this.browse_gen != generation {
+                return;
+            }
+            let rows = match r {
+                Ok(rows) => rows,
+                Err(e) => {
+                    _ = this.tx.unbounded_send(Msg::error(format!("Couldn't read the notes: {e}")));
+                    return;
+                }
+            };
+            let current = this.doc.as_ref().map(|d| (d.id.as_str(), title_of(d.buffer.text()), d.buffer.text().chars().count()));
+            let entries = browse_entries(&rows, current, now());
+            let Some(open) = this.menu.as_mut().filter(|o| o.pop == Pop::Browse) else { return };
+            let was = open.menu.picked().map(|e| e.id.clone()).filter(|_| keep);
+            open.menu.set_entries(entries);
+            if let Some(i) = was.and_then(|id| open.menu.entries.iter().position(|e| e.id == id)) {
+                open.menu.selected = i;
+            }
+            cx.notify();
+        });
+    }
+
+    /// Pin Note / Unpin Note, on the note on screen or a Browse Notes row.
+    fn toggle_pin(&mut self, id: Id, cx: &mut Context<Self>) {
+        let ask = id.clone();
+        self.notes.run(
+            cx,
+            move |s| {
+                let on = !s.list().iter().any(|m| m.id == ask && m.pinned);
+                s.pin(&ask, on)?;
+                Ok(on)
+            },
+            move |this, r, cx| match r {
+                Ok(on) => {
+                    if let Some(d) = this.doc.as_mut().filter(|d| d.id == id) {
+                        d.pinned = on;
+                    }
+                    this.browse(true, cx);
+                    _ = this.tx.unbounded_send(Msg::done(if on { "Note pinned" } else { "Note unpinned" }));
+                    cx.notify();
+                }
+                Err(e) => _ = this.tx.unbounded_send(Msg::error(format!("Couldn't pin the note: {e}"))),
+            },
+        );
+    }
+
+    /// Delete Note (and a Browse Notes row's Delete) asks first.
+    fn ask_delete(&mut self, id: Id, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm = Some((id, title));
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// The confirm closes; the keys go back to the menu's search, or the note.
+    fn close_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm = None;
+        let searching = self.menu.as_ref().is_some_and(|o| o.menu.search.is_some());
+        let handle = if searching { self.menu_input.focus_handle(cx) } else { self.focus.clone() };
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Moves note `id` to Recently Deleted. The note on screen gives way to the one opened last
+    /// (a new one when none is left); history forgets it either way.
+    fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.doc.as_ref().is_some_and(|d| d.id == id) {
+            return self.go(
+                move |s, at| {
+                    s.delete(&id, at)?;
+                    s.last().map_or_else(|| s.create(at).map(created), Ok)
+                },
+                Nav::Gone,
+                "Couldn't delete the note",
+                cx,
+            );
+        }
+        self.save(cx);
+        let (gone, at) = (id.clone(), now());
+        self.notes.run(cx, move |s| s.delete(&gone, at), move |this, r, cx| match r {
+            Ok(()) => {
+                let current = this.doc.as_ref().map_or_else(String::new, |d| d.id.clone());
+                this.history.forget(&id, &current);
+                this.browse(true, cx);
+            }
+            Err(e) => _ = this.tx.unbounded_send(Msg::error(format!("Couldn't delete the note: {e}"))),
+        });
     }
 
     /// Brings the window up, above the others, with the keys.
@@ -421,6 +892,8 @@ impl NotesWindow {
         let place = Place::of(window.window_bounds().get_bounds());
         cx.background_executor().spawn(async move { drop(save_place(&place_path(), place)) }).detach();
         self.blink += 1;
+        self.menu = None;
+        self.confirm = None;
         window.set_visible(false);
     }
 
@@ -430,6 +903,7 @@ impl NotesWindow {
         self.hide(window, cx);
         self.notes = notes;
         self.doc = None;
+        self.history = History::default();
     }
 
     /// The editor changed the note: it is written once typing has paused for `SETTLE`.
@@ -487,35 +961,34 @@ impl NotesWindow {
 
     /// Ctrl+N and the header's New: a new note, or the empty one there already.
     fn new_note(&mut self, cx: &mut Context<Self>) {
-        self.save(cx);
-        let at = now();
-        self.notes.run(
-            cx,
-            move |s| {
-                let id = created(s.create(at)?);
-                s.open_note(&id, at)?;
-                Ok((s.text(&id)?, id))
-            },
-            |this, r, cx| match r {
-                Ok((text, id)) => {
-                    // Keys typed while the create ran are written before the new note shows.
-                    if replaces(this.doc.as_ref(), &id, false) {
-                        this.save(cx);
-                        this.doc = Some(Doc::new(id, text));
-                    }
-                    cx.notify();
-                }
-                Err(e) => _ = this.tx.unbounded_send(Msg::error(format!("Couldn't create a note: {e}"))),
-            },
-        );
+        self.go(|s, at| s.create(at).map(created), Nav::Visit, "Couldn't create a note", cx);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let m = k.modifiers;
+        if let Some(id) = shortcut(k) {
+            self.act(id, window, cx);
+            return cx.stop_propagation();
+        }
+        // A menu's search field sends Up, Down, Enter and Esc as actions (`Render`); these come
+        // from a menu without one, or the confirm.
+        if self.menu.is_some() || self.confirm.is_some() {
+            let key = match k.key.as_str() {
+                "up" => menu::Key::Up,
+                "down" => menu::Key::Down,
+                "tab" if m.shift => menu::Key::Up,
+                "tab" => menu::Key::Down,
+                "enter" => menu::Key::Enter,
+                "escape" => menu::Key::Esc,
+                // typing is the search field's
+                _ => return,
+            };
+            self.key(key, window, cx);
+            return cx.stop_propagation();
+        }
         match k.key.as_str() {
             "escape" if !m.modified() => self.hide(window, cx),
-            "n" if m.control && !m.shift && !m.alt => self.new_note(cx),
             _ => {
                 let Some(doc) = self.doc.as_mut() else { return };
                 let Some(did) = press(&mut doc.buffer, k) else { return };
@@ -718,14 +1191,101 @@ impl NotesWindow {
                     .flex()
                     .items_center()
                     .gap(px(sp::S12))
-                    // Actions (Ctrl+K) and Browse (Ctrl+P) open Task 20's lists.
-                    .child(tool("actions", g::SQUARE_MENU))
-                    .child(tool("browse", g::NOTEBOOK_TABS))
+                    .child(tool("actions", g::SQUARE_MENU).on_click(cx.listener(|this, _, window, cx| this.act("actions", window, cx))))
+                    .child(tool("browse", g::NOTEBOOK_TABS).on_click(cx.listener(|this, _, window, cx| this.act("browse", window, cx))))
                     .child(tool("new", g::PLUS).on_click(cx.listener(|this, _, _, cx| this.new_note(cx))))
                     .child(drag("drag-left")),
             )
             .child(div().id("drag").window_control_area(WindowControlArea::Drag).min_w_0().h_full().flex().items_center().font_weight(FontWeight::SEMIBOLD).text_color(muted).child(div().truncate().child(title)))
             .child(div().flex_1().h_full().flex().items_center().child(drag("drag-right")).child(tool("close", g::CANCEL).on_click(cx.listener(|this, _, window, cx| this.hide(window, cx)))))
+    }
+
+    /// The character count centred, the Text style toggle on the right; while that is on, the
+    /// formatting bar (`.pc-notes__bar`) instead.
+    fn footer(&self, text: &str, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let muted = t.text_muted;
+        let item = |id: &'static str, glyph: &'static str, menu: bool| {
+            div().id(id).flex().items_center().gap(px(sp::S4)).child(design::icon(glyph, ic::MD, muted)).when(menu, |d| d.child(design::icon(g::CHEVRON_DOWN, ic::XS, muted)))
+        };
+        let bar = |on: bool| cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.bar = on;
+            cx.notify();
+        });
+        if !self.bar {
+            return div()
+                .h(px(design::CONTROL))
+                .flex_none()
+                .px(px(sp::S12))
+                .flex()
+                .items_center()
+                .text_size(px(ts::SMALL))
+                .text_color(t.text_faint)
+                .child(div().flex_1())
+                .child(char_count_text(text.chars().count()))
+                .child(div().flex_1().flex().justify_end().child(item("type", g::TYPE, false).on_click(bar(true))))
+                .into_any_element();
+        }
+        let pop = |pop: Pop| cx.listener(move |this, _: &ClickEvent, window, cx| this.toggle_pop(pop, window, cx));
+        let apply = |id: &'static str| cx.listener(move |this, _: &ClickEvent, _, cx| this.restyle_note(id, cx));
+        div()
+            .relative()
+            .h(px(design::CONTROL))
+            .flex_none()
+            .px(px(sp::S12))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(sp::S8))
+            .child(item("heading", g::HEADING, true).on_click(pop(Pop::Heading)))
+            .child(item("style", g::TYPE, true).on_click(pop(Pop::Style)))
+            .child(item("link", g::LINK, false).on_click(apply("link")))
+            .child(item("image", g::PICTURE, false).on_click(apply("image")))
+            .child(item("code", g::CODE, false).on_click(apply("code")))
+            .child(design::vdivider(t))
+            .child(item("quote", g::QUOTE, false).on_click(apply("quote")))
+            .child(item("task", g::LIST_CHECKS, false).on_click(apply("task")))
+            .child(item("list", g::BULLETS, true).on_click(pop(Pop::List)))
+            .child(div().absolute().right(px(sp::S12)).flex().child(item("close-bar", g::CANCEL, false).on_click(bar(false))))
+            .into_any_element()
+    }
+
+    /// The open menu over the window; Browse Notes' rows end in Pin and Delete.
+    fn pop(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let open = self.menu.as_ref()?;
+        let me = cx.weak_entity();
+        let pick = move |i: usize, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| this.pick(i, window, cx));
+        let me = cx.weak_entity();
+        let outside = move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| this.close_menu(window, cx));
+        let field = open.menu.search.as_ref().map(|placeholder| {
+            text_input("notes-menu-search").state(self.menu_input.downgrade()).placeholder(placeholder.clone()).placeholder_color(t.text_faint).caret_color(t.accent).flex_1().whitespace_nowrap().into_any_element()
+        });
+        let notes: Vec<Option<(Id, String)>> = open.menu.entries.iter().map(|e| (open.pop == Pop::Browse && e.id != DELETED).then(|| (e.id.clone(), e.label.clone()))).collect();
+        let (me, muted) = (cx.weak_entity(), t.text_muted);
+        let trail = move |i: usize, on: bool| {
+            let (id, title) = notes.get(i).cloned().flatten()?;
+            let tool = |name: &'static str, glyph: &'static str, delete: bool| {
+                let (me, id, title) = (me.clone(), id.clone(), title.clone());
+                div().id(name).flex().child(design::icon(glyph, ic::MD, muted)).on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    _ = me.update(cx, |this, cx| if delete { this.ask_delete(id.clone(), title.clone(), window, cx) } else { this.toggle_pin(id.clone(), cx) });
+                })
+            };
+            // `.pc-notes__rowtools`: on the selected row, or the one under the mouse
+            Some(div().ml_auto().flex().gap(px(sp::S8)).when(!on, |d| d.invisible().group_hover("pop-row", |s| s.visible())).child(tool("pin", g::PIN, false)).child(tool("delete", g::DELETE, true)).into_any_element())
+        };
+        Some(design::pop_menu(&open.menu, field, &open.scroll, pick, outside, trail, t))
+    }
+
+    /// Delete Note's confirm, over the whole window.
+    fn dialog(&self, t: &Tokens, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (id, title) = self.confirm.clone()?;
+        let delete = cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.close_confirm(window, cx);
+            this.delete(id.clone(), cx);
+        });
+        let cancel = cx.listener(|this, _: &ClickEvent, window, cx| this.close_confirm(window, cx));
+        let buttons = [design::button("Delete", design::Button::Danger, true, t).id("delete").w_full().on_click(delete), design::button("Cancel", design::Button::Quiet, false, t).id("cancel").w_full().on_click(cancel)];
+        Some(design::dialog(true, "Delete Note?", &title, buttons, t))
     }
 }
 
@@ -799,37 +1359,33 @@ fn overlay(layout: TextLayout, sel: Option<(usize, usize)>, caret: Option<usize>
     .size_full()
 }
 
-/// The character count centred; the Text style toggle on the right (Task 20 shows its bar).
-fn footer(text: &str, t: &Tokens) -> impl IntoElement + use<> {
-    div()
-        .h(px(design::CONTROL))
-        .flex_none()
-        .px(px(sp::S12))
-        .flex()
-        .items_center()
-        .text_size(px(ts::SMALL))
-        .text_color(t.text_faint)
-        .child(div().flex_1())
-        .child(char_count_text(text.chars().count()))
-        .child(div().flex_1().flex().justify_end().child(design::icon(g::TYPE, ic::MD, t.text_muted)))
-}
-
 impl Render for NotesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Drawn at the interface size alone, like Settings.
         design::scale_settings();
         let t = Tokens::from_theme(&self.theme, window);
         let text = self.doc.as_ref().map_or(String::new(), |d| d.buffer.text().to_owned());
-        let caret = self.caret_on && window.is_window_active();
+        // The keys are the menu's or the confirm's while either is open.
+        let caret = self.caret_on && window.is_window_active() && self.menu.is_none() && self.confirm.is_none();
+        let (pop, dialog) = (self.pop(&t, cx), self.dialog(&t, cx));
         design::glass_window(&t)
             .size_full()
             .font_family(design::FONT_UI)
             .text_size(px(ts::BODY))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
+            // A menu's search field sends these (its text box's bindings).
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| this.key(menu::Key::Down, window, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, window, cx| this.key(menu::Key::Up, window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| this.key(menu::Key::Enter, window, cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.key(menu::Key::Esc, window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleActions, window, cx| this.act("actions", window, cx)))
+            .on_action(cx.listener(|this, _: &OpenDropdown, window, cx| this.act("browse", window, cx)))
             .child(self.header(title_of(&text), &t, cx))
             .child(self.body(&t, caret, cx))
-            .child(footer(&text, &t))
+            .child(self.footer(&text, &t, cx))
+            .children(pop)
+            .children(dialog)
     }
 }
 
@@ -944,7 +1500,7 @@ mod tests {
         assert_eq!((b.cursor(), b.anchor()), (0, 8));
         key(&mut b, "ctrl-a");
         assert_eq!(b.selection(), (0, 13));
-        let doc = Doc { id: "a".into(), buffer: b, saved: Some("one two\nthree".into()) };
+        let doc = Doc { id: "a".into(), buffer: b, saved: Some("one two\nthree".into()), pinned: false };
         assert_eq!(doc.unsaved(), None, "moving writes nothing");
     }
 
@@ -986,6 +1542,131 @@ mod tests {
         assert_eq!(b.text(), "");
         assert_eq!(key(&mut b, "ctrl-v"), Some(Did::Paste));
         assert_eq!(pasted("a\r\nb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn history_goes_back_and_forward_and_a_new_visit_forgets_forward() {
+        let mut h = History::default();
+        let off = |h: &History| (h.next(Nav::Back).is_none(), h.next(Nav::Forward).is_none());
+        assert_eq!(off(&h), (true, true), "a new window: both off");
+        h.went(None, "a", Nav::Visit);
+        h.went(Some("a".into()), "b", Nav::Visit);
+        h.went(Some("b".into()), "c", Nav::Visit);
+        h.went(Some("c".into()), "c", Nav::Visit);
+        assert_eq!(h.next(Nav::Back).map(String::as_str), Some("b"), "the same note again is no step");
+        h.went(Some("c".into()), "b", Nav::Back);
+        h.went(Some("b".into()), "a", Nav::Back);
+        assert_eq!(off(&h), (true, false), "at the start: Go Back off");
+        assert_eq!(h.next(Nav::Forward).map(String::as_str), Some("b"));
+        h.went(Some("a".into()), "b", Nav::Forward);
+        assert_eq!((h.next(Nav::Back).map(String::as_str), h.next(Nav::Forward).map(String::as_str)), (Some("a"), Some("c")));
+        h.went(Some("b".into()), "d", Nav::Visit);
+        assert_eq!(off(&h), (false, true), "a new note: Go Forward off");
+        h.went(Some("d".into()), "b", Nav::Gone);
+        assert_eq!(h.back, ["a"], "d was deleted and b shows: no step leads to either");
+        // a deleted note leaves both ways, and no step leads to the note on screen
+        let mut h = History { back: vec!["a".into(), "x".into(), "a".into(), "e".into()], forward: vec!["x".into()] };
+        h.forget("x", "e");
+        assert_eq!((h.back.as_slice(), h.forward.as_slice()), (&["a".to_string()][..], &[][..]));
+    }
+
+    #[test]
+    fn the_action_list_has_eight_actions_and_go_back_is_off_without_history() {
+        let mut h = History::default();
+        let a = actions(false, &h);
+        let shown: Vec<(&str, &str, bool)> = a.iter().map(|e| (e.label.as_str(), e.keys, e.off)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("New Note", "Ctrl+N", false),
+                ("Duplicate Note", "", false),
+                ("Pin Note", "Ctrl+Shift+P", false),
+                ("Browse Notes", "Ctrl+P", false),
+                ("Go Back", "Ctrl+[", true),
+                ("Go Forward", "Ctrl+]", true),
+                ("Copy as Markdown", "", false),
+                ("Delete Note", "", false),
+            ]
+        );
+        assert!(a[7].danger && a.iter().filter(|e| e.danger).count() == 1, "Delete Note is the danger row");
+        assert!(a.iter().all(|e| e.icon.is_some()));
+        h.went(Some("a".into()), "b", Nav::Visit);
+        let a = actions(true, &h);
+        assert_eq!((a[2].label.as_str(), a[4].off, a[5].off), ("Unpin Note", false, true));
+        let mut m = menu::Menu::new(a, Some("Search for actions…".into()), menu::Place::Center(px(design::POP_CENTER_TOP)));
+        m.set_filter("go");
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("back"));
+    }
+
+    #[test]
+    fn the_window_shortcuts() {
+        let at = |s: &str| shortcut(&Keystroke::parse(s).unwrap());
+        for (k, id) in [("ctrl-k", "actions"), ("ctrl-p", "browse"), ("ctrl-n", "new"), ("ctrl-shift-p", "pin"), ("ctrl-[", "back"), ("ctrl-]", "forward")] {
+            assert_eq!(at(k), Some(id), "{k}");
+        }
+        for k in ["k->k", "ctrl-alt-p", "ctrl-shift-k", "ctrl-b", "alt-n"] {
+            assert_eq!(at(k), None, "{k}");
+        }
+    }
+
+    #[test]
+    fn browse_rows_say_current_or_when_opened_and_end_with_recently_deleted() {
+        const DAY: i64 = 86_400;
+        let now = 100 * DAY;
+        let meta = |id: &str, title: &str, pinned: bool, opened: i64, modified: i64| NoteMeta { id: id.into(), pinned, created: 0, modified, deleted_at: None, opened, title: title.into() };
+        // the store's order (pinned first, then last opened) is kept
+        let rows = [(meta("p", "Pinned", true, now - 9 * DAY, 0), 5), (meta("g", "Groceries", false, now, 0), 180), (meta("t", "Trip", false, now - 2 * DAY, 0), 397), (meta("n", "Never", false, 0, now - DAY), 1)];
+        let e = browse_entries(&rows, Some(("g", "Groceries list".into(), 186)), now);
+        let shown: Vec<(&str, &str, Option<&str>)> = e.iter().map(|e| (e.id.as_str(), e.label.as_str(), e.two_line.as_deref())).collect();
+        assert_eq!(
+            shown,
+            [
+                ("p", "Pinned", Some("Opened 9 days ago · 5 characters")),
+                ("g", "Groceries list", Some("● Current · 186 characters")),
+                ("t", "Trip", Some("Opened 2 days ago · 397 characters")),
+                ("n", "Never", Some("Edited yesterday · 1 character")),
+                (DELETED, "Recently Deleted", None),
+            ]
+        );
+        assert!(e[..4].iter().all(|e| e.section.as_deref() == Some("Notes") && e.always));
+        assert!(e[3].rule_after && e[4].section.is_none() && e[4].icon == Some(g::ARCHIVE_RESTORE));
+        assert_eq!(browse_entries(&[], None, now).len(), 1, "no notes: only Recently Deleted");
+    }
+
+    #[test]
+    fn the_formatting_bar_formats() {
+        for (id, out) in [
+            ("h1", "# a b"),
+            ("h2", "## a b"),
+            ("h3", "### a b"),
+            ("bold", "a **b**"),
+            ("italic", "a *b*"),
+            ("underline", "a <u>b</u>"),
+            ("strike", "a ~~b~~"),
+            ("highlight", "a ==b=="),
+            ("code", "a `b`"),
+            ("link", "a [b]()"),
+            ("image", "a ![b]()"),
+            ("quote", "> a b"),
+            ("task", "- [ ] a b"),
+            ("bullet", "- a b"),
+            ("numbered", "1. a b"),
+        ] {
+            let mut b = Buffer::new("a b");
+            b.left(true);
+            assert!(restyle(&mut b, id), "{id}");
+            assert_eq!(b.text(), out, "{id}");
+        }
+        let mut b = Buffer::new("## a");
+        assert!(restyle(&mut b, "p"));
+        assert_eq!(b.text(), "a", "Paragraph");
+        assert!(!restyle(&mut b, "nope"));
+        for m in [heading_menu(), style_menu(), list_menu()] {
+            assert!(m.iter().all(|e| restyle(&mut Buffer::new("x"), &e.id)), "every menu entry formats");
+        }
+        assert_eq!(heading_menu().iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Heading 1", "Heading 2", "Heading 3", "Paragraph"]);
+        assert_eq!(style_menu().iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Bold", "Italic", "Underline", "Strikethrough", "Highlight"]);
+        assert_eq!(list_menu().iter().map(|e| (e.label.as_str(), e.icon)).collect::<Vec<_>>(), [("Bulleted List", Some(g::BULLETS)), ("Numbered List", Some(g::LIST_ORDERED))]);
     }
 
     /// Autosave and hide write `Doc::unsaved` through `Store::save`, as `NotesWindow::save` does.
