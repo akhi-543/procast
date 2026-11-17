@@ -44,13 +44,17 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (creating if needed) the notes folder. A missing or broken `notes.json` is rebuilt
-    /// from the `.md` files, and files and entries that disagree are reconciled, so no note is lost.
+    /// Opens (creating if needed) the notes folder. A missing `notes.json` is rebuilt from the
+    /// `.md` files, and files and entries that disagree are reconciled, so no note is lost. One
+    /// that can't be read or parsed is an error, never rebuilt over: it holds what the files
+    /// don't (deleted, pinned, created, opened).
     pub fn open(root: PathBuf) -> io::Result<Store> {
         fs::create_dir_all(&root)?;
-        let read: Option<Vec<NoteMeta>> = fs::read_to_string(root.join("notes.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok());
+        let read: Option<Vec<NoteMeta>> = match fs::read_to_string(root.join("notes.json")) {
+            Ok(t) => Some(serde_json::from_str(&t).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("notes.json is damaged ({e}); move it away to rebuild the list from the notes")))?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
         let had = read.is_some();
         let mut metas = read.unwrap_or_default();
         let before = metas.len();
@@ -212,12 +216,19 @@ impl Store {
             .collect()
     }
 
-    /// Search Notes (`search`), or Recently Deleted Notes (whose title holds `q`, any case), each
-    /// with its length in characters. A note that can't be read counts 0.
+    /// Search Notes (`search`; pinned first, then last opened, a note never opened by its last
+    /// edit), or Recently Deleted Notes (whose title holds `q`, any case), each with its length in
+    /// characters. A note that can't be read counts 0.
     pub fn browse(&self, deleted: bool, q: &str) -> Vec<(NoteMeta, usize)> {
         let q = q.trim().to_lowercase();
         // ponytail: reads every listed note per search; keep lengths in NoteMeta if folders grow large.
-        let notes = if deleted { self.deleted().into_iter().filter(|m| m.title.to_lowercase().contains(&q)).collect() } else { self.search(&q) };
+        let notes: Vec<NoteMeta> = if deleted {
+            self.deleted().into_iter().filter(|m| m.title.to_lowercase().contains(&q)).collect()
+        } else {
+            let mut v = self.search(&q);
+            v.sort_by_key(|m| (std::cmp::Reverse(m.pinned), std::cmp::Reverse(if m.opened > 0 { m.opened } else { m.modified })));
+            v
+        };
         notes
             .into_iter()
             .map(|m| {
@@ -585,7 +596,7 @@ mod tests {
         let b = made(s.create(7));
         s.save(&b, "Beta", 8).unwrap();
         drop(s);
-        fs::write(dir.join("notes.json"), "{ not json").unwrap();
+        fs::remove_file(dir.join("notes.json")).unwrap();
         let s = Store::open(dir.clone()).unwrap();
         let mut ids: Vec<_> = s.list().into_iter().map(|m| m.id).collect();
         ids.sort();
@@ -594,10 +605,27 @@ mod tests {
         assert_eq!(ids, want);
         assert!(s.list().iter().any(|m| m.title == "Alpha"));
         drop(s);
-        fs::remove_file(dir.join("notes.json")).unwrap();
-        assert_eq!(Store::open(dir.clone()).unwrap().list().len(), 2);
         // the rebuilt file is valid json again
         assert!(serde_json::from_str::<Vec<NoteMeta>>(&fs::read_to_string(dir.join("notes.json")).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_notes_json_is_an_error_and_is_never_rebuilt_over() {
+        let dir = tmp("damaged");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(5));
+        s.save(&a, "# Alpha", 6).unwrap();
+        s.delete(&a, 7).unwrap();
+        drop(s);
+        fs::write(dir.join("notes.json"), "{ not json").unwrap();
+        let e = Store::open(dir.clone()).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(dir.join("notes.json")).unwrap(), "{ not json", "the damaged file is left as it was");
+        // a notes.json that can't be read at all (here a folder) is an error too
+        fs::remove_file(dir.join("notes.json")).unwrap();
+        fs::create_dir(dir.join("notes.json")).unwrap();
+        assert!(Store::open(dir.clone()).is_err());
+        assert!(dir.join("notes.json").is_dir());
     }
 
     #[test]
@@ -710,6 +738,16 @@ mod tests {
         assert_eq!(rows(&s, true, ""), [(b.clone(), 7)]);
         assert_eq!(rows(&s, true, "pla"), [(b, 7)]);
         assert!(rows(&s, true, "café").is_empty());
+        // pinned first, then last opened; a note never opened by its last edit
+        let c = made(s.create(10));
+        s.save(&c, "c", 10).unwrap();
+        let d = made(s.create(11));
+        s.save(&d, "d", 11).unwrap();
+        s.open_note(&a, 20).unwrap();
+        let ids = |s: &Store| s.browse(false, "").into_iter().map(|(m, _)| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s), [a.clone(), d.clone(), c.clone()]);
+        s.pin(&c, true).unwrap();
+        assert_eq!(ids(&s), [c, a, d]);
     }
 
     #[test]

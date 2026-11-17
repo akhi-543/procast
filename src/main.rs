@@ -744,19 +744,25 @@ fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
 }
 
 /// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
-/// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 d ago · 397 characters"
-/// ("Edited …" for a note never opened, "Deleted …" in Recently Deleted).
-fn note_rows(list: NotesList, rows: &[(NoteMeta, usize)], now: i64, searching: bool, keep_days: u32) -> Vec<Item> {
+/// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 days ago · 397
+/// characters" ("● Current · 186 characters" for the Notes window's note, `current`, counted
+/// with its edits; "Edited …" for a note never opened; "Deleted …" in Recently Deleted).
+fn note_rows(list: NotesList, rows: &[(NoteMeta, usize)], current: Option<(String, usize)>, now: i64, searching: bool, keep_days: u32) -> Vec<Item> {
     let ago = |t: i64| timers::ago(now.saturating_sub(t).max(0) as u64);
     let items: Vec<Item> = rows
         .iter()
         .map(|(m, n)| {
             let count = notes::window::char_count_text(*n);
+            let cur = current.as_ref().filter(|(id, _)| *id == m.id).map(|(_, n)| *n);
             let it = match (list, m.deleted_at) {
                 (NotesList::Deleted, Some(at)) => {
                     let mut it = Item::new(&m.title, format!("Deleted {} · {count}", ago(at)), Icon::Vector(g::ARCHIVE_RESTORE), Act::RestoreNote(m.id.clone())).sec("Recently Deleted");
                     it.extra = [Act::RestoreNote(m.id.clone()), Act::PurgeNote(m.id.clone())].map(|a| (a.label().to_string(), a)).to_vec();
                     it
+                }
+                (NotesList::All, _) if cur.is_some() => {
+                    let n = notes::window::char_count_text(cur.unwrap_or(*n));
+                    Item::new(&m.title, format!("● Current · {n}"), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes")
                 }
                 _ if m.opened > 0 => Item::new(&m.title, format!("Opened {} · {count}", ago(m.opened)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
                 _ => Item::new(&m.title, format!("Edited {} · {count}", ago(m.modified)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
@@ -1629,7 +1635,7 @@ impl Launcher {
             Mode::Notes(list) => {
                 // The store answers on its worker (`search_notes`); the last answer shows meanwhile.
                 self.search_notes(list, &query, cx);
-                self.note_items(list, &query)
+                self.note_items(list, &query, cx)
             }
             Mode::Define => match &self.define {
                 _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
@@ -3965,6 +3971,7 @@ impl Launcher {
                     return;
                 }
                 return self.show_note(
+                    false,
                     |s, now| {
                         Ok(match s.last() {
                             Some(id) => id,
@@ -3976,11 +3983,11 @@ impl Launcher {
             }
             Act::OpenNote(id) => {
                 self.hide(false, cx);
-                return self.show_note(move |_, _| Ok(id), cx);
+                return self.show_note(false, move |_, _| Ok(id), cx);
             }
             Act::RestoreNote(id) => {
                 self.hide(false, cx);
-                return self.show_note(move |s, _| s.restore(&id).map(|_| id), cx);
+                return self.show_note(false, move |s, _| s.restore(&id).map(|_| id), cx);
             }
             Act::PurgeNote(id) => {
                 let title = self.note_rows.iter().flatten().find(|(m, _)| m.id == id).map(|(m, _)| m.title.clone()).unwrap_or_default();
@@ -4269,6 +4276,7 @@ impl Launcher {
                 self.hide(false, cx);
                 let title = got[0].trim().to_string();
                 self.show_note(
+                    !title.is_empty(),
                     move |s, now| {
                         let id = created(s.create(now)?);
                         if !title.is_empty() {
@@ -4407,9 +4415,15 @@ impl Launcher {
     /// Shows a note in the Notes window, opening the window the first time. `pick` chooses the
     /// note on the store's worker (and may change the store); the note is then marked opened
     /// and read there too.
-    fn show_note(&mut self, pick: impl FnOnce(&mut Store, i64) -> std::io::Result<String> + Send + 'static, cx: &mut Context<Self>) {
+    /// `wrote`: `pick` writes the note's text (Create Note's title), which the window then shows
+    /// even over its own copy of that note.
+    fn show_note(&mut self, wrote: bool, pick: impl FnOnce(&mut Store, i64) -> std::io::Result<String> + Send + 'static, cx: &mut Context<Self>) {
         let now = search::now() as i64;
         let place = self.notes_window.is_none().then(notes::window::place_path);
+        // The note on screen is written before `pick` reads anything.
+        if let Some(h) = self.notes_window {
+            drop(h.update(cx, |w, _, cx| w.save(cx)));
+        }
         self.notes.run(
             cx,
             move |s| {
@@ -4418,18 +4432,27 @@ impl Launcher {
                 let text = s.text(&id)?;
                 Ok((id, text, place.and_then(|p| notes::window::load_place(&p))))
             },
-            |this, r, cx| match r {
-                Ok((id, text, place)) => this.note_window(id, text, place, cx),
-                Err(e) => this.say(Msg::error(format!("Couldn't open the note: {e}"))),
+            move |this, r, cx| match r {
+                Ok((id, text, place)) => this.note_window(id, text, wrote, place, cx),
+                Err(e) => this.note_failed(format!("Couldn't open the note: {e}")),
             },
         );
     }
 
+    /// Opening a note failed: the launcher hid without handing focus back (the window was to take
+    /// it), so the app you came from gets it again, and a toast says why.
+    fn note_failed(&mut self, why: String) {
+        if !self.visible && !self.prev.is_invalid() {
+            win::focus(self.prev);
+        }
+        self.say(Msg::error(why));
+    }
+
     /// The Notes window on note `id`: reused while it exists, else opened where it was last
     /// (`place`, when that is still on a screen) or centred.
-    fn note_window(&mut self, id: String, text: String, place: Option<Place>, cx: &mut Context<Self>) {
+    fn note_window(&mut self, id: String, text: String, wrote: bool, place: Option<Place>, cx: &mut Context<Self>) {
         if let Some(h) = self.notes_window
-            && h.update(cx, |w, window, cx| w.show(id.clone(), text.clone(), window, cx)).is_ok()
+            && h.update(cx, |w, window, cx| w.show(id.clone(), text.clone(), wrote, window, cx)).is_ok()
         {
             return;
         }
@@ -4447,8 +4470,8 @@ impl Launcher {
         let (notes, tx, theme) = (self.notes.clone(), self.tx.clone(), self.cfg.theme.clone());
         self.notes_window = cx.open_window(options, |window, cx| cx.new(|cx| NotesWindow::new(notes, tx, theme, window, cx))).ok();
         match self.notes_window {
-            Some(h) => drop(h.update(cx, |w, window, cx| w.show(id, text, window, cx))),
-            None => self.say(Msg::error("Couldn't open the Notes window")),
+            Some(h) => drop(h.update(cx, |w, window, cx| w.show(id, text, wrote, window, cx))),
+            None => self.note_failed("Couldn't open the Notes window".into()),
         }
     }
 
@@ -4466,7 +4489,7 @@ impl Launcher {
             }));
             if this.confirm.is_none() {
                 let q = this.query(cx);
-                this.items = this.note_items(list, &q);
+                this.items = this.note_items(list, &q, cx);
                 this.selected = this.selected.min(this.items.len().saturating_sub(1));
                 this.scroll_to_selected();
             }
@@ -4474,10 +4497,13 @@ impl Launcher {
         });
     }
 
-    fn note_items(&self, list: NotesList, query: &str) -> Vec<Item> {
+    fn note_items(&self, list: NotesList, query: &str, cx: &App) -> Vec<Item> {
         match &self.note_rows {
             None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
-            Some(rows) => note_rows(list, rows, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_deleted_days),
+            Some(rows) => {
+                let current = self.notes_window.and_then(|h| h.read(cx).ok()).and_then(NotesWindow::current);
+                note_rows(list, rows, current, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_deleted_days)
+            }
         }
     }
 
@@ -6752,20 +6778,23 @@ mod tests {
     fn note_rows_say_when_each_note_was_opened_and_how_long_it_is() {
         let meta = |id: &str, title: &str, opened: i64, deleted_at: Option<i64>| NoteMeta { id: id.into(), pinned: false, created: 0, modified: 100, deleted_at, opened, title: title.into() };
         let now = 3 * 86_400 + 100;
-        let rows = note_rows(NotesList::All, &[(meta("a", "Groceries", now - 120, None), 186), (meta("b", "Plans", 0, None), 1)], now, false, 30);
+        let notes = [(meta("a", "Groceries", now - 120, None), 186), (meta("b", "Plans", 0, None), 1), (meta("c", "Trip", now - 2 * 86_400, None), 397)];
+        let rows = note_rows(NotesList::All, &notes, Some(("c".into(), 400)), now, false, 30);
         let line = |it: &Item| (it.title.clone(), it.subtitle.clone(), it.act.clone(), it.section.clone());
         assert_eq!(line(&rows[0]), ("Groceries".into(), "Opened 2 min ago · 186 characters".into(), Act::OpenNote("a".into()), Some("Notes".into())));
-        assert_eq!(line(&rows[1]).1, "Edited 3 d ago · 1 character", "never opened: its last edit");
+        assert_eq!(line(&rows[1]).1, "Edited 3 days ago · 1 character", "never opened: its last edit");
+        assert_eq!(line(&rows[2]).1, "● Current · 400 characters", "the window's note, counted with its edits");
+        assert_eq!(note_rows(NotesList::All, &notes, None, now, false, 30)[2].subtitle, "Opened 2 days ago · 397 characters");
         assert!(rows.iter().all(|it| it.tint == Some(design::Tint::Paste)));
 
-        let gone = note_rows(NotesList::Deleted, &[(meta("c", "Old", 0, Some(now - 86_400)), 0)], now, false, 30);
-        assert_eq!(line(&gone[0]), ("Old".into(), "Deleted 1 d ago · 0 characters".into(), Act::RestoreNote("c".into()), Some("Recently Deleted".into())));
+        let gone = note_rows(NotesList::Deleted, &[(meta("c", "Old", 0, Some(now - 86_400)), 0)], Some(("c".into(), 0)), now, false, 30);
+        assert_eq!(line(&gone[0]), ("Old".into(), "Deleted yesterday · 0 characters".into(), Act::RestoreNote("c".into()), Some("Recently Deleted".into())));
         let acts: Vec<(String, bool)> = gone[0].actions().into_iter().map(|(l, a)| (l, a.destructive())).collect();
         assert_eq!(acts, [("Restore".to_string(), false), ("Delete Permanently".to_string(), true)]);
 
-        assert_eq!(note_rows(NotesList::All, &[], now, false, 30)[0].act, Act::Cmd(Cmd::CreateNote));
-        assert_eq!(note_rows(NotesList::All, &[], now, true, 30)[0].title, "No matching notes");
-        assert_eq!(note_rows(NotesList::Deleted, &[], now, false, 7)[0].subtitle, "Deleted notes stay 7 days");
+        assert_eq!(note_rows(NotesList::All, &[], None, now, false, 30)[0].act, Act::Cmd(Cmd::CreateNote));
+        assert_eq!(note_rows(NotesList::All, &[], None, now, true, 30)[0].title, "No matching notes");
+        assert_eq!(note_rows(NotesList::Deleted, &[], None, now, false, 7)[0].subtitle, "Deleted notes stay 7 days");
     }
 
     #[test]

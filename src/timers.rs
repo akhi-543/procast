@@ -68,13 +68,14 @@ pub fn done_text(label: &str, length: Duration) -> String {
 /// A finished timer's accessory, until it is dismissed.
 pub const DONE: &str = "Done";
 
-/// How long ago, from the seconds since: "just now", "3 min ago", "2 d ago".
+/// How long ago, from the seconds since: "just now", "3 min ago", "5 h ago", "yesterday", "2 days ago".
 pub fn ago(secs: u64) -> String {
     match secs {
         a @ 0..60 => if a < 10 { "just now".into() } else { format!("{a} s ago") },
         a @ 60..3600 => format!("{} min ago", a / 60),
         a @ 3600..86400 => format!("{} h ago", a / 3600),
-        a => format!("{} d ago", a / 86400),
+        86400..172800 => "yesterday".into(),
+        a => format!("{} days ago", a / 86400),
     }
 }
 
@@ -285,6 +286,18 @@ pub fn rows_changed(shown: &[u64], rows: &[Row]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ago_reads_in_minutes_hours_then_days() {
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(42), "42 s ago");
+        assert_eq!(ago(180), "3 min ago");
+        assert_eq!(ago(5 * 3600), "5 h ago");
+        assert_eq!(ago(86_400), "yesterday");
+        assert_eq!(ago(2 * 86_400 - 1), "yesterday");
+        assert_eq!(ago(2 * 86_400), "2 days ago");
+        assert_eq!(ago(40 * 86_400), "40 days ago");
+    }
 
     fn secs(n: u64) -> Option<Duration> {
         Some(Duration::from_secs(n))

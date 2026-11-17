@@ -1341,9 +1341,9 @@ fallbacks = [\"define\"]").unwrap();
 
         cfg.launcher.sensitivity = "low".into();
         assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");
-        let note = root("note", &cat, &cfg, &frec, &mut m);
-        assert!(note.iter().any(|h| h.title == "Notepad"));
-        assert!(note.iter().any(|h| h.act == Act::Cmd(Cmd::OpenNotes)), "\"note\" finds the Notes commands, not only apps");
+        // "note" finds the Notes commands, not only apps.
+        let note: Vec<String> = root("note", &cat, &cfg, &frec, &mut m).into_iter().filter(|h| h.section.as_deref() == Some("Results")).map(|h| h.title).collect();
+        assert_eq!(note, ["Create Note", "Notepad", "Open Notes", "Search Notes"]);
     }
 
     #[test]

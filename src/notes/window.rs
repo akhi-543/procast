@@ -152,6 +152,25 @@ impl Doc {
     }
 }
 
+/// Whether a read of note `id` replaces the doc on screen. Another note does. The same note keeps
+/// its buffer, since the read may be older than it, unless the reader itself just wrote that
+/// text (`wrote`: Create Note's title) and the buffer has nothing unsaved.
+fn replaces(doc: Option<&Doc>, id: &str, wrote: bool) -> bool {
+    doc.is_none_or(|d| d.id != id || (wrote && d.unsaved().is_none()))
+}
+
+/// Writing `text` to note `id` failed. If that note is still on screen it is marked unsaved (its
+/// next settle or hide tries again); otherwise the write comes back, to be tried once more.
+fn failed(doc: Option<&mut Doc>, id: Id, text: String) -> Option<(Id, String)> {
+    match doc {
+        Some(d) if d.id == id => {
+            d.saved = None;
+            None
+        }
+        _ => Some((id, text)),
+    }
+}
+
 pub struct NotesWindow {
     notes: Notes,
     tx: UnboundedSender<Msg>,
@@ -192,11 +211,15 @@ impl NotesWindow {
         self.doc.is_some()
     }
 
-    /// Shows note `id` with `text` (as the store has it), saving the note on screen first. When
-    /// it already shows that note with edits not yet written, those edits stay.
-    pub fn show(&mut self, id: Id, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        let keep = self.doc.as_ref().is_some_and(|d| d.id == id && d.unsaved().is_some());
-        if !keep {
+    /// The note on screen and its length in characters, edits included.
+    pub fn current(&self) -> Option<(Id, usize)> {
+        self.doc.as_ref().map(|d| (d.id.clone(), d.buffer.text().chars().count()))
+    }
+
+    /// Shows note `id` with `text` as the store had it (see `replaces`), saving the note on
+    /// screen first.
+    pub fn show(&mut self, id: Id, text: String, wrote: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if replaces(self.doc.as_ref(), &id, wrote) {
             self.save(cx);
             self.doc = Some(Doc::new(id, text));
         }
@@ -245,20 +268,27 @@ impl NotesWindow {
         cx.notify();
     }
 
-    /// Writes the note on screen if the file doesn't have its text yet.
-    fn save(&mut self, cx: &mut Context<Self>) {
+    /// Writes the note on screen if the file doesn't have its text yet. The launcher calls it
+    /// before it reads a note, so the read comes after this write on the store's worker.
+    pub fn save(&mut self, cx: &mut Context<Self>) {
         let Some(doc) = self.doc.as_mut() else { return };
         let Some((id, text)) = doc.unsaved() else { return };
         doc.saved = Some(text.clone());
-        let at = now();
-        self.notes.run(cx, move |s| s.save(&id, &text, at).map(|_| id), |this, r, _| {
-            if let Err(e) = r {
-                // Still unsaved: the next settle or hide tries again.
-                if let Some(d) = this.doc.as_mut() {
-                    d.saved = None;
-                }
-                _ = this.tx.unbounded_send(Msg::error(format!("Couldn't save the note: {e}")));
+        self.write(id, text, true, cx);
+    }
+
+    /// Writes `text` to note `id`; a failure is handled by `failed`, and a write for a note no
+    /// longer on screen is tried again once when `retry`.
+    fn write(&mut self, id: Id, text: String, retry: bool, cx: &mut Context<Self>) {
+        let (to, what, at) = (id.clone(), text.clone(), now());
+        self.notes.run(cx, move |s| s.save(&to, &what, at), move |this, r, cx| {
+            let Err(e) = r else { return };
+            if let Some((id, text)) = failed(this.doc.as_mut(), id, text)
+                && retry
+            {
+                return this.write(id, text, false, cx);
             }
+            _ = this.tx.unbounded_send(Msg::error(format!("Couldn't save the note: {e}")));
         });
     }
 
@@ -288,7 +318,9 @@ impl NotesWindow {
             },
             |this, r, cx| match r {
                 Ok((text, id)) => {
-                    if this.doc.as_ref().is_none_or(|d| d.id != id) {
+                    // Keys typed while the create ran are written before the new note shows.
+                    if replaces(this.doc.as_ref(), &id, false) {
+                        this.save(cx);
                         this.doc = Some(Doc::new(id, text));
                     }
                     cx.notify();
@@ -416,6 +448,29 @@ mod tests {
         assert_eq!(load_place(&path), None);
         std::fs::write(&path, r#"{"x":0,"y":0,"w":0,"h":440}"#).unwrap();
         assert_eq!(load_place(&path), None, "a window with no width is not a place");
+    }
+
+    #[test]
+    fn a_read_of_the_note_on_screen_never_replaces_its_buffer() {
+        let mut doc = Doc::new("a".into(), "newer".into());
+        assert!(replaces(None, "a", false), "nothing on screen");
+        assert!(replaces(Some(&doc), "b", false), "another note");
+        assert!(!replaces(Some(&doc), "a", false), "the same note, saved: the read may be older");
+        assert!(replaces(Some(&doc), "a", true), "the reader wrote it (Create Note's title)");
+        doc.buffer.insert(" typed");
+        assert!(!replaces(Some(&doc), "a", false));
+        assert!(!replaces(Some(&doc), "a", true), "unsaved keys always stay");
+    }
+
+    #[test]
+    fn a_failed_write_marks_only_its_own_note_and_comes_back_for_another() {
+        let mut a = Doc::new("a".into(), "text".into());
+        assert_eq!(failed(Some(&mut a), "a".into(), "text".into()), None);
+        assert_eq!(a.saved, None, "still on screen: unsaved, the next settle or hide tries again");
+        let mut b = Doc::new("b".into(), "other".into());
+        assert_eq!(failed(Some(&mut b), "a".into(), "lost?".into()), Some(("a".into(), "lost?".into())), "moved on: tried again");
+        assert_eq!(b.saved.as_deref(), Some("other"), "the note on screen is not touched");
+        assert_eq!(failed(None, "a".into(), "t".into()), Some(("a".into(), "t".into())));
     }
 
     /// Autosave and hide write `Doc::unsaved` through `Store::save`, as `NotesWindow::save` does.
