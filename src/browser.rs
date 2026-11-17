@@ -273,6 +273,8 @@ mod tests {
         assert!(BLOCKED_PAGE.contains("End your focus session to open this page.") && BLOCKED_PAGE.contains("/* bg_solid */"));
         assert!(BLOCKED_SCRIPT.contains("is blocked by procast`") && BLOCKED_SCRIPT.contains("Snooze for ") && BLOCKED_SCRIPT.contains(r#"type: "snooze""#));
         assert!(SCRIPT.contains("blocked.html") && SCRIPT.contains(r#"case "focusSites""#) && SCRIPT.contains(r#"msg.type !== "snooze""#));
+        assert!(SCRIPT.contains(r#"typeof msg.site !== "string""#) && SCRIPT.contains(r#"sender.url.startsWith(chrome.runtime.getURL("blocked.html"))"#), "Snooze only from the blocked page, with a site");
+        assert!(SCRIPT.contains(r#"rule.mode === "off""#) && SCRIPT.contains("snoozed.clear()"), "a session's snoozes end with it");
     }
 
     #[test]

@@ -33,7 +33,10 @@ async function focus(tab) {
 // Focus: the host a tab is on if the filter keeps it out, else null. Only web pages count.
 let focusRule = { mode: "off", sites: [], snooze: 0 };
 // Hosts the blocked page's Snooze let through, and until when (ms). procast repeats the rule
-// every 15 s, which blocks them again once that has passed.
+// every 15 s, which blocks them again once that has passed. A session's snoozes end with it:
+// cleared when Focus goes off or a rule with other sites arrives.
+// ponytail: a new session with the very same mode and sites keeps the old one's snoozes (procast
+// sends no session id); send one with the rule if that matters.
 const snoozed = new Map();
 
 function blockedHost(url) {
@@ -60,7 +63,8 @@ function redirect(tab, url) {
 
 // The blocked page's Snooze: its site is let through for a while, and the tab goes back to it.
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (msg.type !== "snooze" || !sender.tab || !(focusRule.snooze > 0)) return;
+  const fromPage = typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL("blocked.html"));
+  if (!msg || msg.type !== "snooze" || typeof msg.site !== "string" || !msg.site || !fromPage || !sender.tab || !(focusRule.snooze > 0)) return;
   snoozed.set(msg.site, Date.now() + focusRule.snooze * 60000);
   const back = /^https?:\/\//.test(msg.url) ? msg.url : "https://" + msg.site;
   chrome.tabs.update(sender.tab.id, { url: back });
@@ -97,7 +101,9 @@ async function handle(req) {
       return { t: "open", ok: true, existing: !!same };
     }
     case "focusSites": {
-      focusRule = { mode: req.mode, sites: req.sites || [], snooze: req.snooze || 0 };
+      const rule = { mode: req.mode, sites: req.sites || [], snooze: req.snooze || 0 };
+      if (rule.mode === "off" || rule.mode !== focusRule.mode || rule.sites.join() !== focusRule.sites.join()) snoozed.clear();
+      focusRule = rule;
       for (const t of await chrome.tabs.query({})) redirect(t.id, t.url);
       return { t: "focusSites", ok: true };
     }

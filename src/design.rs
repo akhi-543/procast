@@ -1280,6 +1280,7 @@ pub fn toast(text: &str, kind: crate::toast::Kind, t: &Tokens) -> Div {
 
 /// The Focus timer pill (`.pc-hud`): the time in a System-tinted capsule (tabular figures, so
 /// it never jitters), then the goal. On `bg_elevated` like the toast: it floats on the desktop.
+/// `.pc-hud`'s border is the plain `border`.
 pub fn hud(time: &str, goal: &str, t: &Tokens) -> Div {
     let capsule = div().h(px(HUD_TIME)).px(px(sp::S8)).flex().items_center().rounded(px(r::SM)).bg(alpha(Tint::System.hue(t), mix::HUD_FILL)).font_features(tabular()).child(time.to_string());
     div()
@@ -1292,7 +1293,7 @@ pub fn hud(time: &str, goal: &str, t: &Tokens) -> Div {
         .rounded(px(r::MD))
         .bg(t.bg_elevated)
         .border_1()
-        .border_color(rim_border(t))
+        .border_color(t.border)
         .shadow([rim(t), float(t)].concat())
         .text_size(px(ts::BODY_SM))
         .font_weight(gpui::FontWeight::SEMIBOLD)

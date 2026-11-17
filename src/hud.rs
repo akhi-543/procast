@@ -61,14 +61,13 @@ pub struct View {
     shown: bool,
     /// Where the mouse went down on the pill, until it moves (a drag) or comes up (a click).
     down: Option<Point<Pixels>>,
-    /// A drag just started: the mouse-down gpui reports for it is not a click.
-    moving: bool,
 }
 
 impl Render for View {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The interface size, like the Settings window.
-        design::scale_settings();
+        // The launcher's scale: the scale is one global that each window sets as it renders, and
+        // this one sets the same value the launcher does.
+        design::scale_launcher();
         let t = design::Tokens::from_theme(&self.theme, window);
         let card = match self.spot {
             Spot::Pill => self.pill(&t, cx),
@@ -94,15 +93,12 @@ impl View {
             .flex_none()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|v, e: &MouseDownEvent, _, _| {
-                    if !std::mem::take(&mut v.moving) {
-                        v.down = Some(e.position);
-                    }
-                }),
+                cx.listener(|v, e: &MouseDownEvent, _, _| v.down = Some(e.position)),
             )
             .on_mouse_move(cx.listener(|v, e: &MouseMoveEvent, window, _| {
                 if e.dragging() && v.down.is_some_and(|d| f32::from((e.position.x - d.x).abs()).max(f32::from((e.position.y - d.y).abs())) > DRAG) {
-                    (v.down, v.moving) = (None, true);
+                    // No longer a click: the drag's own mouse-up never reaches the pill.
+                    v.down = None;
                     window.start_window_move();
                 }
             }))
@@ -138,7 +134,9 @@ impl View {
             .mr(px(sp::S16))
             .child(design::button("Extend", Button::Quiet, false, t).id("extend").on_click(click(Click::Extend)))
             .child(design::button("Complete", Button::Primary, false, t).id("complete").on_click(click(Click::Complete)));
+        // `.pc-notice`'s border is the plain `border`, not `elevated`'s rim gradient.
         design::elevated(t)
+            .border_color(t.border)
             .flex_row()
             .flex_none()
             .w(px(design::NOTICE_W))
@@ -180,7 +178,7 @@ impl Hud {
             let Ok((hwnd, was)) = handle.update(cx, |v, _, cx| {
                 (v.time, v.goal, v.theme) = (time.clone(), goal.clone(), state.theme.clone());
                 if !on {
-                    (v.down, v.moving) = (None, false);
+                    v.down = None;
                 }
                 cx.notify();
                 (v.hwnd, std::mem::replace(&mut v.shown, on))
@@ -223,7 +221,7 @@ fn window(cx: &mut AsyncApp, spot: Spot, tx: UnboundedSender<Msg>) -> Option<Win
         windows_window_background: gpui::WindowsWindowBackground::Transparent,
         ..Default::default()
     };
-    let view = |tx| View { spot, time: String::new(), goal: String::new(), theme: config::Theme::default(), hwnd: HWND::default(), tx, shown: false, down: None, moving: false };
+    let view = |tx| View { spot, time: String::new(), goal: String::new(), theme: config::Theme::default(), hwnd: HWND::default(), tx, shown: false, down: None };
     let handle = cx.open_window(options, |_, cx| cx.new(|_| view(tx))).ok()?;
     handle
         .update(cx, |v, window, _| {
