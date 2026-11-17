@@ -639,8 +639,8 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Include all media", "screenshots.all_media", Kind::Bool, "Also list the videos there; their text is not read").with_icon(g::PICTURE),
                 row("Text recognition", "screenshots.ocr", Kind::Bool, "Read the text in screenshots with Windows' own OCR, offline").with_icon(g::SCAN_TEXT),
                 row("Read cloud-only files", "screenshots.cloud", Kind::Bool, "Downloads OneDrive files to read them").with_icon(g::CLOUD),
-                // 1 day to 1 year, or Forever.
-                row("Keep screenshots for", "screenshots.keep", Kind::Choice(&CLIPBOARD_KEEP[2..]), "Pinned screenshots are kept").with_icon(g::CLOCK),
+                // 1 hour to 1 year, or Forever: what `[screenshots] keep` takes.
+                row("Keep screenshots for", "screenshots.keep", Kind::Choice(&CLIPBOARD_KEEP[1..]), "Pinned screenshots are kept").with_icon(g::CLOCK),
             ],
         )]),
         "Shortcuts" | "Notes" => vec![],
@@ -1859,7 +1859,7 @@ mod tests {
         assert_eq!((at(0), at(2), at(3), at(4)), ("3".into(), "false".into(), "true".into(), "false".into()), "the defaults: 3 across, text on, cloud off");
         assert_eq!(page[5].help, "Pinned screenshots are kept");
         let Kind::Choice(keep) = page[5].kind else { panic!("Keep is a Choice") };
-        assert_eq!((keep[0].1.text(), keep.last().unwrap().1.text()), ("1d".into(), "unlimited".into()));
+        assert_eq!((keep[0], keep.last().unwrap().1.text()), (("1 hour", S("1h")), "unlimited".into()), "every value the config template documents");
         assert_eq!(choice_at(keep, &at(5), &page[5].path), Some(keep.len() - 1), "unlimited by default");
     }
 

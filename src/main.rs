@@ -913,6 +913,8 @@ struct Launcher {
     shot_pins: HashSet<PathBuf>,
     /// Quick Look (Ctrl+Y): the selected screenshot shows large in place of the grid.
     quick_look: bool,
+    /// The path Quick Look shows and its `shots::detail` line, read once per shot.
+    quick_look_detail: (String, String),
     /// The grid row at the top of the screenshot grid: a decode for a row scrolled far from
     /// it is dropped before it starts.
     grid_top: Arc<AtomicUsize>,
@@ -1078,6 +1080,7 @@ impl Launcher {
             shot_thumbs: vec![],
             shot_pins: HashSet::new(),
             quick_look: false,
+            quick_look_detail: Default::default(),
             grid_top: Arc::new(AtomicUsize::new(0)),
             ai: None,
             ai_scroll: ScrollHandle::new(),
@@ -2593,8 +2596,9 @@ impl Launcher {
         std::thread::spawn(move || {
             // Settle first: arrowing through the shots only decodes where the selection stops.
             std::thread::sleep(Duration::from_millis(100));
+            // Asked again since: that request freed this key's entry (`drop_images`), and a
+            // drop sent now could remove the entry of a newer request for the same key.
             if seq.load(Ordering::Relaxed) != at {
-                let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
                 return;
             }
             let img = shot_file(&key).and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_image(&b, QUICK_LOOK_PX));
@@ -2603,11 +2607,18 @@ impl Launcher {
         None
     }
 
-    /// Forgets the screenshot thumbnails and Quick Look's picture, frees their GPU textures
-    /// and closes Quick Look (the grid closed).
+    /// Forgets the screenshot thumbnails, frees their GPU textures and closes Quick Look (the
+    /// grid closed).
     fn drop_thumbs(&mut self, cx: &mut App) {
+        self.close_quick_look(cx);
+        self.drop_images(&["t:"], cx);
+    }
+
+    /// Closes Quick Look and frees its picture.
+    fn close_quick_look(&mut self, cx: &mut App) {
         self.quick_look = false;
-        self.drop_images(&["t:", "q:"], cx);
+        self.quick_look_detail = Default::default();
+        self.drop_images(&["q:"], cx);
     }
 
     /// Forgets the decoded images whose keys start with one of `prefixes` and frees their GPU textures.
@@ -3009,6 +3020,33 @@ impl Launcher {
         }
     }
 
+    /// A screenshot delete finished (`shots::delete`): it leaves the grid and its pin, and the
+    /// selection goes back to where the shot was.
+    fn on_shot_deleted(&mut self, path: PathBuf, at: usize, done: Result<(), String>, cx: &mut Context<Self>) {
+        let said = match done {
+            Ok(()) => {
+                self.shots.remove(&path);
+                if self.shot_pins.contains(&path)
+                    && let Ok(pins) = shots::pin(&path, false)
+                {
+                    self.shot_pins = pins;
+                }
+                (Tone::Ok, "Screenshot deleted".to_string())
+            }
+            Err(e) => (Tone::Error, e),
+        };
+        if !self.visible {
+            // Windows' question took focus and closed the launcher: say it in a toast.
+            return self.say(if said.0 == Tone::Ok { Msg::done(said.1) } else { Msg::error(said.1) });
+        }
+        self.status = Some(said);
+        if self.mode == Mode::Shots {
+            self.selected = at;
+            self.refresh_in_place(cx);
+        }
+        cx.notify();
+    }
+
     /// Redraws the list with the selection kept at the same place.
     fn refresh_in_place(&mut self, cx: &mut Context<Self>) {
         let at = self.selected;
@@ -3029,7 +3067,8 @@ impl Launcher {
                 Ok(shot) if paste => {
                     clipboard::paste_soon();
                     // Paste Latest Screenshot has no view: its toast says which one went in.
-                    if latest && let Ok(at) = std::fs::metadata(&shot).and_then(|m| m.modified()) {
+                    if latest {
+                        let at = std::fs::metadata(&shot).and_then(|m| m.modified()).ok();
                         drop(tx.unbounded_send(Msg::done(shots::paste_toast(at))));
                     }
                 }
@@ -3868,9 +3907,10 @@ impl Launcher {
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
             Act::OpenWith(path) => win::open_with(&path),
             Act::QuickLook(_) => {
-                self.quick_look = !self.quick_look;
-                if !self.quick_look {
-                    self.drop_images(&["q:"], cx);
+                if self.quick_look {
+                    self.close_quick_look(cx);
+                } else {
+                    self.quick_look = true;
                 }
                 return cx.notify();
             }
@@ -3896,20 +3936,15 @@ impl Launcher {
             }
             Act::DeleteShot(path) => {
                 let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let at = self.selected;
                 let then = move |this: &mut Launcher, _: &mut Context<Launcher>| {
-                    let path = PathBuf::from(path);
-                    this.status = Some(match shots::delete(&path) {
-                        Ok(()) => {
-                            this.shots.remove(&path);
-                            // The pin goes with it.
-                            if this.shot_pins.contains(&path)
-                                && let Ok(pins) = shots::pin(&path, false)
-                            {
-                                this.shot_pins = pins;
-                            }
-                            (Tone::Ok, "Moved to the Recycle Bin".into())
-                        }
-                        Err(e) => (Tone::Error, e),
+                    let tx = this.tx.clone();
+                    // Windows may ask before a delete it can't undo: let its question come forward.
+                    win::allow_foreground();
+                    std::thread::spawn(move || {
+                        let path = PathBuf::from(path);
+                        let done = shots::delete(&path);
+                        let _ = tx.unbounded_send(Msg::ShotDeleted(path, at, done));
                     });
                 };
                 self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Screenshot?".into(), message: name, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
@@ -4513,6 +4548,7 @@ impl Launcher {
             }
             Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
             Msg::Shots(seq, index, read) => self.on_shots(seq, index, read, cx),
+            Msg::ShotDeleted(path, at, done) => self.on_shot_deleted(path, at, done, cx),
             Msg::Hdr(seq, status) => {
                 if take_hdr_read(&mut self.hdr_status, self.hdr_seq, seq, status) {
                     hdr_state(&mut self.items, self.hdr_status.as_deref());
@@ -4820,8 +4856,7 @@ impl Launcher {
             }
             self.refresh(cx);
         } else if self.quick_look {
-            self.quick_look = false;
-            self.drop_images(&["q:"], cx);
+            self.close_quick_look(cx);
             cx.notify();
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
@@ -5210,10 +5245,14 @@ impl Launcher {
     fn quick_look_view(&mut self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
         let path = self.items.get(self.selected).and_then(|it| it.extra.iter().find_map(|(_, a)| if let Act::QuickLook(p) = a { Some(p.clone()) } else { None })).unwrap_or_default();
         let image = self.shot_thumbs.get(self.selected).cloned().flatten().and_then(|key| self.quick_look_image(&key.replacen("t:", "q:", 1), cx));
+        // A stat once per shot shown, not per redraw.
+        if self.quick_look_detail.0 != path {
+            let line = shots::detail(Path::new(&path), SystemTime::now()).unwrap_or_default();
+            self.quick_look_detail = (path.clone(), line);
+        }
+        let meta = self.quick_look_detail.1.clone();
         let path = Path::new(&path);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        // A stat per redraw, and a redraw only comes with a change.
-        let meta = shots::detail(path, SystemTime::now()).unwrap_or_default();
         let picture = match image {
             Some(image) => gpui::img(image).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element(),
             None => design::icon(if shots::picture(path) { g::PICTURE } else { g::VIDEO }, design::ic::XL, t.text_faint).into_any_element(),

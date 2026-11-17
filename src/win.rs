@@ -107,6 +107,8 @@ pub enum Msg {
     /// Screenshot search: the scan's number and the index so far, or None when the scan is
     /// over; and how many pictures have had their text read, of how many (None when none are).
     Shots(u64, Option<crate::shots::ShotIndex>, Option<(usize, usize)>),
+    /// A screenshot delete finished: its path, the grid cell it was in, and how it went.
+    ShotDeleted(PathBuf, usize, Result<(), String>),
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.

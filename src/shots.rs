@@ -301,9 +301,13 @@ pub fn put_image(owner: HWND, path: Option<PathBuf>, folders: &[PathBuf]) -> Res
     if clipboard::set(owner, clipboard::Put::Image(&png), false) { Ok(path) } else { Err("Could not put it on the clipboard".into()) }
 }
 
-/// Paste Latest Screenshot's toast: "Pasted Screenshot 14:59", the time it was taken.
-pub fn paste_toast(mtime: SystemTime) -> String {
-    format!("Pasted Screenshot {}", calendar::clock(calendar::utc_to_local(secs(mtime) as i64)))
+/// Paste Latest Screenshot's toast: "Pasted Screenshot 14:59", the time it was taken; just
+/// "Pasted Screenshot" when that could not be read.
+pub fn paste_toast(mtime: Option<SystemTime>) -> String {
+    match mtime {
+        Some(t) => format!("Pasted Screenshot {}", calendar::clock(calendar::utc_to_local(secs(t) as i64))),
+        None => "Pasted Screenshot".into(),
+    }
 }
 
 /// Quick Look's line under the name: "2.4 MB · Today, 14:59 · Screenshots" (size, `caption`,
@@ -314,17 +318,32 @@ pub fn detail(path: &Path, now: SystemTime) -> Option<String> {
     Some(format!("{} · {} · {folder}", crate::files::size_text(meta.len()), caption(meta.modified().ok()?, now)))
 }
 
-/// Moves a file to the Recycle Bin, quietly (procast asked first).
+/// Moves a file to the Recycle Bin (procast asked first). One the Recycle Bin can't take (on
+/// a network or removable drive, or too big) is deleted for good only once Windows has asked
+/// and been told Yes. Run on a worker thread: it may wait on that question.
 pub fn delete(path: &Path) -> Result<(), String> {
     use windows::{
-        Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW},
+        Win32::{
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+            UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW},
+        },
         core::PCWSTR,
     };
+    // Undo (the Recycle Bin) only works on a full path.
+    let full = std::path::absolute(path).map_err(|e| format!("Could not delete it: {e}"))?;
+    // The Recycle Bin is the shell's, which wants COM on this thread.
+    unsafe { _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     // A list of paths, each ending in a nul, the list in a second one.
-    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
-    let mut op = SHFILEOPSTRUCTW { wFunc: FO_DELETE, pFrom: PCWSTR(from.as_ptr()), fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16, ..Default::default() };
+    let from: Vec<u16> = full.as_os_str().encode_wide().chain([0, 0]).collect();
+    // No "are you sure" (procast asked), except before a delete that can't be undone.
+    let flags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;
+    let mut op = SHFILEOPSTRUCTW { wFunc: FO_DELETE, pFrom: PCWSTR(from.as_ptr()), fFlags: flags.0 as u16, ..Default::default() };
     let failed = unsafe { SHFileOperationW(&mut op) };
-    if failed != 0 || op.fAnyOperationsAborted.as_bool() { Err("Could not move it to the Recycle Bin".into()) } else { Ok(()) }
+    match (failed, op.fAnyOperationsAborted.as_bool()) {
+        (0, false) => Ok(()),
+        (0, true) => Err("Not deleted".into()),
+        _ => Err("Could not delete it".into()),
+    }
 }
 
 fn pins_file() -> PathBuf {
@@ -818,7 +837,8 @@ mod tests {
 
     #[test]
     fn paste_latest_says_when_the_shot_was_taken() {
-        assert_eq!(paste_toast(at(2026, 11, 17, 14, 59)), "Pasted Screenshot 14:59");
+        assert_eq!(paste_toast(Some(at(2026, 11, 17, 14, 59))), "Pasted Screenshot 14:59");
+        assert_eq!(paste_toast(None), "Pasted Screenshot", "its time could not be read: still a toast");
     }
 
     #[test]
