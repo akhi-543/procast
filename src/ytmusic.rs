@@ -114,6 +114,7 @@ impl Filter {
         }
     }
 
+    #[cfg(test)]
     pub fn name(self) -> &'static str {
         match self {
             Self::Songs => "songs",
@@ -498,10 +499,12 @@ impl Control {
     }
 }
 
+#[cfg(test)]
 pub fn search(req: u64, query: &str, filter: Filter) -> Value {
     json!({"t": "ytm", "req": req, "op": "search", "query": query, "filter": filter.name()})
 }
 
+#[cfg(test)]
 pub fn browse(req: u64, id: &str) -> Value {
     json!({"t": "ytm", "req": req, "op": "browse", "id": id})
 }

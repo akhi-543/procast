@@ -159,6 +159,7 @@ pub fn radio_playlist(video_id: &str) -> String {
     format!("RDAMVM{video_id}")
 }
 
+#[cfg(test)]
 pub fn metadata(base: &str) -> Result<bool, String> {
     agent().get(&format!("{}/metadata", root(base))).call().map(|_| true).map_err(|_| OPEN_APP.to_string())
 }
