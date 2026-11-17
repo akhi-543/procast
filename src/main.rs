@@ -578,15 +578,7 @@ impl Launcher {
     /// An extension icon value: "icon:Name", an emoji, an asset file or a URL.
     /// A web image (http only): drawn from the cache once downloaded, `glyph` until then.
     fn web_icon(&mut self, url: &str, glyph: &'static str) -> Icon {
-        if !url.starts_with("http") {
-            return Icon::Vector(glyph);
-        }
-        let cached = net::image_path(url);
-        if cached.exists() {
-            return self.image(cached).map(Icon::Image).unwrap_or(Icon::Vector(glyph));
-        }
-        net::fetch_image(url, &self.tx);
-        Icon::Vector(glyph)
+        net::cached_image(url, &self.tx).and_then(|path| self.image(path)).map_or(Icon::Vector(glyph), Icon::Image)
     }
 
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
@@ -835,16 +827,18 @@ impl Launcher {
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
         }
-        if self.grid() {
-            let rows = grid_rows(&self.items, self.grid_cols()).len();
-            if keep_selection && self.selected > 0 {
-                self.grid_list.splice(0..self.grid_list.item_count(), rows);
-            } else {
-                self.grid_list.reset(rows);
-            }
-        }
         let _ = max;
         self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
+        if self.grid() {
+            // The visible rows redraw every frame: only a changed layout needs the list told.
+            let rows = grid_rows(&self.items, self.grid_cols()).len();
+            if !(keep_selection && self.selected > 0 && rows == self.grid_list.item_count()) {
+                self.grid_list.reset(rows);
+                if self.selected > 0 {
+                    self.grid_reveal();
+                }
+            }
+        }
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
@@ -1001,6 +995,9 @@ impl Launcher {
         self.visible = false;
         self.hidden_at = Some(Instant::now());
         self.panel = None;
+        if self.mode == Mode::Music {
+            self.music.retire_covers();
+        }
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
         self.stop_ext_view();
         if self.mode == Mode::Ext {
@@ -2278,8 +2275,10 @@ impl Launcher {
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
-                if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs | Mode::Music) {
+                if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs) {
                     self.refresh(cx);
+                } else if self.visible && self.mode == Mode::Music {
+                    self.music_covers_arrived(cx);
                 }
             }
             Msg::FilePreview(key, img) => {
@@ -2718,8 +2717,8 @@ impl Launcher {
             return None;
         }
         match (self.grid(), self.music_tabs()) {
-            (true, true) => Some("EmojiGrid Music"),
-            (true, false) => Some("EmojiGrid"),
+            (true, true) => Some("Grid Music"),
+            (true, false) => Some("Grid"),
             (false, true) => Some("Music"),
             (false, false) => None,
         }
@@ -2899,6 +2898,7 @@ enum Slot {
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         design::scale_launcher();
+        self.music_release(window);
         // Rem-based spacing follows the scale too.
         window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
@@ -3415,8 +3415,8 @@ fn main() {
             KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
             KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
-            KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("left", SelectLeft, Some(&format!("Grid > {DEFAULT_INPUT_CONTEXT}"))),
+            KeyBinding::new("right", SelectRight, Some(&format!("Grid > {DEFAULT_INPUT_CONTEXT}"))),
             KeyBinding::new("tab", NextFilter, Some(&format!("Music > {DEFAULT_INPUT_CONTEXT}"))),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),

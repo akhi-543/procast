@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use gpui::{Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, div, img};
+use gpui::{Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, Window, div, img};
 use serde_json::Value;
 
 use crate::{
@@ -30,6 +30,8 @@ const COVERS: usize = 200;
 const GRID_COVER: u32 = 160;
 /// How long typing must pause before a search is sent.
 const TYPING_PAUSE: Duration = Duration::from_millis(300);
+/// Arrived covers redraw the list at most this often.
+const COVER_REFRESH: Duration = Duration::from_millis(100);
 
 const CELL_PAD: f32 = 6.;
 const CELL_GAP: f32 = 4.;
@@ -96,6 +98,55 @@ struct View {
     reselect: Option<usize>,
 }
 
+/// What the view wants from the companion.
+#[derive(Clone, Debug, PartialEq)]
+enum Ask {
+    Search { query: String, filter: Filter },
+    Shelf(Shelf),
+    Page(String),
+}
+
+impl Ask {
+    fn request(&self, req: u64) -> Value {
+        match self {
+            Self::Search { query, filter } => ytmusic::search(req, query, *filter),
+            Self::Shelf(shelf) => ytmusic::browse(req, shelf.browse_id()),
+            Self::Page(id) => ytmusic::browse(req, id),
+        }
+    }
+}
+
+/// A view request the companion has not answered yet; `shelf` is the library shelf it fetches.
+struct Flight {
+    req: u64,
+    shelf: Option<Shelf>,
+}
+
+/// The companion answers one request at a time: one is in flight, and of the ones asked
+/// meanwhile only the newest is kept.
+#[derive(Default)]
+struct Relay {
+    flight: Option<Flight>,
+    wanted: Option<Ask>,
+}
+
+impl Relay {
+    /// What to send now, if anything: the wanted ask, once nothing is in flight.
+    fn next(&mut self) -> Option<Ask> {
+        if self.flight.is_some() { None } else { self.wanted.take() }
+    }
+
+    fn sent(&mut self, req: u64, ask: &Ask) {
+        let shelf = if let Ask::Shelf(shelf) = ask { Some(*shelf) } else { None };
+        self.flight = Some(Flight { req, shelf });
+    }
+
+    /// A reply came: the request it answered, if that is the one in flight.
+    fn landed(&mut self, req: u64) -> Option<Flight> {
+        self.flight.take_if(|flight| flight.req == req)
+    }
+}
+
 #[derive(Default)]
 pub struct MusicState {
     screen: Screen,
@@ -103,6 +154,7 @@ pub struct MusicState {
     req: u64,
     /// Counts query changes: a search waits out the typing pause and runs only if none came since.
     generation: u64,
+    relay: Relay,
     /// Volume requests in flight: their replies say the new level.
     volume_reqs: HashSet<u64>,
     /// Add to Playlist requests in flight, with the playlist's name.
@@ -111,13 +163,21 @@ pub struct MusicState {
     /// The playlists in the library, for the Add to Playlist actions.
     playlists: Vec<MusicItem>,
     covers: HashMap<PathBuf, Option<Arc<RenderImage>>>,
+    /// Covers out of `covers` whose texture a window still has to free.
+    retired: Vec<Arc<RenderImage>>,
+    /// A refresh for arrived covers is already waiting.
+    refresh_due: bool,
     now: Option<NowPlaying>,
 }
 
 impl MusicState {
     /// A cover file changed on disk.
     pub fn drop_cover(&mut self, path: &Path) {
-        self.covers.remove(path);
+        self.retired.extend(self.covers.remove(path).flatten());
+    }
+
+    pub fn retire_covers(&mut self) {
+        self.retired.extend(self.covers.drain().filter_map(|(_, image)| image));
     }
 }
 
@@ -131,6 +191,7 @@ impl Launcher {
         self.media();
         self.music.screen = screen;
         self.music.view = View::default();
+        self.music.relay.wanted = None;
         self.music.generation += 1;
         self.music.playlists = match screen {
             Screen::Search | Screen::Library => ytmusic::load_cached(Shelf::Playlists.browse_id()).map(|(items, _)| items).unwrap_or_default(),
@@ -218,9 +279,8 @@ impl Launcher {
         let section = self.music_section();
         let mut rows: Vec<Item> = items
             .iter()
-            .enumerate()
-            .map(|(at, item)| {
-                let row = self.music_row(item, at, grid, playlist.as_deref());
+            .map(|item| {
+                let row = music_row(item, playlist.as_deref(), &self.music.playlists);
                 match section {
                     Some(section) => row.sec(section),
                     None => row,
@@ -232,6 +292,12 @@ impl Launcher {
         }
         if rows.is_empty() {
             return self.music_none(query);
+        }
+        let by_id: HashMap<&str, &MusicItem> = items.iter().map(|item| (item.id.as_str(), item)).collect();
+        for row in rows.iter_mut().take(COVERS) {
+            if let Some(item) = music_id(&row.act).and_then(|id| by_id.get(id)) {
+                row.icon = self.music_icon(item, grid);
+            }
         }
         if let Some(playlist) = playlist.filter(|_| query.trim().is_empty()) {
             rows.insert(0, Item::new("Play All", title, Icon::Vector(g::PLAY), Act::Music(MusicAct::Play { video: None, playlist: Some(playlist), radio: false })));
@@ -249,45 +315,21 @@ impl Launcher {
         }
     }
 
-    fn music_row(&mut self, item: &MusicItem, at: usize, grid: bool, page: Option<&str>) -> Item {
-        let icon = self.music_icon(item, at, grid);
-        let actions = item_actions(item, page, &self.music.playlists);
-        let mut row = Item::new(&item.title, &item.subtitle, icon, actions[0].1.clone()).acc(&item.duration).with_hay(format!("{} {}", item.title, item.subtitle));
-        row.extra = actions;
-        row
-    }
-
-    fn music_icon(&mut self, item: &MusicItem, at: usize, grid: bool) -> Icon {
-        let glyph = match item.kind {
-            Kind::Song | Kind::Album => g::AUDIO,
-            Kind::Playlist => g::BULLETS,
-            Kind::Artist => g::STAR,
-        };
-        match (at < COVERS, grid) {
-            (false, _) => Icon::Vector(glyph),
-            (true, true) => self.music_cover(&item.thumb, glyph),
-            (true, false) => self.web_icon(&item.thumb, glyph),
-        }
-    }
-
-    /// A web image from the cache at grid size, `glyph` until it is downloaded.
-    fn music_cover(&mut self, url: &str, glyph: &'static str) -> Icon {
-        if !url.starts_with("http") {
-            return Icon::Vector(glyph);
-        }
-        let path = net::image_path(url);
-        if !path.exists() {
-            net::fetch_image(url, &self.tx);
-            return Icon::Vector(glyph);
-        }
-        let covers = &mut self.music.covers;
-        if covers.len() > COVERS && !covers.contains_key(&path) {
-            covers.clear();
-        }
-        let image = covers.entry(path.clone()).or_insert_with(|| ext::load_image_sized(&path, GRID_COVER)).clone();
+    fn music_icon(&mut self, item: &MusicItem, grid: bool) -> Icon {
+        let glyph = glyph_of(item.kind);
+        let Some(path) = net::cached_image(&item.thumb, &self.tx) else { return Icon::Vector(glyph) };
+        let image = if grid { self.music_cover(path) } else { self.image(path) };
         image.map_or(Icon::Vector(glyph), Icon::Image)
     }
 
+    /// A cached web image at grid size.
+    fn music_cover(&mut self, path: PathBuf) -> Option<Arc<RenderImage>> {
+        let covers = &mut self.music.covers;
+        if covers.len() > COVERS && !covers.contains_key(&path) {
+            self.music.retire_covers();
+        }
+        self.music.covers.entry(path.clone()).or_insert_with(|| ext::load_image_sized(&path, GRID_COVER)).clone()
+    }
     /// The one row that says why the list is empty.
     fn music_none(&self, query: &str) -> Vec<Item> {
         let view = &self.music.view;
@@ -326,6 +368,7 @@ impl Launcher {
         view.loading = false;
         view.error = None;
         view.reselect = Some(frame.selected);
+        self.music.relay.wanted = None;
         self.input.update(cx, |input, cx| input.emplace(&frame.query, cx));
         self.refresh(cx);
         true
@@ -335,9 +378,9 @@ impl Launcher {
         let (query, selected) = (self.query(cx), self.selected);
         let view = &mut self.music.view;
         let page = Page { title: item.title.clone(), playlist: playlist_of(&item) };
-        let frame = Frame { page: view.page.replace(page), items: mem::take(&mut view.items), query, searched: mem::take(&mut view.searched), selected };
+        let frame = Frame { page: view.page.replace(page), items: mem::take(&mut view.items), query, searched: if view.loading { String::new() } else { mem::take(&mut view.searched) }, selected };
         view.stack.push(frame);
-        self.music_fetch(|req| ytmusic::browse(req, &item.id));
+        self.music_fetch(Ask::Page(item.id));
         self.input.update(cx, |input, cx| input.emplace("", cx));
         self.selected = 0;
         self.refresh(cx);
@@ -386,13 +429,30 @@ impl Launcher {
         request(self.music.req).is_some_and(|request| self.browsers.ask(None, request))
     }
 
-    /// Asks for what the view shows; its reply fills the view.
-    fn music_fetch(&mut self, request: impl FnOnce(u64) -> Value) {
-        let sent = self.music_ask(|req| Some(request(req)));
+    /// Asks for what the view shows. It goes out when the companion has answered what it was
+    /// asked before; its reply then fills the view.
+    fn music_fetch(&mut self, ask: Ask) {
         let view = &mut self.music.view;
-        view.pending = sent.then_some(self.music.req);
-        view.loading = sent;
+        view.pending = None;
+        view.loading = true;
         view.error = None;
+        self.music.relay.wanted = Some(ask);
+        self.music_send();
+    }
+
+    fn music_send(&mut self) {
+        if !self.browsers.any() {
+            self.music.relay.flight = None;
+        }
+        let Some(ask) = self.music.relay.next() else { return };
+        let sent = self.music_ask(|req| Some(ask.request(req)));
+        let view = &mut self.music.view;
+        if sent {
+            self.music.relay.sent(self.music.req, &ask);
+            view.pending = Some(self.music.req);
+        } else {
+            view.loading = false;
+        }
     }
 
     fn music_done(&mut self, sent: bool, cx: &mut Context<Self>) {
@@ -434,6 +494,7 @@ impl Launcher {
             view.pending = None;
             view.loading = false;
             view.error = None;
+            self.music.relay.wanted = None;
             return self.refresh(cx);
         }
         let generation = self.music.generation;
@@ -455,8 +516,8 @@ impl Launcher {
             return;
         }
         let filter = self.music.view.filter;
-        self.music.view.searched = query.clone();
-        self.music_fetch(|req| ytmusic::search(req, &query, filter));
+        self.music.view.searched.clone_from(&query);
+        self.music_fetch(Ask::Search { query, filter });
         self.refresh(cx);
     }
 
@@ -466,10 +527,12 @@ impl Launcher {
         let view = &mut self.music.view;
         view.pending = None;
         view.loading = false;
+        self.music.relay.wanted = None;
         self.selected = 0;
         match self.music.screen {
             Screen::Search => {
                 view.filter = view.filter.next();
+                view.items.clear();
                 self.music_search(cx);
             }
             Screen::Library => {
@@ -483,24 +546,33 @@ impl Launcher {
 
     /// Shows the saved list of the shelf, and fetches it again when there is none or it is old.
     fn music_shelf(&mut self) {
-        let id = self.music.view.shelf.browse_id();
-        let cached = ytmusic::load_cached(id);
+        let shelf = self.music.view.shelf;
+        let cached = ytmusic::load_cached(shelf.browse_id());
         let stale = cached.as_ref().is_none_or(|(_, age)| *age > ytmusic::STALE);
         let view = &mut self.music.view;
         view.items = cached.map(|(items, _)| items).unwrap_or_default();
         view.error = None;
         view.pending = None;
         view.loading = false;
+        self.music.relay.wanted = None;
         if stale {
-            self.music_fetch(|req| ytmusic::browse(req, id));
+            self.music_fetch(Ask::Shelf(shelf));
         }
     }
 
     pub fn music_reply(&mut self, reply: Reply, cx: &mut Context<Self>) {
         if matches!(reply.op.as_str(), "search" | "browse") {
+            let flight = self.music.relay.landed(reply.req);
+            if let Some(shelf) = flight.and_then(|flight| flight.shelf).filter(|_| reply.error.is_none()) {
+                ytmusic::save_cached(shelf.browse_id(), &reply.items);
+                if shelf == Shelf::Playlists {
+                    self.music.playlists.clone_from(&reply.items);
+                }
+            }
             if self.music.view.pending == Some(reply.req) {
                 self.music_fill(reply, cx);
             }
+            self.music_send();
             return;
         }
         let volume = self.music.volume_reqs.remove(&reply.req);
@@ -510,26 +582,54 @@ impl Launcher {
         }
     }
 
+    /// Puts a reply in the view. A refreshed library shelf keeps the row selected.
     fn music_fill(&mut self, reply: Reply, cx: &mut Context<Self>) {
-        let screen = self.music.screen;
+        let refreshed = self.music.screen == Screen::Library && self.music.view.page.is_none();
+        let kept = self.items.get(self.selected).and_then(|row| music_id(&row.act)).map(String::from).filter(|_| refreshed);
         let view = &mut self.music.view;
         view.pending = None;
         view.loading = false;
         view.error = reply.error;
-        match &mut view.page {
-            Some(page) if !reply.title.is_empty() => page.title = reply.title,
-            None if screen == Screen::Library && view.error.is_none() => {
-                ytmusic::save_cached(view.shelf.browse_id(), &reply.items);
-                if view.shelf == Shelf::Playlists {
-                    self.music.playlists = reply.items.clone();
-                }
-            }
-            _ => {}
+        if let Some(page) = &mut view.page
+            && !reply.title.is_empty()
+        {
+            page.title = reply.title;
         }
         view.items = reply.items;
-        self.selected = 0;
+        if !refreshed {
+            self.selected = 0;
+        }
         if self.visible && self.mode == Mode::Music {
             self.refresh(cx);
+            if let Some(at) = kept.and_then(|id| row_of(&self.items, &id)) {
+                self.selected = at;
+                self.scroll_to_selected();
+                self.grid_reveal();
+            }
+        }
+    }
+    /// A cover arrived: the list is redrawn after a moment, once for all that came meanwhile.
+    pub fn music_covers_arrived(&mut self, cx: &mut Context<Self>) {
+        if mem::replace(&mut self.music.refresh_due, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COVER_REFRESH).await;
+            this.update(cx, |this, cx| {
+                this.music.refresh_due = false;
+                if this.visible && this.mode == Mode::Music {
+                    this.refresh(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Frees the textures of the covers the cache let go of.
+    pub fn music_release(&mut self, window: &mut Window) {
+        for image in mem::take(&mut self.music.retired) {
+            let _ = window.drop_image(image);
         }
     }
 
@@ -539,6 +639,34 @@ impl Launcher {
             self.refresh(cx);
         }
     }
+}
+
+fn glyph_of(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Song | Kind::Album => g::AUDIO,
+        Kind::Playlist => g::BULLETS,
+        Kind::Artist => g::STAR,
+    }
+}
+
+fn music_row(item: &MusicItem, page: Option<&str>, playlists: &[MusicItem]) -> Item {
+    let actions = item_actions(item, page, playlists);
+    let mut row = Item::new(&item.title, &item.subtitle, Icon::Vector(glyph_of(item.kind)), actions[0].1.clone()).acc(&item.duration).with_hay(format!("{} {}", item.title, item.subtitle));
+    row.extra = actions;
+    row
+}
+
+/// The id of the song or page a row stands for.
+fn music_id(act: &Act) -> Option<&str> {
+    match act {
+        Act::Music(MusicAct::Open(item)) => Some(&item.id),
+        Act::Music(MusicAct::Play { video: Some(video), .. }) => Some(video),
+        _ => None,
+    }
+}
+
+fn row_of(rows: &[Item], id: &str) -> Option<usize> {
+    rows.iter().position(|row| music_id(&row.act) == Some(id))
 }
 
 fn no_browser() -> Item {
@@ -625,7 +753,7 @@ fn announces_volume(control: Control) -> bool {
     matches!(control, Control::Mute | Control::VolumeLow | Control::VolumeMedium | Control::VolumeHigh | Control::VolumeUp | Control::VolumeDown)
 }
 
-/// dded is the name of the playlist an Add to Playlist request named.
+/// `added` is the name of the playlist an Add to Playlist request named.
 fn toast(reply: &Reply, volume: bool, added: Option<&str>) -> Option<(bool, String)> {
     if let Some(error) = &reply.error {
         return Some((false, error.clone()));
@@ -796,5 +924,41 @@ mod tests {
         assert!(cell_width(750., 3) > cell_width(750., 8));
         assert_eq!(cell_width(750., 0), cell_width(750., 1));
         assert_eq!(cell_height(100.), 100. + 2. * CELL_GAP + TITLE_HEIGHT + SUBTITLE_HEIGHT);
+    }
+
+    #[test]
+    fn the_newest_ask_waits_for_the_one_in_flight() {
+        let search = |query: &str| Ask::Search { query: query.into(), filter: Filter::Songs };
+        let mut relay = Relay { wanted: Some(search("a")), ..Default::default() };
+        let first = relay.next().unwrap();
+        relay.sent(1, &first);
+        relay.wanted = Some(search("ab"));
+        relay.wanted = Some(search("abc"));
+        assert_eq!(relay.next(), None, "one at a time");
+        assert!(relay.landed(7).is_none(), "an answer to another request changes nothing");
+        assert_eq!(relay.next(), None);
+        assert!(relay.landed(1).is_some());
+        assert_eq!(relay.next(), Some(search("abc")), "the newest wins");
+        assert_eq!(relay.next(), None);
+    }
+
+    #[test]
+    fn a_flight_remembers_its_shelf() {
+        let mut relay = Relay::default();
+        relay.sent(2, &Ask::Shelf(Shelf::Playlists));
+        assert_eq!(relay.landed(2).unwrap().shelf, Some(Shelf::Playlists));
+        relay.sent(3, &Ask::Page("MPREb_1".into()));
+        assert_eq!(relay.landed(3).unwrap().shelf, None);
+        assert_eq!(Ask::Shelf(Shelf::Liked).request(4), ytmusic::browse(4, "VLLM"));
+        assert_eq!(Ask::Page("MPREb_1".into()).request(5), ytmusic::browse(5, "MPREb_1"));
+        assert_eq!(Ask::Search { query: "x".into(), filter: Filter::Albums }.request(6), ytmusic::search(6, "x", Filter::Albums));
+    }
+
+    #[test]
+    fn rows_are_found_by_what_they_open_or_play() {
+        let rows = [music_row(&item(Kind::Album, "MPREb_1", "OLAK1"), None, &[]), music_row(&item(Kind::Song, "abc", ""), None, &[])];
+        assert_eq!((row_of(&rows, "MPREb_1"), row_of(&rows, "abc"), row_of(&rows, "zzz")), (Some(0), Some(1), None));
+        assert_eq!(music_id(&Act::Music(MusicAct::Play { video: None, playlist: Some("PL1".into()), radio: false })), None);
+        assert_eq!(music_id(&Act::None), None);
     }
 }
