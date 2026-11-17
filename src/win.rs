@@ -104,8 +104,9 @@ pub enum Msg {
     Hdr(u64, Vec<crate::hdr::HdrDisplay>),
     /// A root Define row's subtitle: the request number, the word (lowercase), its first short sense.
     Sense { seq: u64, word: String, sense: Option<String> },
-    /// Screenshot search: the scan's number and the index so far, or None when the scan is over.
-    Shots(u64, Option<crate::shots::ShotIndex>),
+    /// Screenshot search: the scan's number and the index so far, or None when the scan is
+    /// over; and how many pictures have had their text read, of how many (None when none are).
+    Shots(u64, Option<crate::shots::ShotIndex>, Option<(usize, usize)>),
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.

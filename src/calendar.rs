@@ -18,7 +18,7 @@ use crate::{
     search::{Act, Icon, Item},
 };
 
-const DAY: i64 = 86400;
+pub(crate) const DAY: i64 = 86400;
 /// How soon an event must start to lead root search as Next (and for Join Meeting).
 const NEXT_WITHIN: i64 = 15 * 60;
 
@@ -40,7 +40,7 @@ pub struct Event {
 // ---- time -----------------------------------------------------------------------------
 
 /// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -48,7 +48,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
@@ -535,7 +535,7 @@ pub fn sections(events: &[Event], now: i64) -> Vec<(&'static str, Vec<Event>)> {
     out
 }
 
-fn clock(naive: i64) -> String {
+pub(crate) fn clock(naive: i64) -> String {
     let s = naive.rem_euclid(DAY);
     format!("{:02}:{:02}", s / 3600, s % 3600 / 60)
 }

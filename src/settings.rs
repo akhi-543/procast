@@ -989,6 +989,13 @@ impl Settings {
         self.focus_row(window, cx);
     }
 
+    /// Opens the section named `name` (the launcher's Add Folder opens Screenshots).
+    pub fn show_section(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = SECTIONS.iter().position(|s| *s == name) {
+            self.set_section(i, window, cx);
+        }
+    }
+
     fn set_section(&mut self, s: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.commit(cx);
         self.recording = false;
@@ -1269,7 +1276,7 @@ impl Settings {
                     drop(me.update(cx, |this, cx| this.save(&path, opts[k].1.value(), cx)));
                 })
             }
-            Kind::Language(lead) => design::dropdown(&language_label(lead, &value), t).into_any_element(),
+            Kind::Language(lead) => design::dropdown(design::g::FILTER, &language_label(lead, &value), t).into_any_element(),
             Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
             Kind::Action(_) => design::button("Rebuild", design::Button::Quiet, on, t).into_any_element(),

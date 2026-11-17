@@ -96,6 +96,8 @@ pub enum Act {
     HideEvent(String),
     /// Open the Add Calendar form.
     AddCalendar,
+    /// Settings → Screenshots, to add a folder (Search Screenshots' empty state).
+    AddShotFolder,
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
@@ -136,7 +138,7 @@ impl Act {
             Act::Cmd(Cmd::Define) => "Define",
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => "Rename",
             Act::Copy(_) | Act::CopyClip(_) => "Copy",
-            Act::CopyShot(_) => "Copy Image",
+            Act::CopyShot(_) => "Copy to Clipboard",
             Act::PasteShot(_) => "Paste Image",
             Act::PinClip(_, true) => "Pin Entry",
             Act::PinClip(_, false) => "Unpin Entry",
@@ -166,6 +168,7 @@ impl Act {
             Act::Join(..) => "Join Meeting",
             Act::HideEvent(_) => "Hide This Event",
             Act::AddCalendar => "Add Calendar",
+            Act::AddShotFolder => "Add Folder",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::FocusExtend => "Extend",

@@ -865,13 +865,13 @@ struct Launcher {
     /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
     clip_images: HashMap<String, Option<Arc<RenderImage>>>,
     /// File Search detail pane: the selected file's information (read when the selection
-    /// changes), and its decoded pictures (`p:`) and shell icons (`i:`) by path.
+    /// changes), and its decoded pictures (`p:`), shell icons (`i:`) and Search Screenshots'
+    /// thumbnails (`t:`) by path.
     file_info: Option<(String, Option<files::FileInfo>)>,
     file_images: HashMap<String, Option<Arc<RenderImage>>>,
     /// Counts selection changes in File Search; a preview worker waits for its count to hold.
     file_seq: Arc<AtomicU64>,
-    /// Emoji picker: the grid's scroll position, by grid row.
-    /// The emoji grid's rows; only the ones on screen are laid out.
+    /// The emoji and screenshot grids' rows; only the ones on screen are laid out.
     grid_list: gpui::ListState,
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
@@ -899,6 +899,10 @@ struct Launcher {
     shots: shots::ShotIndex,
     shots_seq: u64,
     shots_busy: bool,
+    /// How many pictures the scan has read of how many, while it reads them: the banner.
+    shots_progress: Option<(usize, usize)>,
+    /// The bar's dropdown: which screenshots show.
+    shot_kind: shots::Kind,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -1051,6 +1055,8 @@ impl Launcher {
             shots: shots::ShotIndex::default(),
             shots_seq: 0,
             shots_busy: false,
+            shots_progress: None,
+            shot_kind: shots::Kind::All,
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -1503,7 +1509,7 @@ impl Launcher {
                 search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
-            Mode::Shots => shots::rows(&self.shots, &query, &self.cfg.screenshots.primary, 200),
+            Mode::Shots => shots::rows(&self.shots, &query, self.shot_kind, &self.cfg.screenshots.primary),
             // A form draws its own body.
             Mode::Form(_) => vec![],
             Mode::Schedule => {
@@ -1635,15 +1641,16 @@ impl Launcher {
             let (title, hint) = match (self.shots_busy, query.trim().is_empty()) {
                 (true, _) => ("Reading screenshots…", "Text in new pictures is found in the background".to_string()),
                 (_, false) => ("No matches", "Nothing in your screenshots matches".to_string()),
-                _ => ("No screenshots found", format!("Looked in {}", shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", "))),
+                _ => ("No screenshots found", shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")),
             };
-            self.items = vec![empty_row(g::PICTURE, title.into(), hint, vec![])];
+            let add = (title == "No screenshots found").then(|| (Act::AddShotFolder.label().to_string(), Act::AddShotFolder));
+            self.items = vec![empty_row(g::SCAN_SEARCH, title.into(), hint, add.into_iter().collect())];
         }
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
         }
-        if self.mode == Mode::Emoji {
-            self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
+        if matches!(self.mode, Mode::Emoji | Mode::Shots) {
+            self.grid_list.reset(grid_rows(&self.items, self.grid_cols()).len());
         }
         let _ = max;
         self.selected = if keep_selection {
@@ -2266,6 +2273,12 @@ impl Launcher {
 
     /// Scrolls the selected row into view (section headers take list slots too).
     fn scroll_to_selected(&self) {
+        if self.grid() {
+            if let Some(at) = grid_rows(&self.items, self.grid_cols()).iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
+                self.grid_list.scroll_to_reveal_item(at);
+            }
+            return;
+        }
         let at = display_rows(&self.items, self.mode == Mode::Schedule).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
         self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
     }
@@ -2476,9 +2489,9 @@ impl Launcher {
         self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
     }
 
-    /// A file's picture (`p:`, fitted) or shell icon (`i:`), made on a worker thread: None
-    /// until it arrives as Msg::FilePreview.
-    fn file_preview(&mut self, key: String) -> Option<Arc<RenderImage>> {
+    /// A file's picture (`p:`, fitted), shell icon (`i:`) or grid thumbnail (`t:`, 320 px),
+    /// made off the UI thread: None until it arrives as Msg::FilePreview.
+    fn file_preview(&mut self, key: String, cx: &App) -> Option<Arc<RenderImage>> {
         if self.file_images.len() > 300 {
             self.file_images.clear();
         }
@@ -2487,18 +2500,30 @@ impl Launcher {
         }
         self.file_images.insert(key.clone(), None);
         let (tx, seq) = (self.tx.clone(), self.file_seq.clone());
-        let at = seq.load(Ordering::Relaxed);
-        std::thread::spawn(move || {
-            // Settle first: arrowing through a folder only decodes where the selection stops.
-            std::thread::sleep(Duration::from_millis(100));
+        let (at, thumb) = (seq.load(Ordering::Relaxed), key.starts_with("t:"));
+        let make = move || {
             if seq.load(Ordering::Relaxed) != at {
                 let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
                 return;
             }
             let path = &key[2..];
-            let img = if key.starts_with("p:") { std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)) } else { win::file_icon(path) };
+            let img = match &key[..2] {
+                "p:" => std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)),
+                "t:" => std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, THUMB_PX)),
+                _ => win::file_icon(path),
+            };
             let _ = tx.unbounded_send(Msg::FilePreview(key, img));
-        });
+        };
+        if thumb {
+            // A grid's thumbnails are all wanted at once: no settle, on the shared pool.
+            cx.background_executor().spawn(async move { make() }).detach();
+        } else {
+            std::thread::spawn(move || {
+                // Settle first: arrowing through a folder only decodes where the selection stops.
+                std::thread::sleep(Duration::from_millis(100));
+                make();
+            });
+        }
         None
     }
 
@@ -2869,16 +2894,17 @@ impl Launcher {
         self.shots_busy = true;
         let (seq, tx, s) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone());
         std::thread::spawn(move || {
-            let run = || shots::rescan(&shots::folders(&s.folders), shots::keep(&s.keep), s.all_media, s.ocr, |index| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone())))));
+            let run = || shots::rescan(&shots::folders(&s.folders), shots::keep(&s.keep), s.all_media, s.ocr, |index, read| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone()), read))));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
-            let _ = tx.unbounded_send(Msg::Shots(seq, None));
+            let _ = tx.unbounded_send(Msg::Shots(seq, None, None));
         });
     }
 
-    fn on_shots(&mut self, seq: u64, index: Option<shots::ShotIndex>, cx: &mut Context<Self>) {
+    fn on_shots(&mut self, seq: u64, index: Option<shots::ShotIndex>, read: Option<(usize, usize)>, cx: &mut Context<Self>) {
         if seq != self.shots_seq {
             return;
         }
+        self.shots_progress = read;
         match index {
             Some(index) => self.shots = index,
             None => self.shots_busy = false,
@@ -3868,7 +3894,11 @@ impl Launcher {
             Act::Cmd(Cmd::ClearClipboardHistory) => self.history.clear(),
             Act::Cmd(Cmd::Settings) => {
                 self.hide(false, cx);
-                return self.open_settings(cx);
+                return self.open_settings(None, cx);
+            }
+            Act::AddShotFolder => {
+                self.hide(false, cx);
+                return self.open_settings(Some("Screenshots"), cx);
             }
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true, true),
@@ -4039,12 +4069,15 @@ impl Launcher {
         self.run(it.act, it.key, window, cx);
     }
 
-    /// Brings up the settings window, reusing it if it's already open.
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    /// Brings up the settings window, reusing it if it's already open; on `page` when given.
+    fn open_settings(&mut self, page: Option<&str>, cx: &mut Context<Self>) {
         let items = search::all_items(&self.apps, &self.scripts, &self.exts, &self.cfg);
         if let Some(h) = self.settings_window
-            && h.update(cx, |s, window, _| {
+            && h.update(cx, |s, window, cx| {
                 s.set_items(items.clone());
+                if let Some(page) = page {
+                    s.show_section(page, window, cx);
+                }
                 window.activate()
             })
             .is_ok()
@@ -4063,6 +4096,9 @@ impl Launcher {
         self.refresh_index_status(cx);
         let (tx, status, feeds) = (self.tx.clone(), self.index_status.clone(), self.calendar.status.clone());
         self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, feeds, window, cx))).ok();
+        if let (Some(h), Some(page)) = (self.settings_window, page) {
+            drop(h.update(cx, |s, window, cx| s.show_section(page, window, cx)));
+        }
     }
 
     /// Rewrites the Settings index line from the live index and repaints Settings.
@@ -4228,7 +4264,7 @@ impl Launcher {
                 }
             }
             Msg::Hud(hud::Click::Complete) => self.focus_end(true, cx),
-            Msg::Tray(TrayCmd::Settings) => self.open_settings(cx),
+            Msg::Tray(TrayCmd::Settings) => self.open_settings(None, cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Msg::Tray(TrayCmd::Quit) => cx.quit(),
             Msg::Apps(apps) => {
@@ -4314,7 +4350,7 @@ impl Launcher {
                 self.ask_sense(cx);
             }
             Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
-            Msg::Shots(seq, index) => self.on_shots(seq, index, cx),
+            Msg::Shots(seq, index, read) => self.on_shots(seq, index, read, cx),
             Msg::Hdr(seq, status) => {
                 if take_hdr_read(&mut self.hdr_status, self.hdr_seq, seq, status) {
                     hdr_state(&mut self.items, self.hdr_status.as_deref());
@@ -4456,7 +4492,7 @@ impl Launcher {
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
             Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word)),
-            Mode::Shots => Some("Screenshots".into()),
+            Mode::Shots => Some("Search Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
@@ -4481,7 +4517,7 @@ impl Launcher {
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()).unwrap_or_default().into(),
             Mode::Output => "Enter copies the output".into(),
             Mode::Define => "Word to define…".into(),
-            Mode::Shots => "Search screenshots by text or name…".into(),
+            Mode::Shots => "Filter screenshots by name:, text: or date:…".into(),
             Mode::Schedule => "Search events…".into(),
             Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
@@ -4495,9 +4531,6 @@ impl Launcher {
     fn footer_left(&self) -> String {
         if let Some((_, s)) = &self.status {
             return s.clone();
-        }
-        if self.mode == Mode::Shots && self.shots_busy {
-            return "Reading screenshots…".into();
         }
         if self.mode == Mode::Files
             && let Some(f) = &self.files
@@ -4514,8 +4547,8 @@ impl Launcher {
         {
             return line;
         }
-        // The grid shows no names: the selected emoji's is here.
-        if self.grid() && self.panel.is_none()
+        // The emoji grid shows no names: the selected emoji's is here.
+        if self.mode == Mode::Emoji && self.grid() && self.panel.is_none()
             && let Some(it) = self.items.get(self.selected)
         {
             return it.title.clone();
@@ -4550,7 +4583,7 @@ impl Launcher {
             Mode::Ai => Icon::Vector(g::SPARKLES),
             Mode::Translate | Mode::LanguageSets => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
-            Mode::Shots => Icon::Vector(g::PICTURE),
+            Mode::Shots => Icon::Vector(g::SCAN_SEARCH),
             Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
             Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
@@ -4908,9 +4941,9 @@ impl Launcher {
     }
 
     /// File Search's right-hand pane: a preview, then the file's information.
-    fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
+    fn file_detail(&mut self, t: &Tokens, cx: &App) -> gpui::AnyElement {
         let path = match self.items.get(self.selected).map(|it| &it.act) {
-            Some(Act::File(p) | Act::CopyShot(p) | Act::PasteShot(p)) => p.clone(),
+            Some(Act::File(p)) => p.clone(),
             _ => return div().flex_1().into_any_element(),
         };
         if self.file_info.as_ref().is_none_or(|f| f.0 != path) {
@@ -4929,13 +4962,13 @@ impl Launcher {
             files::Preview::Image(_) => (None, None, true),
             files::Preview::Icon => (None, None, false),
         };
-        let picture = if image { self.file_preview(format!("p:{path}")) } else { None };
+        let picture = if image { self.file_preview(format!("p:{path}"), cx) } else { None };
         let top = if let Some(s) = text {
             detail_lines(&s, true).into_any_element()
         } else if let Some(n) = count {
             detail_lines(&if n >= 10_000 { "10000+ items".to_string() } else if n == 1 { "1 item".to_string() } else { format!("{n} items") }, false).into_any_element()
         } else {
-            let icon = if picture.is_none() { self.file_preview(format!("i:{path}")) } else { None };
+            let icon = if picture.is_none() { self.file_preview(format!("i:{path}"), cx) } else { None };
             let shown = picture.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain)).or_else(|| icon.map(|i| gpui::img(i).size(px(design::ic::XL))));
             image_box(t).children(shown).into_any_element()
         };
@@ -4948,9 +4981,9 @@ impl Launcher {
         pane.child(top).children(info_rows(&meta, t)).into_any_element()
     }
 
-    /// Emoji picker: moves the selection by `dx` cells or `dy` grid rows.
+    /// The grids: moves the selection by `dx` cells or `dy` grid rows.
     fn grid_move(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
-        let rows = grid_rows(&self.items, self.cfg.emoji.columns);
+        let rows = grid_rows(&self.items, self.grid_cols());
         let cells: Vec<&Vec<usize>> = rows.iter().filter_map(|r| if let GridRow::Cells(c) = r { Some(c) } else { None }).collect();
         let Some((r, c)) = cells.iter().enumerate().find_map(|(r, row)| row.iter().position(|&i| i == self.selected).map(|c| (r, c))) else { return };
         self.selected = if dy != 0 {
@@ -4959,19 +4992,26 @@ impl Launcher {
         } else {
             (self.selected as isize + dx).clamp(0, self.items.len() as isize - 1) as usize
         };
-        if let Some(at) = rows.iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
-            self.grid_list.scroll_to_reveal_item(at);
-        }
+        self.scroll_to_selected();
         cx.notify();
     }
 
-    /// The emoji picker shows a grid (it falls back to the list for its empty state).
+    /// The emoji picker and Search Screenshots show a grid (each falls back to the list for
+    /// its empty state).
     fn grid(&self) -> bool {
-        self.mode == Mode::Emoji && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+        matches!(self.mode, Mode::Emoji | Mode::Shots) && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    /// Cells per grid row: `[screenshots] columns` (3 to 6) or `[emoji] columns` (4 to 16).
+    fn grid_cols(&self) -> usize {
+        if self.mode == Mode::Shots { self.cfg.screenshots.columns.clamp(3, 6) } else { self.cfg.emoji.columns.clamp(4, 16) }
     }
 
     fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let cols = self.cfg.emoji.columns.clamp(4, 16);
+        if self.mode == Mode::Shots {
+            return self.shot_grid(t, cx);
+        }
+        let cols = self.grid_cols();
         let me = cx.weak_entity();
         let (selected, t) = (self.selected, *t);
         let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
@@ -5018,7 +5058,68 @@ impl Launcher {
             });
         div().flex_1().min_h_0().flex().flex_col().px(px(8.)).py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
     }
+
+    /// Search Screenshots' grid (`.pc-grid`): the section with its count, then the thumbnails
+    /// `grid_cols` across, each decoded off the UI thread as its row comes on screen.
+    fn shot_grid(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cols = self.grid_cols();
+        let me = cx.weak_entity();
+        let (selected, t, count) = (self.selected, *t, self.items.len());
+        let cells: Rc<Vec<(String, String)>> = Rc::new(self.items.iter().map(|it| (shot_path(it).unwrap_or_default().to_string(), it.accessory.clone())).collect());
+        let rows = Rc::new(grid_rows(&self.items, cols));
+        let last = rows.len().saturating_sub(1);
+        let list = gpui::list(self.grid_list.clone(), move |k, _, cx| match &rows[k] {
+            GridRow::Header(s) => design::section_header(s, Some(count), &t).into_any_element(),
+            GridRow::Cells(row) => div()
+                .flex()
+                .w_full()
+                .px(px(design::sp::S16))
+                .pb(px(if k == last { design::sp::S8 } else { design::sp::S12 }))
+                .gap(px(design::sp::S12))
+                .children(row.iter().map(|&i| {
+                    let (path, caption) = &cells[i];
+                    let image = me.update(cx, |this, cx| this.file_preview(format!("t:{path}"), cx)).ok().flatten();
+                    let me = me.clone();
+                    design::thumb(image, caption, i == selected, &t)
+                        .id(("shot", i))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                            me.update(cx, |this, cx| {
+                                this.selected = i;
+                                this.launch(window, cx);
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                }))
+                .children((row.len()..cols).map(|_| div().flex_1().into_any_element()))
+                .into_any_element(),
+        });
+        div().flex_1().min_h_0().flex().flex_col().py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
+    }
+
+    /// Search Screenshots' dropdown: All, Screenshots, Recordings, Pinned.
+    fn open_shot_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = shots::Kind::ALL.iter().map(|k| menu::Entry { id: k.label().into(), label: k.label().into(), ..Default::default() }).collect();
+        let mut m = menu::Menu::new(entries, None, menu::Place::Right);
+        m.selected = shots::Kind::ALL.iter().position(|k| *k == self.shot_kind).unwrap_or(0);
+        let pick = |this: &mut Launcher, id: String, _: &mut Window, cx: &mut Context<Launcher>| {
+            this.shot_kind = shots::Kind::ALL.into_iter().find(|k| k.label() == id).unwrap_or_default();
+            this.refresh(cx);
+        };
+        self.open_menu(m, pick, window, cx);
+    }
 }
+
+/// A screenshot cell's file.
+fn shot_path(it: &Item) -> Option<&str> {
+    match &it.act {
+        Act::CopyShot(p) | Act::PasteShot(p) | Act::File(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// The width a screenshot thumbnail is decoded at.
+const THUMB_PX: u32 = 320;
 
 /// An emoji cell's height.
 const EMOJI_CELL: f32 = 56.;
@@ -5029,9 +5130,9 @@ enum GridRow {
     Cells(Vec<usize>),
 }
 
-/// The emoji picker's layout: each section's header, then its emoji in rows of `cols`.
+/// A grid's layout: each section's header, then its cells in rows of `cols`.
 fn grid_rows(items: &[Item], cols: usize) -> Vec<GridRow> {
-    let cols = cols.clamp(4, 16);
+    let cols = cols.max(1);
     let mut out = vec![];
     let mut last: Option<&str> = None;
     for (i, it) in items.iter().enumerate() {
@@ -5107,7 +5208,7 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::Translate(_) | Act::LangMenu => g::LANGUAGES,
         Act::UseLangSet(_) => g::CHECK,
         Act::EditLangSet(_) => g::EDIT,
-        Act::AddCalendar => g::PLUS,
+        Act::AddCalendar | Act::AddShotFolder => g::PLUS,
         Act::DeleteLangSet(_) => g::DELETE,
         _ => g::PLAY,
     }
@@ -5166,7 +5267,7 @@ impl Render for Launcher {
         let lt = if self.mode == Mode::Translate && self.translation.as_ref().is_some_and(|tr| tr.busy) { Tokens { text: t.text_faint, text_muted: t.text_faint, ..t } } else { t };
         let side = match self.mode {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
-            Mode::Files | Mode::Shots if empty.is_none() => Some(self.file_detail(&t)),
+            Mode::Files if empty.is_none() => Some(self.file_detail(&t, cx)),
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
             _ => None,
@@ -5283,7 +5384,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Shots | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
         let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
@@ -5419,7 +5520,7 @@ impl Render for Launcher {
         let leading = if at_root { design::search_mark(&t).into_any_element() } else { design::back_tile(&t).id("back").on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element() };
         let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.clone()).map(|(opts, cur, on_change)| {
             let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-            design::dropdown(&title, &t)
+            design::dropdown(g::FILTER, &title, &t)
                 .id("dropdown")
                 .on_click(cx.listener(move |this, _, window, cx| {
                     let Some(f) = on_change.clone() else { return };
@@ -5434,8 +5535,13 @@ impl Render for Launcher {
         let dropdown = dropdown.or_else(|| {
             let tr = self.translation.as_ref().filter(|_| self.mode == Mode::Translate)?;
             let label = translate::LangSet { from: tr.job.from.clone(), to: tr.job.to.clone() }.label();
-            Some(design::dropdown(&label, &t).id("lang-set").on_click(cx.listener(|this, _, window, cx| this.open_lang_menu(window, cx))).into_any_element())
+            Some(design::dropdown(g::FILTER, &label, &t).id("lang-set").on_click(cx.listener(|this, _, window, cx| this.open_lang_menu(window, cx))).into_any_element())
         });
+        let dropdown = dropdown.or_else(|| {
+            (self.mode == Mode::Shots).then(|| design::dropdown(g::BULLETS, self.shot_kind.label(), &t).id("shot-kind").on_click(cx.listener(|this, _, window, cx| this.open_shot_menu(window, cx))).into_any_element())
+        });
+        // While the scan reads text: "Reading text in screenshots  94 of 996", static.
+        let banner = self.shots_progress.filter(|(done, of)| self.mode == Mode::Shots && done < of).map(|(done, of)| design::banner(g::SCAN_TEXT, "Reading text in screenshots", &format!("{} of {}", design::thousands(done), design::thousands(of)), &t));
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
         let query_input = text_input("query")
@@ -5670,8 +5776,12 @@ impl Render for Launcher {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenDropdown, window, cx| {
-                if this.mode == Mode::Translate && this.menu.is_none() && this.panel.is_none() {
-                    this.open_lang_menu(window, cx);
+                if this.menu.is_none() && this.panel.is_none() {
+                    match this.mode {
+                        Mode::Translate => this.open_lang_menu(window, cx),
+                        Mode::Shots => this.open_shot_menu(window, cx),
+                        _ => {}
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
@@ -5758,7 +5868,7 @@ impl Render for Launcher {
                     .child(div().min_w_0().child(n))
             }))
             .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
-            .when(!collapsed, |d| d.child(body).child(footer))
+            .when(!collapsed, |d| d.children(banner).child(body).child(footer))
             .children(popover.into_iter().flatten())
             .children(dialog)
             .children(pop)

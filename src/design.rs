@@ -179,8 +179,12 @@ pub const TOKEN: f32 = 22.;
 pub const ARG_MIN: f32 = 72.;
 pub const ARG_MAX: f32 = 200.;
 
-/// The width of the focus ring around a field (and the missing ring around an argument box).
+/// The width of the focus ring around a field (and the missing ring around an argument box,
+/// and the selected thumbnail's accent ring).
 const RING: f32 = 2.;
+
+/// `.pc-thumb__img`: a thumbnail's width to height.
+const THUMB_ASPECT: f32 = 16. / 10.;
 
 /// `color-mix` shares: how much of a colour a wash keeps.
 pub mod mix {
@@ -384,6 +388,7 @@ names! {
     ALARM_CLOCK = "alarm-clock",
     CALENDAR_CLOCK = "calendar-clock",
     SCAN_SEARCH = "scan-search",
+    SCAN_TEXT = "scan-text",
     IMAGE_DOWN = "image-down",
     SUN_MEDIUM = "sun-medium",
     MONITOR_COG = "monitor-cog",
@@ -1045,8 +1050,63 @@ pub fn section_header(title: &str, count: Option<usize>, t: &Tokens) -> Div {
         .text_size(px(ts::SMALL))
         .text_color(t.text_faint)
         .child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
-        .children(count.map(|n| div().flex_none().child(n.to_string())))
+        .children(count.map(|n| div().flex_none().child(thousands(n))))
         .child(div().ml(px(4.)).flex_1().h(px(1.)).bg(t.hairline))
+}
+
+/// A count with a comma every three digits: 1050 -> "1,050".
+pub fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `.pc-thumb`: a picture (cover-fit in a 16:10 `surface` box with a hairline edge; `surface`
+/// alone until it has loaded) over its one-line caption. Selected: a 2 px `accent` ring and
+/// the caption in `text`, no fill.
+pub fn thumb(image: Option<std::sync::Arc<gpui::RenderImage>>, caption: &str, on: bool, t: &Tokens) -> Div {
+    let picture = div()
+        .w_full()
+        .aspect_ratio(THUMB_ASPECT)
+        .rounded(px(r::MD))
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.hairline)
+        .when(on, |d| d.ring(px(RING)).ring_color(t.accent))
+        .children(image.map(|i| img(i).size_full().rounded(px(r::MD)).object_fit(gpui::ObjectFit::Cover)));
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(sp::S4))
+        .child(picture)
+        .child(div().truncate().text_size(px(ts::BODY_SM)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(if on { t.text } else { t.text_muted }).child(caption.to_string()))
+}
+
+/// `.pc-banner`: a one-row notice under the bar (the icon muted, then `text`, then `meta`
+/// faint), static.
+pub fn banner(glyph: &'static str, text: &str, meta: &str, t: &Tokens) -> Div {
+    div()
+        .h(px(ROW))
+        .flex_none()
+        .px(px(sp::S16))
+        .flex()
+        .items_center()
+        .gap(px(sp::S8))
+        .border_b_1()
+        .border_color(t.hairline)
+        .text_size(px(ts::BODY_SM))
+        .text_color(t.text)
+        .child(icon(glyph, ic::MD, t.text_muted))
+        .child(text.to_string())
+        .child(div().text_color(t.text_faint).child(meta.to_string()))
 }
 
 /// Centred icon, title and hint for empty views.
@@ -1334,8 +1394,9 @@ pub fn back_tile(t: &Tokens) -> Div {
     div().size(px(TILE)).flex_none().flex().items_center().justify_center().rounded(px(r::SM)).bg(t.surface).hover(move |s| s.bg(hover)).child(icon(g::BACK, ic::MD, t.text))
 }
 
-/// The search bar's filter dropdown: the current choice between a filter and a chevron.
-pub fn dropdown(label: &str, t: &Tokens) -> Div {
+/// The search bar's dropdown: the current choice between `glyph` (the filter icon, or
+/// Search Screenshots' list) and a chevron.
+pub fn dropdown(glyph: &'static str, label: &str, t: &Tokens) -> Div {
     div()
         .flex_none()
         .h(px(CONTROL))
@@ -1347,7 +1408,7 @@ pub fn dropdown(label: &str, t: &Tokens) -> Div {
         .border_1()
         .border_color(t.border)
         .text_size(px(ts::BODY_SM))
-        .child(icon(g::FILTER, ic::SM, t.text_muted))
+        .child(icon(glyph, ic::SM, t.text_muted))
         .child(div().max_w(px(180.)).truncate().child(label.to_string()))
         .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
 }
@@ -1712,6 +1773,11 @@ pub fn dialog(danger: bool, title: &str, message: &str, buttons: impl IntoIterat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_take_a_comma_every_three_digits() {
+        assert_eq!([0, 7, 999, 1050, 12345, 1_000_000].map(thousands), ["0", "7", "999", "1,050", "12,345", "1,000,000"]);
+    }
 
     #[test]
     fn every_icon_name_is_served() {

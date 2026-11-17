@@ -606,11 +606,13 @@ pub struct Screenshots {
     pub all_media: bool,
     /// Enter: copy | paste (into the app you came from) | open.
     pub primary: String,
+    /// Thumbnails per row in Search Screenshots, 3 to 6.
+    pub columns: usize,
 }
 
 impl Default for Screenshots {
     fn default() -> Self {
-        Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into() }
+        Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into(), columns: 3 }
     }
 }
 
@@ -836,6 +838,7 @@ keep = "unlimited"            # how long a screenshot stays listed: 1h | 1d | 7d
 ocr = true                    # find text in screenshots (Windows' own OCR, offline); off lists them by name only
 all_media = false             # also list videos (their text is not read)
 primary = "copy"              # Enter: copy | paste (into the app you came from) | open
+columns = 3                   # thumbnails per row in Search Screenshots: 3 to 6
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account
