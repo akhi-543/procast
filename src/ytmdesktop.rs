@@ -77,8 +77,7 @@ fn set_volume(level: u32) -> Value {
     json!({"command": "setVolume", "data": level})
 }
 
-pub fn transport(control: Control, step: u32) -> Value {
-    let _ = step;
+pub fn transport(control: Control, step: u32, volume: Option<u32>) -> Value {
     match control {
         Control::PlayPause => json!({"command": "playPause"}),
         Control::Next => json!({"command": "next"}),
@@ -89,8 +88,14 @@ pub fn transport(control: Control, step: u32) -> Value {
         Control::VolumeLow => set_volume(33),
         Control::VolumeMedium => set_volume(66),
         Control::VolumeHigh => set_volume(100),
-        Control::VolumeUp => json!({"command": "volumeUp"}),
-        Control::VolumeDown => json!({"command": "volumeDown"}),
+        Control::VolumeUp => match volume {
+            Some(v) => set_volume(v.saturating_add(step).min(100)),
+            None => json!({"command": "volumeUp"}),
+        },
+        Control::VolumeDown => match volume {
+            Some(v) => set_volume(v.saturating_sub(step)),
+            None => json!({"command": "volumeDown"}),
+        },
         Control::Shuffle => json!({"command": "shuffle"}),
         Control::Repeat => json!({"command": "repeatMode", "data": 1}),
     }
@@ -149,6 +154,7 @@ pub fn to_now_playing(state: &State) -> (NowPlaying, String, String) {
             cover: None,
             video_id: state.video_id.clone(),
             playlist_id: state.playlist_id.clone(),
+            volume: Some(state.volume),
         },
         state.video_id.clone(),
         state.playlist_id.clone(),
@@ -252,20 +258,23 @@ mod tests {
 
     #[test]
     fn play_pause_and_set_volume_json() {
-        assert_eq!(transport(Control::PlayPause, 10), json!({"command":"playPause"}));
+        assert_eq!(transport(Control::PlayPause, 10, None), json!({"command":"playPause"}));
         assert_eq!(set_volume(50), json!({"command":"setVolume","data":50}));
-        assert_eq!(transport(Control::VolumeLow, 10), json!({"command":"setVolume","data":33}));
-        assert_eq!(transport(Control::VolumeMedium, 10), json!({"command":"setVolume","data":66}));
-        assert_eq!(transport(Control::VolumeHigh, 10), json!({"command":"setVolume","data":100}));
-        assert_eq!(transport(Control::VolumeUp, 15), json!({"command":"volumeUp"}));
-        assert_eq!(transport(Control::VolumeDown, 15), json!({"command":"volumeDown"}));
-        assert_eq!(transport(Control::Repeat, 10), json!({"command":"repeatMode","data":1}));
-        assert_eq!(transport(Control::Next, 10), json!({"command":"next"}));
-        assert_eq!(transport(Control::Previous, 10), json!({"command":"previous"}));
-        assert_eq!(transport(Control::Like, 10), json!({"command":"toggleLike"}));
-        assert_eq!(transport(Control::Dislike, 10), json!({"command":"toggleDislike"}));
-        assert_eq!(transport(Control::Mute, 10), json!({"command":"mute"}));
-        assert_eq!(transport(Control::Shuffle, 10), json!({"command":"shuffle"}));
+        assert_eq!(transport(Control::VolumeLow, 10, None), json!({"command":"setVolume","data":33}));
+        assert_eq!(transport(Control::VolumeMedium, 10, None), json!({"command":"setVolume","data":66}));
+        assert_eq!(transport(Control::VolumeHigh, 10, None), json!({"command":"setVolume","data":100}));
+        assert_eq!(transport(Control::VolumeUp, 15, None), json!({"command":"volumeUp"}));
+        assert_eq!(transport(Control::VolumeDown, 15, None), json!({"command":"volumeDown"}));
+        assert_eq!(transport(Control::VolumeUp, 15, Some(40)), json!({"command":"setVolume","data":55}));
+        assert_eq!(transport(Control::VolumeDown, 15, Some(10)), json!({"command":"setVolume","data":0}));
+        assert_eq!(transport(Control::VolumeUp, 15, Some(90)), json!({"command":"setVolume","data":100}));
+        assert_eq!(transport(Control::Repeat, 10, None), json!({"command":"repeatMode","data":1}));
+        assert_eq!(transport(Control::Next, 10, None), json!({"command":"next"}));
+        assert_eq!(transport(Control::Previous, 10, None), json!({"command":"previous"}));
+        assert_eq!(transport(Control::Like, 10, None), json!({"command":"toggleLike"}));
+        assert_eq!(transport(Control::Dislike, 10, None), json!({"command":"toggleDislike"}));
+        assert_eq!(transport(Control::Mute, 10, None), json!({"command":"mute"}));
+        assert_eq!(transport(Control::Shuffle, 10, None), json!({"command":"shuffle"}));
     }
 
     #[test]
@@ -289,6 +298,7 @@ mod tests {
         assert!(now.playing);
         assert_eq!(now.cover, None);
         assert_eq!((now.video_id.as_str(), now.playlist_id.as_str()), ("FGBhQbmPwH8", "OLAK5"));
+        assert_eq!(now.volume, Some(40));
         assert_eq!(video, "FGBhQbmPwH8");
         assert_eq!(playlist, "OLAK5");
         assert_eq!(radio_playlist("FGBhQbmPwH8"), "RDAMVMFGBhQbmPwH8");

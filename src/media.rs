@@ -46,6 +46,7 @@ pub struct NowPlaying {
     pub cover: Option<PathBuf>,
     pub video_id: String,
     pub playlist_id: String,
+    pub volume: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -223,7 +224,7 @@ fn pick(sessions: &[(String, bool)]) -> Option<usize> {
 
 fn is_browser(aumid: &str) -> bool {
     let aumid = aumid.to_lowercase();
-    ["chrome", "msedge", "brave", "music.youtube.com"].iter().any(|b| aumid.contains(b))
+    ["chrome", "msedge", "brave", "music.youtube.com", "squirrel", "youtube_music", "youtubemusic"].iter().any(|b| aumid.contains(b))
 }
 
 /// `prev` is what was last sent: its cover is kept while the track is the same.
@@ -243,6 +244,7 @@ fn read(session: &Session, prev: Option<&NowPlaying>) -> windows::core::Result<N
         cover,
         video_id: String::new(),
         playlist_id: String::new(),
+        volume: None,
     })
 }
 
@@ -309,6 +311,9 @@ mod tests {
         assert!(is_browser("MSEdge"));
         assert!(is_browser("Brave"));
         assert!(is_browser("music.youtube.com-abc"));
+        assert!(is_browser("com.squirrel.youtube-music.YouTube Music"));
+        assert!(is_browser("com.github.th-ch.youtube_music"));
+        assert!(is_browser("YouTubeMusic"));
         assert!(!is_browser("Spotify.exe"));
     }
 
@@ -322,6 +327,7 @@ mod tests {
     #[test]
     fn other_players_are_ignored() {
         assert_eq!(pick(&[s("Spotify.exe", true)]), None);
+        assert_eq!(pick(&[s("Spotify.exe", true), s("com.squirrel.youtube-music.YouTube Music", false)]), Some(1));
         assert_eq!(pick(&[]), None);
     }
 

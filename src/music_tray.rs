@@ -165,6 +165,7 @@ mod tests {
             cover: None,
             video_id: String::new(),
             playlist_id: String::new(),
+            volume: None,
         }
     }
 

@@ -238,6 +238,8 @@ pub struct MusicState {
     /// Last video/playlist ids from desktop `/state` (Copy URL / Open / song radio).
     video_id: String,
     playlist_id: String,
+    /// Last desktop player volume from `/state`, for Volume Up/Down `setVolume`.
+    volume: Option<u32>,
     tray: Option<TrayIcon>,
 }
 
@@ -270,6 +272,7 @@ impl Launcher {
 
     fn music_desktop(&mut self, job: DesktopJob) {
         let step = self.cfg.ytmusic.volume_step;
+        let volume = self.music.volume;
         let fallback = match job {
             DesktopJob::Command(control) => transport(control).map(|t| (self.media().clone(), t)),
             _ => {
@@ -285,7 +288,7 @@ impl Launcher {
                 let token = ytmdesktop::ensure_token(&desktop)?;
                 match &job {
                     DesktopJob::Play { video, playlist } => ytmdesktop::play(&token, &desktop.base, video.as_deref(), playlist.as_deref())?,
-                    DesktopJob::Command(control) => ytmdesktop::command(&token, &desktop.base, ytmdesktop::transport(*control, step))?,
+                    DesktopJob::Command(control) => ytmdesktop::command(&token, &desktop.base, ytmdesktop::transport(*control, step, volume))?,
                     DesktopJob::State => {}
                 }
                 ytmdesktop::state(&token, &desktop.base)
@@ -402,7 +405,7 @@ impl Launcher {
 
     fn track_row(&mut self) -> Item {
         let Some(now) = self.music.now.clone() else {
-            return empty_row(g::PLAY, "Nothing playing".into(), "Play something on music.youtube.com".into(), vec![]);
+            return empty_row(g::PLAY, "Nothing playing".into(), ytmdesktop::OPEN_APP.into(), vec![]);
         };
         let icon = now.cover.clone().and_then(|path| self.image(path)).map_or(Icon::Vector(g::PLAY), Icon::Image);
         track_item(&now, icon)
@@ -910,11 +913,9 @@ impl Launcher {
     }
 
     pub fn music_now(&mut self, now: Option<NowPlaying>, cx: &mut Context<Self>) {
-        if let Some(now) = &now
-            && !now.video_id.is_empty()
-        {
-            self.music.video_id.clone_from(&now.video_id);
-            self.music.playlist_id.clone_from(&now.playlist_id);
+        remember_track(&mut self.music.video_id, &mut self.music.playlist_id, now.as_ref());
+        if let Some(volume) = now.as_ref().and_then(|n| n.volume) {
+            self.music.volume = Some(volume);
         }
         let changed = self.music.now != now;
         self.music.now = now;
@@ -1070,8 +1071,32 @@ fn item_actions(item: &MusicItem, page: Option<&str>, playlists: &[MusicItem]) -
         Kind::Artist => vec![act("Open", MusicAct::Open(item.clone()))],
     };
     actions.push(("Copy URL".into(), Act::Copy(item.url())));
-    actions.push(("Open in YouTube Music".into(), Act::Open(item.url())));
+    if let Some(play) = desktop_play(item) {
+        actions.push(("Open in YouTube Music".into(), Act::Music(play)));
+    }
     actions
+}
+
+/// Play in the desktop app: a song's video id, or an album/playlist's `playlist_of`. Artists have none.
+fn desktop_play(item: &MusicItem) -> Option<MusicAct> {
+    match item.kind {
+        Kind::Song => Some(MusicAct::Play { video: Some(item.id.clone()), playlist: None, radio: false }),
+        Kind::Album | Kind::Playlist => playlist_of(item).map(|playlist| MusicAct::Play { video: None, playlist: Some(playlist), radio: false }),
+        Kind::Artist => None,
+    }
+}
+
+fn remember_track(video_id: &mut String, playlist_id: &mut String, now: Option<&NowPlaying>) {
+    match now.filter(|n| !n.video_id.is_empty()) {
+        Some(n) => {
+            video_id.clone_from(&n.video_id);
+            playlist_id.clone_from(&n.playlist_id);
+        }
+        None => {
+            video_id.clear();
+            playlist_id.clear();
+        }
+    }
 }
 
 /// An album cell's width: `columns` of them side by side across a window `window` wide.
@@ -1180,11 +1205,28 @@ mod tests {
             cover: None,
             video_id: String::new(),
             playlist_id: String::new(),
+            volume: None,
         }
     }
 
     fn reply(op: &str, error: Option<&str>, current: Option<Current>) -> Reply {
         Reply { op: op.into(), error: error.map(String::from), current, ..Default::default() }
+    }
+
+    #[test]
+    fn empty_now_playing_clears_stored_track_ids() {
+        let mut video = "abc".to_string();
+        let mut playlist = "PL1".to_string();
+        remember_track(&mut video, &mut playlist, None);
+        assert!(video.is_empty() && playlist.is_empty());
+        let mut with_id = now("One", "Band", "Record", true);
+        with_id.video_id = "xyz".into();
+        with_id.playlist_id = "PL2".into();
+        remember_track(&mut video, &mut playlist, Some(&with_id));
+        assert_eq!((video.as_str(), playlist.as_str()), ("xyz", "PL2"));
+        let empty_id = now("One", "Band", "Record", true);
+        remember_track(&mut video, &mut playlist, Some(&empty_id));
+        assert!(video.is_empty() && playlist.is_empty());
     }
 
     #[test]
@@ -1293,7 +1335,7 @@ mod tests {
         assert_eq!(actions[2].1, Act::Music(MusicAct::Rate("like", Some("abc".into()))));
         assert_eq!(actions[4].1, Act::Music(MusicAct::AddToPlaylist("VLPL1".into(), Some("abc".into()))));
         assert_eq!(actions[6].1, Act::Copy("https://music.youtube.com/watch?v=abc".into()));
-        assert_eq!(actions[7].1, Act::Open("https://music.youtube.com/watch?v=abc".into()));
+        assert_eq!(actions[7].1, Act::Music(MusicAct::Play { video: Some("abc".into()), playlist: None, radio: false }));
         assert_eq!(labels(&item_actions(&song, None, &[])).len(), 6, "no playlists, no submenu rows");
     }
 
@@ -1305,15 +1347,17 @@ mod tests {
         assert_eq!(actions[0].1, Act::Music(MusicAct::Open(album.clone())));
         assert_eq!(actions[1].1, Act::Music(MusicAct::Play { video: None, playlist: Some("OLAK1".into()), radio: false }));
         assert_eq!(actions[2].1, Act::Copy("https://music.youtube.com/browse/MPREb_1".into()));
+        assert_eq!(actions[3].1, Act::Music(MusicAct::Play { video: None, playlist: Some("OLAK1".into()), radio: false }));
         let playlist = item(Kind::Playlist, "VLPL9", "");
         assert_eq!(item_actions(&playlist, None, &[])[1].1, Act::Music(MusicAct::Play { video: None, playlist: Some("PL9".into()), radio: false }), "the browse id names the playlist");
-        assert_eq!(labels(&item_actions(&item(Kind::Album, "MPREb_2", ""), None, &[])), ["Open", "Copy URL", "Open in YouTube Music"]);
+        assert_eq!(item_actions(&playlist, None, &[])[3].1, Act::Music(MusicAct::Play { video: None, playlist: Some("PL9".into()), radio: false }));
+        assert_eq!(labels(&item_actions(&item(Kind::Album, "MPREb_2", ""), None, &[])), ["Open", "Copy URL"]);
     }
 
     #[test]
     fn an_artist_only_opens() {
         let actions = item_actions(&item(Kind::Artist, "UC1", "RDAO1"), None, &[]);
-        assert_eq!(labels(&actions), ["Open", "Copy URL", "Open in YouTube Music"]);
+        assert_eq!(labels(&actions), ["Open", "Copy URL"]);
         assert_eq!(actions[1].1, Act::Copy("https://music.youtube.com/browse/UC1".into()));
         assert_eq!(playlist_of(&item(Kind::Artist, "UC1", "RDAO1")), None);
         assert_eq!(playlist_of(&item(Kind::Song, "abc", "PL1")), None);
