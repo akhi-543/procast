@@ -117,9 +117,9 @@ struct Row {
     group: String,
 }
 
-const SECTIONS: [&str; 13] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Window", "Theme", "Extensions", "Advanced"];
+const SECTIONS: [&str; 14] = ["General", "Launcher", "Shortcuts", "Apps", "Clipboard", "Snippets", "Quicklinks", "Emoji", "Files", "Window", "Theme", "Extensions", "YouTube Music", "Advanced"];
 /// The sidebar icon of each section, in `SECTIONS` order.
-const SECTION_ICONS: [&str; 13] = [
+const SECTION_ICONS: [&str; 14] = [
     design::g::SLIDERS_HORIZONTAL,
     design::g::SEARCH,
     design::g::KEYBOARD,
@@ -132,6 +132,7 @@ const SECTION_ICONS: [&str; 13] = [
     design::g::WIN_LEFT_HALF,
     design::g::PERSONALIZE,
     design::g::PUZZLE,
+    design::g::AUDIO,
     design::g::WRENCH,
 ];
 
@@ -349,6 +350,15 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Enter", "emoji.action", Kind::Choice(&["paste", "copy"]), "Paste into the app you came from, or only copy."),
                 row("Skin tone", "emoji.skin_tone", Kind::Choice(config::SKIN_TONES), "Used for every emoji that comes in skin tones."),
                 row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
+            ],
+        )]),
+        "YouTube Music" => groups(vec![(
+            "YouTube Music",
+            vec![
+                row("Enabled", "ytmusic.enabled", Kind::Bool, "Search, library and playback controls for music.youtube.com in your browser."),
+                row("Tray player", "ytmusic.tray", Kind::Bool, "A tray icon with the current track and playback controls."),
+                row("Album columns", "ytmusic.columns", Kind::Number, "Albums per row in the grid, 3 to 8."),
+                row("Volume step", "ytmusic.volume_step", Kind::Number, "How much Volume Up and Volume Down change the volume, in percent."),
             ],
         )]),
         "Window" => groups(vec![

@@ -118,6 +118,8 @@ pub enum Reply {
     Tabs(String, Vec<Tab>),
     /// Done (activate, open) or failed.
     Done(Result<(), String>),
+    /// YouTube Music's answer, errors included.
+    Music(crate::ytmusic::Reply),
 }
 
 /// A connected browser: its id and the queue of requests for its worker.
@@ -194,6 +196,9 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
 
 fn parse_reply(body: &[u8]) -> Reply {
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
+    if v["t"] == "ytm" {
+        return Reply::Music(serde_json::from_value(v).unwrap_or_default());
+    }
     if let Some(e) = v["error"].as_str() {
         return Reply::Done(Err(e.to_string()));
     }
@@ -257,6 +262,25 @@ mod tests {
         }
         assert!(matches!(parse_reply(br#"{"t":"open","ok":true}"#), Reply::Done(Ok(()))));
         assert!(matches!(parse_reply(br#"{"t":"activate","error":"No tab with id: 9."}"#), Reply::Done(Err(_))));
+    }
+
+    #[test]
+    fn music_replies_parse() {
+        let found = br#"{"t":"ytm","req":7,"op":"search","title":"","current":null,"items":[
+            {"kind":"song","id":"abc","playlistId":"","title":"One","subtitle":"Song","thumb":"https://i/x.jpg","duration":"3:21"},
+            {"kind":"album","id":"MPREb_1","playlistId":"OLAK5","title":"Two","subtitle":"Album","thumb":"","duration":""}]}"#;
+        match parse_reply(found) {
+            Reply::Music(r) => {
+                assert_eq!((r.req, r.op.as_str(), r.items.len(), r.error), (7, "search", 2, None));
+                assert_eq!((r.items[0].kind, r.items[0].id.as_str()), (crate::ytmusic::Kind::Song, "abc"));
+                assert_eq!((r.items[1].kind, r.items[1].playlist_id.as_str()), (crate::ytmusic::Kind::Album, "OLAK5"));
+            }
+            r => panic!("{r:?}"),
+        }
+        match parse_reply(br#"{"t":"ytm","req":8,"op":"like","title":"","items":[],"current":null,"error":"Open YouTube Music first."}"#) {
+            Reply::Music(r) => assert_eq!((r.req, r.op.as_str(), r.error.as_deref()), (8, "like", Some("Open YouTube Music first."))),
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]

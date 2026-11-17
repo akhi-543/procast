@@ -19,6 +19,8 @@ mod snippets;
 mod system;
 mod toast;
 mod win;
+#[allow(dead_code)]
+mod ytmusic;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -2285,6 +2287,7 @@ impl Launcher {
                     let _ = self.tx.unbounded_send(Msg::Toast(false, e));
                 }
                 browser::Reply::Done(Ok(())) => {}
+                browser::Reply::Music(_) => {}
             },
             Msg::Running(list) => {
                 for (r, icon) in &list {

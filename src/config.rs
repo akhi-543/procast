@@ -25,6 +25,7 @@ pub struct Config {
     pub ai: Ai,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
+    pub ytmusic: YtMusic,
     pub files: Files,
     pub window: Window,
     pub scripts: Scripts,
@@ -213,6 +214,24 @@ impl Default for Emoji {
 }
 
 pub const SKIN_TONES: &[&str] = &["none", "light", "medium_light", "medium", "medium_dark", "dark"];
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct YtMusic {
+    pub enabled: bool,
+    /// A tray icon with the current track and playback controls.
+    pub tray: bool,
+    /// Albums per row in the grid.
+    pub columns: usize,
+    /// Percent that Volume Up and Volume Down change the volume by.
+    pub volume_step: u32,
+}
+
+impl Default for YtMusic {
+    fn default() -> Self {
+        Self { enabled: true, tray: false, columns: 5, volume_step: 10 }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
@@ -460,6 +479,7 @@ impl Default for Config {
             ai: Ai::default(),
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
+            ytmusic: YtMusic::default(),
             files: Files::default(),
             window: Window::default(),
             scripts: Scripts::default(),
@@ -564,6 +584,12 @@ columns = 8                   # emoji per row in the picker
 action = "paste"              # Enter: paste (into the app you came from) | copy
 skin_tone = "none"            # none | light | medium_light | medium | medium_dark | dark
 shortcodes = true             # typing :name: in any app (e.g. :thumbsup:) turns into the emoji
+
+[ytmusic]
+enabled = true                # search, library and playback controls for music.youtube.com in your browser
+tray = false                  # a tray icon with the current track and playback controls
+columns = 5                   # albums per row in the grid
+volume_step = 10              # percent that Volume Up and Volume Down change the volume by
 
 [files]
 enabled = true
