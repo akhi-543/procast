@@ -525,6 +525,12 @@ fn define_rows(v: &DefView, web: &str) -> Vec<Item> {
     }
 }
 
+/// The word typing in the define view asks for once it pauses: the bar trimmed, unless it is
+/// empty or the word already shown.
+fn typed_word<'a>(shown: &str, query: &'a str) -> Option<&'a str> {
+    Some(query.trim()).filter(|w| !w.is_empty() && *w != shown)
+}
+
 /// The word a root Define row's box holds, given the box values shown for it.
 fn define_word<'a>(it: &Item, values: &'a [String]) -> Option<&'a str> {
     values.first().map(|v| v.trim()).filter(|v| it.act == Act::Cmd(Cmd::Define) && !v.is_empty())
@@ -718,6 +724,8 @@ struct Launcher {
     define: Option<DefView>,
     /// Number of the newest lookup; answers to older ones are dropped.
     define_seq: u64,
+    /// Number of the newest change typed in the define view; a pause timer older than it does nothing.
+    define_typed: u64,
     /// Whether the dictionary is downloaded, checked off the UI thread each time the launcher
     /// shows (None until that check answers).
     dict_ready: Option<bool>,
@@ -860,6 +868,7 @@ impl Launcher {
             prev_set: None,
             define: None,
             define_seq: 0,
+            define_typed: 0,
             dict_ready: None,
             senses: HashMap::new(),
             sense_seq: 0,
@@ -2313,7 +2322,10 @@ impl Launcher {
         // Not downloaded (as checked on show): say so without asking the worker.
         let missing = !fetch && self.dict_ready == Some(false);
         self.define = Some(DefView { word: word.clone(), fetch, answer: if missing { Some(Ok(None)) } else { answer } });
-        self.fill_query(&word, cx);
+        // Typed with a space after it ("ice "): the bar stays as typed.
+        if self.query(cx).trim() != word {
+            self.fill_query(&word, cx);
+        }
         self.refresh(cx);
         if missing {
             return;
@@ -2326,21 +2338,15 @@ impl Launcher {
 
     /// Typing in the define view: looks the word up again once typing pauses for `TYPING_QUIET`.
     fn define_soon(&mut self, cx: &mut Context<Self>) {
-        let word = self.query(cx).trim().to_string();
-        if self.define.as_ref().is_none_or(|v| v.word == word) {
-            return;
-        }
-        // Answers still on their way are for older text.
-        self.define_seq += 1;
-        let seq = self.define_seq;
-        if word.is_empty() {
-            // So the word typed again is looked up again (its answer may just have been dropped).
-            return self.define.iter_mut().for_each(|v| v.word.clear());
-        }
+        // Any change outdates a pause still being waited out ("dogs" back to "dog").
+        self.define_typed += 1;
+        let seq = self.define_typed;
+        let query = self.query(cx);
+        let Some(word) = self.define.as_ref().and_then(|v| typed_word(&v.word, &query)).map(str::to_string) else { return };
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(TYPING_QUIET).await;
             _ = this.update(cx, |this, cx| {
-                if this.define_seq == seq && this.mode == Mode::Define {
+                if this.define_typed == seq && this.mode == Mode::Define && this.query(cx).trim() == word {
                     this.define(word, false, cx);
                 }
             });
@@ -3918,7 +3924,7 @@ impl Launcher {
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
-            Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word).trim_end().to_string()),
+            Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word)),
             Mode::Shots => Some("Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
@@ -5587,6 +5593,18 @@ mod tests {
         // Not downloaded: the empty view's Enter downloads it.
         let rows = define_rows(&view("dog", None), web);
         assert_eq!((rows[0].title.as_str(), rows[0].act.clone()), ("Download Dictionary", Act::DownloadDictionary("dog".into())));
+    }
+
+    #[test]
+    fn typing_in_the_define_view_asks_only_for_a_new_word() {
+        // "dog" shown; "s" queues "dogs"; Backspace before the pause is back to "dog": nothing new
+        // is queued (and the bump in `define_soon` outdates the "dogs" timer).
+        assert_eq!(typed_word("dog", "dogs"), Some("dogs"));
+        assert_eq!(typed_word("dog", "dog"), None);
+        assert_eq!(typed_word("dog", " dog "), None);
+        assert_eq!(typed_word("dog", "  "), None);
+        // A trailing space asks for the word without it.
+        assert_eq!(typed_word("ic", "ice "), Some("ice"));
     }
 
     #[test]
