@@ -151,8 +151,8 @@ fn call(endpoint: &str, rest: Value) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|_| UNREACHABLE.to_string())
 }
 
-fn require_session() -> Result<Session, String> {
-    load_session().filter(|s| s.sapisid().is_some()).ok_or_else(|| SIGN_IN.to_string())
+fn require_session(session: Option<Session>) -> Result<Session, String> {
+    session.filter(|s| s.sapisid().is_some()).ok_or_else(|| SIGN_IN.to_string())
 }
 
 fn browse_reply(id: &str, json: &Value, signed_in: bool) -> Reply {
@@ -170,13 +170,19 @@ pub fn search(query: &str, filter: Filter) -> Result<Reply, String> {
     Ok(Reply { op: "search".into(), items: parse_items(&json), ..Default::default() })
 }
 
+#[allow(dead_code)]
 pub fn browse(id: &str) -> Result<Reply, String> {
     let json = call("browse", json!({"browseId": id}))?;
-    Ok(browse_reply(id, &json, require_session().is_ok()))
+    Ok(browse_reply(id, &json, require_session(load_session()).is_ok()))
 }
 
+#[allow(dead_code)]
 pub fn rate(op: &str, video_id: &str) -> Result<Reply, String> {
-    require_session()?;
+    rate_with(load_session(), op, video_id)
+}
+
+fn rate_with(session: Option<Session>, op: &str, video_id: &str) -> Result<Reply, String> {
+    require_session(session)?;
     let endpoint = match op {
         "like" => "like/like",
         "dislike" => "like/dislike",
@@ -187,8 +193,13 @@ pub fn rate(op: &str, video_id: &str) -> Result<Reply, String> {
     Ok(Reply { op: op.into(), ..Default::default() })
 }
 
+#[allow(dead_code)]
 pub fn add_to_playlist(playlist_id: &str, video_id: &str) -> Result<Reply, String> {
-    require_session()?;
+    add_to_playlist_with(load_session(), playlist_id, video_id)
+}
+
+fn add_to_playlist_with(session: Option<Session>, playlist_id: &str, video_id: &str) -> Result<Reply, String> {
+    require_session(session)?;
     let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
     let edit = call(
         "browse/edit_playlist",
@@ -239,13 +250,10 @@ mod tests {
 
     #[test]
     fn mutations_need_a_session() {
-        let none: Option<Session> = None;
-        assert_eq!(none.filter(|s| s.sapisid().is_some()).ok_or_else(|| SIGN_IN.to_string()).err().as_deref(), Some(SIGN_IN));
-        let _ = (
-            browse as fn(&str) -> Result<Reply, String>,
-            rate as fn(&str, &str) -> Result<Reply, String>,
-            add_to_playlist as fn(&str, &str) -> Result<Reply, String>,
-        );
+        assert_eq!(rate_with(None, "like", "abc").unwrap_err().as_str(), SIGN_IN);
+        assert_eq!(rate_with(None, "dislike", "abc").unwrap_err().as_str(), SIGN_IN);
+        assert_eq!(rate_with(None, "unlike", "abc").unwrap_err().as_str(), SIGN_IN);
+        assert_eq!(add_to_playlist_with(None, "PL1", "abc").unwrap_err().as_str(), SIGN_IN);
     }
 
     #[test]
