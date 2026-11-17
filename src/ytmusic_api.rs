@@ -90,50 +90,25 @@ fn save_session_to<'a>(path: &Path, cookies: impl IntoIterator<Item = (&'a str, 
 
 /// Windows ACL equivalent of mode 600. Failures leave the file in place.
 fn restrict_current_user(path: &Path) {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
-    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-    use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::core::PCWSTR;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
 
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return;
-        }
-        let mut needed = 0u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-        let mut buf = vec![0u8; needed as usize];
-        if needed == 0 || GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), needed, &mut needed).is_err() {
-            let _ = CloseHandle(token);
-            return;
-        }
-        let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
-        let sid_len = GetLengthSid(sid) as usize;
-        let acl_len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>().saturating_sub(4) + sid_len;
-        let mut acl = vec![0u8; acl_len.max(64)];
-        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
-        let mask = (GENERIC_READ | GENERIC_WRITE).0;
-        if InitializeAcl(acl_ptr, acl.len() as u32, ACL_REVISION).is_err() || AddAccessAllowedAce(acl_ptr, ACL_REVISION, mask, sid).is_err() {
-            let _ = CloseHandle(token);
-            return;
-        }
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let _ = SetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(acl_ptr),
-            None,
-        );
-        let _ = CloseHandle(token);
+    let Ok(user) = std::env::var("USERNAME") else { return };
+    if user.is_empty() {
+        return;
     }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let grant = format!("{user}:(R,W)");
+    let _ = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(&grant)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 }
 
 fn authorization_header(session: &Session, ts: u64) -> Option<String> {
