@@ -514,10 +514,14 @@ pub fn pick_look(id: &str) -> (&'static str, String) {
     }
 }
 
-/// Typed text in the Block menu that looks like a website ("x.com"), as its domain.
-pub fn typed_site(s: &str) -> Option<String> {
+/// Typed text in the Block menu (or the Block box) that names a program ("steam.exe") or looks
+/// like a website ("x.com"), as its id: "app:steam.exe", "site:x.com".
+pub fn typed_pick(s: &str) -> Option<String> {
     let s = s.trim();
-    (s.contains('.') && !s.contains(' ')).then(|| norm_site(s)).filter(|h| h.contains('.'))
+    if s.to_lowercase().ends_with(".exe") {
+        return Some(format!("app:{}", norm_app(s)));
+    }
+    (s.contains('.') && !s.contains(' ')).then(|| norm_site(s)).filter(|h| h.contains('.')).map(|h| format!("site:{h}"))
 }
 
 /// "Messaging, steam.exe, reddit.com" as ids: a category's name, a program, or a website.
@@ -526,8 +530,7 @@ pub fn pick_ids(text: &str, cats: &[FocusCategory]) -> Result<Vec<String>, Strin
         .iter()
         .map(|p| match category(cats, p) {
             Some(c) => Ok(format!("cat:{}", c.name)),
-            None if p.to_lowercase().ends_with(".exe") => Ok(format!("app:{}", norm_app(p))),
-            None => typed_site(p).map(|h| format!("site:{h}")).ok_or_else(|| format!("No category named {p}. Create it first")),
+            None => typed_pick(p).ok_or_else(|| format!("No category named {p}. Create it first")),
         })
         .collect()
 }
@@ -1086,8 +1089,9 @@ mod tests {
         assert!(apps.contains(&"discord.exe".to_string()) && apps.contains(&"steam.exe".to_string()));
         assert!(sites.contains(&"discord.com".to_string()) && sites.contains(&"reddit.com".to_string()));
         assert!(pick_ids("nope", &cats).unwrap_err().contains("No category named nope"));
-        assert_eq!((typed_site("x.com"), typed_site("https://www.Reddit.com/r")), (Some("x.com".into()), Some("reddit.com".into())));
-        assert_eq!((typed_site("reddit"), typed_site("two words.com"), typed_site("x.")), (None, None, None));
+        assert_eq!((typed_pick("x.com"), typed_pick("https://www.Reddit.com/r")), (Some("site:x.com".into()), Some("site:reddit.com".into())));
+        assert_eq!((typed_pick("reddit"), typed_pick("two words.com"), typed_pick("x.")), (None, None, None));
+        assert_eq!((typed_pick("Steam.EXE"), typed_pick("battle.net.exe")), (Some("app:steam.exe".into()), Some("app:battle.net.exe".into())), "a program, never a website");
     }
 
     #[test]

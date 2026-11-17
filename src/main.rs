@@ -272,6 +272,27 @@ fn focus_form(goal: &str, duration: &str, mode: focus::Mode, picks: &[String]) -
     ]
 }
 
+/// The form Start or Edit Focus Session opens with these box values, prefilled; None to act at
+/// once. Start opens it with Goal empty; Edit (with a session) also when its boxes are empty or
+/// still hold the session as `edit_seed` fills them, and then starts from the session, its mode too.
+fn focus_form_for(f: FocusCmd, got: &[String], session: Option<&focus::Session>, cats: &[config::FocusCategory], default_minutes: u32) -> Option<Result<Vec<FormField>, String>> {
+    let edit = match (f, session) {
+        (FocusCmd::Edit, Some(s)) => Some(s),
+        (FocusCmd::Start, _) => None,
+        _ => return None,
+    };
+    let blank = got.iter().all(|g| g.trim().is_empty());
+    let seed = match edit {
+        Some(s) if blank || got.iter().map(|g| g.trim()).eq(focus::edit_seed(s).iter().map(|g| g.trim())) => focus::edit_seed(s),
+        _ if got.first().is_none_or(|g| g.trim().is_empty()) => got.to_vec(),
+        _ => return None,
+    };
+    Some(focus::parse_start(&seed, cats, default_minutes).map(|start| {
+        let mode = start.filter.as_ref().map(|f| f.0).or(edit.map(|s| s.mode)).unwrap_or(focus::Mode::Block);
+        focus_form(seed.first().map_or("", |g| g.trim()), &focus::minutes_label(start.minutes), mode, &start.picks)
+    }))
+}
+
 /// The Block menu: Focus Categories, then Applications (`apps`: file name and name), less
 /// what is picked already.
 fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], picks: &focus::Picks) -> Vec<menu::Entry> {
@@ -280,12 +301,14 @@ fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], pick
     cats.chain(apps).filter(|e| !picks.0.contains(&e.id)).collect()
 }
 
-/// Typed text that looks like a website puts "Block x.com" (or "Allow x.com", by `verb`) at
-/// the top of the Block menu, whatever the search matches.
+/// Typed text that looks like a website or names a program puts "Block x.com" / "Block
+/// steam.exe" (or "Allow …", by `verb`) at the top of the Block menu, whatever the search matches.
 fn site_lead(entries: &mut Vec<menu::Entry>, verb: &str, typed: &str) {
     entries.retain(|e| !e.always);
-    if let Some(host) = focus::typed_site(typed) {
-        entries.insert(0, menu::Entry { id: format!("site:{host}"), label: format!("{verb} {host}"), icon: Some(g::GLOBE), always: true, ..Default::default() });
+    if let Some(id) = focus::typed_pick(typed) {
+        let (glyph, _) = focus::pick_look(&id);
+        let name = id.split_once(':').map_or("", |(_, v)| v);
+        entries.insert(0, menu::Entry { label: format!("{verb} {name}"), icon: Some(glyph), always: true, id, ..Default::default() });
     }
 }
 
@@ -1793,21 +1816,15 @@ impl Launcher {
     }
 
     /// Enter with a Focus command's boxes: start (or edit) the session, or save the categories.
-    /// With Goal empty, Start and Edit open the form instead, from what the boxes hold (Edit run
-    /// on its own, from the session). A refusal keeps the boxes and says why.
+    /// Start with Goal empty, and Edit as seeded, open the form instead (`focus_form_for`). A
+    /// refusal keeps the boxes and says why.
     fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let cats = focus::categories(&self.cfg.focus_category);
-        let start = matches!(f, FocusCmd::Start | FocusCmd::Edit) && !(f == FocusCmd::Edit && self.focus.session.is_none());
-        if start && got.first().is_none_or(|g| g.trim().is_empty()) {
-            let seed = match &self.focus.session {
-                Some(s) if f == FocusCmd::Edit && got.iter().all(|g| g.trim().is_empty()) => focus::edit_seed(s),
-                _ => got,
-            };
-            return match focus::parse_start(&seed, &cats, self.cfg.focus.default_minutes) {
-                Ok(s) => {
-                    let mode = s.filter.as_ref().map_or(focus::Mode::Block, |f| f.0);
+        if let Some(form) = focus_form_for(f, &got, self.focus.session.as_ref(), &cats, self.cfg.focus.default_minutes) {
+            return match form {
+                Ok(fields) => {
                     self.load_running();
-                    self.open_form(FormKind::Focus, focus_form(seed.first().map_or("", |g| g.trim()), &focus::minutes_label(s.minutes), mode, &s.picks), window, cx);
+                    self.open_form(FormKind::Focus, fields, window, cx);
                 }
                 Err(e) => self.focus_refused(e, cx),
             };
@@ -5401,8 +5418,17 @@ impl Render for Launcher {
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, _: &NextBox, window, cx| if this.is_form() { this.move_field(1, window, cx) } else { this.step_arg(1, window, cx) }))
-            .on_action(cx.listener(|this, _: &PrevBox, window, cx| if this.is_form() { this.move_field(-1, window, cx) } else { this.step_arg(-1, window, cx) }))
+            // Over a form, an open menu takes Tab and Shift+Tab as Down and Up.
+            .on_action(cx.listener(|this, _: &NextBox, window, cx| match this.is_form() {
+                true if this.menu_key(menu::Key::Down, window, cx) => {}
+                true => this.move_field(1, window, cx),
+                false => this.step_arg(1, window, cx),
+            }))
+            .on_action(cx.listener(|this, _: &PrevBox, window, cx| match this.is_form() {
+                true if this.menu_key(menu::Key::Up, window, cx) => {}
+                true => this.move_field(-1, window, cx),
+                false => this.step_arg(-1, window, cx),
+            }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
                 if !this.menu_key(menu::Key::Esc, window, cx) && !this.dismiss_args(window, cx) {
                     this.dismiss(window, cx)
@@ -5461,6 +5487,58 @@ impl Render for Launcher {
             .children(dialog)
             .children(pop)
     }
+}
+
+/// Every key binding: the text box defaults first, then ours, added later at the same depth so
+/// they win for these keys.
+fn key_bindings() -> Vec<KeyBinding> {
+    let ours = [
+        KeyBinding::new("up", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("down", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("tab", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("shift-tab", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-p", OpenDropdown, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-p", EmacsPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-b", EmacsBack, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+        // In a form's text box Tab moves to the next control, never into a menu (Down does that).
+        KeyBinding::new("tab", NextBox, Some(&format!("Form > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("shift-tab", PrevBox, Some(&format!("Form > {DEFAULT_INPUT_CONTEXT}"))),
+        // A form control without a text box (a select, a checkbox) holds the keys itself.
+        KeyBinding::new("tab", NextBox, Some("Form")),
+        KeyBinding::new("shift-tab", PrevBox, Some("Form")),
+        KeyBinding::new("up", SelectPrev, Some("Form")),
+        KeyBinding::new("down", SelectNext, Some("Form")),
+        KeyBinding::new("enter", Launch, Some("Form")),
+        KeyBinding::new("ctrl-enter", Submit, Some("Form")),
+        KeyBinding::new("escape", Dismiss, Some("Form")),
+        KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
+        KeyBinding::new("backspace", PopToken, Some("Form")),
+        KeyBinding::new("backspace", PopToken, Some(&format!("TokenMenu > {DEFAULT_INPUT_CONTEXT}"))),
+        // The settings window when no text field has focus.
+        KeyBinding::new("up", SelectPrev, Some("Settings")),
+        KeyBinding::new("down", SelectNext, Some("Settings")),
+        KeyBinding::new("tab", SelectNext, Some("Settings")),
+        KeyBinding::new("shift-tab", SelectPrev, Some("Settings")),
+        KeyBinding::new("enter", Launch, Some("Settings")),
+        KeyBinding::new("escape", Dismiss, Some("Settings")),
+        KeyBinding::new("ctrl-down", NextSection, Some("Settings")),
+        KeyBinding::new("ctrl-up", PrevSection, Some("Settings")),
+    ];
+    default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)).chain(ours).collect()
 }
 
 /// A plain accent-coloured disc; no third-party artwork.
@@ -5538,51 +5616,7 @@ fn main() {
     }
     gpui_ce_platform::application().with_assets(design::Icons).with_quit_mode(QuitMode::Explicit).run(|cx: &mut App| {
         design::register_fonts(cx);
-        // Defaults first; ours are added later at the same depth, so they win for these keys.
-        cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
-        cx.bind_keys([
-            KeyBinding::new("up", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("down", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("tab", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("shift-tab", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("escape", Dismiss, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-p", OpenDropdown, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-p", EmacsPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-b", EmacsBack, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
-            KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
-            KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
-            KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
-            // A form control without a text box (a select, a checkbox) holds the keys itself.
-            KeyBinding::new("tab", NextBox, Some("Form")),
-            KeyBinding::new("shift-tab", PrevBox, Some("Form")),
-            KeyBinding::new("up", SelectPrev, Some("Form")),
-            KeyBinding::new("down", SelectNext, Some("Form")),
-            KeyBinding::new("enter", Launch, Some("Form")),
-            KeyBinding::new("ctrl-enter", Submit, Some("Form")),
-            KeyBinding::new("escape", Dismiss, Some("Form")),
-            KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
-            KeyBinding::new("backspace", PopToken, Some("Form")),
-            KeyBinding::new("backspace", PopToken, Some(&format!("TokenMenu > {DEFAULT_INPUT_CONTEXT}"))),
-            // The settings window when no text field has focus.
-            KeyBinding::new("up", SelectPrev, Some("Settings")),
-            KeyBinding::new("down", SelectNext, Some("Settings")),
-            KeyBinding::new("tab", SelectNext, Some("Settings")),
-            KeyBinding::new("shift-tab", SelectPrev, Some("Settings")),
-            KeyBinding::new("enter", Launch, Some("Settings")),
-            KeyBinding::new("escape", Dismiss, Some("Settings")),
-            KeyBinding::new("ctrl-down", NextSection, Some("Settings")),
-            KeyBinding::new("ctrl-up", PrevSection, Some("Settings")),
-        ]);
+        cx.bind_keys(key_bindings());
 
         let (cfg, notice) = match config::load() {
             Ok(cfg) if cfg.files.ntfs && ntfs::old_helper_installed() => {
@@ -6049,6 +6083,46 @@ mod tests {
     }
 
     #[test]
+    fn edit_opens_the_form_from_the_session_and_keeps_its_mode() {
+        let cats = focus::categories(&[]);
+        let strings = |a: [&str; 4]| a.map(String::from).to_vec();
+        let values = |r: Option<Result<Vec<FormField>, String>>| r.map(|f| f.unwrap().into_iter().map(|f| f.value).collect::<Vec<_>>());
+        let open = |f: FocusCmd, got: &[&str], s: Option<&focus::Session>| values(focus_form_for(f, &got.iter().map(|g| g.to_string()).collect::<Vec<_>>(), s, &cats, 25));
+        let s = deep_work(50);
+        let from_session = Some(strings(["Deep work", "50 min", "block", "cat:Messaging\ncat:Social"]));
+        let seeded = focus::edit_seed(&s);
+        let seeded: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        assert_eq!(open(FocusCmd::Edit, &seeded, Some(&s)), from_session, "Enter on the boxes as seeded opens the form; the clock does not restart");
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], Some(&s)), from_session, "run on its own (Ctrl+K Edit, a hotkey)");
+        assert_eq!(open(FocusCmd::Edit, &["Essay", "50", "Messaging, Social"], Some(&s)), None, "changed boxes apply at once");
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], None), None, "no session: refused later");
+        assert_eq!(open(FocusCmd::Start, &["", "50", ""], None), Some(strings(["", "50 min", "block", ""])));
+        assert_eq!(open(FocusCmd::Start, &["Read", "", ""], None), None, "a goal starts at once");
+        // An allow session with nothing picked stays an allow session.
+        let open_allow = focus::Session::new("Open", focus::Mode::Allow, &[], &[], 25, false, SystemTime::now());
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], Some(&open_allow)).map(|v| v[2].clone()).as_deref(), Some("allow"));
+    }
+
+    #[test]
+    fn tab_in_a_form_text_box_moves_on_and_backspace_reaches_the_token_menu_first() {
+        let keymap = gpui::Keymap::new(key_bindings());
+        let actions = |key: &str, stack: &[&str]| {
+            let stack: Vec<gpui::KeyContext> = stack.iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+            keymap.bindings_for_input(&[gpui::Keystroke::parse(key).unwrap()], &stack).0.iter().map(|b| b.action().name().rsplit("::").next().unwrap_or_default().to_string()).collect::<Vec<_>>()
+        };
+        let first = |key: &str, stack: &[&str]| actions(key, stack).first().cloned().unwrap_or_default();
+        let input = DEFAULT_INPUT_CONTEXT;
+        assert_eq!(first("tab", &["Form", input]), "NextBox", "Tab on Duration moves on; it never opens the presets");
+        assert_eq!(first("shift-tab", &["Form", input]), "PrevBox");
+        assert_eq!(first("down", &["Form", input]), "SelectNext", "Down still opens them");
+        assert_eq!(first("tab", &[input]), "SelectNext", "the query keeps its Tab");
+        assert_eq!(first("tab", &["Form", "TokenMenu", input]), "NextBox", "in a menu over a form too: its handler steps the open menu");
+        assert_eq!(actions("backspace", &["Form", "TokenMenu", input])[..2], ["PopToken", "DeleteLeft"], "the token first, then (propagated) the text");
+        assert_eq!(first("backspace", &["Form", input]), "DeleteLeft", "Goal's Backspace edits Goal");
+        assert_eq!(first("backspace", &["Form"]), "PopToken", "on the token field itself");
+    }
+
+    #[test]
     fn the_block_menu_lists_what_is_not_picked_and_a_typed_website() {
         let cats = focus::categories(&[]);
         let apps = vec![("discord.exe".to_string(), "Discord".to_string())];
@@ -6062,6 +6136,8 @@ mod tests {
         assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].always), ("Block reddit.com", "site:reddit.com", true));
         site_lead(&mut entries, "Allow", "x.com");
         assert_eq!((entries[0].label.as_str(), entries.len()), ("Allow x.com", 7), "the typed row is replaced, never stacked");
+        site_lead(&mut entries, "Block", "Steam.exe");
+        assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].icon), ("Block steam.exe", "app:steam.exe", Some(g::APP)), "a program, never a website");
         site_lead(&mut entries, "Block", "news");
         assert_eq!(entries.len(), 6, "not a website: no row");
     }
