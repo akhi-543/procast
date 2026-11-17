@@ -17,7 +17,7 @@ use futures::{
     },
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, FontStyle, FontWeight, HighlightStyle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle, StyledText, Subscription, TextLayout, UnderlineStyle, Window, WindowControlArea,
+    App, Bounds, ClipboardItem, Context, DispatchPhase, FocusHandle, FontStyle, FontWeight, HighlightStyle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle, StyledText, Subscription, TextLayout, UnderlineStyle, Window, WindowControlArea,
     PaintQuad, canvas, div, point, prelude::*, size,
 };
 use gpui_ce_elements::editable_text::BLINK_INTERVAL_500MS;
@@ -593,6 +593,7 @@ impl NotesWindow {
 
     /// The note, a line per row: marks hidden except on the cursor's line, fenced code as typed.
     fn body(&mut self, t: &Tokens, caret: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let me = cx.entity().downgrade();
         let body = div()
             .id("body")
             .flex_1()
@@ -604,7 +605,12 @@ impl NotesWindow {
             .flex_col()
             .text_color(t.text)
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| this.press_at(ev.position, ev.modifiers.shift, window, cx)))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.drag_to(ev, cx)))
+            // every move, so a drag keeps selecting past the body's edge (`drag_to` gates on `selecting`)
+            .on_mouse_move_all(move |ev: &MouseMoveEvent, phase, _, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    _ = me.update(cx, |this, cx| this.drag_to(ev, cx));
+                }
+            })
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.selecting = false));
         self.rows.clear();
         let Some(doc) = &self.doc else { return body.child(div().text_color(t.text_faint).child("Start writing…")) };
@@ -612,6 +618,7 @@ impl NotesWindow {
         let (cursor, (sel_from, sel_to)) = (doc.buffer.cursor(), doc.buffer.selection());
         let here = text[..cursor].matches('\n').count();
         let empty = text.is_empty();
+        let last = text.matches('\n').count();
         let (mut start, mut fenced) = (0, false);
         let mut lines = Vec::new();
         // ponytail: every line is laid out each frame (only changed lines are restyled); a
@@ -619,12 +626,14 @@ impl NotesWindow {
         for (i, line) in text.split('\n').enumerate() {
             let fence = editor::is_fence(line);
             let code = fenced || fence;
+            // A fenced run is one block (`.pc-notes__code`): rounded and padded at its first and
+            // last rows, no gap between its rows. Off the cursor's line a fence draws nothing.
+            let (open, close) = (fence && !fenced, (fence && fenced) || (code && i == last));
             fenced ^= fence;
             let raw = i == here;
+            let hidden = fence && !raw;
             let (len, map, st, style) = if code {
-                // off the cursor's line a fence is hidden: the block's padding
-                let shown = if fence && !raw { "" } else { line };
-                (shown.len(), None, styled(shown, &[], t), Style::default())
+                (line.len(), None, styled(line, &[], t), Style::default())
             } else {
                 let s = self.cache.get(line);
                 let style = s.spans.first().map_or_else(Style::default, |s| s.style);
@@ -658,19 +667,30 @@ impl NotesWindow {
                 2 => Some(ts::HEADING),
                 _ => Some(ts::BODY),
             };
-            lines.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(sp::S8))
-                    .when_some(heading, |d, size| d.text_size(px(size)).font_weight(FontWeight::SEMIBOLD))
-                    .when(style.quote, |d| d.border_l(px(design::QUOTE_BAR)).border_color(t.hairline).pl(px(sp::S8)).text_color(t.text_muted))
-                    .when(code, |d| d.font_family(design::FONT_MONO).text_size(px(ts::BODY_SM)).bg(t.surface).px(px(sp::S8)).text_color(t.text_muted))
-                    .when(empty, |d| d.text_color(t.text_faint))
-                    .children(check)
-                    .child(div().relative().flex_1().min_w_0().child(overlay(layout.clone(), sel, (raw && caret).then_some(cursor - start), t)).child(st)),
-            );
-            self.rows.push(Row { start, len: if empty { 0 } else { len }, map, layout });
+            let row = div()
+                .flex()
+                .items_center()
+                .gap(px(sp::S8))
+                // `.pc-notes__body`'s gap between rows, except inside a code block
+                .when(i > 0 && (open || !code), |d| d.mt(px(sp::S8)))
+                .when_some(heading, |d, size| d.text_size(px(size)).font_weight(FontWeight::SEMIBOLD))
+                .when(style.quote, |d| d.border_l(px(design::QUOTE_BAR)).border_color(t.hairline).pl(px(sp::S8)).text_color(t.text_muted))
+                .when(code, |d| {
+                    d.font_family(design::FONT_MONO)
+                        .text_size(px(ts::BODY_SM))
+                        .bg(t.surface)
+                        .px(px(sp::S8))
+                        .text_color(t.text_muted)
+                        .when(open, |d| d.pt(px(sp::S8)).rounded_t(px(r::SM)))
+                        .when(close, |d| d.pb(px(sp::S8)).rounded_b(px(r::SM)))
+                })
+                .when(empty, |d| d.text_color(t.text_faint));
+            if hidden {
+                lines.push(row);
+            } else {
+                lines.push(row.children(check).child(div().relative().flex_1().min_w_0().child(overlay(layout.clone(), sel, (raw && caret).then_some(cursor - start), t)).child(st)));
+                self.rows.push(Row { start, len: if empty { 0 } else { len }, map, layout });
+            }
             start = end + 1;
         }
         self.cache.sweep();
