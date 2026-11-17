@@ -95,6 +95,9 @@ pub enum Msg {
     Notice(String),
     /// A command's result (true) or why it failed (false): shown as a toast that fades away.
     Toast(bool, String),
+    /// What the browser is playing now, or None when nothing is (see media.rs).
+    #[allow(dead_code)]
+    NowPlaying(Option<crate::media::NowPlaying>),
 }
 
 pub enum TrayCmd {

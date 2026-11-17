@@ -10,6 +10,8 @@ mod desktops;
 mod ext;
 mod files;
 mod keys;
+#[allow(dead_code)]
+mod media;
 mod net;
 mod ntfs;
 mod scripts;
@@ -2225,6 +2227,7 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
+            Msg::NowPlaying(_) => {}
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
