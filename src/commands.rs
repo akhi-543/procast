@@ -93,6 +93,8 @@ pub enum Cmd {
     Define,
     /// Today's and tomorrow's events from the calendar feeds.
     MySchedule,
+    /// Open the link of the meeting on now, or of the next one within 15 minutes.
+    JoinMeeting,
     /// Search the screenshot folders by the text in each picture.
     SearchScreenshots,
     /// Put the newest screenshot on the clipboard and paste it into the app you came from.
@@ -202,6 +204,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::InstantTranslatePaste, "Instant Translate Paste", "translator google language selection selected text replace", g::LANGUAGES),
     (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
     (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR_CLOCK),
+    (Cmd::JoinMeeting, "Join Meeting", "calendar meeting call video teams zoom meet webex link", g::VIDEO),
     (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::SCAN_SEARCH),
     (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::IMAGE_DOWN),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
@@ -313,7 +316,7 @@ impl Cmd {
             Cmd::Focus(_) => "Focus",
             Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste => "Translator",
             Cmd::Define => "Dictionary",
-            Cmd::MySchedule => "Calendar",
+            Cmd::MySchedule | Cmd::JoinMeeting => "Calendar",
             Cmd::HdrSettings => "Windows Settings",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
@@ -368,7 +371,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
         }
     }
     Ok(None)
@@ -721,6 +724,7 @@ mod tests {
             (Cmd::InstantTranslatePaste, g::LANGUAGES, Tint::Web),
             (Cmd::Define, g::BOOK_OPEN, Tint::Web),
             (Cmd::MySchedule, g::CALENDAR_CLOCK, Tint::System),
+            (Cmd::JoinMeeting, g::VIDEO, Tint::System),
             (Cmd::SearchScreenshots, g::SCAN_SEARCH, Tint::File),
             (Cmd::PasteLatestScreenshot, g::IMAGE_DOWN, Tint::Paste),
             (Cmd::ToggleHdr, g::SUN_MEDIUM, Tint::System),

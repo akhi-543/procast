@@ -92,6 +92,10 @@ pub enum Act {
     FocusExtend,
     /// Open a meeting link: event title, address. Asks "Join <title>?" first when `[calendar] confirm_join`.
     Join(String, String),
+    /// Leave a calendar event out of My Schedule and root search, by `calendar::hidden_key`.
+    HideEvent(String),
+    /// Open a Settings page by name.
+    OpenSettings(&'static str),
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
@@ -160,6 +164,8 @@ impl Act {
             Act::AddTime(..) => "Add Time",
             Act::RenameTimer(_) => "Rename",
             Act::Join(..) => "Join Meeting",
+            Act::HideEvent(_) => "Hide This Event",
+            Act::OpenSettings(_) => "Open Settings",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
             Act::FocusExtend => "Extend",
@@ -273,6 +279,8 @@ pub struct Item {
     pub keywords: Vec<String>,
     /// The accessory ticks (a timer's time left): tabular figures at a fixed width, shown in root too.
     pub live: bool,
+    /// The event on now (My Schedule): its live accessory, "until 11:00", is in the accent (`.pc-now`).
+    pub now: bool,
     /// The accessory is a switch, on or off (Auto HDR in root search).
     pub toggle: Option<bool>,
     /// The ActionBar also shows the second action, under this label, with Ctrl+Enter.
@@ -300,6 +308,7 @@ impl Item {
             values: vec![],
             keywords: vec![],
             live: false,
+            now: false,
             toggle: None,
             bar_second: None,
         }
@@ -850,16 +859,6 @@ fn clip_kind(text: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// "3 min ago".
-pub fn ago(at: u64) -> String {
-    match now().saturating_sub(at) {
-        a @ 0..60 => if a < 10 { "just now".into() } else { format!("{a} s ago") },
-        a @ 60..3600 => format!("{} min ago", a / 60),
-        a @ 3600..86400 => format!("{} h ago", a / 3600),
-        a => format!("{} d ago", a / 86400),
-    }
-}
-
 fn file_name(path: &str) -> &str {
     path.trim_end_matches('\\').rsplit('\\').next().unwrap_or(path)
 }
@@ -889,7 +888,7 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
         };
         let key = e.key();
         let section = if e.pinned { "Pinned" } else if now.saturating_sub(e.at) < 86400 { "Today" } else { "Earlier" };
-        let mut it = Item::new(title, sub, icon, Act::Clip(key.clone())).acc(ago(e.at)).sec(section).tinted(Tint::Paste).with_hay(hay);
+        let mut it = Item::new(title, sub, icon, Act::Clip(key.clone())).acc(crate::timers::ago(now.saturating_sub(e.at))).sec(section).tinted(Tint::Paste).with_hay(hay);
         it.extra = [Act::Clip(key.clone()), Act::CopyClip(key.clone()), Act::PinClip(key.clone(), !e.pinned)].map(|a| (a.label().to_string(), a)).to_vec();
         if let Kind::Files(files) = &e.kind {
             it.extra.push(("Show in Explorer".into(), Act::Reveal(files[0].clone())));

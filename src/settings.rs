@@ -590,8 +590,6 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
         "Calendar" => groups(vec![(
             "Meetings",
             vec![
-                row("Calendar feeds", "calendar.ics", Kind::List, "ICS addresses (https:// or webcal://) of the calendars My Schedule shows, checked every 10 minutes.").with_icon(g::CALENDAR_CLOCK),
-                row("Show events within", "calendar.tolerance_secs", Kind::Number, "Seconds around now within which an event shows in an empty search.").with_icon(g::CALENDAR_CLOCK),
                 row("Confirm before joining", "calendar.confirm_join", Kind::Bool, "Ask \"Join <title>?\" before opening a meeting link.").with_icon(g::VIDEO),
                 row("Remind before", "calendar.remind_minutes", Kind::Number, "Minutes before an event to show a reminder. 0 turns reminders off.").with_icon(g::BELL),
                 row("Ignore events", "calendar.ignore", Kind::List, "Events whose title contains one of these words are left out.").with_icon(g::BAN),
@@ -715,6 +713,13 @@ impl Settings {
     pub fn set_items(&mut self, items: Vec<Item>) {
         if SECTIONS[self.section] != "Shortcuts" {
             self.items = items;
+        }
+    }
+
+    /// Shows page `name` (Settings → Calendar from My Schedule's empty state).
+    pub fn open_section(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(s) = SECTIONS.iter().position(|x| *x == name) {
+            self.set_section(s, window, cx);
         }
     }
 

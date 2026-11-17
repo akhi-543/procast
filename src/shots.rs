@@ -19,7 +19,7 @@ use windows::Win32::Foundation::HWND;
 use crate::{
     clipboard, config,
     design::{Tint, g},
-    search::{Act, Icon, Item, ago},
+    search::{Act, Icon, Item},
 };
 
 const IMAGES: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
@@ -294,7 +294,7 @@ pub fn rows(index: &ShotIndex, query: &str, primary: &str, max: usize) -> Vec<It
             acts.push(Act::Reveal(path));
             let first = s.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(120).collect::<String>();
             let icon = Icon::Vector(if s.is_video() { g::VIDEO } else { g::PICTURE });
-            let mut it = Item::new(s.name(), first, icon, acts[0].clone()).acc(ago(s.mtime)).tinted(Tint::File);
+            let mut it = Item::new(s.name(), first, icon, acts[0].clone()).acc(crate::timers::ago(crate::search::now().saturating_sub(s.mtime))).tinted(Tint::File);
             it.extra = acts.into_iter().map(|a| (a.label().to_string(), a)).collect();
             it
         })

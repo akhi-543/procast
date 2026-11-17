@@ -1717,6 +1717,13 @@ mod tests {
                     assert!(width(&form) <= width(LIVE_WIDEST) + 0.01, "{form} is wider than {LIVE_WIDEST}");
                 }
             }
+            // My Schedule's accessories; "until 00:00" is drawn at weight 600 (`.pc-now`).
+            for form in ["00:00 – 00:00", "All day", "in 00 min"] {
+                assert!(width(form) <= width(LIVE_WIDEST) + 0.01, "{form} is wider than {LIVE_WIDEST}");
+            }
+            let bold = text.resolve_font(&gpui::Font { weight: gpui::FontWeight::SEMIBOLD, ..gpui::font(FONT_UI) });
+            let until = "until 00:00".chars().map(|c| text.advance(bold, px(ts::BODY_SM), if c.is_ascii_digit() { '0' } else { c }).map_or(0., |a| f32::from(a.width))).sum::<f32>();
+            assert!(until <= width(LIVE_WIDEST) + 0.01, "until 00:00 is wider than {LIVE_WIDEST}");
             cx.quit();
         });
     }

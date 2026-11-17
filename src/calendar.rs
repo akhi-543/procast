@@ -1,6 +1,6 @@
 //! My Schedule: events from ICS feeds (Google, Outlook and Apple all publish one). Feeds are
-//! fetched every 10 minutes off the UI thread; the last good copy is kept in memory. Times are
-//! Unix seconds (UTC) here and local time on screen.
+//! fetched every `[calendar] refresh_minutes` off the UI thread; the last good copy is kept in
+//! memory. Times are Unix seconds (UTC) here and local time on screen.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,12 +13,13 @@ use windows::Win32::{
 };
 
 use crate::{
-    design::g,
+    design::{Tint, g},
     search::{Act, Icon, Item},
 };
 
-const REFRESH: Duration = Duration::from_secs(600);
 const DAY: i64 = 86400;
+/// How soon an event must start to lead root search as Next (and for Join Meeting).
+const NEXT_WITHIN: i64 = 15 * 60;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
@@ -28,6 +29,11 @@ pub struct Event {
     /// The meeting link (Teams, Zoom, Meet, Webex) found in the event's text.
     pub join: Option<String>,
     pub all_day: bool,
+    /// Which `[[calendar_feed]]` it came from (set by `Calendar::events`).
+    pub feed: usize,
+    pub location: String,
+    /// The ICS UID: one per event, shared by a repeating event's occurrences.
+    pub uid: String,
 }
 
 // ---- time -----------------------------------------------------------------------------
@@ -224,6 +230,7 @@ struct Raw {
     start: Option<When>,
     end: Option<When>,
     title: String,
+    location: String,
     /// Description, location and conference properties: where a meeting link hides.
     text: String,
     rrule: Option<String>,
@@ -258,7 +265,12 @@ pub fn parse_ics(s: &str, from: i64, to: i64) -> Vec<Event> {
                     "DTSTART" => r.start = When::parse(value, params),
                     "DTEND" => r.end = When::parse(value, params),
                     "SUMMARY" => r.title = unescape(value).trim().to_string(),
-                    "DESCRIPTION" | "LOCATION" | "URL" | "X-GOOGLE-CONFERENCE" | "X-MICROSOFT-SKYPETEAMSMEETINGURL" => {
+                    "LOCATION" => {
+                        r.location = unescape(value).trim().to_string();
+                        r.text.push_str(&r.location);
+                        r.text.push('\n');
+                    }
+                    "DESCRIPTION" | "URL" | "X-GOOGLE-CONFERENCE" | "X-MICROSOFT-SKYPETEAMSMEETINGURL" => {
                         r.text.push_str(&unescape(value));
                         r.text.push('\n');
                     }
@@ -294,7 +306,7 @@ pub fn parse_ics(s: &str, from: i64, to: i64) -> Vec<Event> {
             }
             if s < to && s + len.max(1) > from {
                 let title = if r.title.is_empty() { "(No title)".to_string() } else { r.title.clone() };
-                out.push(Event { start: s, end: s + len, title, join: join_link(&r.text), all_day: start.date });
+                out.push(Event { start: s, end: s + len, title, join: join_link(&r.text), all_day: start.date, feed: 0, location: r.location.clone(), uid: r.uid.clone() });
             }
         }
     }
@@ -341,6 +353,8 @@ pub struct Calendar {
     feeds: HashMap<String, Vec<Event>>,
     fetched: Option<Instant>,
     fetching: bool,
+    /// When a fetch last brought events (Unix seconds): "Updated 5 min ago" while the next one runs.
+    updated: Option<u64>,
     /// Feeds whose last fetch failed and was announced: quiet until one works again.
     failed: HashSet<String>,
     /// Events already reminded of: (start, title).
@@ -348,10 +362,10 @@ pub struct Calendar {
 }
 
 impl Calendar {
-    /// Time to fetch: feeds are set up, none is being fetched, and 10 minutes passed. A failed
+    /// Time to fetch: feeds are set up, none is being fetched, and `every` passed. A failed
     /// fetch waits just as long, and keeps the last good events.
-    pub fn wants_fetch(&self, feeds: usize, now: Instant) -> bool {
-        feeds > 0 && !self.fetching && self.fetched.is_none_or(|t| now.duration_since(t) >= REFRESH)
+    pub fn wants_fetch(&self, feeds: usize, now: Instant, every: Duration) -> bool {
+        feeds > 0 && !self.fetching && self.fetched.is_none_or(|t| now.duration_since(t) >= every)
     }
 
     pub fn fetching(&mut self, now: Instant) {
@@ -364,6 +378,11 @@ impl Calendar {
         self.fetching || self.fetched.is_none()
     }
 
+    /// While a fetch runs over events already shown: "Updated 5 min ago", from the last good one.
+    pub fn updated_line(&self, now: u64) -> Option<String> {
+        self.updated.filter(|_| self.fetching).map(|at| format!("Updated {}", crate::timers::ago(now.saturating_sub(at))))
+    }
+
     /// The feed list changed: forget the old feeds and fetch again at once.
     pub fn reset(&mut self, urls: &[String]) {
         self.feeds.retain(|u, _| urls.contains(u));
@@ -371,8 +390,8 @@ impl Calendar {
         self.fetched = None;
     }
 
-    /// Takes a fetch's results; returns what to tell the user: each failing feed once.
-    pub fn done(&mut self, results: Vec<(String, Result<Vec<Event>, String>)>) -> Vec<String> {
+    /// Takes a fetch's results (finished at `now`); returns what to tell the user: each failing feed once.
+    pub fn done(&mut self, results: Vec<(String, Result<Vec<Event>, String>)>, now: u64) -> Vec<String> {
         self.fetching = false;
         let mut say = vec![];
         for (url, r) in results {
@@ -380,6 +399,7 @@ impl Calendar {
                 Ok(events) => {
                     self.failed.remove(&url);
                     self.feeds.insert(url, events);
+                    self.updated = Some(now);
                 }
                 Err(e) => {
                     if self.failed.insert(url) {
@@ -391,29 +411,80 @@ impl Calendar {
         say
     }
 
-    /// Every event of the feeds now configured, without the ignored ones, by start time.
-    pub fn events(&self, urls: &[String], ignore: &[String]) -> Vec<Event> {
-        let mut v: Vec<Event> = urls.iter().filter_map(|u| self.feeds.get(u)).flatten().filter(|e| !ignored(&e.title, ignore)).cloned().collect();
+    /// Every event of the feeds now configured (`urls`, in `[[calendar_feed]]` order), without
+    /// the ignored and the hidden ones, by start time.
+    pub fn events(&self, urls: &[String], ignore: &[String], hidden: &HashSet<String>) -> Vec<Event> {
+        let mut v: Vec<Event> = urls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, u)| Some((i, self.feeds.get(u)?)))
+            .flat_map(|(i, evs)| evs.iter().map(move |e| Event { feed: i, ..e.clone() }))
+            .filter(|e| !ignored(&e.title, ignore) && !hidden.contains(&hidden_key(e)))
+            .collect();
         v.sort_by_key(|e| e.start);
         v
     }
 
-    /// Reminder texts for events starting within `minutes`, each event once. 0 turns them off.
+    /// Reminder texts, "Standup · in 5 min", for events with a meeting link starting within
+    /// `minutes`, each event once. 0 turns them off.
     pub fn due(&mut self, events: &[Event], now: i64, minutes: u32) -> Vec<String> {
         self.fired.retain(|(start, _)| *start > now - DAY);
         let window = i64::from(minutes) * 60;
         events
             .iter()
-            .filter(|e| window > 0 && !e.all_day && e.start - window <= now && now < e.start)
+            .filter(|e| window > 0 && !e.all_day && e.join.is_some() && e.start - window <= now && now < e.start)
             .filter(|e| self.fired.insert((e.start, e.title.clone())))
-            .map(|e| format!("{} starts in {} min", e.title, (e.start - now + 59) / 60))
+            .map(|e| format!("{} · {}", e.title, in_minutes(e, now)))
             .collect()
     }
+
+    /// The event root search's Next section shows: the first one starting within 15 minutes
+    /// (when `in_search`), or one a reminder announced, until it starts.
+    pub fn next<'a>(&self, events: &'a [Event], now: i64, in_search: bool) -> Option<&'a Event> {
+        events.iter().filter(|e| !e.all_day && e.start > now).find(|e| (in_search && e.start - now <= NEXT_WITHIN) || self.fired.contains(&(e.start, e.title.clone())))
+    }
+}
+
+/// What Join Meeting joins: an event with a link that is on now, else the next one starting
+/// within 15 minutes.
+pub fn joinable(events: &[Event], now: i64) -> Option<&Event> {
+    let linked = || events.iter().filter(|e| !e.all_day && e.join.is_some());
+    linked().find(|e| e.start <= now && now < e.end).or_else(|| linked().find(|e| e.start > now && e.start - now <= NEXT_WITHIN))
 }
 
 pub fn ignored(title: &str, ignore: &[String]) -> bool {
     let title = title.to_lowercase();
     ignore.iter().any(|w| !w.trim().is_empty() && title.contains(&w.trim().to_lowercase()))
+}
+
+/// What Hide This Event stores: the event's UID, or its start and title when it has none.
+pub fn hidden_key(e: &Event) -> String {
+    if e.uid.is_empty() { format!("{}|{}", e.start, e.title) } else { e.uid.clone() }
+}
+
+/// The hidden events' keys in `calendar-hidden.json` (a JSON list). A file that cannot be
+/// read or parsed hides nothing; only `hide` writes it.
+pub fn load_hidden(path: &std::path::Path) -> HashSet<String> {
+    read_hidden(path).unwrap_or_default().into_iter().collect()
+}
+
+fn read_hidden(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let text = crate::focus::text_or_empty(std::fs::read_to_string(path)).map_err(|_| "Could not read calendar-hidden.json".to_string())?;
+    if text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    serde_json::from_str(&text).map_err(|_| "calendar-hidden.json is not a list of events".to_string())
+}
+
+/// Adds `key` to the hidden events and writes the file; a file it cannot read is left as it is.
+pub fn hide(path: &std::path::Path, key: String) -> Result<HashSet<String>, String> {
+    let mut list = read_hidden(path)?;
+    if !list.contains(&key) {
+        list.push(key);
+    }
+    let text = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+    crate::focus::write_atomic(path, &text).map_err(|e| format!("Could not write calendar-hidden.json: {e}"))?;
+    Ok(list.into_iter().collect())
 }
 
 /// Everything in `events` overlapping `from..to`.
@@ -427,14 +498,25 @@ pub fn today_and_tomorrow(now: i64) -> (i64, i64) {
     (local_to_utc(midnight), local_to_utc(midnight + 2 * DAY))
 }
 
-/// On now, or starting within `tolerance` seconds: what the empty root search shows.
-pub fn near(e: &Event, now: i64, tolerance: i64) -> bool {
-    !e.all_day && e.start - tolerance <= now && now < e.end.max(e.start + 1)
-}
-
 /// "Today" or "Tomorrow" by the event's local start day.
 pub fn day_label(start: i64, now: i64) -> &'static str {
     if utc_to_local(start).div_euclid(DAY) <= utc_to_local(now).div_euclid(DAY) { "Today" } else { "Tomorrow" }
+}
+
+/// My Schedule's sections: Now (timed events under way), Today and Tomorrow, the empty ones
+/// left out. Today's past events are dropped; all-day events come first in their day.
+pub fn sections(events: &[Event], now: i64) -> Vec<(&'static str, Vec<Event>)> {
+    let (from, to) = today_and_tomorrow(now);
+    let mut v = within(events, from, to);
+    v.retain(|e| e.end.max(e.start + 1) > now);
+    v.sort_by_key(|e| (!e.all_day, e.start));
+    let mut out = vec![("Now", vec![]), ("Today", vec![]), ("Tomorrow", vec![])];
+    for e in v {
+        let i = if !e.all_day && e.start <= now { 0 } else if day_label(e.start, now) == "Today" { 1 } else { 2 };
+        out[i].1.push(e);
+    }
+    out.retain(|(_, v)| !v.is_empty());
+    out
 }
 
 fn clock(naive: i64) -> String {
@@ -446,22 +528,62 @@ pub fn span(e: &Event) -> String {
     if e.all_day { "All day".into() } else { format!("{} – {}", clock(utc_to_local(e.start)), clock(utc_to_local(e.end))) }
 }
 
-/// How far off an event is: "Now", "in 5 min", "in 3 h", nothing beyond a day.
-pub fn when(e: &Event, now: i64) -> String {
-    let d = e.start - now;
-    match d {
-        _ if e.all_day => String::new(),
-        ..=0 => "Now".into(),
-        1..=3599 => format!("in {} min", (d + 59) / 60),
-        3600..=86399 => format!("in {} h", d / 3600),
-        _ => String::new(),
+/// The accessory of the event on now: "until 11:00".
+pub fn until(e: &Event) -> String {
+    format!("until {}", clock(utc_to_local(e.end)))
+}
+
+/// The Next row's accessory and the reminder's: "in 8 min" (rounded up).
+pub fn in_minutes(e: &Event, now: i64) -> String {
+    format!("in {} min", (e.start - now + 59).max(60) / 60)
+}
+
+/// The meeting service a join link goes to.
+pub fn service(join: &str) -> Option<&'static str> {
+    const SERVICES: [(&str, &str); 6] = [("meet.google.com", "Google Meet"), ("teams.microsoft.com", "Teams"), ("teams.live.com", "Teams"), ("zoom.us", "Zoom"), ("zoom.com", "Zoom"), ("webex.com", "Webex")];
+    let (host, _) = split_link(join)?;
+    SERVICES.iter().find(|(h, _)| host == *h || host.ends_with(&format!(".{h}"))).map(|(_, name)| *name)
+}
+
+/// A row's subtitle: the calendar's name, then the meeting service: "Work · Google Meet".
+pub fn subtitle(feed_name: &str, e: &Event) -> String {
+    [feed_name.trim(), e.join.as_deref().and_then(service).unwrap_or("")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+}
+
+/// The event's day in its calendar's web page, for a Google or Outlook feed (`feed` is its ICS address).
+pub fn calendar_url(feed: &str, e: &Event) -> Option<String> {
+    let (host, _) = split_link(&url_of(feed))?;
+    let (y, m, d) = civil_from_days(utc_to_local(e.start).div_euclid(DAY));
+    match host.as_str() {
+        "calendar.google.com" => Some(format!("https://calendar.google.com/calendar/r/day/{y}/{m}/{d}")),
+        "outlook.live.com" => Some(format!("https://outlook.live.com/calendar/0/view/day/{y}/{m}/{d}")),
+        _ => None,
     }
 }
 
-/// An event as a row; Enter joins its meeting, or does `otherwise` when it has no link.
-pub fn row(e: &Event, now: i64, otherwise: Act) -> Item {
-    let act = e.join.as_ref().map_or(otherwise, |url| Act::Join(e.title.clone(), url.clone()));
-    Item::new(e.title.clone(), span(e), Icon::Vector(g::CALENDAR), act).acc(when(e, now))
+/// Copy Details: title, time, location and link, one per line.
+pub fn details(e: &Event) -> String {
+    [e.title.as_str(), &span(e), &e.location, e.join.as_deref().unwrap_or("")].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+/// An event as a row (`feed`: its calendar's name and ICS address). Enter joins its meeting,
+/// else opens its day in the calendar's web page, else copies its details; Ctrl+K also copies
+/// the link or the details, or hides the event.
+pub fn row(e: &Event, feed: (&str, &str), accessory: String) -> Item {
+    let mut acts: Vec<(String, Act)> = vec![];
+    match (&e.join, calendar_url(feed.1, e)) {
+        (Some(url), _) => acts.extend([("Join Meeting".into(), Act::Join(e.title.clone(), url.clone())), ("Copy Join Link".into(), Act::Copy(url.clone()))]),
+        (None, Some(page)) => acts.push(("Open in Calendar".into(), Act::Open(page))),
+        (None, None) => {}
+    }
+    acts.push(("Copy Details".into(), Act::Copy(details(e))));
+    acts.push(("Hide This Event".into(), Act::HideEvent(hidden_key(e))));
+    let sub = subtitle(feed.0, e);
+    let glyph = if e.join.is_some() { g::VIDEO } else { g::CALENDAR_CLOCK };
+    let mut it = Item::new(e.title.clone(), sub.clone(), Icon::Vector(glyph), acts[0].1.clone()).acc(accessory).tinted(Tint::System).with_hay(format!("{} {sub} {}", e.title, e.location));
+    it.extra = acts;
+    it.live = true;
+    it
 }
 
 // ---- fetching -------------------------------------------------------------------------
@@ -486,10 +608,19 @@ fn fetch_error(e: &ureq::Error, host: &str) -> String {
     }
 }
 
+/// An http(s) address's host, read right after its own scheme, so it is never a piece of
+/// the path or query ("?u=https://token"): a feed address is a secret.
+fn feed_host(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#', '\\']).next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (["http", "https"].iter().any(|s| scheme.eq_ignore_ascii_case(s)) && !host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 /// Blocks on the network: call from a worker thread. Keeps the days around now.
 pub fn fetch(url: &str) -> Result<Vec<Event>, String> {
     let url = url_of(url);
-    let Some(host) = crate::focus::host_of(&url) else { return Err("that calendar address is not valid".into()) };
+    let Some(host) = feed_host(&url) else { return Err("that calendar address is not valid".into()) };
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
     let mut resp = agent.get(&url).call().map_err(|e| fetch_error(&e, &host))?;
     let body = resp.body_mut().read_to_string().map_err(|e| fetch_error(&e, &host))?;
@@ -515,14 +646,19 @@ mod tests {
     }
 
     fn ev(start: i64, end: i64, title: &str) -> Event {
-        Event { start, end, title: title.into(), join: None, all_day: false }
+        Event { start, end, title: title.into(), join: None, all_day: false, feed: 0, location: String::new(), uid: String::new() }
+    }
+
+    /// An event with a Google Meet link.
+    fn meet(start: i64, end: i64, title: &str) -> Event {
+        Event { join: Some("https://meet.google.com/abc-defg-hij".into()), ..ev(start, end, title) }
     }
 
     #[test]
     fn a_utc_event_keeps_its_times() {
         let ics = cal("BEGIN:VEVENT\r\nUID:1\r\nDTSTART:20260115T093000Z\r\nDTEND:20260115T103000Z\r\nSUMMARY:Standup\\, daily\r\nEND:VEVENT\r\n");
         let e = parse_ics(&ics, 0, FAR);
-        assert_eq!(e, vec![Event { start: utc(2026, 1, 15, 9, 30), end: utc(2026, 1, 15, 10, 30), title: "Standup, daily".into(), join: None, all_day: false }]);
+        assert_eq!(e, vec![Event { start: utc(2026, 1, 15, 9, 30), end: utc(2026, 1, 15, 10, 30), title: "Standup, daily".into(), join: None, all_day: false, feed: 0, location: String::new(), uid: "1".into() }]);
         // Outside the window: not listed.
         assert!(parse_ics(&ics, utc(2026, 1, 15, 10, 30), FAR).is_empty());
     }
@@ -627,39 +763,172 @@ mod tests {
     }
 
     #[test]
-    fn ignored_titles_are_skipped_whatever_their_case() {
+    fn ignored_and_hidden_events_are_skipped() {
         let mut c = Calendar::default();
-        c.done(vec![("u".into(), Ok(vec![ev(10, 20, "Focus Time"), ev(30, 40, "Review")]))]);
+        c.done(vec![("u".into(), Ok(vec![ev(10, 20, "Focus Time"), ev(30, 40, "Review")]))], 0);
         let urls = ["u".to_string()];
-        assert_eq!(c.events(&urls, &[]).len(), 2);
-        let left = c.events(&urls, &["focus".into(), " ".into()]);
+        let none = HashSet::new();
+        assert_eq!(c.events(&urls, &[], &none).len(), 2);
+        let left = c.events(&urls, &["focus".into(), " ".into()], &none);
         assert_eq!(left.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), vec!["Review"]);
         // Feeds dropped from the config do not show.
-        assert!(c.events(&[], &[]).is_empty());
+        assert!(c.events(&[], &[], &none).is_empty());
+        // Hide This Event: by UID, or by start and title without one.
+        let hidden: HashSet<String> = [hidden_key(&ev(30, 40, "Review"))].into();
+        assert_eq!(hidden_key(&ev(30, 40, "Review")), "30|Review");
+        assert_eq!(c.events(&urls, &[], &hidden).iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), vec!["Focus Time"]);
+        assert_eq!(hidden_key(&Event { uid: "abc@google.com".into(), ..ev(1, 2, "X") }), "abc@google.com");
+        // Each event knows its feed's place in the list.
+        c.done(vec![("v".into(), Ok(vec![ev(50, 60, "Gym")]))], 0);
+        let feeds: Vec<usize> = c.events(&["u".into(), "v".into()], &[], &none).iter().map(|e| e.feed).collect();
+        assert_eq!(feeds, vec![0, 0, 1]);
     }
 
     #[test]
-    fn reminders_come_once_inside_the_window() {
+    fn the_hidden_store_adds_keys_and_never_overwrites_a_bad_file() {
+        let dir = std::env::temp_dir().join(format!("procast-cal-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calendar-hidden.json");
+        let _ = std::fs::remove_file(&path);
+        assert!(load_hidden(&path).is_empty());
+        assert_eq!(hide(&path, "a".into()).unwrap().len(), 1);
+        assert_eq!(hide(&path, "a".into()).unwrap().len(), 1, "once");
+        hide(&path, "b".into()).unwrap();
+        assert_eq!(load_hidden(&path), ["a".to_string(), "b".to_string()].into());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_hidden(&path).is_empty());
+        assert!(hide(&path, "c".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminders_come_once_for_meetings_with_a_link() {
         let mut c = Calendar::default();
-        let events = [ev(1000, 2000, "Standup"), ev(5000, 6000, "Later")];
-        assert!(c.due(&events, 600, 5).is_empty()); // 400 s away > 5 min? no: 400 > 300
-        assert_eq!(c.due(&events, 710, 5), vec!["Standup starts in 5 min".to_string()]); // 290 s -> 5 min
+        let events = [meet(1000, 2000, "Standup"), meet(5000, 6000, "Later"), ev(1000, 2000, "No link")];
+        assert!(c.due(&events, 600, 5).is_empty()); // 400 s away: more than 5 min
+        assert_eq!(c.due(&events, 710, 5), vec!["Standup · in 5 min".to_string()]); // 290 s -> 5 min
         assert!(c.due(&events, 720, 5).is_empty()); // already told
         assert!(c.due(&events, 1000, 5).is_empty()); // started
         assert!(Calendar::default().due(&events, 900, 0).is_empty()); // off
-        let all_day = [Event { all_day: true, ..ev(1000, 2000, "Holiday") }];
+        let all_day = [Event { all_day: true, ..meet(1000, 2000, "Holiday") }];
         assert!(Calendar::default().due(&all_day, 900, 5).is_empty());
     }
 
     #[test]
-    fn the_empty_root_shows_what_is_on_now_or_about_to_be() {
-        let e = ev(10_000, 12_000, "Call");
-        assert!(!near(&e, 10_000 - 601, 600));
-        assert!(near(&e, 10_000 - 600, 600));
-        assert!(near(&e, 11_000, 600));
-        assert!(!near(&e, 12_000, 600));
-        assert!(!near(&Event { all_day: true, ..e.clone() }, 11_000, 600));
-        assert_eq!((when(&e, 11_000), when(&e, 10_000 - 61), when(&e, 10_000 - 7200), when(&e, -100_000)), ("Now".into(), "in 2 min".into(), "in 2 h".into(), String::new()));
+    fn next_is_the_meeting_within_15_minutes_or_one_reminded_of() {
+        let events = [ev(0, 500, "On now"), ev(2000, 3000, "Soon"), ev(4000, 5000, "Later")];
+        let c = Calendar::default();
+        assert_eq!(c.next(&events, 2000 - 900, true).map(|e| e.title.as_str()), Some("Soon"));
+        assert_eq!(c.next(&events, 2000 - 901, true), None);
+        assert_eq!(c.next(&events, 2000 - 60, false), None, "next_in_search off");
+        assert_eq!(c.next(&events, 2000, true), None, "started");
+        // A reminder 30 minutes ahead puts it in Next at once, even with next_in_search off.
+        let mut c = Calendar::default();
+        let later = [meet(4000, 5000, "Planning")];
+        assert_eq!(c.due(&later, 4000 - 1800, 30).len(), 1);
+        assert_eq!(c.next(&later, 4000 - 1800, false).map(|e| e.title.as_str()), Some("Planning"));
+    }
+
+    #[test]
+    fn join_meeting_takes_the_meeting_on_now_then_the_next_one() {
+        let events = [ev(0, 1000, "No link"), meet(100, 1000, "On now"), meet(1500, 2000, "Next")];
+        assert_eq!(joinable(&events, 500).map(|e| e.title.as_str()), Some("On now"));
+        assert_eq!(joinable(&events, 1000).map(|e| e.title.as_str()), Some("Next"));
+        assert_eq!(joinable(&events[2..], 1500 - 901), None, "more than 15 min away");
+        assert_eq!(joinable(&[ev(0, 1000, "No link")], 500), None);
+    }
+
+    #[test]
+    fn sections_drop_the_past_and_put_all_day_first() {
+        let now = utc(2026, 1, 15, 12, 0);
+        let (today, _) = today_and_tomorrow(now);
+        let tomorrow = today + DAY;
+        let all_day = |start: i64, title: &str| Event { all_day: true, ..ev(start, start + DAY, title) };
+        let events = [
+            ev(today + 3600, today + 7200, "Early"),
+            ev(now - 600, now + 600, "Standup"),
+            ev(now + 3600, now + 5400, "1:1"),
+            all_day(today, "Holiday"),
+            ev(tomorrow + 9 * 3600, tomorrow + 10 * 3600, "Review"),
+            all_day(tomorrow, "Trip"),
+        ];
+        let secs = sections(&events, now);
+        let got: Vec<(&str, Vec<&str>)> = secs.iter().map(|(name, v)| (*name, v.iter().map(|e| e.title.as_str()).collect())).collect();
+        // "Early" ended before now; counts are each section's length.
+        assert_eq!(got, vec![("Now", vec!["Standup"]), ("Today", vec!["Holiday", "1:1"]), ("Tomorrow", vec!["Trip", "Review"])]);
+        assert!(sections(&[ev(today + 60, today + 120, "Gone")], now).is_empty());
+    }
+
+    #[test]
+    fn until_and_in_minutes_read_as_the_card_does() {
+        let now = utc(2026, 1, 15, 12, 0);
+        let e = ev(now - 600, local_to_utc(utc(2026, 1, 15, 11, 0)), "Design review");
+        assert_eq!(until(&e), "until 11:00");
+        let soon = ev(now + 8 * 60, now + 3600, "Sync");
+        assert_eq!(in_minutes(&soon, now), "in 8 min");
+        assert_eq!(in_minutes(&soon, now + 7 * 60 + 30), "in 1 min");
+        assert_eq!(in_minutes(&soon, now + 8 * 60 - 1), "in 1 min");
+    }
+
+    #[test]
+    fn service_names_each_meeting_host() {
+        for (link, name) in [
+            ("https://meet.google.com/abc-defg-hij", "Google Meet"),
+            ("https://teams.microsoft.com/l/meetup-join/x", "Teams"),
+            ("https://teams.live.com/meet/9876", "Teams"),
+            ("https://us02web.zoom.us/j/1", "Zoom"),
+            ("https://acme.webex.com/meet/jo", "Webex"),
+        ] {
+            assert_eq!(service(link), Some(name), "{link}");
+        }
+        assert_eq!(service("https://zoom.us.evil.com/j/1"), None);
+        assert_eq!(service("https://example.com/"), None);
+    }
+
+    #[test]
+    fn the_subtitle_is_the_calendar_then_the_service() {
+        assert_eq!(subtitle("Work", &meet(0, 1, "Design review")), "Work · Google Meet");
+        assert_eq!(subtitle("Work", &ev(0, 1, "1:1")), "Work");
+        assert_eq!(subtitle("", &meet(0, 1, "x")), "Google Meet");
+    }
+
+    #[test]
+    fn calendar_url_opens_the_day_in_google_or_outlook() {
+        let e = ev(local_to_utc(utc(2026, 11, 17, 14, 0)), local_to_utc(utc(2026, 11, 17, 15, 0)), "Gym");
+        let google = "https://calendar.google.com/calendar/ical/me%40gmail.com/private-abc/basic.ics";
+        assert_eq!(calendar_url(google, &e).as_deref(), Some("https://calendar.google.com/calendar/r/day/2026/11/17"));
+        let outlook = "webcal://outlook.live.com/owa/calendar/00000/abc/calendar.ics";
+        assert_eq!(calendar_url(outlook, &e).as_deref(), Some("https://outlook.live.com/calendar/0/view/day/2026/11/17"));
+        assert_eq!(calendar_url("https://cal.example.com/a.ics", &e), None);
+        assert_eq!(calendar_url("https://evil.com?.calendar.google.com/a.ics", &e), None);
+    }
+
+    #[test]
+    fn a_row_joins_else_opens_the_calendar_else_copies() {
+        let google = "https://calendar.google.com/calendar/ical/x/basic.ics";
+        let labels = |it: &Item| it.actions().into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+        let m = Event { location: "Room 4".into(), ..meet(local_to_utc(utc(2026, 1, 15, 10, 0)), local_to_utc(utc(2026, 1, 15, 11, 0)), "Design review") };
+        let it = row(&m, ("Work", google), "14:00 – 14:30".into());
+        assert_eq!(labels(&it), ["Join Meeting", "Copy Join Link", "Copy Details", "Hide This Event"]);
+        assert!(matches!(&it.act, Act::Join(t, u) if t == "Design review" && u == "https://meet.google.com/abc-defg-hij"));
+        assert_eq!((it.subtitle.as_str(), it.accessory.as_str(), it.live), ("Work · Google Meet", "14:00 – 14:30", true));
+        assert!(matches!(it.icon, Icon::Vector(g::VIDEO)));
+        assert_eq!(details(&m), "Design review\n10:00 – 11:00\nRoom 4\nhttps://meet.google.com/abc-defg-hij");
+        let plain = ev(m.start, m.end, "Gym");
+        let it = row(&plain, ("Personal", google), String::new());
+        assert_eq!(labels(&it), ["Open in Calendar", "Copy Details", "Hide This Event"]);
+        assert!(matches!(it.icon, Icon::Vector(g::CALENDAR_CLOCK)));
+        let it = row(&plain, ("Personal", "https://cal.example.com/a.ics"), String::new());
+        assert_eq!(labels(&it), ["Copy Details", "Hide This Event"]);
+        assert_eq!(it.act, Act::Copy("Gym\n10:00 – 11:00".into()));
+    }
+
+    #[test]
+    fn the_location_is_kept_and_its_link_still_joins() {
+        let ics = cal("BEGIN:VEVENT\r\nUID:x@google.com\r\nDTSTART:20260115T093000Z\r\nDTEND:20260115T100000Z\r\nSUMMARY:Sync\r\nLOCATION:https://zoom.us/j/123\r\nEND:VEVENT\r\n");
+        let e = &parse_ics(&ics, 0, FAR)[0];
+        assert_eq!((e.location.as_str(), e.join.as_deref(), e.uid.as_str()), ("https://zoom.us/j/123", Some("https://zoom.us/j/123"), "x@google.com"));
     }
 
     #[test]
@@ -673,21 +942,38 @@ mod tests {
 
     #[test]
     fn a_failing_feed_is_announced_once_and_keeps_its_events() {
+        const EVERY: Duration = Duration::from_secs(900);
         let mut c = Calendar::default();
         let t = Instant::now();
-        assert!(c.wants_fetch(1, t) && !c.wants_fetch(0, t));
+        assert!(c.wants_fetch(1, t, EVERY) && !c.wants_fetch(0, t, EVERY));
         c.fetching(t);
-        assert!(!c.wants_fetch(1, t + REFRESH * 2), "one fetch at a time");
+        assert!(!c.wants_fetch(1, t + EVERY * 2, EVERY), "one fetch at a time");
         let url = "https://cal.example.com/private/secret.ics".to_string();
-        assert!(c.done(vec![(url.clone(), Ok(vec![ev(1, 2, "A")]))]).is_empty());
-        assert!(!c.wants_fetch(1, t + REFRESH - Duration::from_secs(1)) && c.wants_fetch(1, t + REFRESH));
-        let say = c.done(vec![(url.clone(), Err("http status: 500".into()))]);
+        assert!(c.done(vec![(url.clone(), Ok(vec![ev(1, 2, "A")]))], 1000).is_empty());
+        assert!(!c.wants_fetch(1, t + EVERY - Duration::from_secs(1), EVERY) && c.wants_fetch(1, t + EVERY, EVERY));
+        let say = c.done(vec![(url.clone(), Err("http status: 500".into()))], 2000);
         assert_eq!(say, vec!["Calendar: http status: 500".to_string()]);
         assert!(!say[0].contains("secret"));
-        assert!(c.done(vec![(url.clone(), Err("again".into()))]).is_empty());
-        assert_eq!(c.events(std::slice::from_ref(&url), &[]).len(), 1);
-        c.done(vec![(url.clone(), Ok(vec![]))]);
-        assert_eq!(c.done(vec![(url, Err("down".into()))]).len(), 1, "told again after a good fetch");
+        assert!(c.done(vec![(url.clone(), Err("again".into()))], 2000).is_empty());
+        assert_eq!(c.events(std::slice::from_ref(&url), &[], &HashSet::new()).len(), 1);
+        c.done(vec![(url.clone(), Ok(vec![]))], 2000);
+        assert_eq!(c.done(vec![(url, Err("down".into()))], 2000).len(), 1, "told again after a good fetch");
+    }
+
+    #[test]
+    fn while_a_fetch_runs_the_bar_says_when_the_last_one_came() {
+        let mut c = Calendar::default();
+        assert_eq!(c.updated_line(1000), None);
+        c.fetching(Instant::now());
+        assert_eq!(c.updated_line(1000), None, "nothing fetched yet");
+        c.done(vec![("u".into(), Ok(vec![]))], 1000);
+        assert_eq!(c.updated_line(1300), None, "not loading");
+        c.fetching(Instant::now());
+        assert_eq!(c.updated_line(1300).as_deref(), Some("Updated 5 min ago"));
+        // A failed fetch does not count as an update.
+        c.done(vec![("u".into(), Err("down".into()))], 1300);
+        c.fetching(Instant::now());
+        assert_eq!(c.updated_line(1600).as_deref(), Some("Updated 10 min ago"));
     }
 
     #[test]
@@ -702,6 +988,16 @@ mod tests {
         // And the entries that never reach ureq.
         for bad in ["/private/token.ics", "token.ics", "ftp://x.com/token.ics", ""] {
             assert_eq!(fetch(bad), Err("that calendar address is not valid".to_string()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_host_in_an_error_never_comes_from_the_path() {
+        assert_eq!(feed_host("https://cal.example.com/private/a.ics?u=https://token.example/x").as_deref(), Some("cal.example.com"));
+        assert_eq!(feed_host("HTTP://me:pw@Localhost:8000/a.ics").as_deref(), Some("localhost"));
+        assert_eq!(feed_host("https://x.com\\a@token/b").as_deref(), Some("x.com"));
+        for bad in ["ftp://x.com/a.ics", "/private/token.ics", "https:///token.ics", ""] {
+            assert_eq!(feed_host(bad), None, "{bad}");
         }
     }
 

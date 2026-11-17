@@ -392,20 +392,28 @@ fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> 
     cfg.files.enabled.then(|| files::Files::start(&cfg.files, tx.clone()))
 }
 
+/// Hide This Event's store, in `config::dir()`.
+const CALENDAR_HIDDEN: &str = "calendar-hidden.json";
+
 /// Section marker for a row that stands in for an empty view (drawn as an empty state).
 const EMPTY: &str = "\u{0}empty";
 /// The section of running timers and stopwatches at the head of root search.
 const RUNNING: &str = "Running";
 /// The Focus session's section, above Running.
 const FOCUS: &str = "Focus";
+/// The next meeting's section, under Running.
+const NEXT: &str = "Next";
+/// The Settings page My Schedule's empty state opens.
+const SETTINGS_CALENDAR: &str = "Calendar";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
-/// with the same section share one header.
-fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
+/// with the same section share one header; `headed` heads a section even when it is the only
+/// one (My Schedule's Now, Today and Tomorrow).
+fn display_rows(items: &[Item], headed: bool) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
     // A header says something only when there is more than one section (Focus, Running with
-    // its count, and Did you mean always head their rows), and "Results" right under the
+    // its count, Next and Did you mean always head their rows), and "Results" right under the
     // search field says nothing.
     let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
@@ -413,7 +421,7 @@ fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last && (!one || sec == Some(FOCUS) || sec == Some(RUNNING) || sec == Some(DID_YOU_MEAN)) && !(sec == Some("Results") && out.is_empty()) {
+        if sec.is_some() && sec != last && (!one || headed || matches!(sec, Some(FOCUS | RUNNING | NEXT | DID_YOU_MEAN))) && !(sec == Some("Results") && out.is_empty()) {
             out.push(None);
         }
         last = sec;
@@ -481,11 +489,13 @@ fn head_rows(mut above: Vec<Item>, mut found: Vec<Item>, query: &str, cfg: &Conf
 
 /// Where root search's selection starts: on the row the query names (`search::heads`), so its
 /// boxes show; else, while something is typed, on the first row past the Focus and Running
-/// rows (Enter on "te" opens what was searched for, it never pauses a timer); else the top.
-fn root_selection(items: &[Item], query: &str, cfg: &Config) -> usize {
+/// rows (Enter on "te" opens what was searched for, it never pauses a timer); else on the Next
+/// row after a meeting reminder (`pick_next`), so Enter joins; else the top.
+fn root_selection(items: &[Item], query: &str, cfg: &Config, pick_next: bool) -> usize {
     let typed = !query.trim().is_empty();
-    let head = |it: &Item| matches!(it.section.as_deref(), Some(RUNNING | FOCUS));
-    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && !head(it))).unwrap_or(0)
+    let head = |it: &Item| matches!(it.section.as_deref(), Some(RUNNING | FOCUS | NEXT));
+    let next = || items.iter().position(|it| pick_next && !typed && it.section.as_deref() == Some(NEXT));
+    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && !head(it))).or_else(next).unwrap_or(0)
 }
 
 /// The timer or stopwatch a Running row stands for.
@@ -790,6 +800,10 @@ struct Launcher {
     focus: focus::Focus,
     /// Calendar feeds' events; fetched and reminded of on the 10 s `Msg::Tick`.
     calendar: calendar::Calendar,
+    /// Hide This Event's keys (`calendar::hidden_key`), from `calendar-hidden.json`.
+    hidden_events: HashSet<String>,
+    /// A meeting reminder went out: the next open selects root's Next row, so Enter joins.
+    pick_next: bool,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -957,6 +971,8 @@ impl Launcher {
             timer_tick: None,
             focus: focus::Focus::load(config::dir().join("focus.json")),
             calendar: calendar::Calendar::default(),
+            hidden_events: calendar::load_hidden(&config::dir().join(CALENDAR_HIDDEN)),
+            pick_next: false,
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -1440,7 +1456,7 @@ impl Launcher {
                 let mut rows = self.focus_rows(&query);
                 rows.extend(self.timer_rows(&query));
                 if query.trim().is_empty() {
-                    rows.extend(self.schedule_now());
+                    rows.extend(self.next_rows());
                 }
                 let found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
                 let mut rows = head_rows(rows, found, &query, &self.cfg);
@@ -1607,7 +1623,7 @@ impl Launcher {
         self.selected = if keep_selection {
             self.selected.min(self.items.len().saturating_sub(1))
         } else if self.mode == Mode::Root {
-            root_selection(&self.items, &query, &self.cfg)
+            root_selection(&self.items, &query, &self.cfg, self.pick_next)
         } else if self.mode == Mode::Translate {
             self.translation.as_ref().map_or(0, |tr| tr.first)
         } else {
@@ -1692,38 +1708,68 @@ impl Launcher {
 
     // ---- My Schedule (the decisions are in calendar.rs) ------------------------------
 
+    /// The `[[calendar_feed]]` addresses, in order (an event's `feed` indexes them).
+    fn feed_urls(&self) -> Vec<String> {
+        self.cfg.calendar_feed.iter().map(|f| f.url.clone()).collect()
+    }
+
     fn calendar_events(&self) -> Vec<calendar::Event> {
-        self.calendar.events(&self.cfg.calendar.ics, &self.cfg.calendar.ignore)
+        self.calendar.events(&self.feed_urls(), &self.cfg.calendar.ignore, &self.hidden_events)
     }
 
-    /// Events on now or about to start, for an empty root search.
-    fn schedule_now(&self) -> Vec<Item> {
+    /// An event's row, with its calendar's name and address.
+    fn event_row(&self, e: &calendar::Event, accessory: String) -> Item {
+        let feed = self.cfg.calendar_feed.get(e.feed);
+        calendar::row(e, (feed.map_or("", |f| f.name.as_str()), feed.map_or("", |f| f.url.as_str())), accessory)
+    }
+
+    /// The Next section of an empty root search: the meeting about to start (`Calendar::next`).
+    fn next_rows(&self) -> Vec<Item> {
         let now = search::now() as i64;
-        let tolerance = i64::from(self.cfg.calendar.tolerance_secs);
         let events = self.calendar_events();
-        events.iter().filter(|e| calendar::near(e, now, tolerance)).map(|e| calendar::row(e, now, Act::Cmd(Cmd::MySchedule)).sec("My Schedule")).collect()
+        self.calendar.next(&events, now, self.cfg.calendar.next_in_search).map(|e| self.event_row(e, calendar::in_minutes(e, now)).sec(NEXT)).into_iter().collect()
     }
 
-    /// Today's and tomorrow's events, or why there are none.
+    /// My Schedule: Now, Today and Tomorrow, or why there is nothing.
     fn schedule_rows(&self) -> Vec<Item> {
+        if self.cfg.calendar_feed.iter().all(|f| f.url.trim().is_empty()) {
+            // ponytail: opens Settings → Calendar until Task 15's Add Calendar form.
+            let add = vec![("Add Calendar".to_string(), Act::OpenSettings(SETTINGS_CALENDAR))];
+            return vec![empty_row(g::CALENDAR_CLOCK, "No calendar connected".into(), "Paste your calendar's ICS address to see today's meetings here".into(), add)];
+        }
         let now = search::now() as i64;
-        if self.cfg.calendar.ics.is_empty() {
-            let edit = vec![("Edit Config".to_string(), Act::Cmd(Cmd::EditConfig))];
-            return vec![empty_row(g::CALENDAR, "No calendar connected".into(), "Add your calendar's ICS address as ics = [\"…\"] under [calendar] in config.toml".into(), edit)];
-        }
-        let (from, to) = calendar::today_and_tomorrow(now);
-        let events = calendar::within(&self.calendar_events(), from, to);
-        if events.is_empty() {
+        let sections = calendar::sections(&self.calendar_events(), now);
+        if sections.is_empty() {
             let text = if self.calendar.pending() { "Fetching your calendar…" } else { "Nothing on today or tomorrow" };
-            return vec![empty_row(g::CALENDAR, text.into(), String::new(), vec![])];
+            return vec![empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![])];
         }
-        events.iter().map(|e| calendar::row(e, now, Act::None).sec(calendar::day_label(e.start, now))).collect()
+        let mut rows = vec![];
+        for (name, events) in sections {
+            for e in events {
+                let on = name == "Now";
+                let mut it = self.event_row(&e, if on { calendar::until(&e) } else { calendar::span(&e) }).sec(name);
+                it.now = on;
+                rows.push(it);
+            }
+        }
+        rows
     }
 
-    /// Every 10 s: fetches the feeds when due (off the UI thread), and reminds of events about to start.
-    fn calendar_tick(&mut self) {
-        let urls = self.cfg.calendar.ics.clone();
-        if self.calendar.wants_fetch(urls.len(), Instant::now()) {
+    /// The meeting Enter on `act` opens, (title, link): a Join row's, or Join Meeting's (`calendar::joinable`).
+    fn join_target(&self, act: &Act) -> Option<(String, String)> {
+        match act {
+            Act::Join(title, url) => Some((title.clone(), url.clone())),
+            Act::Cmd(Cmd::JoinMeeting) => calendar::joinable(&self.calendar_events(), search::now() as i64).and_then(|e| Some((e.title.clone(), e.join.clone()?))),
+            _ => None,
+        }
+    }
+
+    /// Every 10 s: fetches the feeds when due (off the UI thread), reminds of meetings about to
+    /// start, and keeps root's Next row current.
+    fn calendar_tick(&mut self, cx: &mut Context<Self>) {
+        let urls: Vec<String> = self.feed_urls().into_iter().filter(|u| !u.trim().is_empty()).collect();
+        let every = Duration::from_secs(u64::from(self.cfg.calendar.refresh_minutes.max(5)) * 60);
+        if self.calendar.wants_fetch(urls.len(), Instant::now(), every) {
             self.calendar.fetching(Instant::now());
             let tx = self.tx.clone();
             std::thread::spawn(move || {
@@ -1740,8 +1786,21 @@ impl Launcher {
         }
         let events = self.calendar_events();
         for text in self.calendar.due(&events, search::now() as i64, self.cfg.calendar.remind_minutes) {
-            self.say(Msg::done(text));
+            self.say(Msg::sticky(toast::Kind::Info, text));
+            self.pick_next = true;
         }
+        if !self.visible || self.mode != Mode::Root || self.panel.is_some() || !self.query(cx).trim().is_empty() {
+            return;
+        }
+        let next = self.next_rows();
+        let shown: Vec<&Item> = self.items.iter().filter(|it| it.section.as_deref() == Some(NEXT)).collect();
+        if shown.len() != next.len() || shown.iter().zip(&next).any(|(a, b)| a.title != b.title) {
+            return self.refresh(cx);
+        }
+        for (it, n) in self.items.iter_mut().filter(|it| it.section.as_deref() == Some(NEXT)).zip(next) {
+            it.accessory = n.accessory;
+        }
+        cx.notify();
     }
 
     // ---- Focus sessions (the decisions are in focus.rs) -----------------------------
@@ -2083,7 +2142,7 @@ impl Launcher {
 
     /// Scrolls the selected row into view (section headers take list slots too).
     fn scroll_to_selected(&self) {
-        let at = display_rows(&self.items).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
+        let at = display_rows(&self.items, self.mode == Mode::Schedule).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
         self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
     }
 
@@ -2250,6 +2309,7 @@ impl Launcher {
         self.typed = Default::default();
         win::cloak(self.hwnd, true);
         self.visible = false;
+        self.pick_next = false;
         self.hidden_at = Some(Instant::now());
         self.panel = None;
         self.menu = None;
@@ -3357,9 +3417,9 @@ impl Launcher {
             }
         };
         let needs_confirm = match item.act {
+            Act::Join(..) | Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(&item.act).is_some(),
             Act::Cmd(cmd) => cmd.destructive(),
             Act::Script(i) => self.scripts[i].confirm,
-            Act::Join(..) => self.cfg.calendar.confirm_join,
             _ => false,
         };
         if needs_confirm && self.armed != Some(self.selected) {
@@ -3521,6 +3581,25 @@ impl Launcher {
             Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
             Act::Join(_, url) => win::open(&url),
+            Act::Cmd(Cmd::JoinMeeting) => match self.join_target(&Act::Cmd(Cmd::JoinMeeting)) {
+                Some((_, url)) => win::open(&url),
+                None => self.say(Msg::error("No meeting with a link right now")),
+            },
+            Act::HideEvent(key) => {
+                match calendar::hide(&config::dir().join(CALENDAR_HIDDEN), key) {
+                    Ok(set) => self.hidden_events = set,
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return self.refresh(cx);
+            }
+            Act::OpenSettings(page) => {
+                self.hide(false, cx);
+                self.open_settings(cx);
+                if let Some(h) = self.settings_window {
+                    drop(h.update(cx, |s, window, cx| s.open_section(page, window, cx)));
+                }
+                return;
+            }
             Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
             Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
@@ -3986,8 +4065,8 @@ impl Launcher {
                     self.files = start_files(&cfg, &self.tx);
                     self.refresh_index_status(cx);
                 }
-                if cfg.calendar.ics != self.cfg.calendar.ics {
-                    self.calendar.reset(&cfg.calendar.ics);
+                if cfg.calendar_feed.iter().map(|f| &f.url).ne(self.cfg.calendar_feed.iter().map(|f| &f.url)) {
+                    self.calendar.reset(&cfg.calendar_feed.iter().map(|f| f.url.clone()).collect::<Vec<_>>());
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
@@ -4140,11 +4219,11 @@ impl Launcher {
                 self.history.prune(search::now());
                 let idle = Duration::from_secs(self.cfg.apps.auto_quit_minutes.max(1) * 60);
                 self.autoquit.tick(&self.cfg.apps.auto_quit, idle, win::foreground());
-                self.calendar_tick();
+                self.calendar_tick(cx);
                 self.tick(cx);
             }
             Msg::Calendar(results) => {
-                for text in self.calendar.done(results) {
+                for text in self.calendar.done(results, search::now()) {
                     self.say(Msg::error(text));
                 }
                 if self.visible && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
@@ -4293,6 +4372,11 @@ impl Launcher {
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
         }
+        if self.mode == Mode::Schedule
+            && let Some(line) = self.calendar.updated_line(search::now())
+        {
+            return line;
+        }
         // The grid shows no names: the selected emoji's is here.
         if self.grid() && self.panel.is_none()
             && let Some(it) = self.items.get(self.selected)
@@ -4305,6 +4389,7 @@ impl Launcher {
         match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
             // A Running row's accessory is its time; its kind is the subtitle. The session row is Focus.
             Some(it) if it.section.as_deref() == Some(FOCUS) => FOCUS.into(),
+            Some(it) if it.section.as_deref() == Some(NEXT) => "My Schedule".into(),
             Some(it) if it.live => it.subtitle.clone(),
             Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
             _ => "procast".into(),
@@ -4329,7 +4414,7 @@ impl Launcher {
             Mode::Translate | Mode::LanguageSets => Icon::Vector(g::LANGUAGES),
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
             Mode::Shots => Icon::Vector(g::PICTURE),
-            Mode::Schedule => Icon::Vector(g::CALENDAR),
+            Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
             Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
@@ -4574,7 +4659,7 @@ impl Launcher {
             }
         };
         meta.insert(0, ("Application".into(), if e.app.is_empty() { "Unknown".into() } else { e.app.clone() }));
-        meta.push(("Copied".into(), format!("{} · {}", win::local_time_of(e.at), search::ago(e.at))));
+        meta.push(("Copied".into(), format!("{} · {}", win::local_time_of(e.at), timers::ago(search::now().saturating_sub(e.at)))));
         if e.pinned {
             meta.push(("Pinned".into(), "Yes".into()));
         }
@@ -4892,7 +4977,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool, toggle: Option<bool> },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool, now: bool, toggle: Option<bool> },
 }
 
 impl Render for Launcher {
@@ -4947,9 +5032,9 @@ impl Render for Launcher {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
             _ if let Mode::Form(kind) = self.mode => format!("{}  Ctrl+↵", kind.bar().2),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
-            (None, Some(it)) if self.armed == Some(self.selected) => match &it.act {
-                Act::Join(title, url) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(url).unwrap_or_default()),
-                _ => format!("Press ↵ again to {}", it.title),
+            (None, Some(it)) if self.armed == Some(self.selected) => match self.join_target(&it.act) {
+                Some((title, url)) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(&url).unwrap_or_default()),
+                None => format!("Press ↵ again to {}", it.title),
             },
             (None, Some(_)) => match &primary {
                 Some(p) if actions.len() > 1 => format!("{p}  ↵    {}Actions  Ctrl+K", bar_second.as_ref().map(|s| format!("{s}  Ctrl+↵    ")).unwrap_or_default()),
@@ -4991,7 +5076,7 @@ impl Render for Launcher {
         // ---- results list ----
         let slots: Vec<Slot> = {
             let mut out = vec![];
-            let rows = display_rows(&self.items);
+            let rows = display_rows(&self.items, self.mode == Mode::Schedule);
             let count = |sec: &Option<String>| self.items.iter().filter(|it| &it.section == sec).count();
             // The right-hand column shows what tells rows apart. In root search that is a
             // row's own hotkey or alias (its kind is in the action bar); elsewhere it is the
@@ -5031,7 +5116,7 @@ impl Render for Launcher {
                             None if mirrored.is_empty() => it.subtitle.clone(),
                             None => mirrored,
                         };
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live, toggle: it.toggle });
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live, now: it.now, toggle: it.toggle });
                     }
                 }
             }
@@ -5049,7 +5134,7 @@ impl Render for Launcher {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live, toggle } => {
+                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live, now, toggle } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
                             let accessory = if let Some(state) = toggle {
@@ -5057,7 +5142,9 @@ impl Render for Launcher {
                             } else if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
                             } else if *live {
-                                Some(design::live(accessory, live_w, if accessory == timers::DONE { t.success } else { t.text_muted }).into_any_element())
+                                // The event on now: "until 11:00" in the accent, weight 600 (`.pc-now`).
+                                let color = if *now { t.accent } else if accessory == timers::DONE { t.success } else { t.text_muted };
+                                Some(design::live(accessory, live_w, color).when(*now, |d| d.font_weight(gpui::FontWeight::SEMIBOLD)).into_any_element())
                             } else if !accessory.is_empty() {
                                 Some(accessory.clone().into_any_element())
                             } else {
@@ -5961,9 +6048,13 @@ mod tests {
     #[test]
     fn running_is_always_headed_and_results_are_headed_below_another_section() {
         let it = |sec: &str| Item::new("x", "", Icon::glyph("x"), Act::None).sec(sec);
-        assert_eq!(display_rows(&[it("Running")]), [None, Some(0)], "alone, still headed");
-        assert_eq!(display_rows(&[it("Results"), it("Running"), it("Results")]), [Some(0), None, Some(1), None, Some(2)]);
-        assert_eq!(display_rows(&[it("Results"), it("Results")]), [Some(0), Some(1)]);
+        assert_eq!(display_rows(&[it("Running")], false), [None, Some(0)], "alone, still headed");
+        assert_eq!(display_rows(&[it("Results"), it("Running"), it("Results")], false), [Some(0), None, Some(1), None, Some(2)]);
+        assert_eq!(display_rows(&[it("Results"), it("Results")], false), [Some(0), Some(1)]);
+        // My Schedule heads even a lone section; root heads a lone Next.
+        assert_eq!(display_rows(&[it("Today"), it("Today")], true), [None, Some(0), Some(1)]);
+        assert_eq!(display_rows(&[it("Today")], false), [Some(0)]);
+        assert_eq!(display_rows(&[it(NEXT)], false), [None, Some(0)]);
     }
 
     #[test]
@@ -5987,7 +6078,7 @@ mod tests {
 
         // Misspelled: Did you mean alone, still headed; its first row (the closest match) is where the selection starts.
         let rows = define_rows(&view("serendipty", Some(dict::Answer { senses: vec![], maybe: vec![("serendipity".into(), dict::Pos::Noun)] })), web);
-        assert_eq!(display_rows(&rows), [None, Some(0)]);
+        assert_eq!(display_rows(&rows, false), [None, Some(0)]);
         assert_eq!((rows[0].title.as_str(), rows[0].subtitle.as_str()), ("serendipity", "Noun"));
 
         // Unknown: the empty view, Enter searches the web.
@@ -6048,7 +6139,7 @@ mod tests {
         let shown = |q: &str| {
             let found = search::root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
             let rows = head_rows(vec![running.clone()], found, q, &cfg);
-            let at = root_selection(&rows, q, &cfg);
+            let at = root_selection(&rows, q, &cfg, false);
             (rows, at)
         };
         let (rows, at) = shown("t");
@@ -6069,9 +6160,20 @@ mod tests {
         let cfg = Config::default();
         let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
         let rows = vec![running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
-        assert_eq!(root_selection(&rows, "te", &cfg), 1, "Enter on \"te\" opens Terminal, it does not pause tea");
-        assert_eq!(root_selection(&rows, "", &cfg), 0, "an empty search starts on the top row");
-        assert_eq!(root_selection(&rows[..1], "tea", &cfg), 0, "only Running rows: the first of them");
+        assert_eq!(root_selection(&rows, "te", &cfg, false), 1, "Enter on \"te\" opens Terminal, it does not pause tea");
+        assert_eq!(root_selection(&rows, "", &cfg, false), 0, "an empty search starts on the top row");
+        assert_eq!(root_selection(&rows[..1], "tea", &cfg, false), 0, "only Running rows: the first of them");
+    }
+
+    #[test]
+    fn after_a_reminder_the_empty_search_starts_on_the_next_meeting() {
+        let cfg = Config::default();
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let next = Item::new("Standup", "Work · Teams", Icon::glyph("x"), Act::Join("Standup".into(), "https://teams.live.com/meet/1".into())).sec(NEXT);
+        let rows = vec![running, next, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(root_selection(&rows, "", &cfg, true), 1, "Enter joins");
+        assert_eq!(root_selection(&rows, "", &cfg, false), 0, "no reminder: the top row");
+        assert_eq!(root_selection(&rows, "te", &cfg, true), 2, "typing still starts on the results");
     }
 
     fn deep_work(minutes: u32) -> focus::Session {
@@ -6097,8 +6199,8 @@ mod tests {
         // Focus heads root above Running, headed even alone; a typed query starts past both.
         let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
         let rows = vec![it, running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
-        assert_eq!(display_rows(&rows[..1]), [None, Some(0)]);
-        assert_eq!(root_selection(&rows, "de", &Config::default()), 2);
+        assert_eq!(display_rows(&rows[..1], false), [None, Some(0)]);
+        assert_eq!(root_selection(&rows, "de", &Config::default(), false), 2);
     }
 
     #[test]

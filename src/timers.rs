@@ -69,6 +69,16 @@ pub fn done_text(label: &str, length: Duration) -> String {
 pub const DONE: &str = "Done";
 
 /// The system "ding"; silent when there is no sound device.
+/// How long ago, from the seconds since: "just now", "3 min ago", "2 d ago".
+pub fn ago(secs: u64) -> String {
+    match secs {
+        a @ 0..60 => if a < 10 { "just now".into() } else { format!("{a} s ago") },
+        a @ 60..3600 => format!("{} min ago", a / 60),
+        a @ 3600..86400 => format!("{} h ago", a / 3600),
+        a => format!("{} d ago", a / 86400),
+    }
+}
+
 pub fn beep() {
     unsafe { _ = MessageBeep(MB_OK) };
 }

@@ -51,27 +51,46 @@ pub struct Config {
     /// `[[focus_category]]`: named app and website lists a Focus session can use.
     pub focus_category: Vec<FocusCategory>,
     pub calendar: Calendar,
+    /// `[[calendar_feed]]`: the calendars My Schedule shows.
+    pub calendar_feed: Vec<CalendarFeed>,
 }
 
-/// My Schedule: calendar feeds and what to do with their events.
+/// My Schedule: what to do with the feeds' events.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Calendar {
-    /// ICS feed addresses (`https://` or `webcal://`).
-    pub ics: Vec<String>,
-    /// Seconds around now within which an event shows in an empty root search.
-    pub tolerance_secs: u32,
+    /// How often the ICS feeds are fetched: 5, 15, 30 or 60 minutes.
+    pub refresh_minutes: u32,
+    /// Minutes before a meeting with a link to remind you: 0 (off), 2, 5, 10, 15 or 30.
+    pub remind_minutes: u32,
     /// Ask "Join <title>?" before opening a meeting link.
     pub confirm_join: bool,
-    /// Minutes before an event to remind you; 0 = no reminders.
-    pub remind_minutes: u32,
+    /// The next meeting within 15 minutes heads root search.
+    pub next_in_search: bool,
     /// Events whose title contains one of these words are left out.
     pub ignore: Vec<String>,
 }
 
 impl Default for Calendar {
     fn default() -> Self {
-        Self { ics: vec![], tolerance_secs: 600, confirm_join: true, remind_minutes: 5, ignore: vec![] }
+        Self { refresh_minutes: 15, remind_minutes: 5, confirm_join: true, next_in_search: true, ignore: vec![] }
+    }
+}
+
+/// One `[[calendar_feed]]`: a calendar's secret ICS address, its name and colour.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CalendarFeed {
+    /// `https://` or `webcal://`.
+    pub url: String,
+    pub name: String,
+    /// A kind tint: system, window, paste, web or calc.
+    pub colour: String,
+}
+
+impl Default for CalendarFeed {
+    fn default() -> Self {
+        Self { url: String::new(), name: String::new(), colour: "system".into() }
     }
 }
 
@@ -555,6 +574,7 @@ impl Default for Config {
             focus: Focus::default(),
             focus_category: vec![],
             calendar: Calendar::default(),
+            calendar_feed: vec![],
         }
     }
 }
@@ -851,11 +871,16 @@ pill = true                   # false hides the floating Focus timer
 # sites = ["reddit.com", "x.com"]
 
 [calendar]
-ics = []                      # calendar feed addresses (Google "secret address in iCal format", Outlook "published calendar", webcal:// works too), checked every 10 minutes
-tolerance_secs = 600          # an event on now, or starting within this many seconds, shows in an empty search
-confirm_join = true           # ask "Join <title>?" before opening a meeting link
-remind_minutes = 5            # a toast this many minutes before an event; 0 = no reminders
-ignore = []                   # events whose title contains one of these words are left out, e.g. ["Focus time"]
+refresh_minutes = 15          # how often the ICS feeds are fetched: 5, 15, 30 or 60
+remind_minutes = 5            # notice before meetings with a link: 0 (off), 2, 5, 10, 15 or 30
+confirm_join = true           # ask before opening the meeting link
+next_in_search = true         # show the next meeting within 15 minutes at the top of search
+ignore = []                   # events whose title contains one of these words are hidden, e.g. ["Focus time"]
+# Calendars (Google: "Secret address in iCal format"; Outlook: Publish -> ICS; webcal:// works too):
+# [[calendar_feed]]
+# url = ""                    # the calendar's secret ICS address
+# name = "Work"
+# colour = "system"           # system, window, paste, web or calc
 
 [emoji]
 hotkey = ""                   # e.g. "Ctrl+Alt+E"
