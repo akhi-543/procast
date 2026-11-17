@@ -531,6 +531,28 @@ fn root_selection(items: &[Item], query: &str, cfg: &Config, pick_next: bool) ->
     items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && !head(it))).or_else(next).unwrap_or(0)
 }
 
+/// Where the row `was` sits in the rebuilt `items`: the same timer, else the same frecency key
+/// (or, without one, the same title) in the same section.
+fn same_row(items: &[Item], was: &Item) -> Option<usize> {
+    if let Some(id) = timer_id(was) {
+        return items.iter().position(|it| timer_id(it) == Some(id));
+    }
+    items.iter().position(|it| it.section == was.section && it.key == was.key && (was.key.is_some() || it.title == was.title))
+}
+
+/// The action bar's left text for the selected row: what kind of thing it is.
+fn row_footer(it: Option<&Item>) -> String {
+    match it.filter(|it| it.section.as_deref() != Some(EMPTY)) {
+        // A Running row's accessory is its time; its kind is the subtitle. The session row is Focus.
+        Some(it) if it.section.as_deref() == Some(FOCUS) => FOCUS.into(),
+        Some(it) if it.section.as_deref() == Some(NEXT) => "My Schedule".into(),
+        Some(it) if it.live => it.subtitle.clone(),
+        // A clipboard row's accessory is when it was copied ("yesterday"), not a kind.
+        Some(it) if !it.accessory.is_empty() && !matches!(it.act, Act::Clip(_)) => it.accessory.clone(),
+        _ => "procast".into(),
+    }
+}
+
 /// The timer or stopwatch a Running row stands for.
 fn timer_id(it: &Item) -> Option<u64> {
     it.live.then(|| it.extra.iter().find_map(|(_, a)| if let Act::StopTimer(id) = a { Some(*id) } else { None })).flatten()
@@ -1767,12 +1789,12 @@ impl Launcher {
         cx.notify();
     }
 
-    /// `refresh`, with the selection kept on the Running row it was on: pausing the second timer
-    /// must not move Enter onto the first.
-    fn refresh_keeping_timer(&mut self, cx: &mut Context<Self>) {
-        let kept = self.items.get(self.selected).and_then(timer_id);
+    /// `refresh`, with the selection kept on the row it was on (`same_row`): pausing the second
+    /// timer, or a tick that adds a Running or Next row above, must not move Enter onto another row.
+    fn refresh_keeping(&mut self, cx: &mut Context<Self>) {
+        let was = self.items.get(self.selected).cloned();
         self.refresh(cx);
-        if let Some(i) = kept.and_then(|id| self.items.iter().position(|it| timer_id(it) == Some(id))) {
+        if let Some(i) = was.and_then(|w| same_row(&self.items, &w)) {
             self.selected = i;
             self.sync_args(cx);
             self.scroll_to_selected();
@@ -1823,9 +1845,12 @@ impl Launcher {
         }
         let shown: Vec<u64> = self.items.iter().filter_map(timer_id).collect();
         let rows = self.timers.matching(now, &self.query(cx));
-        // A timer that finished, appeared or went away rebuilds the list; otherwise only the times change.
-        if !due.is_empty() || timers::rows_changed(&shown, &rows) {
-            return self.refresh_keeping_timer(cx);
+        // A timer that finished, appeared or went away rebuilds the list; otherwise only the times
+        // change. An open panel or an armed row (Join's second Enter) waits, as in `calendar_tick`:
+        // a rebuild would close the question; the times still tick in place.
+        let waits = self.panel.is_some() || self.armed.is_some();
+        if !waits && (!due.is_empty() || timers::rows_changed(&shown, &rows)) {
+            return self.refresh_keeping(cx);
         }
         for it in &mut self.items {
             if let Some(id) = timer_id(it)
@@ -2024,7 +2049,7 @@ impl Launcher {
         let next = self.next_rows();
         let shown: Vec<&Item> = self.items.iter().filter(|it| it.section.as_deref() == Some(NEXT)).collect();
         if shown.len() != next.len() || shown.iter().zip(&next).any(|(a, b)| a.title != b.title) {
-            return self.refresh(cx);
+            return self.refresh_keeping(cx);
         }
         for (it, n) in self.items.iter_mut().filter(|it| it.section.as_deref() == Some(NEXT)).zip(next) {
             it.accessory = n.accessory;
@@ -2093,14 +2118,13 @@ impl Launcher {
     }
 
     /// Adds categories to config.toml (the config reload applies them within a couple of seconds).
-    fn focus_save_categories(&self, cats: &[config::FocusCategory]) -> Result<String, String> {
-        let text = focus::text_or_empty(std::fs::read_to_string(config::path()))?;
-        let (text, n) = focus::add_categories(&text, cats)?;
-        if n == 0 {
-            return Err("Those categories are already in config.toml".into());
-        }
-        config::parse(&text)?;
-        focus::write_atomic(&config::path(), &text).map_err(|e| e.to_string())?;
+    fn focus_save_categories(cats: &[config::FocusCategory]) -> Result<String, String> {
+        let mut n = 0;
+        config::edit_file(&config::path(), |text| {
+            let (text, added) = focus::add_categories(text, cats)?;
+            n = added;
+            if n == 0 { Err("Those categories are already in config.toml".into()) } else { Ok(text) }
+        })?;
         Ok(format!("Added {n} focus categor{}", if n == 1 { "y" } else { "ies" }))
     }
 
@@ -2121,13 +2145,25 @@ impl Launcher {
         let done = match f {
             FocusCmd::Edit if self.focus.session.is_none() => Err("No Focus session is running".to_string()),
             FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &cats, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
-            FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
-            FocusCmd::ImportCategories => std::fs::read_to_string(got[0].trim().trim_matches('"'))
-                .map_err(|e| format!("Could not read the file: {e}"))
-                .and_then(|t| focus::import(&t))
-                .and_then(|c| self.focus_save_categories(&c)),
+            FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| Self::focus_save_categories(&[c])),
+            FocusCmd::ImportCategories => {
+                // A typed path may be a slow or missing drive: read off the UI thread.
+                let path = got[0].trim().trim_matches('"').to_string();
+                let read = cx.background_executor().spawn(async move { std::fs::read_to_string(path).map_err(|e| format!("Could not read the file: {e}")).and_then(|t| focus::import(&t)) });
+                cx.spawn(async move |this, cx| {
+                    let cats = read.await;
+                    _ = this.update(cx, |this, cx| this.focus_saved(cats.and_then(|c| Self::focus_save_categories(&c)), cx));
+                })
+                .detach();
+                return;
+            }
             _ => return,
         };
+        self.focus_saved(done, cx);
+    }
+
+    /// A Focus command's answer: done hides the launcher with a toast; a refusal says why.
+    fn focus_saved(&mut self, done: Result<String, String>, cx: &mut Context<Self>) {
         match done {
             Ok(text) => {
                 self.say(Msg::done(text));
@@ -4170,21 +4206,21 @@ impl Launcher {
             }
             Act::PauseTimer(id) => {
                 self.timers.pause(id, SystemTime::now());
-                return self.refresh_keeping_timer(cx);
+                return self.refresh_keeping(cx);
             }
             Act::ResumeTimer(id) => {
                 self.timers.resume(id, SystemTime::now());
                 self.watch_timers();
-                return self.refresh_keeping_timer(cx);
+                return self.refresh_keeping(cx);
             }
             Act::RestartTimer(id) => {
                 self.timers.restart(id, SystemTime::now());
                 self.watch_timers();
-                return self.refresh_keeping_timer(cx);
+                return self.refresh_keeping(cx);
             }
             Act::AddTime(id, secs) => {
                 self.timers.add(id, Duration::from_secs(secs));
-                return self.refresh_keeping_timer(cx);
+                return self.refresh_keeping(cx);
             }
             Act::RenameTimer(id) => {
                 let Some(r) = self.timers.rows(SystemTime::now()).into_iter().find(|r| r.id == id) else { return };
@@ -4401,7 +4437,10 @@ impl Launcher {
     /// Once at startup, on the store's worker: notes deleted longer ago than `[notes]
     /// keep_deleted_days` go for good.
     fn purge_old_notes(&mut self, cx: &mut Context<Self>) {
-        let (now, days) = (search::now() as i64, self.cfg.notes.keep_deleted_days);
+        if let Some(e) = self.cfg.notes.folder_error() {
+            self.say(Msg::error(e));
+        }
+        let (now, days) = (search::now() as i64, self.cfg.notes.keep_days());
         self.notes.run(cx, move |s| s.purge_expired(now, days), |this, r, _| {
             if let Err(e) = r {
                 this.say(Msg::error(format!("Notes: {e}")));
@@ -4499,7 +4538,7 @@ impl Launcher {
             None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
             Some(rows) => {
                 let current = self.notes_window.and_then(|h| h.read(cx).ok()).and_then(NotesWindow::current);
-                note_rows(list, rows, current, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_deleted_days)
+                note_rows(list, rows, current, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_days())
             }
         }
     }
@@ -4668,6 +4707,11 @@ impl Launcher {
                 }
                 if cfg.calendar_feed.iter().map(|f| &f.url).ne(self.cfg.calendar_feed.iter().map(|f| &f.url)) {
                     self.calendar.reset(&cfg.calendar_feed.iter().map(|f| f.url.clone()).collect::<Vec<_>>());
+                }
+                if cfg.notes.folder != self.cfg.notes.folder
+                    && let Some(e) = cfg.notes.folder_error()
+                {
+                    self.say(Msg::error(e));
                 }
                 if cfg.notes.dir() != self.cfg.notes.dir() {
                     self.notes = Notes::start(cfg.notes.dir(), cx);
@@ -4853,8 +4897,8 @@ impl Launcher {
                     drop(h.update(cx, |_, _, cx| cx.notify()));
                 }
                 // An armed row (Join's confirm) waits for its second Enter: a refresh would move it.
-                if self.visible && self.armed.is_none() && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
-                    self.refresh(cx);
+                if self.visible && self.armed.is_none() && self.panel.is_none() && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
+                    self.refresh_keeping(cx);
                 }
             }
             Msg::ImageReady(path) => {
@@ -4879,7 +4923,7 @@ impl Launcher {
                 }
             }
             Msg::FilePreviewDropped(key) => {
-                self.file_images.remove(&key);
+                release(self.file_images.remove(&key).and_then(|e| e.0).into_iter().collect(), cx);
                 // Re-selected meanwhile? The next render asks again.
                 if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
@@ -5020,14 +5064,7 @@ impl Launcher {
         if let Some(label) = self.label() {
             return label;
         }
-        match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
-            // A Running row's accessory is its time; its kind is the subtitle. The session row is Focus.
-            Some(it) if it.section.as_deref() == Some(FOCUS) => FOCUS.into(),
-            Some(it) if it.section.as_deref() == Some(NEXT) => "My Schedule".into(),
-            Some(it) if it.live => it.subtitle.clone(),
-            Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
-            _ => "procast".into(),
-        }
+        row_footer(self.items.get(self.selected))
     }
 
     /// The icon on the left of the action bar.
@@ -7155,6 +7192,39 @@ mod tests {
         assert_eq!(root_selection(&rows, "", &cfg, true), 1, "Enter joins");
         assert_eq!(root_selection(&rows, "", &cfg, false), 0, "no reminder: the top row");
         assert_eq!(root_selection(&rows, "te", &cfg, true), 2, "typing still starts on the results");
+    }
+
+    #[test]
+    fn the_action_bar_names_a_row_by_its_kind_never_its_age() {
+        let app = Item::new("Terminal", "", Icon::glyph("x"), Act::None).acc("Application".to_string());
+        assert_eq!(row_footer(Some(&app)), "Application");
+        for when in ["yesterday", "just now", "3 min ago"] {
+            let clip = Item::new("text", "", Icon::glyph("x"), Act::Clip("k".into())).acc(when.to_string());
+            assert_eq!(row_footer(Some(&clip)), "procast", "{when}");
+        }
+        assert_eq!(row_footer(None), "procast");
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_selection_on_the_same_row() {
+        let timer = |id, title: &str| running_row(timers::Row { id, title: title.into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let app = |title: &str, key: Option<&str>| {
+            let mut it = Item::new(title, "", Icon::glyph("x"), Act::None).sec("Results");
+            it.key = key.map(Into::into);
+            it
+        };
+        let next = Item::new("Standup", "", Icon::glyph("x"), Act::Join("Standup".into(), "https://teams.live.com/meet/1".into())).sec(NEXT);
+        let before = vec![timer(1, "Timer"), app("Terminal", Some("app:term")), app("Notes", None)];
+        // A timer and a meeting came in above: the rows moved down, the selection follows them.
+        let after = vec![next.clone(), timer(2, "Timer"), timer(1, "Timer"), app("Terminal", Some("app:term")), app("Notes", None)];
+        assert_eq!(same_row(&after, &before[0]), Some(2), "the same timer, not the first one with its title");
+        assert_eq!(same_row(&after, &before[1]), Some(3), "the same key");
+        assert_eq!(same_row(&after, &before[2]), Some(4), "no key: the same title in the same section");
+        assert_eq!(same_row(&after, &next), Some(0));
+        assert_eq!(same_row(&before, &next), None, "gone: refresh's own choice stands");
+        let mut elsewhere = app("Notes", None);
+        elsewhere.section = Some("Commands".into());
+        assert_eq!(same_row(&after, &elsewhere), None, "a title in another section is another row");
     }
 
     fn deep_work(minutes: u32) -> focus::Session {

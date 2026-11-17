@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     editor::{self, Block, Buffer, Mark, Span, SpanCache, Style},
-    store::{Exists, Id, NoteMeta, Store, title_of},
+    store::{Exists, Id, NoteMeta, Store, normalized, title_of},
 };
 use crate::{
     Dismiss, Launch, OpenDropdown, SelectNext, SelectPrev, ToggleActions, config,
@@ -55,8 +55,9 @@ impl Notes {
             .spawn(async move {
                 let mut store = Store::open(root.clone());
                 while let Some(job) = rx.next().await {
-                    // A transient failure (a lock at startup) is retried; a damaged index stays an error.
-                    if store.as_ref().is_err_and(|e| e.kind() != io::ErrorKind::InvalidData) {
+                    // A failure (a lock at startup, a damaged index since moved away) is retried;
+                    // `Store::open` never writes over a damaged index.
+                    if store.is_err() {
                         store = Store::open(root.clone());
                     }
                     // A panicking job only drops its answer.
@@ -73,7 +74,8 @@ impl Notes {
         let _ = self.0.unbounded_send(Box::new(move |store: &mut io::Result<Store>| {
             let r = match store {
                 Ok(s) => job(s),
-                Err(e) => Err(io::Error::new(e.kind(), format!("the notes folder can't be opened: {e}"))),
+                // Its own words: they say what to do, and a prefix would push that out of the toast.
+                Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
             };
             let _ = tx.send(r);
         }));
@@ -479,11 +481,6 @@ fn press(b: &mut Buffer, k: &Keystroke) -> Option<Did> {
             Did::Edited
         }
     })
-}
-
-/// Clipboard text as the note keeps it: `\n` line ends.
-fn pasted(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// A line as drawn, for the mouse: where it starts in the note, how many display bytes it has,
@@ -1002,7 +999,7 @@ impl NotesWindow {
                     }
                     Did::Paste => {
                         let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
-                        doc.buffer.insert(&pasted(&text));
+                        doc.buffer.insert(&normalized(&text));
                         true
                     }
                 };
@@ -1542,7 +1539,7 @@ mod tests {
         assert_eq!(key(&mut b, "ctrl-x"), Some(Did::Copy { text: "héllo".into(), cut: true }));
         assert_eq!(b.text(), "");
         assert_eq!(key(&mut b, "ctrl-v"), Some(Did::Paste));
-        assert_eq!(pasted("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(normalized("a\r\nb\rc"), "a\nb\nc");
     }
 
     #[test]
@@ -1689,5 +1686,23 @@ mod tests {
         let s = Store::open(dir).unwrap();
         assert_eq!(s.text(&id).unwrap(), "# Groceries\nmilk");
         assert_eq!(s.list()[0].title, "Groceries");
+    }
+
+    /// A note another editor saved with CRLF line ends and a byte-order mark opens as `\n` text,
+    /// titled, and not unsaved: the file is rewritten only when the note is edited.
+    #[test]
+    fn a_crlf_note_with_a_bom_opens_clean() {
+        let dir = tmp("crlf");
+        let id = created(Store::open(dir.clone()).unwrap().create(10).unwrap());
+        let file = dir.join(format!("{id}.md"));
+        std::fs::write(&file, "\u{feff}# Groceries\r\nmilk\r\n").unwrap();
+        let s = Store::open(dir).unwrap();
+        assert_eq!(s.list()[0].title, "Groceries");
+        let mut doc = Doc::new(id.clone(), s.text(&id).unwrap());
+        assert_eq!(doc.buffer.text(), "# Groceries\nmilk\n");
+        assert_eq!(doc.unsaved(), None, "normalizing is not an edit");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "\u{feff}# Groceries\r\nmilk\r\n", "the file is left as it was");
+        doc.buffer.insert("x");
+        assert!(!doc.unsaved().unwrap().1.contains('\r'));
     }
 }

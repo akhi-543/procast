@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,10 @@ pub struct Store {
     last: u64,
 }
 
+/// Why a damaged `notes.json` stops the store, and what to do: short enough to follow the longest
+/// "Couldn't duplicate the note: " in a toast.
+const DAMAGED: &str = "move notes.json away to rebuild";
+
 impl Store {
     /// Opens (creating if needed) the notes folder. A missing `notes.json` is rebuilt from the
     /// `.md` files, and files and entries that disagree are reconciled, so no note is lost. One
@@ -51,7 +55,8 @@ impl Store {
     pub fn open(root: PathBuf) -> io::Result<Store> {
         fs::create_dir_all(&root)?;
         let read: Option<Vec<NoteMeta>> = match fs::read_to_string(root.join("notes.json")) {
-            Ok(t) => Some(serde_json::from_str(&t).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("notes.json is damaged ({e}); move it away to rebuild the list from the notes")))?),
+            // The toast says what to do; the parser's detail would push that past its 60 characters.
+            Ok(t) => Some(serde_json::from_str(&t).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, DAMAGED))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
@@ -77,7 +82,7 @@ impl Store {
             changed = true;
         }
         for m in &mut metas {
-            m.title = title_of(&fs::read_to_string(root.join(format!("{}.md", m.id))).unwrap_or_default());
+            m.title = title_of(&read_note(&root.join(format!("{}.md", m.id))).unwrap_or_default());
         }
         let last = metas.iter().filter_map(|m| u64::from_str_radix(&m.id, 36).ok()).max().unwrap_or(0);
         let store = Store { root, metas, last };
@@ -110,7 +115,7 @@ impl Store {
     /// transient lock can never look like an empty note (and get saved over the real one).
     pub fn text(&self, id: &str) -> io::Result<String> {
         checked(id)?;
-        match fs::read_to_string(self.path(id)) {
+        match read_note(&self.path(id)) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
             r => r,
         }
@@ -190,18 +195,6 @@ impl Store {
             self.purge(id)?;
         }
         Ok(old.len())
-    }
-
-    /// Snapshots, newest first, as (unix seconds, text).
-    #[cfg_attr(not(test), expect(dead_code, reason = "no screen restores a snapshot yet"))]
-    pub fn history(&self, id: &str) -> Vec<(i64, String)> {
-        let mut v: Vec<(i64, String)> = self
-            .snapshots(id)
-            .into_iter()
-            .filter_map(|t| Some((t, fs::read_to_string(self.history_dir(id).join(format!("{t}.md"))).ok()?)))
-            .collect();
-        v.reverse();
-        v
     }
 
     /// Live notes whose title or text contains `q`, ignoring case; ordered like `list()`.
@@ -323,6 +316,17 @@ fn base36(mut n: u64) -> String {
 }
 
 /// First line with something in it, without the markdown around it; "Untitled" for an empty note.
+/// Text as the editor keeps it: `\n` line ends and no byte-order mark (a note saved by another
+/// editor; pasted text).
+pub fn normalized(text: &str) -> String {
+    text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// A note file's text, `normalized`. The file keeps its own line ends until the note is edited.
+fn read_note(path: &Path) -> io::Result<String> {
+    fs::read_to_string(path).map(|t| normalized(&t))
+}
+
 pub fn title_of(text: &str) -> String {
     text.lines().map(strip_line).find(|l| !l.is_empty()).unwrap_or_else(|| "Untitled".into())
 }
@@ -354,6 +358,13 @@ fn strip_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A note's snapshots, newest first, as (unix seconds, text): what `snapshot` kept.
+    fn history(s: &Store, id: &str) -> Vec<(i64, String)> {
+        let mut v: Vec<(i64, String)> = s.snapshots(id).into_iter().filter_map(|t| Some((t, fs::read_to_string(s.history_dir(id).join(format!("{t}.md"))).ok()?))).collect();
+        v.reverse();
+        v
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("procast-notes-{}-{name}", std::process::id()));
@@ -470,13 +481,13 @@ mod tests {
         let mut s = open("history");
         let a = made(s.create(1000));
         s.save(&a, "a", 1000).unwrap();
-        assert!(s.history(&a).is_empty());
+        assert!(history(&s, &a).is_empty());
         s.save(&a, "ab", 1100).unwrap();
         s.save(&a, "abcdef", 1200).unwrap();
         // throttled: only the first overwritten version, stamped when it was written
-        assert_eq!(s.history(&a), [(1000, "a".to_string())]);
+        assert_eq!(history(&s, &a), [(1000, "a".to_string())]);
         s.save(&a, "x", 5000).unwrap();
-        assert_eq!(s.history(&a), [(1200, "abcdef".to_string()), (1000, "a".to_string())]);
+        assert_eq!(history(&s, &a), [(1200, "abcdef".to_string()), (1000, "a".to_string())]);
         assert_eq!(s.text(&a).unwrap(), "x");
     }
 
@@ -487,9 +498,9 @@ mod tests {
         s.save(&a, "v1", 1000).unwrap();
         s.save(&a, "v2", 1100).unwrap(); // snapshot v1 @1000
         s.save(&a, "v3", 1299).unwrap(); // 299 s since 1000: none
-        assert_eq!(s.history(&a).len(), 1);
+        assert_eq!(history(&s, &a).len(), 1);
         s.save(&a, "v4", 1300).unwrap(); // 300 s: snapshot v3 @1299
-        assert_eq!(s.history(&a), [(1299, "v3".to_string()), (1000, "v1".to_string())]);
+        assert_eq!(history(&s, &a), [(1299, "v3".to_string()), (1000, "v1".to_string())]);
     }
 
     #[test]
@@ -498,11 +509,11 @@ mod tests {
         let a = made(s.create(1000));
         s.save(&a, "keep me", 1000).unwrap();
         s.save(&a, "keep me", 2000).unwrap(); // unchanged: nothing
-        assert!(s.history(&a).is_empty());
+        assert!(history(&s, &a).is_empty());
         s.save(&a, "", 3000).unwrap(); // wipe: the old text is recoverable
-        assert_eq!(s.history(&a), [(2000, "keep me".to_string())]);
+        assert_eq!(history(&s, &a), [(2000, "keep me".to_string())]);
         s.save(&a, "new", 9000).unwrap(); // old text is blank: nothing
-        assert_eq!(s.history(&a).len(), 1);
+        assert_eq!(history(&s, &a).len(), 1);
     }
 
     #[test]
@@ -530,7 +541,7 @@ mod tests {
         for i in 0..60 {
             s.save(&a, &format!("v{i}"), 1000 + i * 300).unwrap();
         }
-        let h = s.history(&a);
+        let h = history(&s, &a);
         assert_eq!(h.len(), 50);
         assert_eq!(h[0].1, "v58");
         assert_eq!(h[49].1, "v9");
@@ -542,10 +553,10 @@ mod tests {
         let a = made(s.create(0));
         s.save(&a, "x", 10).unwrap();
         s.save(&a, "y", 20).unwrap();
-        assert_eq!(s.history(&a).len(), 1);
+        assert_eq!(history(&s, &a).len(), 1);
         s.delete(&a, 30).unwrap();
         s.purge(&a).unwrap();
-        assert!(s.history(&a).is_empty());
+        assert!(history(&s, &a).is_empty());
     }
 
     #[test]
@@ -617,6 +628,8 @@ mod tests {
         fs::write(dir.join("notes.json"), "{ not json").unwrap();
         let e = Store::open(dir.clone()).err().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let toast = crate::toast::clip(&format!("Couldn't duplicate the note: {e}"));
+        assert!(toast.ends_with("move notes.json away to rebuild"), "the toast keeps what to do: {toast}");
         assert_eq!(fs::read_to_string(dir.join("notes.json")).unwrap(), "{ not json", "the damaged file is left as it was");
         // a notes.json that can't be read at all (here a folder) is an error too
         fs::remove_file(dir.join("notes.json")).unwrap();
@@ -716,7 +729,7 @@ mod tests {
             assert!(s.text(id).is_err(), "{id:?}");
             assert!(s.save(id, "t", 1).is_err(), "{id:?}");
             assert!(s.purge(id).is_err(), "{id:?}");
-            assert!(s.history(id).is_empty(), "{id:?}");
+            assert!(history(&s, id).is_empty(), "{id:?}");
         }
         assert_eq!(s.text("zz9").unwrap(), "", "a valid id with no file is an empty note");
     }

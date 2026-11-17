@@ -70,6 +70,9 @@ pub struct Toast {
 
 impl Render for Toast {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The scale is one global each window sets as it renders; like the HUD, the launcher's,
+        // so a Notes caret blink or a HUD tick in between never changes the pill's shadows.
+        design::scale_launcher();
         let t = design::Tokens::from_theme(&self.theme, window);
         // Only a sticky toast gets clicks, and only on the pill (`clickable`).
         let pill = design::toast(&self.text, self.kind, &t).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| _ = this.dismiss(cx)));

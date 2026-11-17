@@ -637,8 +637,21 @@ impl Default for Notes {
 }
 
 impl Notes {
+    /// The notes folder. A relative one would follow the working directory, so the default
+    /// stands in for it (`folder_error` says why).
     pub fn dir(&self) -> PathBuf {
-        if self.folder.trim().is_empty() { dir().join("notes") } else { PathBuf::from(self.folder.trim()) }
+        let folder = std::path::Path::new(self.folder.trim());
+        if folder.is_absolute() { folder.to_path_buf() } else { dir().join("notes") }
+    }
+
+    /// Why the folder set is not used.
+    pub fn folder_error(&self) -> Option<&'static str> {
+        (!self.folder.trim().is_empty() && !std::path::Path::new(self.folder.trim()).is_absolute()).then_some("Notes folder needs a full path; using the default")
+    }
+
+    /// Days a deleted note is kept: at least one, so 0 can't purge every deleted note at startup.
+    pub fn keep_days(&self) -> u32 {
+        self.keep_deleted_days.max(1)
     }
 }
 
@@ -1297,6 +1310,18 @@ fn key_code(key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_settings_that_would_lose_notes_are_refused() {
+        let notes = |folder: &str, days| Notes { folder: folder.into(), keep_deleted_days: days };
+        assert_eq!(notes("", 0).keep_days(), 1, "0 would purge every deleted note at startup");
+        assert_eq!(notes("", 30).keep_days(), 30);
+        for relative in ["Notes", "D:", "\\Notes", ".\\n"] {
+            assert_eq!((notes(relative, 30).dir(), notes(relative, 30).folder_error().is_some()), (dir().join("notes"), true), "{relative}");
+        }
+        assert_eq!((notes("D:\\Notes", 30).dir(), notes("D:\\Notes", 30).folder_error()), (PathBuf::from("D:\\Notes"), None));
+        assert_eq!(notes("  ", 30).folder_error(), None, "empty is the default, not a mistake");
+    }
 
     #[test]
     fn removable_is_read_from_config_text() {
