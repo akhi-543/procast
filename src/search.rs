@@ -101,6 +101,16 @@ pub enum Act {
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
     CopyShot(String),
     PasteShot(String),
+    /// A file (by path) in the Windows "Open with" picker.
+    OpenWith(String),
+    /// Search Screenshots: show the selected shot large, or close it (the path is the shot's).
+    QuickLook(String),
+    /// Pin (true) or unpin a screenshot, by path; pinned ones are never pruned.
+    PinShot(String, bool),
+    /// Copy the text read in a screenshot, by path.
+    CopyText(String),
+    /// Move a screenshot to the Recycle Bin, by path (asks first).
+    DeleteShot(String),
     /// Look a word up in the offline dictionary; the answer opens in its own view.
     Define(String),
     /// The define view's Download Dictionary, then the word's lookup.
@@ -129,7 +139,7 @@ impl Act {
         match self {
             Act::App(_) | Act::Open(_) | Act::File(_) => "Open",
             Act::RunAsAdmin(_) => "Run as Administrator",
-            Act::Reveal(_) => "Show in Explorer",
+            Act::Reveal(_) => "Show in File Explorer",
             Act::Run(_) | Act::Script(_) => "Run",
             Act::Ask(_) => "Ask",
             Act::With(act, _) => act.label(),
@@ -139,7 +149,13 @@ impl Act {
             Act::Cmd(Cmd::Desktop(Desk::Rename)) => "Rename",
             Act::Copy(_) | Act::CopyClip(_) => "Copy",
             Act::CopyShot(_) => "Copy to Clipboard",
-            Act::PasteShot(_) => "Paste Image",
+            Act::PasteShot(_) => "Paste",
+            Act::OpenWith(_) => "Open With…",
+            Act::QuickLook(_) => "Quick Look",
+            Act::PinShot(_, true) => "Pin",
+            Act::PinShot(_, false) => "Unpin",
+            Act::CopyText(_) => "Copy Text",
+            Act::DeleteShot(_) => "Delete",
             Act::PinClip(_, true) => "Pin Entry",
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
@@ -189,8 +205,29 @@ impl Act {
 
     /// Removes or ends something; the action panel draws these in `danger`.
     pub fn destructive(&self) -> bool {
-        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_) | Act::DeleteLangSet(_)) || matches!(self, Act::Cmd(c) if c.destructive())
+        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_) | Act::DeleteLangSet(_) | Act::DeleteShot(_)) || matches!(self, Act::Cmd(c) if c.destructive())
     }
+}
+
+/// An action's own shortcut, shown as KeyCaps in the ActionPanel and pressed on the selected
+/// row without opening it. The panel's first two rows take Enter and Ctrl+Enter by place.
+pub fn act_keys(act: &Act) -> Option<&'static str> {
+    Some(match act {
+        Act::File(_) => "Ctrl+O",
+        Act::OpenWith(_) => "Ctrl+Shift+O",
+        Act::QuickLook(_) => "Ctrl+Y",
+        Act::Reveal(_) => "Ctrl+Alt+O",
+        _ => return None,
+    })
+}
+
+/// The ActionPanel takes a search field (`panel_filter`) past this many actions.
+pub const PANEL_FILTER_AT: usize = 6;
+
+/// The panel's actions whose label holds `q` (any case), each with its place in the full list.
+pub fn panel_filter(acts: Vec<(String, Act)>, q: &str) -> Vec<(usize, (String, Act))> {
+    let q = q.trim().to_lowercase();
+    acts.into_iter().enumerate().filter(|(_, (label, _))| label.to_lowercase().contains(&q)).collect()
 }
 
 #[derive(Clone)]
@@ -894,7 +931,7 @@ pub fn clipboard(query: &str, entries: &[Entry], max: usize, matcher: &mut Match
         let mut it = Item::new(title, sub, icon, Act::Clip(key.clone())).acc(crate::timers::ago(now.saturating_sub(e.at))).sec(section).tinted(Tint::Paste).with_hay(hay);
         it.extra = [Act::Clip(key.clone()), Act::CopyClip(key.clone()), Act::PinClip(key.clone(), !e.pinned)].map(|a| (a.label().to_string(), a)).to_vec();
         if let Kind::Files(files) = &e.kind {
-            it.extra.push(("Show in Explorer".into(), Act::Reveal(files[0].clone())));
+            it.extra.push((Act::Reveal(files[0].clone()).label().into(), Act::Reveal(files[0].clone())));
         }
         it.extra.push(("Delete Entry".into(), Act::DeleteClip(key)));
         it
@@ -1099,6 +1136,30 @@ fallbacks = [\"define\"]").unwrap();
         assert!(Act::DeleteClip("x".into()).destructive() && Act::ForceQuit(1).destructive() && Act::Cmd(Cmd::ShutDown).destructive());
         assert!(Act::Cmd(Cmd::ClearClipboardHistory).destructive() && Act::Cmd(Cmd::ClearSearchHistory).destructive());
         assert!(!Act::Copy("x".into()).destructive() && !Act::Hide("k".into()).destructive() && !Act::Cmd(Cmd::Settings).destructive());
+    }
+
+    #[test]
+    fn actions_show_their_shortcuts() {
+        let p = || "C:\\Shots\\a.png".to_string();
+        assert_eq!(act_keys(&Act::File(p())), Some("Ctrl+O"));
+        assert_eq!(act_keys(&Act::OpenWith(p())), Some("Ctrl+Shift+O"));
+        assert_eq!(act_keys(&Act::QuickLook(p())), Some("Ctrl+Y"));
+        assert_eq!(act_keys(&Act::Reveal(p())), Some("Ctrl+Alt+O"));
+        // Copy and Paste take Enter and Ctrl+Enter by their place in the panel, not by act.
+        for act in [Act::CopyShot(p()), Act::PasteShot(p()), Act::PinShot(p(), true), Act::CopyText(p()), Act::DeleteShot(p())] {
+            assert_eq!(act_keys(&act), None, "{}", act.label());
+        }
+        assert!(Act::DeleteShot(p()).destructive() && !Act::PinShot(p(), true).destructive());
+    }
+
+    #[test]
+    fn the_panel_filter_keeps_matching_labels() {
+        let acts: Vec<(String, Act)> = ["Copy to Clipboard", "Paste", "Open", "Open With…", "Copy Text"].iter().map(|l| (l.to_string(), Act::None)).collect();
+        let kept = |q: &str| panel_filter(acts.clone(), q).into_iter().map(|(i, (l, _))| format!("{i}:{l}")).collect::<Vec<_>>();
+        assert_eq!(kept("copy"), ["0:Copy to Clipboard", "4:Copy Text"], "any case, each with its place in the full list");
+        assert_eq!(kept(" OPEN "), ["2:Open", "3:Open With…"]);
+        assert_eq!(kept("").len(), 5);
+        assert!(kept("zebra").is_empty());
     }
 
     #[test]

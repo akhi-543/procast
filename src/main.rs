@@ -37,7 +37,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, RwLock,
@@ -87,6 +87,8 @@ actions!(procast, [NextBox, PrevBox]);
 actions!(procast, [PopToken]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
+// An action's own shortcut (`search::act_keys`) on the selected row: Ctrl+O, Ctrl+Shift+O, Ctrl+Y, Ctrl+Alt+O.
+actions!(procast, [KeyOpen, KeyOpenWith, KeyQuickLook, KeyReveal]);
 
 use design::{BAR, FOOTER, LIST_PAD, ROW};
 use search::MAX_ARGS;
@@ -870,7 +872,8 @@ struct Launcher {
     file_info: Option<(String, Option<files::FileInfo>)>,
     file_images: HashMap<String, (Option<Arc<RenderImage>>, u64)>,
     file_tick: u64,
-    /// Counts selection changes in File Search; a preview worker waits for its count to hold.
+    /// Counts selection changes in File Search (and Quick Look's pictures asked for); a preview
+    /// worker waits for its count to hold.
     file_seq: Arc<AtomicU64>,
     /// The emoji and screenshot grids' rows; only the ones on screen are laid out.
     grid_list: gpui::ListState,
@@ -906,6 +909,10 @@ struct Launcher {
     shot_kind: shots::Kind,
     /// Each grid cell's thumbnail key (`shots::thumb_key`; None for a video).
     shot_thumbs: Vec<Option<String>>,
+    /// The pinned screenshots (`shots::pins`), read as each scan starts.
+    shot_pins: HashSet<PathBuf>,
+    /// Quick Look (Ctrl+Y): the selected screenshot shows large in place of the grid.
+    quick_look: bool,
     /// The grid row at the top of the screenshot grid: a decode for a row scrolled far from
     /// it is dropped before it starts.
     grid_top: Arc<AtomicUsize>,
@@ -956,6 +963,10 @@ impl Launcher {
                         site_lead(&mut open.menu.entries, verb, &typed);
                     }
                     open.menu.set_filter(&typed);
+                    cx.notify();
+                } else if let Some((_, sel)) = &mut this.panel {
+                    // The ActionPanel's search field: its first match is selected.
+                    *sel = 0;
                     cx.notify();
                 }
             }),
@@ -1065,6 +1076,8 @@ impl Launcher {
             shots_progress: None,
             shot_kind: shots::Kind::All,
             shot_thumbs: vec![],
+            shot_pins: HashSet::new(),
+            quick_look: false,
             grid_top: Arc::new(AtomicUsize::new(0)),
             ai: None,
             ai_scroll: ScrollHandle::new(),
@@ -2559,17 +2572,47 @@ impl Launcher {
                     let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
                     return;
                 }
-                let path = key.split_once('|').map(|(_, p)| std::path::Path::new(p)).filter(|p| shots::picture(p) && std::fs::metadata(p).is_ok_and(|m| m.len() <= shots::MAX_BYTES));
-                let img = path.and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_width(&b, THUMB_PX));
+                let img = shot_file(&key).and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_width(&b, THUMB_PX));
                 let _ = tx.unbounded_send(Msg::FilePreview(key, img));
             })
             .detach();
         None
     }
 
-    /// Forgets the screenshot thumbnails and frees their GPU textures (the grid closed).
+    /// Quick Look's picture (`q:` with the thumbnail key's time and path), fitted inside
+    /// `QUICK_LOOK_PX`: decoded on a worker once the selection rests, and the one shown before
+    /// it freed. None until it arrives as Msg::FilePreview.
+    fn quick_look_image(&mut self, key: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.cached_image(key) {
+            return img;
+        }
+        self.drop_images(&["q:"], cx);
+        self.file_images.insert(key.to_string(), (None, self.file_tick));
+        let at = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, seq, key) = (self.tx.clone(), self.file_seq.clone(), key.to_string());
+        std::thread::spawn(move || {
+            // Settle first: arrowing through the shots only decodes where the selection stops.
+            std::thread::sleep(Duration::from_millis(100));
+            if seq.load(Ordering::Relaxed) != at {
+                let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
+                return;
+            }
+            let img = shot_file(&key).and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_image(&b, QUICK_LOOK_PX));
+            let _ = tx.unbounded_send(Msg::FilePreview(key, img));
+        });
+        None
+    }
+
+    /// Forgets the screenshot thumbnails and Quick Look's picture, frees their GPU textures
+    /// and closes Quick Look (the grid closed).
     fn drop_thumbs(&mut self, cx: &mut App) {
-        let gone = self.file_images.extract_if(|k, _| k.starts_with("t:")).filter_map(|(_, v)| v.0).collect();
+        self.quick_look = false;
+        self.drop_images(&["t:", "q:"], cx);
+    }
+
+    /// Forgets the decoded images whose keys start with one of `prefixes` and frees their GPU textures.
+    fn drop_images(&mut self, prefixes: &[&str], cx: &mut App) {
+        let gone = self.file_images.extract_if(|k, _| prefixes.iter().any(|p| k.starts_with(p))).filter_map(|(_, v)| v.0).collect();
         release(gone, cx);
     }
 
@@ -2938,9 +2981,10 @@ impl Launcher {
         }
         self.shots_seq += 1;
         self.shots_busy = true;
-        let (seq, tx, s) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone());
+        self.shot_pins = shots::pins();
+        let (seq, tx, s, pins) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone(), self.shot_pins.clone());
         std::thread::spawn(move || {
-            let run = || shots::rescan(&shots::folders(&s.folders), shots::keep(&s.keep), s.all_media, s.ocr, |index, read| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone()), read))));
+            let run = || shots::rescan(&s, pins, |index, read| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone()), read))));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
             let _ = tx.unbounded_send(Msg::Shots(seq, None, None));
         });
@@ -2952,29 +2996,44 @@ impl Launcher {
         }
         self.shots_progress = read;
         match index {
-            Some(index) => self.shots = index,
+            // A pin made during the scan is the launcher's, not yet the scan's.
+            Some(mut index) => {
+                index.set_pins(self.shot_pins.clone());
+                self.shots = index
+            }
             None => self.shots_busy = false,
         }
         if self.mode == Mode::Shots {
             // New results arrive while you browse: keep the selection where it is.
-            let at = self.selected;
-            self.refresh(cx);
-            self.selected = at.min(self.items.len().saturating_sub(1));
-            self.scroll_to_selected();
+            self.refresh_in_place(cx);
         }
+    }
+
+    /// Redraws the list with the selection kept at the same place.
+    fn refresh_in_place(&mut self, cx: &mut Context<Self>) {
+        let at = self.selected;
+        self.refresh(cx);
+        self.selected = at.min(self.items.len().saturating_sub(1));
+        self.scroll_to_selected();
     }
 
     /// Puts a screenshot (the newest when `path` is None) on the clipboard as an image, and
     /// pastes it into the app you came from if `paste`. The work runs off the UI thread.
     fn shot_to_clipboard(&mut self, path: Option<PathBuf>, paste: bool, cx: &mut Context<Self>) {
         self.hide(true, cx);
-        let (owner, tx, folders) = (self.hwnd.0 as isize, self.tx.clone(), shots::folders(&self.cfg.screenshots.folders));
+        let (owner, tx, folders, latest) = (self.hwnd.0 as isize, self.tx.clone(), shots::folders(&self.cfg.screenshots.folders), path.is_none());
         std::thread::spawn(move || {
             let put = || shots::put_image(HWND(owner as _), path, &folders);
             let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(put)).unwrap_or_else(|_| Err("Could not read that screenshot".into()));
             match done {
-                Ok(()) if paste => clipboard::paste_soon(),
-                Ok(()) => drop(tx.unbounded_send(Msg::done("Screenshot copied"))),
+                Ok(shot) if paste => {
+                    clipboard::paste_soon();
+                    // Paste Latest Screenshot has no view: its toast says which one went in.
+                    if latest && let Ok(at) = std::fs::metadata(&shot).and_then(|m| m.modified()) {
+                        drop(tx.unbounded_send(Msg::done(shots::paste_toast(at))));
+                    }
+                }
+                Ok(_) => drop(tx.unbounded_send(Msg::done("Screenshot copied"))),
                 Err(e) => drop(tx.unbounded_send(Msg::error(e))),
             }
         });
@@ -3563,6 +3622,10 @@ impl Launcher {
         if !self.form_under() || self.menu.is_some() {
             return;
         }
+        // The ActionPanel's search field keeps the keys while the panel is open.
+        if self.panel_filtered() {
+            return;
+        }
         let on_root = self.form_focus.is_focused(window);
         if self.panel.is_some() || self.confirm.is_some() {
             if !on_root && !self.input.focus_handle(cx).is_focused(window) {
@@ -3582,11 +3645,14 @@ impl Launcher {
 
     /// Enter on the selected row (or on the highlighted Ctrl+K action).
     fn launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((item, i)) = self.panel.take() {
+        if let Some((item, i)) = &self.panel {
+            // Nothing matches the panel's search: Enter does nothing.
+            let Some((at, (_, act))) = self.panel_rows(cx).into_iter().nth(*i) else { return };
+            let (plain, key) = (item.args.is_empty(), item.key.clone());
+            self.panel = None;
             // The primary action of a row with arguments goes through its boxes, like Enter.
-            if i > 0 || item.args.is_empty() {
-                let act = item.actions().swap_remove(i).1;
-                return self.run(act, item.key.clone(), window, cx);
+            if at > 0 || plain {
+                return self.run(act, key, window, cx);
             }
         }
         if self.mode == Mode::Install {
@@ -3800,6 +3866,56 @@ impl Launcher {
             Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
             Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
+            Act::OpenWith(path) => win::open_with(&path),
+            Act::QuickLook(_) => {
+                self.quick_look = !self.quick_look;
+                if !self.quick_look {
+                    self.drop_images(&["q:"], cx);
+                }
+                return cx.notify();
+            }
+            Act::PinShot(path, on) => {
+                match shots::pin(Path::new(&path), on) {
+                    Ok(pins) => {
+                        self.shot_pins = pins.clone();
+                        self.shots.set_pins(pins);
+                        self.status = Some((Tone::Ok, if on { "Pinned" } else { "Unpinned" }.into()));
+                    }
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return self.refresh_in_place(cx);
+            }
+            Act::CopyText(path) => {
+                let text = self.shots.text(Path::new(&path)).trim().to_string();
+                if text.is_empty() {
+                    self.status = Some((Tone::Error, "No text found in this screenshot".into()));
+                    return cx.notify();
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.say(Msg::done("Copied text"));
+            }
+            Act::DeleteShot(path) => {
+                let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let then = move |this: &mut Launcher, _: &mut Context<Launcher>| {
+                    let path = PathBuf::from(path);
+                    this.status = Some(match shots::delete(&path) {
+                        Ok(()) => {
+                            this.shots.remove(&path);
+                            // The pin goes with it.
+                            if this.shot_pins.contains(&path)
+                                && let Ok(pins) = shots::pin(&path, false)
+                            {
+                                this.shot_pins = pins;
+                            }
+                            (Tone::Ok, "Moved to the Recycle Bin".into())
+                        }
+                        Err(e) => (Tone::Error, e),
+                    });
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Screenshot?".into(), message: name, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
             Act::Cmd(Cmd::ClipboardHistory) => return self.set_mode(Mode::Clipboard, cx),
             Act::Cmd(Cmd::Emoji) => return self.set_mode(Mode::Emoji, cx),
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
@@ -4703,6 +4819,10 @@ impl Launcher {
                 self.reply(c.run, c.id, Ok(json!(false)));
             }
             self.refresh(cx);
+        } else if self.quick_look {
+            self.quick_look = false;
+            self.drop_images(&["q:"], cx);
+            cx.notify();
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
             self.send(json!({"t": "pop", "run": run}));
@@ -5049,9 +5169,67 @@ impl Launcher {
     }
 
     /// The emoji picker and Search Screenshots show a grid (each falls back to the list for
-    /// its empty state).
+    /// its empty state, and for a confirm's two rows).
     fn grid(&self) -> bool {
-        matches!(self.mode, Mode::Emoji | Mode::Shots) && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+        matches!(self.mode, Mode::Emoji | Mode::Shots) && self.confirm.is_none() && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    /// The open ActionPanel's actions, each with its place among all of them; with a search
+    /// field (`panel_filtered`), only those whose label holds what is typed in it.
+    fn panel_rows(&self, cx: &App) -> Vec<(usize, (String, Act))> {
+        let Some((item, _)) = &self.panel else { return vec![] };
+        let typed = if self.panel_filtered() { self.menu_input.read(cx).as_str().to_string() } else { String::new() };
+        search::panel_filter(item.actions(), &typed)
+    }
+
+    /// The open ActionPanel has a search field: more than `PANEL_FILTER_AT` actions. Typing
+    /// goes to it (`menu_input`) while it is open.
+    fn panel_filtered(&self) -> bool {
+        self.panel.as_ref().is_some_and(|(item, _)| item.actions().len() > search::PANEL_FILTER_AT)
+    }
+
+    /// An action's own shortcut (`search::act_keys`, "Ctrl+O"): runs that action of the open
+    /// panel's row, or else of the selected row, without the panel. Otherwise the keys go on.
+    fn shortcut(&mut self, keys: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let item = match &self.panel {
+            Some((item, _)) => Some(item.clone()),
+            None => self.items.get(self.selected).cloned(),
+        };
+        let act = item.as_ref().and_then(|it| it.actions().into_iter().map(|a| a.1).find(|a| search::act_keys(a) == Some(keys)));
+        match (item, act) {
+            (Some(item), Some(act)) if self.menu.is_none() => {
+                self.panel = None;
+                self.run(act, item.key, window, cx)
+            }
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Quick Look (Ctrl+Y): the selected screenshot large, contain-fit, in place of the grid,
+    /// with its name (weight 600) and "2.4 MB · Today, 14:59 · Screenshots" under it.
+    fn quick_look_view(&mut self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let path = self.items.get(self.selected).and_then(|it| it.extra.iter().find_map(|(_, a)| if let Act::QuickLook(p) = a { Some(p.clone()) } else { None })).unwrap_or_default();
+        let image = self.shot_thumbs.get(self.selected).cloned().flatten().and_then(|key| self.quick_look_image(&key.replacen("t:", "q:", 1), cx));
+        let path = Path::new(&path);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // A stat per redraw, and a redraw only comes with a change.
+        let meta = shots::detail(path, SystemTime::now()).unwrap_or_default();
+        let picture = match image {
+            Some(image) => gpui::img(image).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element(),
+            None => design::icon(if shots::picture(path) { g::PICTURE } else { g::VIDEO }, design::ic::XL, t.text_faint).into_any_element(),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .px(px(design::sp::S16))
+            .py(px(design::sp::S12))
+            .gap(px(design::sp::S4))
+            .child(div().flex_1().min_h_0().pb(px(design::sp::S8)).flex().items_center().justify_center().child(picture))
+            .child(div().truncate().font_weight(gpui::FontWeight::SEMIBOLD).child(name))
+            .child(div().truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(meta))
+            .into_any_element()
     }
 
     /// Cells per grid row: `[screenshots] columns` (3 to 6) or `[emoji] columns` (4 to 16).
@@ -5165,6 +5343,15 @@ impl Launcher {
 
 /// The width a screenshot thumbnail is decoded at.
 const THUMB_PX: u32 = 320;
+/// Quick Look's picture is decoded to fit inside this many pixels each way.
+const QUICK_LOOK_PX: u32 = 1280;
+
+/// The picture a thumbnail or Quick Look key (`t:`/`q:{mtime}|{path}`) names, if it may be
+/// read: no bigger than `shots::MAX_BYTES`.
+fn shot_file(key: &str) -> Option<&Path> {
+    key.split_once('|').map(|(_, p)| Path::new(p)).filter(|p| shots::picture(p) && std::fs::metadata(p).is_ok_and(|m| m.len() <= shots::MAX_BYTES))
+}
+
 /// A thumbnail decode is dropped when its row is further than this from the grid's top row.
 const NEAR_ROWS: usize = 12;
 /// `file_images` past `FILE_IMAGES_MAX` entries is cut to the `FILE_IMAGES_KEEP` used last.
@@ -5294,14 +5481,17 @@ fn act_glyph(act: &Act) -> &'static str {
     match act {
         Act::Favorite(..) => g::STAR,
         Act::Hide(_) => g::CANCEL,
-        Act::Copy(_) | Act::CopyClip(_) | Act::CopyShot(_) => g::COPY,
-        Act::PinClip(..) => g::PIN,
+        Act::Copy(_) | Act::CopyClip(_) | Act::CopyShot(_) | Act::CopyText(_) => g::COPY,
+        Act::PinClip(..) | Act::PinShot(..) => g::PIN,
         Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) | Act::PasteShot(_) => g::PASTE,
         Act::Open(_) => g::GLOBE,
-        Act::File(_) => g::DOCUMENT,
-        Act::Reveal(_) => g::FOLDER,
+        // g::PDF is the `file` icon.
+        Act::File(_) => g::PDF,
+        Act::OpenWith(_) => g::APP,
+        Act::QuickLook(_) => g::EYE,
+        Act::Reveal(_) => g::FOLDER_SEARCH,
         Act::RunAsAdmin(_) => g::SHIELD,
-        Act::DeleteClip(_) | Act::UninstallExt(_) => g::DELETE,
+        Act::DeleteClip(_) | Act::UninstallExt(_) | Act::DeleteShot(_) => g::DELETE,
         Act::Install(_) | Act::DownloadDictionary(_) => g::DOWNLOAD,
         Act::Define(_) | Act::SimilarWords(_) => g::BOOK_OPEN,
         Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::Layout(_) | Act::ExtRun(..) => g::PLAY,
@@ -5349,7 +5539,8 @@ impl Render for Launcher {
         let t = Tokens::from_theme(&self.cfg.theme, window);
         // A menu closed without `close_menu` (a mode change, an extension exiting) would
         // strand focus on its no longer drawn field, where no key binding matches.
-        if self.menu.is_none() && self.menu_input.focus_handle(cx).is_focused(window) {
+        // The ActionPanel's search field is the menu's while the panel is open.
+        if self.menu.is_none() && !self.panel_filtered() && self.menu_input.focus_handle(cx).is_focused(window) {
             if self.is_form() {
                 self.focus_field(window, cx);
             } else {
@@ -5365,7 +5556,7 @@ impl Render for Launcher {
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
         // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.
-        let grid = self.grid().then(|| self.grid_view(&t, cx));
+        let grid = self.grid().then(|| if self.quick_look { self.quick_look_view(&t, cx) } else { self.grid_view(&t, cx) });
         // The translator's previous answers, dimmed while the next ones are on their way.
         let lt = if self.mode == Mode::Translate && self.translation.as_ref().is_some_and(|tr| tr.busy) { Tokens { text: t.text_faint, text_muted: t.text_faint, ..t } } else { t };
         let side = match self.mode {
@@ -5406,6 +5597,7 @@ impl Render for Launcher {
             }
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
+        let panel_rows = self.panel_rows(cx);
         dump_ui(
             "procast-ui.json",
             json!({
@@ -5414,7 +5606,7 @@ impl Render for Launcher {
                 "query": self.query(cx),
                 "label": self.label(),
                 "rows": match &self.panel {
-                    Some((item, _)) => item.actions().into_iter().map(|a| a.0).collect::<Vec<_>>(),
+                    Some(_) => panel_rows.iter().map(|(_, a)| a.0.clone()).collect::<Vec<_>>(),
                     None => self.items.iter().filter(|it| it.section.as_deref() != Some(EMPTY)).map(|it| it.title.clone()).collect(),
                 },
                 "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
@@ -5429,6 +5621,7 @@ impl Render for Launcher {
                 "trays": self.trays.keys().collect::<Vec<_>>(),
                 "args": arg_values,
                 "arg_missing": self.arg_missing,
+                "quick_look": self.quick_look,
             }),
         );
 
@@ -5745,16 +5938,21 @@ impl Render for Launcher {
         let footer = design::action_bar(mark, &self.footer_left(), tone.is_some(), right, &t);
 
         // ---- overlays ----
+        let search = self.panel_filtered().then(|| {
+            let input = text_input("panel-search").state(self.menu_input.downgrade()).placeholder("Search for actions…").placeholder_color(t.text_faint).caret_color(t.accent).w_full().whitespace_nowrap();
+            design::panel_search(input, &t)
+        });
         let popover = self.panel.as_ref().map(|(item, sel)| {
             let me = cx.weak_entity();
-            let rows = item.actions().into_iter().enumerate().map(|(i, (label, act))| {
+            let rows = panel_rows.into_iter().enumerate().map(|(i, (at, (label, act)))| {
                 let me = me.clone();
-                let keys: &[&str] = match i {
-                    0 => &["↵"],
-                    1 => &["Ctrl", "↵"],
-                    _ => &[],
+                // The first two take Enter and Ctrl+Enter by place; the rest their own keys.
+                let keys: Vec<&str> = match at {
+                    0 => vec!["↵"],
+                    1 => vec!["Ctrl", "↵"],
+                    _ => search::act_keys(&act).map_or(vec![], |k| k.split('+').collect()),
                 };
-                design::panel_row(act_glyph(&act), &label, keys, i == *sel, act.destructive(), &t).id(("act", i)).on_click(move |_, window, cx| {
+                design::panel_row(act_glyph(&act), &label, &keys, i == *sel, act.destructive(), &t).id(("act", i)).on_click(move |_, window, cx| {
                     me.update(cx, |this, cx| {
                         if let Some((_, p)) = &mut this.panel {
                             *p = i;
@@ -5768,7 +5966,7 @@ impl Render for Launcher {
             // A click on it closes the panel; the panel occludes it, so clicks inside stay with the panel.
             [
                 design::scrim(t.scrim_soft).id("panel-scrim").occlude().on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element(),
-                design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t).occlude().into_any_element(),
+                design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t).children(search).occlude().into_any_element(),
             ]
         });
         let dialog = self.confirm.as_ref().map(|c| {
@@ -5834,8 +6032,9 @@ impl Render for Launcher {
                 if this.panel.is_none() && this.grid() {
                     return this.grid_move(0, 1, cx);
                 }
+                let shown = this.panel_rows(cx).len();
                 match &mut this.panel {
-                    Some((item, i)) => *i = (*i + 1).min(item.actions().len().saturating_sub(1)),
+                    Some((_, i)) => *i = (*i + 1).min(shown.saturating_sub(1)),
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
                 }
                 this.armed = None;
@@ -5868,7 +6067,7 @@ impl Render for Launcher {
                 this.scroll_to_selected();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleActions, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleActions, window, cx| {
                 if this.menu.is_some() {
                     return;
                 }
@@ -5876,8 +6075,17 @@ impl Render for Launcher {
                     Some(_) => None,
                     None => this.items.get(this.selected).cloned().filter(|it| it.section.as_deref() != Some(EMPTY) || !it.extra.is_empty()).filter(|it| it.act != Act::None || !it.extra.is_empty()).map(|it| (it, 0)),
                 };
+                // A long panel has a search field, and typing goes there.
+                if this.panel_filtered() {
+                    this.menu_input.update(cx, |s, cx| s.emplace("", cx));
+                    window.focus(&this.menu_input.focus_handle(cx), cx);
+                }
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &KeyOpen, window, cx| this.shortcut("Ctrl+O", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyOpenWith, window, cx| this.shortcut("Ctrl+Shift+O", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyQuickLook, window, cx| this.shortcut("Ctrl+Y", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyReveal, window, cx| this.shortcut("Ctrl+Alt+O", window, cx)))
             .on_action(cx.listener(|this, _: &OpenDropdown, window, cx| {
                 if this.menu.is_none() && this.panel.is_none() {
                     match this.mode {
@@ -5948,8 +6156,8 @@ impl Render for Launcher {
                     && item.actions().len() > 1
                 {
                     // Ctrl+Enter: the secondary action, as shown in the action panel.
-                    this.panel = Some((item, 1));
-                    this.launch(window, cx);
+                    let act = item.actions().swap_remove(1).1;
+                    this.run(act, item.key, window, cx);
                 } else {
                     this.launch(window, cx)
                 }
@@ -5991,6 +6199,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("ctrl-p", OpenDropdown, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-o", KeyOpen, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-o", KeyOpenWith, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-y", KeyQuickLook, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-alt-o", KeyReveal, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),

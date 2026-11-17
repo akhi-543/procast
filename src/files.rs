@@ -571,8 +571,9 @@ const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
 
 /// Whether reading this file or listing this folder would download it (OneDrive and other cloud
-/// placeholders): the detail pane shows the icon and never opens those.
-fn is_cloud_only(attributes: u32) -> bool {
+/// placeholders): the detail pane shows the icon and never opens those, and Search
+/// Screenshots leaves them out unless `[screenshots] cloud`.
+pub fn is_cloud_only(attributes: u32) -> bool {
     attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0
 }
 

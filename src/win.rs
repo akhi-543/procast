@@ -826,6 +826,12 @@ pub fn reveal(path: &str) {
     shell("open", "explorer.exe".into(), format!("/select,\"{path}\"").into());
 }
 
+/// The Windows "Open with" picker for a file. OpenAs_RunDLL takes the rest of the command
+/// line as the path, so it goes unquoted.
+pub fn open_with(path: &str) {
+    shell("open", "rundll32.exe".into(), format!("shell32.dll,OpenAs_RunDLL {path}").into());
+}
+
 /// ShellExecute for paths, URLs and shell: targets.
 pub fn open(target: &str) {
     shell("open", target.into(), HSTRING::new());

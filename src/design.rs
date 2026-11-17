@@ -414,6 +414,7 @@ names! {
     PLANE = "plane",
     NEWSPAPER = "newspaper",
     SHOPPING_CART = "shopping-cart",
+    CLOUD = "cloud",
 }
 
 #[derive(Clone, Copy)]
@@ -1721,7 +1722,38 @@ pub fn action_panel(head: impl IntoElement, rows: impl IntoIterator<Item = impl 
         .max_h(px(320.))
         .p(px(4.))
         .child(head)
-        .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(rows))
+        .child(div().id("panel").min_h_0().flex().flex_col().overflow_y_scroll().children(rows))
+}
+
+/// The ActionPanel's search field (a panel of more than six actions), at its bottom edge
+/// over a hairline: the search glyph, then `input`.
+pub fn panel_search(input: impl IntoElement, t: &Tokens) -> Div {
+    div()
+        .h(px(CONTROL))
+        .mt(px(sp::S4))
+        .px(px(sp::S8))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(sp::S12))
+        .border_t_1()
+        .border_color(t.hairline)
+        .text_size(px(ts::BODY_SM))
+        .child(icon(g::SEARCH, ic::MD, t.text_muted))
+        .child(div().flex_1().min_w_0().child(input))
+}
+
+/// One cell of the Column count picker's little grids.
+pub const MINI_CELL: f32 = 6.;
+/// The gap between a little grid's cells.
+pub const MINI_GAP: f32 = 2.;
+
+/// The Column count picker's segment for `n` columns: a little grid of `n` cells in place of
+/// a label, lit (accent cells) when picked.
+pub fn columns_segment(n: usize, on: bool, t: &Tokens) -> Div {
+    let cell = if on { t.accent } else { t.text_muted };
+    let grid = div().flex().gap(px(MINI_GAP)).children((0..n).map(|_| div().w(px(MINI_CELL)).h(px(MINI_CELL + MINI_GAP)).rounded(px(MINI_GAP / 2.)).bg(cell)));
+    segment("", on, t).child(grid)
 }
 
 /// The panel's header: the item's icon tile and title over a hairline.

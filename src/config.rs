@@ -608,11 +608,13 @@ pub struct Screenshots {
     pub primary: String,
     /// Thumbnails per row in Search Screenshots, 3 to 6.
     pub columns: usize,
+    /// Also list (and read) OneDrive files kept only in the cloud, which downloads them.
+    pub cloud: bool,
 }
 
 impl Default for Screenshots {
     fn default() -> Self {
-        Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into(), columns: 3 }
+        Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into(), columns: 3, cloud: false }
     }
 }
 
@@ -839,6 +841,7 @@ ocr = true                    # find text in screenshots (Windows' own OCR, offl
 all_media = false             # also list videos (their text is not read)
 primary = "copy"              # Enter: copy | paste (into the app you came from) | open
 columns = 3                   # thumbnails per row in Search Screenshots: 3 to 6
+cloud = false                 # also list OneDrive files kept only online; reading them downloads them
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account

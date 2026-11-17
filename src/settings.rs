@@ -29,6 +29,8 @@ enum Kind {
     Hotkey,
     /// One of a few labelled values: a segmented control.
     Choice(&'static [Opt]),
+    /// Settings → Screenshots' Column count: a segment per `COLUMN_COUNTS`, each a little grid.
+    Columns,
     /// A language code from `translate::LANGUAGES`, picked in a dropdown with search; these
     /// options ("Auto-Detect", "None") lead the list.
     Language(&'static [Opt]),
@@ -113,6 +115,8 @@ const CLIPBOARD_KEEP: &[Opt] = &[
     ("1 year", S("365d")),
     ("Forever", S("unlimited")),
 ];
+/// The column counts Search Screenshots offers.
+const COLUMN_COUNTS: [i64; 4] = [3, 4, 5, 6];
 const SKIN_TONES: &[Opt] = &[("None", S("none")), ("Light", S("light")), ("Medium light", S("medium_light")), ("Medium", S("medium")), ("Medium dark", S("medium_dark")), ("Dark", S("dark"))];
 
 /// The fields a `[[list]]` table is edited by, with their labels and help.
@@ -243,7 +247,8 @@ fn head(section: &str) -> Option<&'static str> {
         "Calendar" => "Today's meetings in search, with a one-key join.",
         "Games" => "Turn HDR on by itself while you play.",
         "Focus" => "Block distracting apps and websites while you work.",
-        "Screenshots" | "Notes" => "",
+        "Screenshots" => "Find screenshots by the words in them.",
+        "Notes" => "",
         _ => return None,
     })
 }
@@ -626,7 +631,19 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
             )]));
             out
         }
-        "Shortcuts" | "Screenshots" | "Notes" => vec![],
+        "Screenshots" => groups(vec![(
+            "",
+            vec![
+                row("Column count", "screenshots.columns", Kind::Columns, "Thumbnails per row in Search Screenshots").with_icon(g::TILES),
+                row("Folders to search", "screenshots.folders", Kind::List, "Full paths, e.g. D:\\Shots. With none, Pictures\\Screenshots").with_icon(g::FOLDER),
+                row("Include all media", "screenshots.all_media", Kind::Bool, "Also list the videos there; their text is not read").with_icon(g::PICTURE),
+                row("Text recognition", "screenshots.ocr", Kind::Bool, "Read the text in screenshots with Windows' own OCR, offline").with_icon(g::SCAN_TEXT),
+                row("Read cloud-only files", "screenshots.cloud", Kind::Bool, "Downloads OneDrive files to read them").with_icon(g::CLOUD),
+                // 1 day to 1 year, or Forever.
+                row("Keep screenshots for", "screenshots.keep", Kind::Choice(&CLIPBOARD_KEEP[2..]), "Pinned screenshots are kept").with_icon(g::CLOCK),
+            ],
+        )]),
+        "Shortcuts" | "Notes" => vec![],
         _ => {
             let watcher = if crate::foreground::RUNNING.load(std::sync::atomic::Ordering::Relaxed) { "Foreground watcher: running" } else { "Foreground watcher: stopped" };
             vec![
@@ -765,7 +782,7 @@ impl Settings {
         }
         let section = SECTIONS[self.section];
         let mut out = rows(self.section, &self.exts, &self.text);
-        if !matches!(section, "Translator" | "Focus") {
+        if !matches!(section, "Translator" | "Screenshots" | "Focus") {
             return out;
         }
         // Then its commands (their subtitle is the section's name), each with its alias and hotkey.
@@ -1023,6 +1040,10 @@ impl Settings {
                 let i = choice_at(opts, &current, &r.path).map_or(0, |i| (i + 1) % opts.len());
                 self.save(&r.path, opts[i].1.value(), cx);
             }
+            Kind::Columns => {
+                let i = COLUMN_COUNTS.iter().position(|n| n.to_string() == current).map_or(0, |i| (i + 1) % COLUMN_COUNTS.len());
+                self.save(&r.path, COLUMN_COUNTS[i].into(), cx);
+            }
             Kind::Language(lead) => {
                 self.menu_input.update(cx, |s, cx| s.emplace("", cx));
                 window.focus(&self.menu_input.focus_handle(cx), cx);
@@ -1276,6 +1297,17 @@ impl Settings {
                     drop(me.update(cx, |this, cx| this.save(&path, opts[k].1.value(), cx)));
                 })
             }
+            Kind::Columns => design::segment_track(
+                COLUMN_COUNTS.map(|n| {
+                    let (me, path) = (me.clone(), r.path.clone());
+                    design::columns_segment(n as usize, value == n.to_string(), t).id(SharedString::from(format!("{}={n}", r.path.join(".")))).on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        drop(me.update(cx, |this, cx| this.save(&path, n.into(), cx)));
+                    })
+                }),
+                t,
+            )
+            .into_any_element(),
             Kind::Language(lead) => design::dropdown(design::g::FILTER, &language_label(lead, &value), t).into_any_element(),
             Kind::Hotkey => design::hotkey_control(&value, self.recording && on, t).into_any_element(),
             Kind::Open(_) => design::button("Open", design::Button::Quiet, on, t).into_any_element(),
@@ -1429,7 +1461,7 @@ impl Settings {
                 drop(click.update(cx, |this, cx| {
                     let again = this.selected == i;
                     this.select(i, window, cx);
-                    let typed = matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List | Kind::Csv | Kind::Feed(Some(_)) | Kind::Keys | Kind::Filter | Kind::Command(_) | Kind::Choice(_) | Kind::Category);
+                    let typed = matches!(this.rows()[i].kind, Kind::Text | Kind::Number | Kind::List | Kind::Csv | Kind::Feed(Some(_)) | Kind::Keys | Kind::Filter | Kind::Command(_) | Kind::Choice(_) | Kind::Columns | Kind::Category);
                     if again && matches!(this.rows()[i].kind, Kind::Command(_)) || !typed {
                         this.activate(window, cx);
                     }
@@ -1782,7 +1814,7 @@ mod tests {
     #[test]
     fn long_choice_rows_stack() {
         let labels: Vec<String> = (0..SECTIONS.len()).flat_map(|s| rows(s, &[], "")).filter(|r| stacked(&r.kind)).map(|r| r.label).collect();
-        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone", "Remind me before"]);
+        assert_eq!(labels, ["Hyper key", "Keep the last search", "An app's hotkey", "Keep entries for", "Speed", "Sound", "Skin tone", "Keep screenshots for", "Remind me before"]);
         assert!(stacked(&Kind::Category));
     }
 
@@ -1810,6 +1842,25 @@ mod tests {
         }
         let launcher = rows(SECTIONS.iter().position(|x| *x == "Launcher").unwrap(), &[], "");
         assert!(!launcher.iter().any(|r| ["Games", "Focus", "Calendar"].contains(&r.group.as_str())));
+    }
+
+    #[test]
+    fn the_screenshots_page_lists_its_six_settings() {
+        let s = SECTIONS.iter().position(|x| *x == "Screenshots").unwrap();
+        let page = rows(s, &[], "");
+        let shown: Vec<(&str, &str)> = page.iter().map(|r| (r.label.as_str(), r.icon)).collect();
+        assert_eq!(
+            shown,
+            [("Column count", g::TILES), ("Folders to search", g::FOLDER), ("Include all media", g::PICTURE), ("Text recognition", g::SCAN_TEXT), ("Read cloud-only files", g::CLOUD), ("Keep screenshots for", g::CLOCK)]
+        );
+        assert_eq!(head("Screenshots"), Some("Find screenshots by the words in them."));
+        assert_eq!((&page[0].kind, &page[1].kind), (&Kind::Columns, &Kind::List));
+        let at = |i: usize| config::shown_value("", &page[i].path);
+        assert_eq!((at(0), at(2), at(3), at(4)), ("3".into(), "false".into(), "true".into(), "false".into()), "the defaults: 3 across, text on, cloud off");
+        assert_eq!(page[5].help, "Pinned screenshots are kept");
+        let Kind::Choice(keep) = page[5].kind else { panic!("Keep is a Choice") };
+        assert_eq!((keep[0].1.text(), keep.last().unwrap().1.text()), ("1d".into(), "unlimited".into()));
+        assert_eq!(choice_at(keep, &at(5), &page[5].path), Some(keep.len() - 1), "unlimited by default");
     }
 
     #[test]

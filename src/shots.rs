@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Cursor,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,8 +32,9 @@ pub struct Shot {
     pub text: String,
     /// Reading its text failed; not tried again until the file changes.
     pub failed: bool,
-    /// Listed under Pinned. Older indexes have no such field.
-    #[serde(default)]
+    /// Listed under Pinned and never pruned. Set from the pins file (`set_pins`), not stored
+    /// here: an index rebuilt with OCR off starts empty.
+    #[serde(skip)]
     pub pinned: bool,
     /// The file name and the text in lower case, made once (`lower`) rather than per keystroke.
     #[serde(skip)]
@@ -66,6 +68,9 @@ impl Shot {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ShotIndex {
     entries: Vec<Shot>,
+    /// The pinned paths (`pins`); a file that is indexed again keeps its pin.
+    #[serde(skip)]
+    pins: HashSet<PathBuf>,
 }
 
 /// How an update scans: videos too, how old a file may be, and how many files to read per call.
@@ -76,6 +81,8 @@ pub struct Opts {
     pub batch: usize,
     /// Read the pictures for their text. Off: they are listed with no text and never read.
     pub ocr: bool,
+    /// List OneDrive files that are only in the cloud (reading them downloads them).
+    pub cloud: bool,
 }
 
 fn ext(path: &Path) -> Option<String> {
@@ -95,17 +102,25 @@ fn secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Whether a file with these attributes is listed: one OneDrive keeps only in the cloud
+/// only with `cloud`, since reading it downloads it.
+fn listed(attrs: u32, cloud: bool) -> bool {
+    cloud || !crate::files::is_cloud_only(attrs)
+}
+
 /// The pictures (and videos) directly inside `folders` with their modified times. Folders
-/// that are missing are skipped.
+/// that are missing are skipped, and cloud-only files too unless `cloud`.
 // ponytail: top level only; add recursion if people sort screenshots into subfolders.
-fn scan(folders: &[PathBuf], all_media: bool) -> HashMap<PathBuf, u64> {
+fn scan(folders: &[PathBuf], all_media: bool, cloud: bool) -> HashMap<PathBuf, u64> {
+    use std::os::windows::fs::MetadataExt;
     let mut found = HashMap::new();
     for entry in folders.iter().filter_map(|f| fs::read_dir(f).ok()).flatten().flatten() {
         let path = entry.path();
         let wanted = picture(&path) || (all_media && video(&path));
+        // From the directory listing: the file itself is not opened.
         let Ok(meta) = entry.metadata() else { continue };
         // The index is stored as JSON: a path that isn't Unicode can't be.
-        if wanted && meta.is_file() && path.to_str().is_some() {
+        if wanted && meta.is_file() && listed(meta.file_attributes(), cloud) && path.to_str().is_some() {
             found.insert(path, meta.modified().map(secs).unwrap_or(0));
         }
     }
@@ -124,6 +139,24 @@ impl ShotIndex {
     /// The saved index; empty when there is none or it doesn't parse.
     pub fn load() -> Self {
         fs::read(Self::file()).ok().and_then(|b| Self::parse(&b)).unwrap_or_default()
+    }
+
+    /// Pins `pins` (`pins()`), and unpins the rest.
+    pub fn set_pins(&mut self, pins: HashSet<PathBuf>) {
+        for e in &mut self.entries {
+            e.pinned = pins.contains(&e.path);
+        }
+        self.pins = pins;
+    }
+
+    /// Forgets a file (deleted).
+    pub fn remove(&mut self, path: &Path) {
+        self.entries.retain(|e| e.path != path);
+    }
+
+    /// The text read in the file at `path`; empty when none was.
+    pub fn text(&self, path: &Path) -> &str {
+        self.entries.iter().find(|e| e.path == path).map_or("", |e| e.text.as_str())
     }
 
     fn parse(json: &[u8]) -> Option<Self> {
@@ -147,7 +180,8 @@ impl ShotIndex {
     /// its text recognised: a picture that can't be recognised is remembered as `failed` and
     /// not tried again until it changes, but one that can't be read right now (locked by
     /// OneDrive or an antivirus) is left out so the next scan retries it. Without `opts.ocr`
-    /// nothing is read. A pin survives the file changing. Returns how many were indexed.
+    /// nothing is read. A pin survives the file changing, and keeps a file older than
+    /// `opts.keep`. Returns how many were indexed.
     /// (A scan plans once and indexes batch by batch: `scan_loop`.)
     #[cfg(test)]
     fn update(&mut self, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> usize {
@@ -159,10 +193,10 @@ impl ShotIndex {
     /// newest is popped first).
     fn plan(&mut self, folders: &[PathBuf], opts: Opts) -> Vec<(PathBuf, u64)> {
         self.prune(opts.keep);
-        let mut found = scan(folders, opts.all_media);
+        let mut found = scan(folders, opts.all_media, opts.cloud);
         if let Some(keep) = opts.keep {
             let at = cutoff(keep);
-            found.retain(|_, m| *m >= at);
+            found.retain(|p, m| *m >= at || self.pins.contains(p));
         }
         self.entries.retain(|e| found.contains_key(&e.path));
         let known: HashMap<&PathBuf, u64> = self.entries.iter().map(|e| (&e.path, e.mtime)).collect();
@@ -175,12 +209,11 @@ impl ShotIndex {
     /// are left; a file that can't be read right now is dropped from `todo`. Returns how many
     /// were indexed.
     fn index(&mut self, todo: &mut Vec<(PathBuf, u64)>, opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> usize {
-        let pins: HashSet<&PathBuf> = self.entries.iter().filter(|e| e.pinned).map(|e| &e.path).collect();
         let mut fresh = Vec::new();
         while fresh.len() < opts.batch
             && let Some((path, mtime)) = todo.pop()
         {
-            let pinned = pins.contains(&path);
+            let pinned = self.pins.contains(&path);
             let (text, failed) = if video(&path) || !opts.ocr {
                 (String::new(), false)
             } else {
@@ -209,11 +242,11 @@ impl ShotIndex {
         self.entries.iter().filter(|s| kind.has(s) && matches(s, &f, now)).collect()
     }
 
-    /// Forgets entries older than `keep`.
+    /// Forgets entries older than `keep`, except pinned ones.
     pub fn prune(&mut self, keep: Option<Duration>) {
         if let Some(keep) = keep {
             let at = cutoff(keep);
-            self.entries.retain(|e| e.mtime >= at);
+            self.entries.retain(|e| e.pinned || e.mtime >= at);
         }
     }
 }
@@ -243,9 +276,9 @@ fn pictures() -> PathBuf {
     known.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("Pictures"))
 }
 
-/// The newest picture in the folders.
+/// The newest picture in the folders (cloud-only ones too: pasting it is asked for).
 pub fn latest(folders: &[PathBuf]) -> Option<PathBuf> {
-    scan(folders, false).into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).map(|(p, _)| p)
+    scan(folders, false, true).into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).map(|(p, _)| p)
 }
 
 /// A picture file as PNG bytes, for the clipboard (which gets the PNG and a bitmap made from it).
@@ -260,26 +293,93 @@ pub fn png_of(path: &Path) -> Result<Vec<u8>, String> {
     Ok(png.into_inner())
 }
 
-/// Puts a screenshot (the newest one when `path` is None) on the clipboard as an image.
-pub fn put_image(owner: HWND, path: Option<PathBuf>, folders: &[PathBuf]) -> Result<(), String> {
+/// Puts a screenshot (the newest one when `path` is None) on the clipboard as an image;
+/// returns which.
+pub fn put_image(owner: HWND, path: Option<PathBuf>, folders: &[PathBuf]) -> Result<PathBuf, String> {
     let path = path.or_else(|| latest(folders)).ok_or("No screenshots found")?;
     let png = png_of(&path)?;
-    if clipboard::set(owner, clipboard::Put::Image(&png), false) { Ok(()) } else { Err("Could not put it on the clipboard".into()) }
+    if clipboard::set(owner, clipboard::Put::Image(&png), false) { Ok(path) } else { Err("Could not put it on the clipboard".into()) }
 }
 
-/// Brings the saved index up to date, reading new screenshots' text a batch at a time;
-/// `show` gets the index after each step, with how many pictures have been read of how many
-/// there are to read (None when nothing is read). Run on a worker thread. Without OCR
-/// (switched off, or Windows has no OCR language installed) nothing is read or saved and no
-/// picture is marked failed: the folders are just listed.
-pub fn rescan(folders: &[PathBuf], keep: Option<Duration>, all_media: bool, ocr: bool, show: impl FnMut(&ShotIndex, Option<(usize, usize)>)) {
+/// Paste Latest Screenshot's toast: "Pasted Screenshot 14:59", the time it was taken.
+pub fn paste_toast(mtime: SystemTime) -> String {
+    format!("Pasted Screenshot {}", calendar::clock(calendar::utc_to_local(secs(mtime) as i64)))
+}
+
+/// Quick Look's line under the name: "2.4 MB · Today, 14:59 · Screenshots" (size, `caption`,
+/// folder name). None when the file is gone.
+pub fn detail(path: &Path, now: SystemTime) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    let folder = path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(format!("{} · {} · {folder}", crate::files::size_text(meta.len()), caption(meta.modified().ok()?, now)))
+}
+
+/// Moves a file to the Recycle Bin, quietly (procast asked first).
+pub fn delete(path: &Path) -> Result<(), String> {
+    use windows::{
+        Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW},
+        core::PCWSTR,
+    };
+    // A list of paths, each ending in a nul, the list in a second one.
+    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    let mut op = SHFILEOPSTRUCTW { wFunc: FO_DELETE, pFrom: PCWSTR(from.as_ptr()), fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16, ..Default::default() };
+    let failed = unsafe { SHFileOperationW(&mut op) };
+    if failed != 0 || op.fAnyOperationsAborted.as_bool() { Err("Could not move it to the Recycle Bin".into()) } else { Ok(()) }
+}
+
+fn pins_file() -> PathBuf {
+    config::dir().join("screenshot-pins.txt")
+}
+
+/// The pinned screenshots' paths, one per line in %APPDATA%\procast\screenshot-pins.txt, kept
+/// apart from the index so pins outlive a rebuild (and the scan thread never writes them).
+pub fn pins() -> HashSet<PathBuf> {
+    read_pins(&pins_file())
+}
+
+fn read_pins(file: &Path) -> HashSet<PathBuf> {
+    parse_pins(&fs::read_to_string(file).unwrap_or_default())
+}
+
+fn parse_pins(text: &str) -> HashSet<PathBuf> {
+    text.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
+}
+
+/// Pins (`on`) or unpins `path`; returns every pin.
+// ponytail: a pin outlives its file being removed outside procast; prune the list if it grows.
+pub fn pin(path: &Path, on: bool) -> Result<HashSet<PathBuf>, String> {
+    pin_in(&pins_file(), path, on)
+}
+
+fn pin_in(file: &Path, path: &Path, on: bool) -> Result<HashSet<PathBuf>, String> {
+    let text = crate::focus::text_or_empty(fs::read_to_string(file)).map_err(|_| "Could not read the pinned screenshots".to_string())?;
+    let mut pins = parse_pins(&text);
+    if on {
+        pins.insert(path.to_path_buf());
+    } else {
+        pins.remove(path);
+    }
+    let mut lines: Vec<String> = pins.iter().map(|p| p.display().to_string() + "\n").collect();
+    lines.sort();
+    crate::focus::write_atomic(file, &lines.concat()).map_err(|e| format!("Could not save the pin: {e}"))?;
+    Ok(pins)
+}
+
+/// Brings the saved index up to date as `[screenshots]` says, reading new screenshots' text
+/// a batch at a time; `show` gets the index after each step, with how many pictures have
+/// been read of how many there are to read (None when nothing is read). `pins` are kept
+/// whatever their age. Run on a worker thread. Without OCR (switched off, or Windows has no
+/// OCR language installed) nothing is read or saved and no picture is marked failed: the
+/// folders are just listed.
+pub fn rescan(s: &config::Screenshots, pins: HashSet<PathBuf>, show: impl FnMut(&ShotIndex, Option<(usize, usize)>)) {
     // Text recognition is a WinRT API.
     unsafe { _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED) };
-    let ocr = ocr && clipboard::ocr_ready();
+    let ocr = s.ocr && clipboard::ocr_ready();
     let mut index = if ocr { ShotIndex::load() } else { ShotIndex::default() };
+    index.set_pins(pins);
     // Listing costs a stat per file, so its batches are bigger than reading ones.
-    let opts = Opts { all_media, keep, batch: if ocr { 20 } else { 500 }, ocr };
-    scan_loop(&mut index, folders, opts, clipboard::recognise, show, ShotIndex::save);
+    let opts = Opts { all_media: s.all_media, keep: keep(&s.keep), batch: if ocr { 20 } else { 500 }, ocr, cloud: s.cloud };
+    scan_loop(&mut index, &folders(&s.folders), opts, clipboard::recognise, show, ShotIndex::save);
 }
 
 /// Scans `folders` once, then indexes what changed batch by batch, showing the index before
@@ -465,7 +565,8 @@ pub fn thumb_key(s: &Shot) -> Option<String> {
 
 /// The grid's cells, newest first: the file name as title, the caption (or, for a `text:`
 /// filter, the words found) as accessory, and the primary action first (`primary`: copy |
-/// paste | open); videos only open. With each, its `thumb_key`.
+/// paste | open), then Open With…, Quick Look, Show in File Explorer, Pin, Copy Text and
+/// Delete; a video is not copied as a picture. With each, its `thumb_key`.
 pub fn rows(index: &ShotIndex, query: &str, kind: Kind, primary: &str) -> (Vec<Item>, Vec<Option<String>>) {
     let now = SystemTime::now();
     let words: Vec<String> = parse_filter(query).into_iter().filter(|f| f.0 == Field::Text).map(|f| f.1).collect();
@@ -481,7 +582,11 @@ pub fn rows(index: &ShotIndex, query: &str, kind: Kind, primary: &str) -> (Vec<I
                 (_, "open") => vec![open, copy, paste],
                 _ => vec![copy, paste, open],
             };
-            acts.push(Act::Reveal(path));
+            acts.extend([Act::OpenWith(path.clone()), Act::QuickLook(path.clone()), Act::Reveal(path.clone()), Act::PinShot(path.clone(), !s.pinned)]);
+            if !s.is_video() {
+                acts.push(Act::CopyText(path.clone()));
+            }
+            acts.push(Act::DeleteShot(path));
             let caption = text_hit(s, &words).unwrap_or_else(|| caption(UNIX_EPOCH + Duration::from_secs(s.mtime), now));
             let icon = Icon::Vector(if s.is_video() { g::VIDEO } else { g::PICTURE });
             let mut it = Item::new(s.name(), "", icon, acts[0].clone()).acc(caption).tinted(Tint::File).sec(SECTION);
@@ -509,7 +614,7 @@ mod tests {
         fs::File::options().write(true).open(path).unwrap().set_modified(at).unwrap();
     }
 
-    const OPTS: Opts = Opts { all_media: false, keep: None, batch: 100, ocr: true };
+    const OPTS: Opts = Opts { all_media: false, keep: None, batch: 100, ocr: true, cloud: false };
 
     #[test]
     fn new_files_are_read_once() {
@@ -618,7 +723,7 @@ mod tests {
         assert_eq!(text_hit(&s, &["inv".into(), "due".into()]).as_deref(), Some("Invoice due"));
         assert_eq!(text_hit(&s, &["total".into(), "zebra".into()]), None, "every word or none");
         assert_eq!(text_hit(&s, &[]), None);
-        let mut idx = ShotIndex { entries: vec![s] };
+        let mut idx = ShotIndex { entries: vec![s], ..Default::default() };
         assert_eq!(rows(&idx, "text:TOTAL", Kind::All, "copy").0[0].accessory, "Total:", "the caption of a text: match");
         idx.entries[0].mtime = secs(SystemTime::now());
         assert!(rows(&idx, "total", Kind::All, "copy").0[0].accessory.starts_with("Today, "), "a plain word keeps the time");
@@ -631,7 +736,7 @@ mod tests {
         let now = SystemTime::now();
         let mut pinned = shot("p.png", now, "");
         pinned.pinned = true;
-        let idx = ShotIndex { entries: vec![pinned, shot("a.png", now, ""), shot("v.mp4", now, "")] };
+        let idx = ShotIndex { entries: vec![pinned, shot("a.png", now, ""), shot("v.mp4", now, "")], ..Default::default() };
         let names = |k: Kind| idx.search("", k, now).iter().map(|s| s.name()).collect::<Vec<_>>();
         assert_eq!(names(Kind::Pinned), ["p.png"]);
         assert_eq!(names(Kind::Screenshots), ["p.png", "a.png"]);
@@ -653,10 +758,78 @@ mod tests {
         touch(&d.join("a.png"), 10);
         let mut idx = ShotIndex::default();
         idx.update(std::slice::from_ref(&d), OPTS, |_| Some(String::new()));
-        idx.entries[0].pinned = true;
+        idx.set_pins(HashSet::from([d.join("a.png")]));
+        assert!(idx.entries[0].pinned);
         touch(&d.join("a.png"), 1);
         assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, |_| Some(String::new())), 1);
         assert!(idx.entries[0].pinned);
+    }
+
+    #[test]
+    fn prune_and_keep_spare_pinned_shots() {
+        let d = dir("pinkeep");
+        touch(&d.join("old.png"), 7 * 86400);
+        touch(&d.join("new.png"), 10);
+        let day = Some(Duration::from_secs(86400));
+        let mut idx = ShotIndex::default();
+        idx.set_pins(HashSet::from([d.join("old.png")]));
+        idx.update(std::slice::from_ref(&d), Opts { keep: day, ..OPTS }, |_| Some(String::new()));
+        assert_eq!(idx.entries.len(), 2, "a pinned file older than keep is still listed");
+        idx.prune(day);
+        assert_eq!(idx.entries.len(), 2, "and prune keeps it");
+        idx.set_pins(HashSet::new());
+        idx.prune(day);
+        assert_eq!(idx.entries.iter().map(Shot::name).collect::<Vec<_>>(), ["new.png"], "unpinned, it goes");
+    }
+
+    #[test]
+    fn pins_survive_a_rebuild_with_ocr_off() {
+        let d = dir("pinnocr");
+        touch(&d.join("a.png"), 10);
+        touch(&d.join("b.png"), 20);
+        // OCR off starts from an empty index each scan: the pins come from their own file.
+        let mut idx = ShotIndex::default();
+        idx.set_pins(HashSet::from([d.join("b.png")]));
+        scan_loop(&mut idx, std::slice::from_ref(&d), Opts { ocr: false, ..OPTS }, |_| None, |_, _| {}, |_| {});
+        let pinned: Vec<String> = idx.search("", Kind::Pinned, SystemTime::now()).iter().map(|s| s.name()).collect();
+        assert_eq!(pinned, ["b.png"]);
+    }
+
+    #[test]
+    fn pins_are_saved_in_their_own_file() {
+        let d = dir("pinfile");
+        let file = d.join("pins.txt");
+        let (a, b) = (PathBuf::from("C:\\Shots\\a.png"), PathBuf::from("C:\\Shots\\b b.png"));
+        assert_eq!(pin_in(&file, &a, true).unwrap(), HashSet::from([a.clone()]));
+        assert_eq!(pin_in(&file, &b, true).unwrap(), HashSet::from([a.clone(), b.clone()]));
+        assert_eq!(read_pins(&file), HashSet::from([a.clone(), b.clone()]), "read back from the file");
+        assert_eq!(pin_in(&file, &a, false).unwrap(), HashSet::from([b.clone()]));
+        assert_eq!(read_pins(&d.join("none.txt")), HashSet::new(), "no file: no pins");
+    }
+
+    #[test]
+    fn cloud_only_files_are_listed_only_when_asked() {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS};
+        let cloud = FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 | FILE_ATTRIBUTE_ARCHIVE.0;
+        assert!(!listed(cloud, false), "reading it would download it");
+        assert!(listed(cloud, true));
+        assert!(listed(FILE_ATTRIBUTE_ARCHIVE.0, false), "a file on disk is always listed");
+    }
+
+    #[test]
+    fn paste_latest_says_when_the_shot_was_taken() {
+        assert_eq!(paste_toast(at(2026, 11, 17, 14, 59)), "Pasted Screenshot 14:59");
+    }
+
+    #[test]
+    fn quick_look_details_give_size_time_and_folder() {
+        let d = dir("detail");
+        let f = d.join("a.png");
+        fs::write(&f, vec![0u8; 2048]).unwrap();
+        let line = detail(&f, SystemTime::now()).unwrap();
+        let folder = d.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(line.starts_with("2.0 KB · Today, ") && line.ends_with(&format!(" · {folder}")), "{line}");
+        assert_eq!(detail(&d.join("gone.png"), SystemTime::now()), None);
     }
 
     #[test]
@@ -700,12 +873,15 @@ mod tests {
         idx.update(std::slice::from_ref(&d), Opts { all_media: true, ..OPTS }, |_| Some("\n  Total due\nmore".into()));
         let label = |it: &Item| it.extra.iter().map(|a| a.0.as_str()).collect::<Vec<_>>().join(",");
         let (rows, thumbs) = rows(&idx, "", Kind::All, "paste");
-        assert_eq!(rows.iter().map(&label).collect::<Vec<_>>(), ["Open,Show in Explorer", "Paste Image,Copy to Clipboard,Open,Show in Explorer"], "a video can only open");
+        let rest = "Open With…,Quick Look,Show in File Explorer,Pin";
+        assert_eq!(rows.iter().map(&label).collect::<Vec<_>>(), [format!("Open,{rest},Delete"), format!("Paste,Copy to Clipboard,Open,{rest},Copy Text,Delete")], "a video can't be copied as a picture");
         assert_eq!((rows[1].title.as_str(), rows[1].section.as_deref()), ("a.png", Some(SECTION)), "the whole name, in the one section");
         let png = &idx.entries[1];
         assert_eq!(thumbs, [None, Some(format!("t:{}|{}", png.mtime, png.path.display()))], "a video's file is never read for a thumbnail");
-        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "open").0[0]), "Open,Copy to Clipboard,Paste Image,Show in Explorer");
-        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "copy").0[0]), "Copy to Clipboard,Paste Image,Open,Show in Explorer");
+        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "open").0[0]), format!("Open,Copy to Clipboard,Paste,{rest},Copy Text,Delete"));
+        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "copy").0[0]), format!("Copy to Clipboard,Paste,Open,{rest},Copy Text,Delete"));
+        idx.set_pins(HashSet::from([png.path.clone()]));
+        assert!(label(&super::rows(&idx, "a.png", Kind::All, "copy").0[0]).contains(",Unpin,"), "a pinned shot offers Unpin");
     }
 
     #[test]
