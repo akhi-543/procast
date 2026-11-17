@@ -2,9 +2,10 @@ use std::{fs, path::PathBuf, time::Duration};
 
 use serde_json::{Value, json};
 
-use crate::{config, ytmusic::Control};
+use crate::{config, media::NowPlaying, ytmusic::Control};
 
-const OPEN_APP: &str = "Open YouTube Music Desktop App (companion server on)";
+
+pub const OPEN_APP: &str = "Open YouTube Music Desktop App (companion server on)";
 const REAUTH: &str = "Re-authorize procast in YouTube Music Desktop App";
 
 pub struct Desktop {
@@ -136,6 +137,28 @@ pub fn parse_state(v: &Value) -> State {
     }
 }
 
+/// Maps companion `/state` onto the Now Playing row. Cover is filled by the caller
+/// (`net::cached_image` on `thumb_url`); video/playlist ids are for Copy URL.
+pub fn to_now_playing(state: &State) -> (NowPlaying, String, String) {
+    (
+        NowPlaying {
+            title: state.title.clone(),
+            artist: state.artist.clone(),
+            album: state.album.clone(),
+            playing: state.playing,
+            cover: None,
+            video_id: state.video_id.clone(),
+            playlist_id: state.playlist_id.clone(),
+        },
+        state.video_id.clone(),
+        state.playlist_id.clone(),
+    )
+}
+
+pub fn radio_playlist(video_id: &str) -> String {
+    format!("RDAMVM{video_id}")
+}
+
 pub fn metadata(base: &str) -> Result<bool, String> {
     agent().get(&format!("{}/metadata", root(base))).call().map(|_| true).map_err(|_| OPEN_APP.to_string())
 }
@@ -242,6 +265,32 @@ mod tests {
         assert_eq!(transport(Control::Dislike, 10), json!({"command":"toggleDislike"}));
         assert_eq!(transport(Control::Mute, 10), json!({"command":"mute"}));
         assert_eq!(transport(Control::Shuffle, 10), json!({"command":"shuffle"}));
+    }
+
+    #[test]
+    fn state_maps_to_now_playing_and_radio_playlist() {
+        let state = State {
+            title: "One More Time".into(),
+            artist: "Daft Punk".into(),
+            album: "Discovery".into(),
+            video_id: "FGBhQbmPwH8".into(),
+            playlist_id: "OLAK5".into(),
+            playing: true,
+            volume: 40,
+            muted: false,
+            like_status: 2,
+            thumb_url: "https://example.test/large.jpg".into(),
+        };
+        let (now, video, playlist) = to_now_playing(&state);
+        assert_eq!(now.title, "One More Time");
+        assert_eq!(now.artist, "Daft Punk");
+        assert_eq!(now.album, "Discovery");
+        assert!(now.playing);
+        assert_eq!(now.cover, None);
+        assert_eq!((now.video_id.as_str(), now.playlist_id.as_str()), ("FGBhQbmPwH8", "OLAK5"));
+        assert_eq!(video, "FGBhQbmPwH8");
+        assert_eq!(playlist, "OLAK5");
+        assert_eq!(radio_playlist("FGBhQbmPwH8"), "RDAMVMFGBhQbmPwH8");
     }
 
     #[test]

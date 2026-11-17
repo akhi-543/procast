@@ -5,7 +5,10 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, channel},
+    },
 };
 
 use futures::channel::mpsc::UnboundedSender;
@@ -23,6 +26,17 @@ use windows::{
 
 use crate::win::Msg;
 
+static DESKTOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// When true, SMTC must not overwrite Now Playing (desktop companion is the source).
+pub fn set_desktop_active(active: bool) {
+    DESKTOP_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+fn desktop_active() -> bool {
+    DESKTOP_ACTIVE.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
     pub title: String,
@@ -30,6 +44,8 @@ pub struct NowPlaying {
     pub album: String,
     pub playing: bool,
     pub cover: Option<PathBuf>,
+    pub video_id: String,
+    pub playlist_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +62,7 @@ enum Event {
     Do(Transport),
 }
 
+#[derive(Clone)]
 pub struct Media(Sender<Event>);
 
 impl Media {
@@ -104,6 +121,9 @@ impl Worker {
     }
 
     fn publish(&mut self) {
+        if desktop_active() {
+            return;
+        }
         let prev = self.sent.clone().flatten();
         let next = match &self.tracked {
             Some(tracked) => match read(&tracked.session, prev.as_ref()) {
@@ -215,7 +235,15 @@ fn read(session: &Session, prev: Option<&NowPlaying>) -> windows::core::Result<N
         Some(p) if p.title == title && p.artist == artist && p.cover.is_some() => p.cover.clone(),
         _ => save_cover(&properties, &title, &artist),
     };
-    Ok(NowPlaying { album: properties.AlbumTitle()?.to_string(), playing: is_playing(session), title, artist, cover })
+    Ok(NowPlaying {
+        album: properties.AlbumTitle()?.to_string(),
+        playing: is_playing(session),
+        title,
+        artist,
+        cover,
+        video_id: String::new(),
+        playlist_id: String::new(),
+    })
 }
 
 /// The name is per track because the UI caches decoded images by path.
@@ -263,6 +291,16 @@ mod tests {
 
     fn s(id: &str, playing: bool) -> (String, bool) {
         (id.to_string(), playing)
+    }
+
+    #[test]
+    fn desktop_active_blocks_smtc_now_playing() {
+        set_desktop_active(false);
+        assert!(!desktop_active());
+        set_desktop_active(true);
+        assert!(desktop_active());
+        set_desktop_active(false);
+        assert!(!desktop_active());
     }
 
     #[test]

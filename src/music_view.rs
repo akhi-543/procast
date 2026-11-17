@@ -18,11 +18,12 @@ use crate::{
     commands::{self, Cmd},
     design::{self, Tokens, g, px},
     empty_row, ext,
-    media::{Media, NowPlaying, Transport},
+    media::{self, Media, NowPlaying, Transport},
     music_tray::{self, Action},
     net,
     search::{self, Act, Icon, Item},
-    win::{self, Msg},
+    win::Msg,
+    ytmdesktop,
     ytmusic::{self, Control, Filter, Kind, MusicItem, Reply, Screen, Shelf},
 };
 
@@ -36,7 +37,6 @@ const TYPING_PAUSE: Duration = Duration::from_millis(300);
 const COVER_REFRESH: Duration = Duration::from_millis(100);
 
 const NO_BROWSER: &str = "No browser connected: run Set Up Browser Extension";
-const HOME: &str = "https://music.youtube.com/";
 
 const CELL_PAD: f32 = 6.;
 const CELL_GAP: f32 = 4.;
@@ -185,10 +185,17 @@ pub struct MusicState {
     /// A refresh for arrived covers is already waiting.
     refresh_due: bool,
     now: Option<NowPlaying>,
+    /// Last video/playlist ids from desktop `/state` (Copy URL / Open / song radio).
+    video_id: String,
+    playlist_id: String,
     tray: Option<TrayIcon>,
 }
 
 impl MusicState {
+    pub fn cover_is(&self, path: &Path) -> bool {
+        self.now.as_ref().and_then(|now| now.cover.as_deref()) == Some(path)
+    }
+
     /// A cover file changed on disk.
     pub fn drop_cover(&mut self, path: &Path) {
         self.retired.extend(self.covers.remove(path).flatten());
@@ -199,14 +206,81 @@ impl MusicState {
     }
 }
 
+enum DesktopJob {
+    Play { video: Option<String>, playlist: Option<String> },
+    Command(Control),
+    State,
+}
+
 impl Launcher {
     fn media(&mut self) -> &Media {
         let tx = &self.tx;
         self.media.get_or_insert_with(|| Media::start(tx.clone()))
     }
 
+    fn music_desktop(&mut self, job: DesktopJob) {
+        let step = self.cfg.ytmusic.volume_step;
+        let fallback = match job {
+            DesktopJob::Command(control) => transport(control).map(|t| (self.media().clone(), t)),
+            _ => {
+                self.media();
+                None
+            }
+        };
+        let base = self.cfg.ytmusic.desktop_url.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let run = || {
+                let desktop = ytmdesktop::Desktop::new(&base);
+                let token = ytmdesktop::ensure_token(&desktop)?;
+                match &job {
+                    DesktopJob::Play { video, playlist } => ytmdesktop::play(&token, &desktop.base, video.as_deref(), playlist.as_deref())?,
+                    DesktopJob::Command(control) => ytmdesktop::command(&token, &desktop.base, ytmdesktop::transport(*control, step))?,
+                    DesktopJob::State => {}
+                }
+                ytmdesktop::state(&token, &desktop.base)
+            };
+            match run() {
+                Ok(state) => {
+                    media::set_desktop_active(true);
+                    let (mut now, video_id, playlist_id) = ytmdesktop::to_now_playing(&state);
+                    now.video_id = video_id;
+                    now.playlist_id = playlist_id;
+                    now.cover = if state.thumb_url.is_empty() {
+                        None
+                    } else {
+                        net::cached_image(&state.thumb_url, &tx).or_else(|| Some(net::image_path(&state.thumb_url)))
+                    };
+                    let _ = tx.unbounded_send(Msg::NowPlaying(Some(now).filter(|n| !n.title.is_empty() || !n.video_id.is_empty())));
+                }
+                Err(e) => {
+                    if e == ytmdesktop::OPEN_APP {
+                        media::set_desktop_active(false);
+                        if let Some((media, t)) = fallback {
+                            media.send(t);
+                            return;
+                        }
+                        if matches!(job, DesktopJob::State) {
+                            return;
+                        }
+                    }
+                    let _ = tx.unbounded_send(Msg::Toast(false, e));
+                }
+            }
+        });
+    }
+
+    fn music_fail(&mut self, message: &str, cx: &mut Context<Self>) {
+        if self.visible && self.mode == Mode::Music {
+            self.status = Some((Tone::Error, message.into()));
+            return cx.notify();
+        }
+        let _ = self.tx.unbounded_send(Msg::Toast(false, message.into()));
+    }
+
     pub fn music_open(&mut self, screen: Screen, cx: &mut Context<Self>) {
         self.media();
+        self.music_desktop(DesktopJob::State);
         self.music.screen = screen;
         self.music.view = View::default();
         self.music.relay.wanted = None;
@@ -271,12 +345,8 @@ impl Launcher {
             Screen::QuickActions => vec![],
             Screen::Search | Screen::Library => return self.music_list(query),
         };
-        let connected = self.browsers.any();
-        let controls = control_rows(self.cfg.ytmusic.volume_step).into_iter().filter(|row| connected || matches!(row.act, Act::Music(MusicAct::Control(c)) if transport(c).is_some())).collect();
+        let controls = control_rows(self.cfg.ytmusic.volume_step);
         rows.extend(search::filter(query, controls, &mut self.matcher));
-        if !connected {
-            rows.push(no_browser());
-        }
         rows
     }
 
@@ -408,15 +478,28 @@ impl Launcher {
         let sent = match act {
             MusicAct::Control(control) => return self.music_control(control, cx),
             MusicAct::Open(item) => return self.music_page(item, cx),
-            MusicAct::Play { video, playlist, radio } => self.music_ask(|req| Some(ytmusic::play(req, video.as_deref(), playlist.as_deref(), radio))),
+            MusicAct::Play { video, playlist, radio } => return self.music_play(video, playlist, radio, cx),
             MusicAct::Rate(op, video) => self.music_ask(|req| Some(ytmusic::rate(req, op, video.as_deref()))),
             MusicAct::AddToPlaylist(playlist, video) => {
                 let name = playlist_name(&self.music.playlists, &playlist);
                 self.music_add(&playlist, video.as_deref(), name)
             }
-            MusicAct::Current(link) => self.music_link(link),
+            MusicAct::Current(link) => return self.music_link(link, cx),
         };
         self.music_done(sent, cx);
+    }
+
+    fn music_play(&mut self, video: Option<String>, playlist: Option<String>, radio: bool, cx: &mut Context<Self>) {
+        if radio {
+            let video = video.filter(|id| !id.is_empty()).or_else(|| nonempty(&self.music.video_id));
+            let Some(video) = video else {
+                return self.music_fail("Nothing playing on YouTube Music", cx);
+            };
+            self.music_desktop(DesktopJob::Play { video: Some(video.clone()), playlist: Some(ytmdesktop::radio_playlist(&video)) });
+        } else {
+            self.music_desktop(DesktopJob::Play { video, playlist });
+        }
+        self.music_done(true, cx);
     }
 
     fn music_add(&mut self, playlist: &str, video: Option<&str>, name: String) -> bool {
@@ -433,47 +516,51 @@ impl Launcher {
     }
 
     fn music_send_control(&mut self, control: Control) -> bool {
-        let step = self.cfg.ytmusic.volume_step;
-        if let Some(transport) = transport(control) {
-            self.media().send(transport);
-            return true;
-        }
-        self.media();
-        let sent = self.music_ask(|req| ytmusic::control(req, control, step));
-        if sent && announces_volume(control) {
-            self.music.volume_reqs.insert(self.music.req);
-        }
-        sent
+        self.music_desktop(DesktopJob::Command(control));
+        true
     }
 
-    /// Asks the browser which track plays, to copy or open its link when it answers. Opening
-    /// without a browser goes to YouTube Music's home page; false when copying has nothing to ask.
-    fn music_link(&mut self, link: Link) -> bool {
-        let sent = self.music_ask(|req| Some(ytmusic::current(req)));
-        if sent {
-            self.music.links.insert(self.music.req, link);
-        } else if link == Link::Open {
-            win::open(HOME);
-            return true;
+    /// Copy URL uses desktop video/playlist ids. Open sends `changeVideo` for those ids.
+    fn music_link(&mut self, link: Link, cx: &mut Context<Self>) {
+        let video = nonempty(&self.music.video_id);
+        let playlist = nonempty(&self.music.playlist_id);
+        match link {
+            Link::Copy => {
+                let Some(video) = video else {
+                    return self.music_fail("Nothing playing on YouTube Music", cx);
+                };
+                let url = ytmusic::watch_url(&video, playlist.as_deref().unwrap_or(""));
+                cx.write_to_clipboard(ClipboardItem::new_string(url));
+                let _ = self.tx.unbounded_send(Msg::Toast(true, "Copied".into()));
+                self.music_done(true, cx);
+            }
+            Link::Open => {
+                if video.is_none() && playlist.is_none() {
+                    return self.music_fail("Nothing playing on YouTube Music", cx);
+                }
+                self.music_desktop(DesktopJob::Play { video, playlist });
+                self.music_done(true, cx);
+            }
         }
-        sent
     }
 
     fn music_linked(&mut self, link: Link, reply: &Reply, cx: &mut Context<Self>) {
-        let url = current_url(reply);
-        let toast = match (link, url) {
-            (Link::Open, url) => {
-                win::open(url.as_deref().unwrap_or(HOME));
-                None
+        match link {
+            Link::Open => {
+                let Some(current) = reply.current.as_ref().filter(|current| !current.video_id.is_empty()) else { return };
+                self.music_desktop(DesktopJob::Play { video: Some(current.video_id.clone()), playlist: nonempty(&current.playlist_id) });
             }
-            (Link::Copy, Some(url)) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(url));
-                Some((true, "Copied".to_string()))
+            Link::Copy => {
+                let url = current_url(reply);
+                let toast = match url {
+                    Some(url) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url));
+                        (true, "Copied".to_string())
+                    }
+                    None => (false, reply.error.clone().unwrap_or_else(|| "Nothing playing on YouTube Music".into())),
+                };
+                let _ = self.tx.unbounded_send(Msg::Toast(toast.0, toast.1));
             }
-            (Link::Copy, None) => Some((false, reply.error.clone().unwrap_or_else(|| "Nothing playing on YouTube Music".into()))),
-        };
-        if let Some((ok, text)) = toast {
-            let _ = self.tx.unbounded_send(Msg::Toast(ok, text));
         }
     }
 
@@ -692,6 +779,12 @@ impl Launcher {
     }
 
     pub fn music_now(&mut self, now: Option<NowPlaying>, cx: &mut Context<Self>) {
+        if let Some(now) = &now
+            && !now.video_id.is_empty()
+        {
+            self.music.video_id.clone_from(&now.video_id);
+            self.music.playlist_id.clone_from(&now.playlist_id);
+        }
         let changed = self.music.now != now;
         self.music.now = now;
         if changed {
@@ -713,6 +806,7 @@ impl Launcher {
             let playlists = self.tray_playlists();
             self.music.tray = music_tray::create(self.music.now.as_ref(), &playlists);
             self.music_tray_listen();
+            self.music_desktop(DesktopJob::State);
         } else if !wanted {
             self.music.tray = None;
         }
@@ -725,7 +819,7 @@ impl Launcher {
         }
     }
 
-    fn music_tray_refresh(&mut self) {
+    pub fn music_tray_refresh(&mut self) {
         if self.music.tray.is_none() {
             return;
         }
@@ -743,28 +837,40 @@ impl Launcher {
         self.music.playlists.clone()
     }
 
-    pub fn music_tray_act(&mut self, id: &str) {
+    pub fn music_tray_act(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(action) = Action::parse(id) else { return };
-        let sent = match action {
-            Action::PlayPause => self.music_send_control(Control::PlayPause),
-            Action::Like => self.music_send_control(Control::Like),
-            Action::Next => self.music_send_control(Control::Next),
-            Action::Previous => self.music_send_control(Control::Previous),
-            Action::Radio => self.music_ask(|req| Some(ytmusic::play(req, None, None, true))),
+        match action {
+            Action::PlayPause => {
+                self.music_send_control(Control::PlayPause);
+            }
+            Action::Like => {
+                self.music_send_control(Control::Like);
+            }
+            Action::Next => {
+                self.music_send_control(Control::Next);
+            }
+            Action::Previous => {
+                self.music_send_control(Control::Previous);
+            }
+            Action::Radio => self.music_play(None, None, true, cx),
             Action::Add(playlist) => {
                 let name = playlist_name(&self.tray_playlists(), &playlist);
-                self.music_add(&playlist, None, name)
+                let sent = self.music_add(&playlist, None, name);
+                if !sent {
+                    let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
+                }
             }
-            Action::Copy => self.music_link(Link::Copy),
-            Action::Open => self.music_link(Link::Open),
-        };
-        if !sent {
-            let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
+            Action::Copy => self.music_link(Link::Copy, cx),
+            Action::Open => self.music_link(Link::Open, cx),
         }
     }
 }
 
 /// The name of the library playlist with this id, with or without the `VL` of its browse id.
+fn nonempty(id: &str) -> Option<String> {
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 fn playlist_name(playlists: &[MusicItem], id: &str) -> String {
     let bare = |id: &str| id.strip_prefix("VL").unwrap_or(id).to_string();
     playlists.iter().find(|playlist| bare(&playlist.id) == bare(id)).map(|playlist| playlist.title.clone()).unwrap_or_default()
@@ -884,6 +990,7 @@ fn transport(control: Control) -> Option<Transport> {
     }
 }
 
+#[cfg(test)]
 fn announces_volume(control: Control) -> bool {
     matches!(control, Control::Mute | Control::VolumeLow | Control::VolumeMedium | Control::VolumeHigh | Control::VolumeUp | Control::VolumeDown)
 }
@@ -940,7 +1047,15 @@ mod tests {
     use crate::ytmusic::Current;
 
     fn now(title: &str, artist: &str, album: &str, playing: bool) -> NowPlaying {
-        NowPlaying { title: title.into(), artist: artist.into(), album: album.into(), playing, cover: None }
+        NowPlaying {
+            title: title.into(),
+            artist: artist.into(),
+            album: album.into(),
+            playing,
+            cover: None,
+            video_id: String::new(),
+            playlist_id: String::new(),
+        }
     }
 
     fn reply(op: &str, error: Option<&str>, current: Option<Current>) -> Reply {
@@ -983,7 +1098,8 @@ mod tests {
         assert!(matches!(transport(Control::PlayPause), Some(Transport::PlayPause)));
         assert!(matches!(transport(Control::Next), Some(Transport::Next)));
         assert!(matches!(transport(Control::Previous), Some(Transport::Previous)));
-        assert!(Control::ALL.iter().all(|&c| transport(c).is_some() == ytmusic::control(1, c, 10).is_none()));
+        assert!(transport(Control::Like).is_none() && transport(Control::VolumeUp).is_none() && transport(Control::Mute).is_none());
+        assert_eq!(ytmdesktop::radio_playlist("abc"), "RDAMVMabc");
         assert!(announces_volume(Control::VolumeUp) && announces_volume(Control::Mute));
         assert!(!announces_volume(Control::Shuffle) && !announces_volume(Control::Like));
     }

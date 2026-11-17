@@ -2279,12 +2279,16 @@ impl Launcher {
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
                 self.music.drop_cover(&path);
+                if self.music.cover_is(&path) {
+                    self.music_tray_refresh();
+                }
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
                 if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs) {
                     self.refresh(cx);
-                } else if self.visible && self.mode == Mode::Music {
+                }
+                if self.visible && self.mode == Mode::Music {
                     self.music_covers_arrived(cx);
                 }
             }
@@ -2332,7 +2336,7 @@ impl Launcher {
                     self.refresh(cx);
                 }
             }
-            Msg::TrayMusic(id) => self.music_tray_act(&id),
+            Msg::TrayMusic(id) => self.music_tray_act(&id, cx),
             Msg::TrayExt(run, f) => {
                 if !f.is_empty() {
                     self.send(json!({"t": "event", "run": run, "fn": f, "args": [{"type": "left-click"}]}));

@@ -157,7 +157,15 @@ mod tests {
     use crate::ytmusic::Kind;
 
     fn now(title: &str, artist: &str, playing: bool) -> NowPlaying {
-        NowPlaying { title: title.into(), artist: artist.into(), album: String::new(), playing, cover: None }
+        NowPlaying {
+            title: title.into(),
+            artist: artist.into(),
+            album: String::new(),
+            playing,
+            cover: None,
+            video_id: String::new(),
+            playlist_id: String::new(),
+        }
     }
 
     fn playlist(id: &str, title: &str) -> MusicItem {

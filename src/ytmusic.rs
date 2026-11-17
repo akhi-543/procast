@@ -286,6 +286,7 @@ pub fn add_to_playlist(req: u64, playlist_id: &str, video: Option<&str>) -> Valu
 }
 
 /// With `radio` and no `video`, the radio of the track now playing.
+#[allow(dead_code)]
 pub fn play(req: u64, video: Option<&str>, playlist: Option<&str>, radio: bool) -> Value {
     let mut v = json!({"t": "ytm", "req": req, "op": "play"});
     if let Some(video) = video {
@@ -300,11 +301,13 @@ pub fn play(req: u64, video: Option<&str>, playlist: Option<&str>, radio: bool) 
     v
 }
 
+#[allow(dead_code)]
 pub fn current(req: u64) -> Value {
     json!({"t": "ytm", "req": req, "op": "current"})
 }
 
 /// None for the controls that go through the Windows media session instead.
+#[allow(dead_code)]
 pub fn control(req: u64, control: Control, step: u32) -> Option<Value> {
     let action = |action: &str| json!({"t": "ytm", "req": req, "op": "control", "action": action});
     let valued = |action: &str, value: u32| json!({"t": "ytm", "req": req, "op": "control", "action": action, "value": value});
