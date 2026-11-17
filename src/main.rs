@@ -4460,7 +4460,8 @@ impl Launcher {
             }
             Msg::FilePreview(key, img) => {
                 match self.file_images.get_mut(&key) {
-                    Some(entry) => entry.0 = img,
+                    // A second decode of the same key (reopened meanwhile): free the first.
+                    Some(entry) => release(std::mem::replace(&mut entry.0, img).into_iter().collect(), cx),
                     // Forgotten meanwhile (evicted, or the grid closed): not kept.
                     None => release(img.into_iter().collect(), cx),
                 }
