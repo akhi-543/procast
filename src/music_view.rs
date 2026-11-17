@@ -478,18 +478,18 @@ impl Launcher {
         let sent = match act {
             MusicAct::Control(control) => return self.music_control(control, cx),
             MusicAct::Open(item) => return self.music_page(item, cx),
-            MusicAct::Play { video, playlist, radio } => return self.music_play(video, playlist, radio, cx),
+            MusicAct::Play { video, playlist, radio } => return self.music_play(video, playlist, radio, true, cx),
             MusicAct::Rate(op, video) => self.music_ask(|req| Some(ytmusic::rate(req, op, video.as_deref()))),
             MusicAct::AddToPlaylist(playlist, video) => {
                 let name = playlist_name(&self.music.playlists, &playlist);
                 self.music_add(&playlist, video.as_deref(), name)
             }
-            MusicAct::Current(link) => return self.music_link(link, cx),
+            MusicAct::Current(link) => return self.music_link(link, true, cx),
         };
         self.music_done(sent, cx);
     }
 
-    fn music_play(&mut self, video: Option<String>, playlist: Option<String>, radio: bool, cx: &mut Context<Self>) {
+    fn music_play(&mut self, video: Option<String>, playlist: Option<String>, radio: bool, hide: bool, cx: &mut Context<Self>) {
         if radio {
             let video = video.filter(|id| !id.is_empty()).or_else(|| nonempty(&self.music.video_id));
             let Some(video) = video else {
@@ -499,7 +499,9 @@ impl Launcher {
         } else {
             self.music_desktop(DesktopJob::Play { video, playlist });
         }
-        self.music_done(true, cx);
+        if hide {
+            self.music_done(true, cx);
+        }
     }
 
     fn music_add(&mut self, playlist: &str, video: Option<&str>, name: String) -> bool {
@@ -521,7 +523,7 @@ impl Launcher {
     }
 
     /// Copy URL uses desktop video/playlist ids. Open sends `changeVideo` for those ids.
-    fn music_link(&mut self, link: Link, cx: &mut Context<Self>) {
+    fn music_link(&mut self, link: Link, hide: bool, cx: &mut Context<Self>) {
         let video = nonempty(&self.music.video_id);
         let playlist = nonempty(&self.music.playlist_id);
         match link {
@@ -532,15 +534,16 @@ impl Launcher {
                 let url = ytmusic::watch_url(&video, playlist.as_deref().unwrap_or(""));
                 cx.write_to_clipboard(ClipboardItem::new_string(url));
                 let _ = self.tx.unbounded_send(Msg::Toast(true, "Copied".into()));
-                self.music_done(true, cx);
             }
             Link::Open => {
                 if video.is_none() && playlist.is_none() {
                     return self.music_fail("Nothing playing on YouTube Music", cx);
                 }
                 self.music_desktop(DesktopJob::Play { video, playlist });
-                self.music_done(true, cx);
             }
+        }
+        if hide {
+            self.music_done(true, cx);
         }
     }
 
@@ -852,7 +855,7 @@ impl Launcher {
             Action::Previous => {
                 self.music_send_control(Control::Previous);
             }
-            Action::Radio => self.music_play(None, None, true, cx),
+            Action::Radio => self.music_play(None, None, true, false, cx),
             Action::Add(playlist) => {
                 let name = playlist_name(&self.tray_playlists(), &playlist);
                 let sent = self.music_add(&playlist, None, name);
@@ -860,8 +863,8 @@ impl Launcher {
                     let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
                 }
             }
-            Action::Copy => self.music_link(Link::Copy, cx),
-            Action::Open => self.music_link(Link::Open, cx),
+            Action::Copy => self.music_link(Link::Copy, false, cx),
+            Action::Open => self.music_link(Link::Open, false, cx),
         }
     }
 }
