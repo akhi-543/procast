@@ -1,13 +1,11 @@
-// YouTube Music for procast: InnerTube calls with the browser's own signed-in session, and
-// control of the music.youtube.com tab. Loaded by background.js (importScripts) and by tests.
-//   {t: "ytm", req, op: "search" | "browse" | "like" | "dislike" | "unlike" | "addToPlaylist" | "play" | "control" | "current", ...}
-//     -> {t: "ytm", req, op, title, items: [{kind, id, playlistId, title, subtitle, thumb, duration}], current, error?}
+// YouTube Music for procast: InnerTube calls with the browser's own signed-in session.
+// Loaded by background.js (importScripts) and by tests.
+//   {t: "ytm", req, op: "search" | "browse" | "like" | "dislike" | "unlike" | "addToPlaylist" | "exportSession", ...}
+//     -> {t: "ytm", req, op, title, items: [{kind, id, playlistId, title, subtitle, thumb, duration}], current, cookies?, error?}
 
 (() => {
   const ORIGIN = "https://music.youtube.com";
   const RULE_ID = 1;
-  const NO_TAB = "Open music.youtube.com in this browser first";
-  const NOT_READY = "YouTube Music isn't ready in the tab yet";
   const SIGN_IN = "Sign in to music.youtube.com in this browser to see your library";
   const CONTEXT = { client: { clientName: "WEB_REMIX", clientVersion: "1.20241111.01.00", hl: "en" } };
   const FILTERS = {
@@ -17,7 +15,6 @@
     playlists: "EgWKAQIoAWoMEA4QChADEAQQCRAF",
   };
   const LIKES = { like: "like/like", dislike: "like/dislike", unlike: "like/removelike" };
-  const CONTROLS = ["volume", "volumeUp", "volumeDown", "mute", "unmute", "shuffle", "repeat"];
   const RENDERERS = ["musicTwoRowItemRenderer", "musicResponsiveListItemRenderer"];
   const PAGE_KINDS = {
     MUSIC_PAGE_TYPE_ALBUM: "album",
@@ -171,86 +168,9 @@
     }
   }
 
-  // ---- the music.youtube.com tab -----------------------------------------------------
-
-  async function findTab() {
-    const tabs = await chrome.tabs.query({ url: `${ORIGIN}/*` });
-    return tabs.find((t) => t.audible) ?? tabs[0];
-  }
-
-  async function requireTab() {
-    const tab = await findTab();
-    if (!tab) throw new Error(NO_TAB);
-    return tab;
-  }
-
-  async function inTab(tab, func, ...args) {
-    const [injected] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func, args });
-    return injected.result;
-  }
-
-  // Injected into the page: no access to anything outside the function.
-  function readPlayer() {
-    const player = document.getElementById("movie_player");
-    if (!player?.getVideoData) return null;
-    const data = player.getVideoData();
-    return {
-      videoId: data.video_id || "",
-      title: data.title || "",
-      artist: data.author || "",
-      playlistId: data.list || new URL(location.href).searchParams.get("list") || "",
-      volume: Math.round(player.getVolume()),
-      muted: player.isMuted(),
-    };
-  }
-
-  function applyControl(action, value) {
-    const player = document.getElementById("movie_player");
-    if (!player?.getVideoData) return false;
-    const click = (selector) => document.querySelector(selector)?.click();
-    const step = (sign) => Math.max(0, Math.min(100, player.getVolume() + sign * value));
-    switch (action) {
-      case "volume":
-        player.setVolume(value);
-        if (value > 0) player.unMute();
-        break;
-      case "volumeUp":
-        player.setVolume(step(1));
-        break;
-      case "volumeDown":
-        player.setVolume(step(-1));
-        break;
-      case "mute":
-        player.mute();
-        break;
-      case "unmute":
-        player.unMute();
-        break;
-      case "shuffle":
-        click("ytmusic-player-bar .shuffle");
-        break;
-      case "repeat":
-        click("ytmusic-player-bar .repeat");
-        break;
-    }
-    return true;
-  }
-
-  async function readCurrent(tab) {
-    const current = await inTab(tab, readPlayer);
-    if (!current) throw new Error(NOT_READY);
-    return current;
-  }
-
-  async function currentTrack() {
-    return readCurrent(await requireTab());
-  }
-
   async function videoIdOf(req) {
     if (req.videoId) return req.videoId;
-    const current = await currentTrack();
-    if (!current.videoId) throw new Error("Nothing is playing in YouTube Music");
-    return current.videoId;
+    throw new Error("Nothing is playing in YouTube Music");
   }
 
   function watchUrl({ videoId, playlistId, radio }) {
@@ -284,21 +204,9 @@
     return {};
   }
 
-  async function play(req) {
-    const videoId = req.videoId || (req.radio ? await videoIdOf(req) : "");
-    const url = watchUrl({ videoId, playlistId: req.playlistId, radio: req.radio });
-    const tab = await findTab();
-    if (tab) await chrome.tabs.update(tab.id, { url });
-    else await chrome.tabs.create({ url, active: false });
-    return {};
-  }
-
-  async function control({ action, value }) {
-    if (!CONTROLS.includes(action)) throw new Error(`Unknown control: ${action}`);
-    if (action === "volume" && typeof value !== "number") throw new Error("Missing volume");
-    const tab = await requireTab();
-    if (!(await inTab(tab, applyControl, action, value))) throw new Error(NOT_READY);
-    return { current: await readCurrent(tab) };
+  async function exportSession() {
+    const cookies = await chrome.cookies.getAll({ url: ORIGIN });
+    return { cookies: (cookies ?? []).map(({ name, value }) => ({ name, value })) };
   }
 
   async function run(req) {
@@ -314,12 +222,8 @@
         return {};
       case "addToPlaylist":
         return addToPlaylist(req);
-      case "play":
-        return play(req);
-      case "control":
-        return control(req);
-      case "current":
-        return { current: await currentTrack() };
+      case "exportSession":
+        return exportSession();
       default:
         throw new Error("unknown request");
     }
@@ -334,5 +238,5 @@
     }
   }
 
-  globalThis.ytm = { handle, setup, items, page, authorization, watchUrl };
+  globalThis.ytm = { handle, setup, items, page, FILTERS, authorization, watchUrl };
 })();

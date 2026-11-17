@@ -58,6 +58,88 @@ fn load_session_from(path: &Path) -> Option<Session> {
     Some(Session { cookies })
 }
 
+pub fn signed_in() -> bool {
+    load_session().is_some_and(|s| s.sapisid().is_some())
+}
+
+/// Writes `session.json` as a name → value object. Refuses to write when neither
+/// `SAPISID` nor `__Secure-3PAPISID` is present.
+pub fn save_session<'a>(cookies: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), String> {
+    save_session_to(&session_path(), cookies)
+}
+
+fn save_session_to<'a>(path: &Path, cookies: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), String> {
+    let mut map = BTreeMap::new();
+    for (name, value) in cookies {
+        if !name.is_empty() {
+            map.insert(name.to_string(), value.to_string());
+        }
+    }
+    let signed = ["SAPISID", "__Secure-3PAPISID"].iter().any(|n| map.get(*n).is_some_and(|v| !v.is_empty()));
+    if !signed {
+        return Err(SIGN_IN.to_string());
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|_| "Couldn't save the YouTube Music session".to_string())?;
+    }
+    let body = serde_json::to_vec(&map).map_err(|_| "Couldn't save the YouTube Music session".to_string())?;
+    fs::write(path, body).map_err(|_| "Couldn't save the YouTube Music session".to_string())?;
+    restrict_current_user(path);
+    Ok(())
+}
+
+/// Windows ACL equivalent of mode 600. Failures leave the file in place.
+fn restrict_current_user(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        let mut buf = vec![0u8; needed as usize];
+        if needed == 0 || GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), needed, &mut needed).is_err() {
+            let _ = CloseHandle(token);
+            return;
+        }
+        let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+        let sid_len = GetLengthSid(sid) as usize;
+        let acl_len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>().saturating_sub(4) + sid_len;
+        let mut acl = vec![0u8; acl_len.max(64)];
+        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+        let mask = (GENERIC_READ | GENERIC_WRITE).0;
+        if InitializeAcl(acl_ptr, acl.len() as u32, ACL_REVISION).is_err() || AddAccessAllowedAce(acl_ptr, ACL_REVISION, mask, sid).is_err() {
+            let _ = CloseHandle(token);
+            return;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let _ = SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl_ptr),
+            None,
+        );
+        let _ = CloseHandle(token);
+    }
+}
+
+fn authorization_header(session: &Session, ts: u64) -> Option<String> {
+    session.sapisid().map(|sid| authorization(sid, ts))
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into()
 }
@@ -142,8 +224,8 @@ fn call(endpoint: &str, rest: Value) -> Result<Value, String> {
     let url = format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false");
     let mut req = agent().post(&url).header("Content-Type", "application/json").header("X-Origin", ORIGIN).header("X-Goog-AuthUser", "0");
     if let Some(session) = load_session() {
-        if let Some(sid) = session.sapisid().map(str::to_owned) {
-            req = req.header("Authorization", authorization(&sid, unix_secs())).header("Cookie", session.cookie_header());
+        if let Some(header) = authorization_header(&session, unix_secs()) {
+            req = req.header("Authorization", header).header("Cookie", session.cookie_header());
         }
     }
     let mut resp = req.send(body.to_string()).map_err(|_| UNREACHABLE.to_string())?;
@@ -175,7 +257,6 @@ pub fn browse(id: &str) -> Result<Reply, String> {
     Ok(browse_reply(id, &json, require_session(load_session()).is_ok()))
 }
 
-#[allow(dead_code)]
 pub fn rate(op: &str, video_id: &str) -> Result<Reply, String> {
     rate_with(load_session(), op, video_id)
 }
@@ -192,7 +273,6 @@ fn rate_with(session: Option<Session>, op: &str, video_id: &str) -> Result<Reply
     Ok(Reply { op: op.into(), ..Default::default() })
 }
 
-#[allow(dead_code)]
 pub fn add_to_playlist(playlist_id: &str, video_id: &str) -> Result<Reply, String> {
     add_to_playlist_with(load_session(), playlist_id, video_id)
 }
@@ -218,6 +298,19 @@ mod tests {
     #[test]
     fn sapisidhash_matches_the_node_vector() {
         assert_eq!(authorization("secret", 1700000000), "SAPISIDHASH 1700000000_d2a0deeb95ea263a68778d9e9ac8840dce59d800");
+    }
+
+    #[test]
+    fn session_file_with_sapisid_produces_authorization() {
+        let dir = std::env::temp_dir().join(format!("procast-ytmusic-auth-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("session.json");
+        fs::write(&path, r#"{"SAPISID":"secret"}"#).unwrap();
+        let session = load_session_from(&path).unwrap();
+        let header = authorization_header(&session, 1_700_000_000).expect("SAPISIDHASH from the temp session");
+        assert!(header.starts_with("SAPISIDHASH 1700000000_"));
+        assert_eq!(header.len(), "SAPISIDHASH 1700000000_".len() + 40);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -53,6 +53,14 @@ fn percent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     Ok(f64::deserialize(d)?.round().clamp(0., 100.) as u32)
 }
 
+/// A cookie name and value from `exportSession`.
+#[derive(Clone, Debug, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+}
+
 /// The companion's answer to one request.
 #[derive(Clone, Debug, PartialEq, Deserialize, Default)]
 #[serde(default)]
@@ -62,6 +70,7 @@ pub struct Reply {
     pub title: String,
     pub items: Vec<MusicItem>,
     pub current: Option<Current>,
+    pub cookies: Vec<Cookie>,
     pub error: Option<String>,
 }
 
@@ -498,6 +507,7 @@ pub fn browse(req: u64, id: &str) -> Value {
 }
 
 /// `op` is "like", "dislike" or "unlike". Without `video` it rates the track now playing.
+#[allow(dead_code)]
 pub fn rate(req: u64, op: &str, video: Option<&str>) -> Value {
     let mut v = json!({"t": "ytm", "req": req, "op": op});
     if let Some(video) = video {
@@ -506,6 +516,7 @@ pub fn rate(req: u64, op: &str, video: Option<&str>) -> Value {
     v
 }
 
+#[allow(dead_code)]
 pub fn add_to_playlist(req: u64, playlist_id: &str, video: Option<&str>) -> Value {
     let mut v = json!({"t": "ytm", "req": req, "op": "addToPlaylist", "playlistId": playlist_id.strip_prefix("VL").unwrap_or(playlist_id)});
     if let Some(video) = video {
@@ -514,45 +525,8 @@ pub fn add_to_playlist(req: u64, playlist_id: &str, video: Option<&str>) -> Valu
     v
 }
 
-/// With `radio` and no `video`, the radio of the track now playing.
-#[allow(dead_code)]
-pub fn play(req: u64, video: Option<&str>, playlist: Option<&str>, radio: bool) -> Value {
-    let mut v = json!({"t": "ytm", "req": req, "op": "play"});
-    if let Some(video) = video {
-        v["videoId"] = video.into();
-    }
-    if let Some(playlist) = playlist {
-        v["playlistId"] = playlist.into();
-    }
-    if radio {
-        v["radio"] = true.into();
-    }
-    v
-}
-
-#[allow(dead_code)]
-pub fn current(req: u64) -> Value {
-    json!({"t": "ytm", "req": req, "op": "current"})
-}
-
-/// None for the controls that go through the Windows media session instead.
-#[allow(dead_code)]
-pub fn control(req: u64, control: Control, step: u32) -> Option<Value> {
-    let action = |action: &str| json!({"t": "ytm", "req": req, "op": "control", "action": action});
-    let valued = |action: &str, value: u32| json!({"t": "ytm", "req": req, "op": "control", "action": action, "value": value});
-    match control {
-        Control::PlayPause | Control::Next | Control::Previous => None,
-        Control::Like => Some(rate(req, "like", None)),
-        Control::Dislike => Some(rate(req, "dislike", None)),
-        Control::Mute => Some(action("mute")),
-        Control::VolumeLow => Some(valued("volume", 33)),
-        Control::VolumeMedium => Some(valued("volume", 66)),
-        Control::VolumeHigh => Some(valued("volume", 100)),
-        Control::VolumeUp => Some(valued("volumeUp", step)),
-        Control::VolumeDown => Some(valued("volumeDown", step)),
-        Control::Shuffle => Some(action("shuffle")),
-        Control::Repeat => Some(action("repeat")),
-    }
+pub fn export_session(req: u64) -> Value {
+    json!({"t": "ytm", "req": req, "op": "exportSession"})
 }
 
 pub fn watch_url(video: &str, playlist: &str) -> String {
@@ -641,21 +615,11 @@ mod tests {
         assert_eq!(rate(3, "unlike", Some("abc")), json!({"t": "ytm", "req": 3, "op": "unlike", "videoId": "abc"}));
         assert_eq!(add_to_playlist(4, "VLPL1", Some("abc")), json!({"t": "ytm", "req": 4, "op": "addToPlaylist", "playlistId": "PL1", "videoId": "abc"}));
         assert_eq!(add_to_playlist(4, "PL1", None), json!({"t": "ytm", "req": 4, "op": "addToPlaylist", "playlistId": "PL1"}));
-        assert_eq!(play(5, Some("abc"), None, false), json!({"t": "ytm", "req": 5, "op": "play", "videoId": "abc"}));
-        assert_eq!(play(5, None, Some("PL1"), false), json!({"t": "ytm", "req": 5, "op": "play", "playlistId": "PL1"}));
-        assert_eq!(play(5, None, None, true), json!({"t": "ytm", "req": 5, "op": "play", "radio": true}));
-        assert_eq!(current(6), json!({"t": "ytm", "req": 6, "op": "current"}));
+        assert_eq!(export_session(6), json!({"t": "ytm", "req": 6, "op": "exportSession"}));
     }
 
     #[test]
-    fn controls_map_to_requests() {
-        let sent = |c| control(9, c, 10);
-        assert_eq!(sent(Control::Mute), Some(json!({"t": "ytm", "req": 9, "op": "control", "action": "mute"})));
-        assert_eq!(sent(Control::VolumeLow), Some(json!({"t": "ytm", "req": 9, "op": "control", "action": "volume", "value": 33})));
-        assert_eq!(sent(Control::VolumeUp), Some(json!({"t": "ytm", "req": 9, "op": "control", "action": "volumeUp", "value": 10})));
-        assert_eq!(sent(Control::Shuffle), Some(json!({"t": "ytm", "req": 9, "op": "control", "action": "shuffle"})));
-        assert_eq!(sent(Control::Like), Some(json!({"t": "ytm", "req": 9, "op": "like"})));
-        assert_eq!(sent(Control::Next), None);
+    fn controls_keep_their_labels() {
         assert_eq!(Control::VolumeDown.subtitle(15), "Decrease the volume by 15%");
         assert_eq!(Control::ALL.len(), 13);
     }

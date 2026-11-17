@@ -78,6 +78,8 @@ pub enum Cmd {
     BrowserSetup,
     /// Open a YouTube Music screen.
     YtMusic(Screen),
+    /// Copy signed-in cookies from the companion into `session.json`.
+    YtImportSession,
     /// Control YouTube Music playback, from anywhere.
     YtControl(Control),
     Desktop(Desk),
@@ -148,6 +150,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::YtMusic(Screen::Library), "YouTube Music Library", "youtube music liked songs albums playlists artists", g::BULLETS),
     (Cmd::YtMusic(Screen::NowPlaying), "YouTube Music Now Playing", "youtube music current track song playing", g::PLAY),
     (Cmd::YtMusic(Screen::QuickActions), "YouTube Music Quick Actions", "youtube music controls volume like shuffle repeat", g::SLIDERS_HORIZONTAL),
+    (Cmd::YtImportSession, "Import YouTube Music Session", "youtube music cookies library sign in session", g::DOWNLOAD),
     (Cmd::YtControl(Control::PlayPause), "Play/Pause Music", "youtube music song resume stop toggle", g::PLAY),
     (Cmd::YtControl(Control::Next), "Next Track", "youtube music song skip forward", g::FORWARD),
     (Cmd::YtControl(Control::Previous), "Previous Track", "youtube music song skip back", g::BACK),
@@ -252,6 +255,7 @@ impl Cmd {
     pub fn key(self) -> String {
         match self {
             Cmd::YtMusic(screen) => format!("ytm:{}", screen.slug()),
+            Cmd::YtImportSession => "ytm:import".into(),
             Cmd::YtControl(control) => format!("ytm:{}", control.slug()),
             _ => format!("cmd:{self:?}"),
         }
@@ -267,7 +271,7 @@ impl Cmd {
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
-            Cmd::YtMusic(_) | Cmd::YtControl(_) => "YouTube Music",
+            Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => "YouTube Music",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -279,7 +283,7 @@ impl Cmd {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi | Cmd::YtMusic(_) | Cmd::YtControl(_) => Tint::Web,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -317,7 +321,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::YtMusic(_) | Cmd::YtControl(_) => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
         }
     }
     Ok(None)
@@ -801,11 +805,12 @@ mod tests {
 
     #[test]
     fn music_commands_are_listed_with_their_own_keys() {
-        let music: Vec<_> = ALL.iter().filter(|(c, ..)| matches!(c, Cmd::YtMusic(_) | Cmd::YtControl(_))).collect();
-        assert_eq!(music.len(), 4 + Control::ALL.len());
+        let music: Vec<_> = ALL.iter().filter(|(c, ..)| matches!(c, Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_))).collect();
+        assert_eq!(music.len(), 5 + Control::ALL.len());
         assert!(Control::ALL.iter().all(|&c| music.iter().any(|&&(cmd, ..)| cmd == Cmd::YtControl(c))));
         assert!(music.iter().all(|&&(c, ..)| c.subtitle() == "YouTube Music" && c.key().starts_with("ytm:")));
         assert_eq!(Cmd::YtMusic(Screen::QuickActions).key(), "ytm:actions");
+        assert_eq!(Cmd::YtImportSession.key(), "ytm:import");
         assert_eq!(Cmd::YtControl(Control::PlayPause).key(), "ytm:play-pause");
         assert_eq!(Cmd::Lock.key(), "cmd:Lock");
         let mut keys: Vec<String> = ALL.iter().map(|&(c, ..)| c.key()).collect();

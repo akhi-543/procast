@@ -300,7 +300,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled
             || cmd == Cmd::SearchFiles && !cfg.files.enabled
             || matches!(cmd, Cmd::Desktop(_)) && !desktops::supported()
-            || matches!(cmd, Cmd::YtMusic(_) | Cmd::YtControl(_)) && !cfg.ytmusic.enabled
+            || matches!(cmd, Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_)) && !cfg.ytmusic.enabled
         {
             continue;
         }
@@ -899,9 +899,9 @@ mod tests {
     fn music_commands_follow_the_setting() {
         let count = |toml: &str| {
             let cat = catalog(&[], &[], &[], &crate::config::parse(toml).unwrap());
-            cat.iter().filter(|it| matches!(it.act, Act::Cmd(Cmd::YtMusic(_) | Cmd::YtControl(_)))).count()
+            cat.iter().filter(|it| matches!(it.act, Act::Cmd(Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_)))).count()
         };
-        assert_eq!(count(""), 17);
+        assert_eq!(count(""), 18);
         assert_eq!(count("[ytmusic]\nenabled = false"), 0);
     }
 }

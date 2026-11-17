@@ -82,9 +82,30 @@ test("watch urls", () => {
 });
 
 test("every reply echoes the request and reports failures", async () => {
-  const signedOut = load({ cookies: { get: async () => null }, tabs: { query: async () => [] } });
-  const reply = await signedOut.handle({ t: "ytm", req: 7, op: "current" });
-  assert.deepEqual(JSON.parse(JSON.stringify(reply)), { t: "ytm", req: 7, op: "current", title: "", items: [], current: null, error: "Open music.youtube.com in this browser first" });
+  const reply = await load().handle({ t: "ytm", req: 7, op: "nope" });
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), { t: "ytm", req: 7, op: "nope", title: "", items: [], current: null, error: "unknown request" });
+});
+
+test("exportSession returns cookie names and values", async () => {
+  const chrome = {
+    cookies: {
+      getAll: async ({ url }) => {
+        assert.equal(url, "https://music.youtube.com");
+        return [
+          { name: "SAPISID", value: "one", domain: ".youtube.com" },
+          { name: "PREF", value: "two" },
+        ];
+      },
+    },
+  };
+  const reply = await load(chrome).handle({ t: "ytm", req: 9, op: "exportSession" });
+  assert.equal(reply.error, undefined);
+  assert.equal(reply.req, 9);
+  assert.equal(reply.op, "exportSession");
+  assert.equal(reply.cookies.length, 2);
+  assert.equal(reply.cookies[0].name, "SAPISID");
+  assert.equal(reply.cookies[1].name, "PREF");
+  assert.ok(Object.keys(reply.cookies[0]).join(",") === "name,value");
 });
 
 test("a signed-out library asks to sign in", async () => {
@@ -147,21 +168,6 @@ test("a failed playlist edit is an error", async () => {
   assert.equal(reply.error, "Couldn't add to the playlist");
   const done = recording({}, ok({ status: "STATUS_SUCCEEDED" }));
   assert.equal((await done.ytm.handle({ t: "ytm", req: 1, op: "addToPlaylist", playlistId: "PL1", videoId: "abc" })).error, undefined);
-});
-
-function tabWith(result) {
-  const chrome = { tabs: { query: async () => [{ id: 3 }] }, scripting: { executeScript: async () => [{ result }] } };
-  return load(chrome);
-}
-
-test("a tab without a player isn't ready", async () => {
-  const notReady = "YouTube Music isn't ready in the tab yet";
-  assert.equal((await tabWith(null).handle({ t: "ytm", req: 1, op: "current" })).error, notReady);
-  assert.equal((await tabWith(false).handle({ t: "ytm", req: 1, op: "control", action: "mute" })).error, notReady);
-});
-
-test("volume needs a value", async () => {
-  assert.equal((await tabWith(true).handle({ t: "ytm", req: 1, op: "control", action: "volume" })).error, "Missing volume");
 });
 
 test("setup never throws", async () => {

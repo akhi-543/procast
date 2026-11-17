@@ -105,7 +105,7 @@ extensions run, so these figures are for a fresh start.<br>
 **YouTube Music**
 - Search songs, albums, artists and playlists; browse your library (albums, playlists, artists, liked songs) in a cover grid
 - Now Playing and Quick Actions (like, dislike, play/pause, next, previous, volume, shuffle, repeat), each bindable to a hotkey
-- Optional tray player; runs inside procast with no extra process, and controls music.youtube.com in Chrome, Edge or Brave
+- Optional tray player; the desktop YouTube Music app plays, search runs in-process, and **Import YouTube Music Session** is optional for the full library
 
 **AI**: Quick AI from the search bar with follow-ups, running the Claude Agent SDK on your own Claude Code login
 
@@ -222,7 +222,7 @@ Press <kbd>Alt</kbd>+<kbd>Space</kbd>. procast lives in the tray and can start a
 - Whole-drive file search: run **Enable Fast File Search** once (asks for admin), then turn on Settings → Files → Search whole drives
 - Extensions: **Browse Extension Store**, or **Install Extension** with a store name (`obsidian`) or a local folder
 - Browser tabs: run **Set Up Browser Extension**, then in Chrome, Edge or Brave load `%APPDATA%\procast\browser-extension` with "Load unpacked"
-- YouTube Music: run **Set Up Browser Extension** (or click Reload on it in `chrome://extensions` if it's already loaded, so it gets the new permissions), sign in to music.youtube.com in that browser, then run **YouTube Music Library**. Settings → YouTube Music turns on the tray player
+- YouTube Music: play in the desktop YouTube Music app; search does not need Chrome. Optionally run **Set Up Browser Extension**, reload it once after an update, then **Import YouTube Music Session** for the full library. Settings → YouTube Music turns on the tray player
 - Quick AI: sign in to [Claude Code](https://claude.com/claude-code) once; procast uses that login
 
 Settings live in `%APPDATA%\procast\config.toml`. Edit them in the Settings window or by hand; changes apply within two seconds.

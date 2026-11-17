@@ -10,7 +10,6 @@ use std::{
 };
 
 use gpui::{ClipboardItem, Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, Window, div, img};
-use serde_json::Value;
 use tray_icon::TrayIcon;
 
 use crate::{
@@ -38,6 +37,7 @@ const TYPING_PAUSE: Duration = Duration::from_millis(300);
 const COVER_REFRESH: Duration = Duration::from_millis(100);
 
 const NO_BROWSER: &str = "No browser connected: run Set Up Browser Extension";
+const IMPORT_SESSION: &str = "Import YouTube Music Session";
 
 const CELL_PAD: f32 = 6.;
 const CELL_GAP: f32 = 4.;
@@ -522,18 +522,26 @@ impl Launcher {
     }
 
     pub fn music_act(&mut self, act: MusicAct, cx: &mut Context<Self>) {
-        let sent = match act {
-            MusicAct::Control(control) => return self.music_control(control, cx),
-            MusicAct::Open(item) => return self.music_page(item, cx),
-            MusicAct::Play { video, playlist, radio } => return self.music_play(video, playlist, radio, true, cx),
-            MusicAct::Rate(op, video) => self.music_ask(|req| Some(ytmusic::rate(req, op, video.as_deref()))),
+        match act {
+            MusicAct::Control(control) => self.music_control(control, cx),
+            MusicAct::Open(item) => self.music_page(item, cx),
+            MusicAct::Play { video, playlist, radio } => self.music_play(video, playlist, radio, true, cx),
+            MusicAct::Rate(op, video) => self.music_rate(op, video, cx),
             MusicAct::AddToPlaylist(playlist, video) => {
                 let name = playlist_name(&self.music.playlists, &playlist);
-                self.music_add(&playlist, video.as_deref(), name)
+                self.music_add(&playlist, video.as_deref(), name, true, cx);
             }
-            MusicAct::Current(link) => return self.music_link(link, true, cx),
-        };
-        self.music_done(sent, cx);
+            MusicAct::Current(link) => self.music_link(link, true, cx),
+        }
+    }
+
+    pub fn music_import_session(&mut self, cx: &mut Context<Self>) {
+        self.music.req += 1;
+        let req = self.music.req;
+        if !self.browsers.ask(None, ytmusic::export_session(req)) {
+            let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
+        }
+        self.hide(true, cx);
     }
 
     fn music_play(&mut self, video: Option<String>, playlist: Option<String>, radio: bool, hide: bool, cx: &mut Context<Self>) {
@@ -551,12 +559,64 @@ impl Launcher {
         }
     }
 
-    fn music_add(&mut self, playlist: &str, video: Option<&str>, name: String) -> bool {
-        let sent = self.music_ask(|req| Some(ytmusic::add_to_playlist(req, playlist, video)));
-        if sent {
-            self.music.added.insert(self.music.req, name);
+    fn music_rate(&mut self, op: &'static str, video: Option<String>, cx: &mut Context<Self>) {
+        let video = video.filter(|id| !id.is_empty());
+        let current = nonempty(&self.music.video_id);
+        let on_now = video.as_ref().map_or(true, |id| current.as_ref() == Some(id));
+        if on_now {
+            match op {
+                "like" => return self.music_control(Control::Like, cx),
+                "dislike" => return self.music_control(Control::Dislike, cx),
+                "unlike" => {
+                    let _ = self.tx.unbounded_send(Msg::Toast(false, IMPORT_SESSION.into()));
+                    return self.music_done(true, cx);
+                }
+                _ => {}
+            }
         }
-        sent
+        let Some(video) = video else {
+            let _ = self.tx.unbounded_send(Msg::Toast(false, IMPORT_SESSION.into()));
+            return self.music_done(true, cx);
+        };
+        if !ytmusic_api::signed_in() {
+            let _ = self.tx.unbounded_send(Msg::Toast(false, IMPORT_SESSION.into()));
+            return self.music_done(true, cx);
+        }
+        self.music_innertube(op.to_string(), None, move || ytmusic_api::rate(op, &video));
+        self.music_done(true, cx);
+    }
+
+    fn music_add(&mut self, playlist: &str, video: Option<&str>, name: String, hide: bool, cx: &mut Context<Self>) {
+        let video = video.filter(|id| !id.is_empty()).map(str::to_string).or_else(|| nonempty(&self.music.video_id));
+        let Some(video) = video else {
+            return self.music_fail("Nothing playing on YouTube Music", cx);
+        };
+        if !ytmusic_api::signed_in() {
+            let _ = self.tx.unbounded_send(Msg::Toast(false, IMPORT_SESSION.into()));
+            if hide {
+                self.music_done(true, cx);
+            }
+            return;
+        }
+        let playlist = playlist.to_string();
+        self.music_innertube("addToPlaylist".into(), Some(name), move || ytmusic_api::add_to_playlist(&playlist, &video));
+        if hide {
+            self.music_done(true, cx);
+        }
+    }
+
+    fn music_innertube(&mut self, op: String, added: Option<String>, job: impl FnOnce() -> Result<Reply, String> + Send + 'static) {
+        self.music.req += 1;
+        let req = self.music.req;
+        if let Some(name) = added {
+            self.music.added.insert(req, name);
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut reply = job().unwrap_or_else(|error| Reply { op, error: Some(error), ..Default::default() });
+            reply.req = req;
+            let _ = tx.unbounded_send(Msg::Music(reply));
+        });
     }
 
     fn music_control(&mut self, control: Control, cx: &mut Context<Self>) {
@@ -612,12 +672,6 @@ impl Launcher {
                 let _ = self.tx.unbounded_send(Msg::Toast(toast.0, toast.1));
             }
         }
-    }
-
-    /// Sends a request to the newest connected browser; false if there is none.
-    fn music_ask(&mut self, request: impl FnOnce(u64) -> Option<Value>) -> bool {
-        self.music.req += 1;
-        request(self.music.req).is_some_and(|request| self.browsers.ask(None, request))
     }
 
     /// Asks for what the view shows. It goes out when the companion has answered what it was
@@ -767,6 +821,18 @@ impl Launcher {
     }
 
     pub fn music_reply(&mut self, reply: Reply, cx: &mut Context<Self>) {
+        if reply.op == "exportSession" {
+            let toast = if let Some(error) = reply.error {
+                (false, error)
+            } else {
+                match ytmusic_api::save_session(reply.cookies.iter().map(|c| (c.name.as_str(), c.value.as_str()))) {
+                    Ok(()) => (true, "Imported YouTube Music session".into()),
+                    Err(error) => (false, error),
+                }
+            };
+            let _ = self.tx.unbounded_send(Msg::Toast(toast.0, toast.1));
+            return;
+        }
         if matches!(reply.op.as_str(), "search" | "browse") {
             let flight = self.music.relay.landed(reply.req);
             if let Some(shelf) = flight.and_then(|flight| flight.shelf).filter(|_| reply.error.is_none()) {
@@ -920,10 +986,7 @@ impl Launcher {
             Action::Radio => self.music_play(None, None, true, false, cx),
             Action::Add(playlist) => {
                 let name = playlist_name(&self.tray_playlists(), &playlist);
-                let sent = self.music_add(&playlist, None, name);
-                if !sent {
-                    let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
-                }
+                self.music_add(&playlist, None, name, false, cx);
             }
             Action::Copy => self.music_link(Link::Copy, false, cx),
             Action::Open => self.music_link(Link::Open, false, cx),
@@ -1064,6 +1127,7 @@ fn toast(reply: &Reply, volume: bool, added: Option<&str>) -> Option<(bool, Stri
     match reply.op.as_str() {
         "like" => Some((true, "Liked".into())),
         "dislike" => Some((true, "Disliked".into())),
+        "unlike" => Some((true, "Removed like".into())),
         "addToPlaylist" => Some((true, added.filter(|name| !name.is_empty()).map_or_else(|| "Added to playlist".into(), |name| format!("Added to {name}")))),
         "control" if volume => reply.current.as_ref().map(|c| (true, if c.muted { "Muted".into() } else { format!("Volume {}%", c.volume) })),
         _ => None,

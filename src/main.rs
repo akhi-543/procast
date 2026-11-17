@@ -1803,6 +1803,7 @@ impl Launcher {
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
             Act::Cmd(Cmd::SearchTabs) => return self.set_mode(Mode::Tabs, cx),
             Act::Cmd(Cmd::YtMusic(screen)) => return self.music_open(screen, cx),
+            Act::Cmd(Cmd::YtImportSession) => return self.music_import_session(cx),
             Act::Cmd(Cmd::YtControl(control)) => return self.music_act(music_view::MusicAct::Control(control), cx),
             Act::Music(act) => return self.music_act(act, cx),
             Act::Cmd(Cmd::BrowserSetup) => {
