@@ -91,6 +91,8 @@ pub enum Msg {
     Browser(u32, crate::browser::Reply),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
+    /// A menu item of the YouTube Music tray icon was clicked (see music_tray.rs): its id.
+    TrayMusic(String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
     /// A command's result (true) or why it failed (false): shown as a toast that fades away.

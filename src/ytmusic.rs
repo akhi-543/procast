@@ -300,7 +300,6 @@ pub fn play(req: u64, video: Option<&str>, playlist: Option<&str>, radio: bool) 
     v
 }
 
-#[allow(dead_code)]
 pub fn current(req: u64) -> Value {
     json!({"t": "ytm", "req": req, "op": "current"})
 }

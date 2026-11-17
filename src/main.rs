@@ -11,6 +11,7 @@ mod ext;
 mod files;
 mod keys;
 mod media;
+mod music_tray;
 mod music_view;
 mod net;
 mod ntfs;
@@ -2155,6 +2156,7 @@ impl Launcher {
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
+                self.music_tray_sync();
                 self.notice = None;
             }
             Err(e) => self.notice = Some(e),
@@ -2325,6 +2327,7 @@ impl Launcher {
                     self.refresh(cx);
                 }
             }
+            Msg::TrayMusic(id) => self.music_tray_act(&id),
             Msg::TrayExt(run, f) => {
                 if !f.is_empty() {
                     self.send(json!({"t": "event", "run": run, "fn": f, "args": [{"type": "left-click"}]}));
@@ -3353,6 +3356,10 @@ fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
             }
             return;
         }
+        if let Some(msg) = music_tray::message(&e.id.0) {
+            let _ = menu_tx.unbounded_send(msg);
+            return;
+        }
         let cmd = match &e.id {
             id if *id == ids.0 => TrayCmd::Open,
             id if *id == ids.1 => TrayCmd::Settings,
@@ -3465,6 +3472,7 @@ fn main() {
             win::cloak(this.hwnd, true);
             window.set_visible(true);
             this.tray_icon = tray;
+            this.music_tray_sync();
             this.scan_apps(true, false);
             // For screenshots and checks of the settings window without clicking through.
             if std::env::var_os("PROCAST_OPEN_SETTINGS").is_some() {

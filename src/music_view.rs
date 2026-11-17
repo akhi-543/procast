@@ -9,8 +9,9 @@ use std::{
     time::Duration,
 };
 
-use gpui::{Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, Window, div, img};
+use gpui::{ClipboardItem, Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, Window, div, img};
 use serde_json::Value;
+use tray_icon::TrayIcon;
 
 use crate::{
     Launcher, Mode, Tone,
@@ -18,9 +19,10 @@ use crate::{
     design::{self, Tokens, g, px},
     empty_row, ext,
     media::{Media, NowPlaying, Transport},
+    music_tray::{self, Action},
     net,
     search::{self, Act, Icon, Item},
-    win::Msg,
+    win::{self, Msg},
     ytmusic::{self, Control, Filter, Kind, MusicItem, Reply, Screen, Shelf},
 };
 
@@ -33,12 +35,22 @@ const TYPING_PAUSE: Duration = Duration::from_millis(300);
 /// Arrived covers redraw the list at most this often.
 const COVER_REFRESH: Duration = Duration::from_millis(100);
 
+const NO_BROWSER: &str = "No browser connected: run Set Up Browser Extension";
+const HOME: &str = "https://music.youtube.com/";
+
 const CELL_PAD: f32 = 6.;
 const CELL_GAP: f32 = 4.;
 const TITLE_HEIGHT: f32 = 20.;
 const SUBTITLE_HEIGHT: f32 = 18.;
 /// The grid's horizontal padding (both sides) and the window's border.
 const GRID_INSET: f32 = 18.;
+
+/// What to do with the link of the track now playing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Link {
+    Copy,
+    Open,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MusicAct {
@@ -49,6 +61,7 @@ pub enum MusicAct {
     /// A playlist id and a video (None: the track now playing).
     AddToPlaylist(String, Option<String>),
     Control(Control),
+    Current(Link),
 }
 
 impl MusicAct {
@@ -61,6 +74,8 @@ impl MusicAct {
             Self::Rate(..) => "Like",
             Self::AddToPlaylist(..) => "Add to Playlist",
             Self::Control(control) => control.title(),
+            Self::Current(Link::Copy) => "Copy URL",
+            Self::Current(Link::Open) => "Open in YouTube Music",
         }
     }
 }
@@ -159,6 +174,8 @@ pub struct MusicState {
     volume_reqs: HashSet<u64>,
     /// Add to Playlist requests in flight, with the playlist's name.
     added: HashMap<u64, String>,
+    /// `current` requests in flight: their replies say which track to link to.
+    links: HashMap<u64, Link>,
     view: View,
     /// The playlists in the library, for the Add to Playlist actions.
     playlists: Vec<MusicItem>,
@@ -168,6 +185,7 @@ pub struct MusicState {
     /// A refresh for arrived covers is already waiting.
     refresh_due: bool,
     now: Option<NowPlaying>,
+    tray: Option<TrayIcon>,
 }
 
 impl MusicState {
@@ -393,34 +411,70 @@ impl Launcher {
             MusicAct::Play { video, playlist, radio } => self.music_ask(|req| Some(ytmusic::play(req, video.as_deref(), playlist.as_deref(), radio))),
             MusicAct::Rate(op, video) => self.music_ask(|req| Some(ytmusic::rate(req, op, video.as_deref()))),
             MusicAct::AddToPlaylist(playlist, video) => {
-                let sent = self.music_ask(|req| Some(ytmusic::add_to_playlist(req, &playlist, video.as_deref())));
-                if sent {
-                    let name = self.music.playlists.iter().find(|item| item.id == playlist).map(|item| item.title.clone());
-                    self.music.added.insert(self.music.req, name.unwrap_or_default());
-                }
-                sent
+                let name = playlist_name(&self.music.playlists, &playlist);
+                self.music_add(&playlist, video.as_deref(), name)
             }
+            MusicAct::Current(link) => self.music_link(link),
         };
         self.music_done(sent, cx);
     }
 
+    fn music_add(&mut self, playlist: &str, video: Option<&str>, name: String) -> bool {
+        let sent = self.music_ask(|req| Some(ytmusic::add_to_playlist(req, playlist, video)));
+        if sent {
+            self.music.added.insert(self.music.req, name);
+        }
+        sent
+    }
+
     fn music_control(&mut self, control: Control, cx: &mut Context<Self>) {
-        let step = self.cfg.ytmusic.volume_step;
-        let sent = match transport(control) {
-            Some(transport) => {
-                self.media().send(transport);
-                true
-            }
-            None => {
-                self.media();
-                let sent = self.music_ask(|req| ytmusic::control(req, control, step));
-                if sent && announces_volume(control) {
-                    self.music.volume_reqs.insert(self.music.req);
-                }
-                sent
-            }
-        };
+        let sent = self.music_send_control(control);
         self.music_done(sent, cx);
+    }
+
+    fn music_send_control(&mut self, control: Control) -> bool {
+        let step = self.cfg.ytmusic.volume_step;
+        if let Some(transport) = transport(control) {
+            self.media().send(transport);
+            return true;
+        }
+        self.media();
+        let sent = self.music_ask(|req| ytmusic::control(req, control, step));
+        if sent && announces_volume(control) {
+            self.music.volume_reqs.insert(self.music.req);
+        }
+        sent
+    }
+
+    /// Asks the browser which track plays, to copy or open its link when it answers. Opening
+    /// without a browser goes to YouTube Music's home page; false when copying has nothing to ask.
+    fn music_link(&mut self, link: Link) -> bool {
+        let sent = self.music_ask(|req| Some(ytmusic::current(req)));
+        if sent {
+            self.music.links.insert(self.music.req, link);
+        } else if link == Link::Open {
+            win::open(HOME);
+            return true;
+        }
+        sent
+    }
+
+    fn music_linked(&mut self, link: Link, reply: &Reply, cx: &mut Context<Self>) {
+        let url = current_url(reply);
+        let toast = match (link, url) {
+            (Link::Open, url) => {
+                win::open(url.as_deref().unwrap_or(HOME));
+                None
+            }
+            (Link::Copy, Some(url)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url));
+                Some((true, "Copied".to_string()))
+            }
+            (Link::Copy, None) => Some((false, reply.error.clone().unwrap_or_else(|| "Nothing playing on YouTube Music".into()))),
+        };
+        if let Some((ok, text)) = toast {
+            let _ = self.tx.unbounded_send(Msg::Toast(ok, text));
+        }
     }
 
     /// Sends a request to the newest connected browser; false if there is none.
@@ -457,7 +511,7 @@ impl Launcher {
 
     fn music_done(&mut self, sent: bool, cx: &mut Context<Self>) {
         if !sent {
-            let message = "No browser connected: run Set Up Browser Extension".to_string();
+            let message = NO_BROWSER.to_string();
             if self.visible && self.mode == Mode::Music {
                 self.status = Some((Tone::Error, message));
                 return cx.notify();
@@ -567,6 +621,7 @@ impl Launcher {
                 ytmusic::save_cached(shelf.browse_id(), &reply.items);
                 if shelf == Shelf::Playlists {
                     self.music.playlists.clone_from(&reply.items);
+                    self.music_tray_refresh();
                 }
             }
             if self.music.view.pending == Some(reply.req) {
@@ -574,6 +629,9 @@ impl Launcher {
             }
             self.music_send();
             return;
+        }
+        if let Some(link) = self.music.links.remove(&reply.req) {
+            return self.music_linked(link, &reply, cx);
         }
         let volume = self.music.volume_reqs.remove(&reply.req);
         let added = self.music.added.remove(&reply.req);
@@ -634,11 +692,80 @@ impl Launcher {
     }
 
     pub fn music_now(&mut self, now: Option<NowPlaying>, cx: &mut Context<Self>) {
+        let changed = self.music.now != now;
         self.music.now = now;
+        if changed {
+            self.music_tray_refresh();
+        }
         if self.visible && self.mode == Mode::Music && self.music.screen == Screen::NowPlaying {
             self.refresh(cx);
         }
     }
+
+    /// Brings the tray icon in line with the config: there is one while YouTube Music and its tray are on.
+    pub fn music_tray_sync(&mut self) {
+        let wanted = self.cfg.ytmusic.enabled && self.cfg.ytmusic.tray;
+        if wanted && self.music.tray.is_none() {
+            self.media();
+            let playlists = self.tray_playlists();
+            self.music.tray = music_tray::create(self.music.now.as_ref(), &playlists);
+            if self.music.tray.is_some() && self.tray_icon.is_none() {
+                music_tray::listen(self.tx.clone());
+            }
+        } else if !wanted {
+            self.music.tray = None;
+        }
+    }
+
+    fn music_tray_refresh(&mut self) {
+        if self.music.tray.is_none() {
+            return;
+        }
+        let playlists = self.tray_playlists();
+        if let Some(tray) = &self.music.tray {
+            music_tray::update(tray, self.music.now.as_ref(), &playlists);
+        }
+    }
+
+    /// The library's playlists: the ones the views loaded, or else the saved list.
+    fn tray_playlists(&self) -> Vec<MusicItem> {
+        if self.music.playlists.is_empty() {
+            return ytmusic::load_cached(Shelf::Playlists.browse_id()).map(|(items, _)| items).unwrap_or_default();
+        }
+        self.music.playlists.clone()
+    }
+
+    pub fn music_tray_act(&mut self, id: &str) {
+        let Some(action) = Action::parse(id) else { return };
+        let sent = match action {
+            Action::PlayPause => self.music_send_control(Control::PlayPause),
+            Action::Like => self.music_send_control(Control::Like),
+            Action::Next => self.music_send_control(Control::Next),
+            Action::Previous => self.music_send_control(Control::Previous),
+            Action::Radio => self.music_ask(|req| Some(ytmusic::play(req, None, None, true))),
+            Action::Add(playlist) => {
+                let name = playlist_name(&self.tray_playlists(), &playlist);
+                self.music_add(&playlist, None, name)
+            }
+            Action::Copy => self.music_link(Link::Copy),
+            Action::Open => self.music_link(Link::Open),
+        };
+        if !sent {
+            let _ = self.tx.unbounded_send(Msg::Toast(false, NO_BROWSER.into()));
+        }
+    }
+}
+
+/// The name of the library playlist with this id, with or without the `VL` of its browse id.
+fn playlist_name(playlists: &[MusicItem], id: &str) -> String {
+    let bare = |id: &str| id.strip_prefix("VL").unwrap_or(id).to_string();
+    playlists.iter().find(|playlist| bare(&playlist.id) == bare(id)).map(|playlist| playlist.title.clone()).unwrap_or_default()
+}
+
+/// The link to the track a `current` reply says is playing.
+fn current_url(reply: &Reply) -> Option<String> {
+    let current = reply.current.as_ref().filter(|current| reply.error.is_none() && !current.video_id.is_empty())?;
+    Some(ytmusic::watch_url(&current.video_id, &current.playlist_id))
 }
 
 fn glyph_of(kind: Kind) -> &'static str {
@@ -775,9 +902,16 @@ fn track_item(now: &NowPlaying, icon: Icon) -> Item {
     let play_pause = MusicAct::Control(Control::PlayPause);
     let radio = MusicAct::Play { video: None, playlist: None, radio: true };
     let mut item = Item::new(&now.title, now_subtitle(now), icon, Act::Music(play_pause.clone())).acc(if now.playing { "Playing" } else { "Paused" }).sec("Now Playing");
-    item.extra = [("Play/Pause", play_pause), ("Like", MusicAct::Control(Control::Like)), ("Dislike", MusicAct::Control(Control::Dislike)), ("Start Radio", radio)]
-        .map(|(label, act)| (label.to_string(), Act::Music(act)))
-        .to_vec();
+    item.extra = [
+        ("Play/Pause", play_pause),
+        ("Like", MusicAct::Control(Control::Like)),
+        ("Dislike", MusicAct::Control(Control::Dislike)),
+        ("Start Radio", radio),
+        ("Copy URL", MusicAct::Current(Link::Copy)),
+        ("Open in YouTube Music", MusicAct::Current(Link::Open)),
+    ]
+    .map(|(label, act)| (label.to_string(), Act::Music(act)))
+    .to_vec();
     item
 }
 
@@ -819,8 +953,10 @@ mod tests {
         assert_eq!((row.title.as_str(), row.subtitle.as_str(), row.accessory.as_str()), ("One", "Band · Record", "Playing"));
         assert_eq!(row.act, Act::Music(MusicAct::Control(Control::PlayPause)));
         let labels: Vec<_> = row.extra.iter().map(|(label, _)| label.as_str()).collect();
-        assert_eq!(labels, ["Play/Pause", "Like", "Dislike", "Start Radio"]);
+        assert_eq!(labels, ["Play/Pause", "Like", "Dislike", "Start Radio", "Copy URL", "Open in YouTube Music"]);
         assert_eq!(row.extra[3].1, Act::Music(MusicAct::Play { video: None, playlist: None, radio: true }));
+        assert_eq!(row.extra[4].1, Act::Music(MusicAct::Current(Link::Copy)));
+        assert_eq!(row.extra[5].1, Act::Music(MusicAct::Current(Link::Open)));
         assert_eq!(track_item(&now("One", "", "", false), Icon::Vector(g::PLAY)).accessory, "Paused");
     }
 
@@ -852,6 +988,7 @@ mod tests {
         assert_eq!((label(MusicAct::Rate("like", None)), label(MusicAct::Rate("dislike", None)), label(MusicAct::Rate("unlike", None))), ("Like", "Dislike", "Remove Like"));
         assert_eq!(label(MusicAct::AddToPlaylist("PL1".into(), None)), "Add to Playlist");
         assert_eq!(label(MusicAct::Control(Control::VolumeDown)), "Volume Down");
+        assert_eq!((label(MusicAct::Current(Link::Copy)), label(MusicAct::Current(Link::Open))), ("Copy URL", "Open in YouTube Music"));
         assert_eq!(Act::Cmd(Cmd::YtMusic(Screen::NowPlaying)).label(), "Open");
     }
 
@@ -870,6 +1007,22 @@ mod tests {
         assert_eq!(toast(&reply("addToPlaylist", None, None), false, Some("Road Trip")), Some((true, "Added to Road Trip".into())));
         assert_eq!(toast(&reply("addToPlaylist", None, None), false, Some("")), Some((true, "Added to playlist".into())));
         assert_eq!(toast(&reply("addToPlaylist", Some("Sign in first."), None), false, Some("Road Trip")), Some((false, "Sign in first.".into())));
+    }
+
+    #[test]
+    fn the_current_track_has_a_link() {
+        let playing = |video: &str, playlist: &str| Current { video_id: video.into(), playlist_id: playlist.into(), ..Default::default() };
+        assert_eq!(current_url(&reply("current", None, Some(playing("abc", "")))), Some("https://music.youtube.com/watch?v=abc".into()));
+        assert_eq!(current_url(&reply("current", None, Some(playing("abc", "PL1")))), Some("https://music.youtube.com/watch?v=abc&list=PL1".into()));
+        assert_eq!(current_url(&reply("current", None, Some(playing("", "PL1")))), None);
+        assert_eq!(current_url(&reply("current", None, None)), None);
+        assert_eq!(current_url(&reply("current", Some("Open YouTube Music first."), Some(playing("abc", "")))), None);
+    }
+
+    #[test]
+    fn playlists_are_named_with_or_without_the_browse_prefix() {
+        let library = [MusicItem { id: "VLPL1".into(), title: "Road Trip".into(), ..Default::default() }];
+        assert_eq!((playlist_name(&library, "PL1").as_str(), playlist_name(&library, "VLPL1").as_str(), playlist_name(&library, "PL2").as_str()), ("Road Trip", "Road Trip", ""));
     }
 
     fn item(kind: Kind, id: &str, playlist: &str) -> MusicItem {
