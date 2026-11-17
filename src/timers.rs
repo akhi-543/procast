@@ -23,23 +23,24 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     } else if let Ok(n) = s.parse::<u64>() {
         n
     } else {
-        let (mut total, mut num) = (0u64, String::new());
-        for c in s.chars() {
-            let unit = match c {
-                '0'..='9' => {
-                    num.push(c);
-                    continue;
-                }
-                'h' => 3600,
-                'm' => 60,
-                's' => 1,
+        // Number-unit pairs, spaces allowed: "1h30m", "1 hour 30 minutes"; a bare number last
+        // takes the unit below the one before it ("1h30", "5m30").
+        let (mut total, mut last, mut rest) = (0u64, 0u64, s.as_str());
+        while !rest.trim_start().is_empty() {
+            rest = rest.trim_start();
+            let n = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            let num = rest[..n].parse::<u64>().ok()?;
+            rest = rest[n..].trim_start();
+            let u = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+            last = match &rest[..u] {
+                "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+                "m" | "min" | "mins" | "minute" | "minutes" => 60,
+                "s" | "sec" | "secs" | "second" | "seconds" => 1,
+                "" if rest.is_empty() && last > 1 => last / 60,
                 _ => return None,
             };
-            total = total.checked_add(num.parse::<u64>().ok()?.checked_mul(unit)?)?;
-            num.clear();
-        }
-        if !num.is_empty() {
-            return None;
+            total = total.checked_add(num.checked_mul(last)?)?;
+            rest = &rest[u..];
         }
         total
     };
@@ -288,7 +289,12 @@ mod tests {
         assert_eq!(parse_duration("1:30"), secs(90));
         assert_eq!(parse_duration("1:02:03"), secs(3723));
         assert_eq!(parse_duration(" 5M "), secs(300));
-        for bad in ["0", "0m", "abc", "", "5x", "m", "1:2:3:4", "1:", "99999999999999999999"] {
+        assert_eq!(parse_duration("1h30"), secs(5400), "a bare number after hours is minutes");
+        assert_eq!(parse_duration("5m30"), secs(330), "and after minutes, seconds");
+        assert_eq!(parse_duration("1 hour 30 minutes"), secs(5400));
+        assert_eq!(parse_duration("50 min"), secs(3000));
+        assert_eq!(parse_duration("2 hrs 10 secs"), secs(7210));
+        for bad in ["0", "0m", "abc", "", "5x", "m", "1:2:3:4", "1:", "99999999999999999999", "30 1h", "1 hour minutes", "5 m é"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
     }

@@ -2,7 +2,8 @@
 //! Pure state: hosts (launcher, Settings, Notes) feed it keys and map the `Event` it returns.
 
 /// One row. `section` groups consecutive entries under a header; `rule_after` draws a rule
-/// below it; `off` shows it faint and skips it; `two_line` adds a second line under the label.
+/// below it; `off` shows it faint and skips it; `two_line` adds a second line under the label;
+/// `always` shows it whatever the search says (a row made from the typed text).
 #[derive(Clone, Default)]
 pub struct Entry {
     pub id: String,
@@ -14,6 +15,7 @@ pub struct Entry {
     pub rule_after: bool,
     pub off: bool,
     pub two_line: Option<String>,
+    pub always: bool,
 }
 
 /// Where the menu sits in its window.
@@ -72,7 +74,7 @@ impl Menu {
     /// Entries whose label contains the filter, ignoring case.
     pub fn visible(&self) -> Vec<usize> {
         let f = self.filter.to_lowercase();
-        (0..self.entries.len()).filter(|&i| self.entries[i].label.to_lowercase().contains(&f)).collect()
+        (0..self.entries.len()).filter(|&i| self.entries[i].always || self.entries[i].label.to_lowercase().contains(&f)).collect()
     }
 
     /// The visible entries with a header before each section that still has one, and a rule
@@ -131,6 +133,12 @@ impl Menu {
             self.filter = s.to_string();
             self.reselect();
         }
+    }
+
+    /// New entries (the opener's list changed while open); the selection moves to the first that shows.
+    pub fn set_entries(&mut self, entries: Vec<Entry>) {
+        self.entries = entries;
+        self.reselect();
     }
 
     fn reselect(&mut self) {
@@ -214,6 +222,20 @@ mod tests {
         assert_eq!(m.picked().map(|e| e.id.as_str()), Some("network"), "clearing an empty field on open");
         m.set_filter("o");
         assert_eq!(m.selected, 1, "real typing still reselects");
+    }
+
+    #[test]
+    fn an_always_entry_shows_whatever_is_typed_and_new_entries_reselect() {
+        let mut m = menu(vec![e("Messaging", None), e("Social", None)]);
+        m.set_filter("x.com");
+        assert!(m.visible().is_empty());
+        m.entries.insert(0, Entry { always: true, ..e("Block x.com", None) });
+        m.set_filter("https://x.com");
+        assert_eq!((m.visible(), m.selected), (vec![0], 0), "shown and selected though its label differs");
+        m.set_filter("");
+        m.step(1);
+        m.set_entries(vec![e("Social", None)]);
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("social"), "never left on a stale index");
     }
 
     #[test]

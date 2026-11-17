@@ -160,6 +160,13 @@ pub const FORM_LABEL: f32 = 120.;
 /// `.pc-form__note`: a form note lines up with the controls (label column plus the row gap).
 pub const FORM_NOTE_INDENT: f32 = 132.;
 
+/// `.pc-field--tokens`: the token field's least height, and its chevron's drop to line up with
+/// the first row of tokens.
+pub const TOKEN_FIELD_MIN: f32 = 52.;
+const TOKEN_CHEVRON_TOP: f32 = 3.;
+/// `.pc-token`: one token's height.
+pub const TOKEN: f32 = 22.;
+
 /// `.pc-arg`: an argument box's width grows with its text between these.
 pub const ARG_MIN: f32 = 72.;
 pub const ARG_MAX: f32 = 200.;
@@ -378,6 +385,12 @@ names! {
     PLUS = "plus",
     ARROW_UP_DOWN = "arrow-up-down",
     CLIPBOARD_PASTE = "clipboard-paste",
+    MESSAGE_CIRCLE = "message-circle",
+    USERS = "users",
+    CIRCLE_PLAY = "circle-play",
+    PLANE = "plane",
+    NEWSPAPER = "newspaper",
+    SHOPPING_CART = "shopping-cart",
 }
 
 #[derive(Clone, Copy)]
@@ -1051,6 +1064,44 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
 /// `.pc-field` holding `body`, with `glyph` after it in text_muted (a select's chevron, a duration's clock).
 pub fn field_with_icon(focused: bool, body: impl IntoElement, glyph: Option<&'static str>, t: &Tokens) -> Div {
     field(focused, t).gap(px(sp::S8)).child(div().flex_1().min_w_0().truncate().child(body)).children(glyph.map(|g| icon(g, ic::MD, t.text_muted)))
+}
+
+/// `.pc-token`: a picked category or app in a token field: its icon, its name, then the ×
+/// (`remove`, the element the host makes clickable).
+pub fn token(glyph: &'static str, name: &str, remove: impl IntoElement, t: &Tokens) -> Div {
+    div()
+        .flex_none()
+        .h(px(TOKEN))
+        .pl(px(sp::S8))
+        .pr(px(sp::S4))
+        .flex()
+        .items_center()
+        .gap(px(sp::S4))
+        .rounded(px(r::XS))
+        .bg(t.surface_strong)
+        .text_color(t.text)
+        .text_size(px(ts::SMALL))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(icon(glyph, ic::SM, t.text_muted))
+        .child(name.to_string())
+        .child(remove)
+}
+
+/// The token's × (`cancel`, 12).
+pub fn token_x(t: &Tokens) -> Svg {
+    icon(g::CANCEL, ic::SM, t.text_muted)
+}
+
+/// `.pc-field--tokens`: a field that grows with its tokens, wrapping them, a chevron at the right.
+pub fn token_field(focused: bool, tokens: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> Div {
+    field(focused, t)
+        .h_auto()
+        .min_h(px(TOKEN_FIELD_MIN))
+        .items_start()
+        .py(px(sp::S4))
+        .gap(px(sp::S8))
+        .child(div().flex_1().min_w_0().flex().flex_wrap().gap(px(sp::S4)).children(tokens))
+        .child(icon(g::CHEVRON_DOWN, ic::MD, t.text_muted).mt(px(TOKEN_CHEVRON_TOP)))
 }
 
 /// `.pc-form__row`: the label right-aligned in its column at control height, then the control

@@ -88,6 +88,8 @@ pub enum Act {
     RenameTimer(u64),
     /// Start a Focus session with a category's lists (by name), blocking them or allowing only them.
     FocusStart(String, crate::focus::Mode),
+    /// Five more minutes for the Focus session.
+    FocusExtend,
     /// Open a meeting link: event title, address. Asks "Join <title>?" first when `[calendar] confirm_join`.
     Join(String, String),
     /// A screenshot (by path) put on the clipboard as an image: copy, or copy and paste.
@@ -160,6 +162,7 @@ impl Act {
             Act::Join(..) => "Join Meeting",
             Act::FocusStart(_, crate::focus::Mode::Block) => "Start Focus Session",
             Act::FocusStart(_, crate::focus::Mode::Allow) => "Start Allow-Only Focus Session",
+            Act::FocusExtend => "Extend",
             Act::Translate(_) => "Translate",
             Act::Define(_) => "Define",
             Act::DownloadDictionary(_) => "Download Dictionary",
@@ -272,6 +275,8 @@ pub struct Item {
     pub live: bool,
     /// The accessory is a switch, on or off (Auto HDR in root search).
     pub toggle: Option<bool>,
+    /// The ActionBar also shows the second action, under this label, with Ctrl+Enter.
+    pub bar_second: Option<String>,
 }
 
 impl Item {
@@ -296,6 +301,7 @@ impl Item {
             keywords: vec![],
             live: false,
             toggle: None,
+            bar_second: None,
         }
     }
 
@@ -390,7 +396,7 @@ pub fn named_in<'a>(item: &Item, q: &'a str, cfg: &Config) -> Option<&'a str> {
     let rest = named(item, q)?;
     let by_focus = q.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("focus ")) && item.act == Act::Cmd(Cmd::Focus(FocusCmd::Start));
     let rest_lc = rest.trim().to_lowercase();
-    (!(by_focus && cfg.focus_category.iter().any(|c| c.name.to_lowercase().contains(&rest_lc)))).then_some(rest)
+    (!(by_focus && crate::focus::categories(&cfg.focus_category).iter().any(|c| c.name.to_lowercase().contains(&rest_lc)))).then_some(rest)
 }
 
 /// Whether `q` names this row so that it leads root search with its boxes: its title or a
@@ -513,13 +519,12 @@ fn command_args(cmd: Cmd, cfg: &Config) -> (Vec<Arg>, &'static [&'static str]) {
         }
         Cmd::Define => (vec![Arg { word: true, missing: "Type a word to define".into(), ..Arg::new("Word") }], &["define", "def"]),
         Cmd::Focus(f @ (FocusCmd::Start | FocusCmd::Edit)) => {
-            let mut cats: Vec<(String, String)> = cfg.focus_category.iter().map(|c| (c.name.clone(), c.name.clone())).collect();
-            // ponytail: not pickable until the app picker (feature screens Task 12).
-            cats.push((String::new(), "Applications…".into()));
+            // Apps and websites are typed ("Social, steam.exe, x.com") or picked in the form (Enter with Goal empty).
+            let cats = crate::focus::categories(&cfg.focus_category).into_iter().map(|c| (c.name.clone(), c.name)).collect();
             let args = vec![
                 Arg { help: "What are you focusing on?".into(), ..Arg::optional("Goal") },
                 Arg { word: true, help: format!("0 for no limit; empty: {} min", cfg.focus.default_minutes), ..Arg::optional("Minutes") },
-                Arg { kind: ArgKind::Choice(cats), help: "A category to block; add \"allow\" to allow only it".into(), ..Arg::optional("Block") },
+                Arg { kind: ArgKind::Choice(cats), help: "Categories, apps or websites, comma separated; add \"allow\" to allow only them".into(), ..Arg::optional("Block") },
             ];
             (args, if f == FocusCmd::Start { &["focus"] } else { &[] })
         }
@@ -1383,6 +1388,7 @@ fallbacks = [\"define\", \"web\"]").unwrap();
         let start = cat.iter().find(|it| it.act == Act::Cmd(Cmd::Focus(FocusCmd::Start))).unwrap();
         assert_eq!(named_in(start, "focus ", &cfg), None, "Search Focus Categories' prefix lists the categories");
         assert_eq!(named_in(start, "focus wor", &cfg), None);
+        assert_eq!(named_in(start, "focus soc", &cfg), None, "the built-in categories too");
         assert_eq!(named_in(start, "focus deep work", &cfg), Some("deep work"));
         let ask = |q: &str| root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
         assert!(ask("focus wor").iter().all(|it| it.values.is_empty()), "no Goal pre-filled from a category search");

@@ -82,6 +82,8 @@ actions!(procast, [SelectLeft, SelectRight]);
 actions!(procast, [OpenDropdown]);
 // Tab and Shift+Tab while argument boxes show.
 actions!(procast, [NextBox, PrevBox]);
+// Backspace on a token field (or in its menu's empty search) takes the last token.
+actions!(procast, [PopToken]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 
@@ -169,7 +171,7 @@ enum Mode {
 
 /// A native launcher form: what it is for, which names its title and primary action.
 #[derive(Clone, Copy, PartialEq, Debug)]
-#[expect(dead_code, reason = "Focus and AddCalendar are opened by Tasks 12/15")]
+#[expect(dead_code, reason = "AddCalendar is opened by Task 15")]
 enum FormKind {
     Focus,
     AddCalendar,
@@ -192,12 +194,15 @@ impl FormKind {
 /// One control of a launcher form.
 #[derive(Clone)]
 enum Ctl {
-    /// A text box, two lines high when `tall`, with `icon` after the text.
-    Text { placeholder: SharedString, icon: Option<&'static str>, tall: bool },
+    /// A text box, two lines high when `tall`, with `icon` after the text; Down opens a menu of
+    /// `presets` when there are any, and the pick is typed in.
+    Text { placeholder: SharedString, icon: Option<&'static str>, tall: bool, presets: &'static [&'static str] },
     /// Picks one entry's id from a menu; true gives the menu a search field.
     Select(Vec<menu::Entry>, bool),
     /// A checkbox named by the field's label; its value is "true" when on.
     Check,
+    /// A token field (Focus's Block): the value is the picked `focus::Picks`, one id a line.
+    Tokens,
     /// Muted text (the value); with no label it is a `form_note`.
     Note,
     Rule,
@@ -239,12 +244,49 @@ fn next_field(fields: &[FormField], i: usize, d: isize) -> usize {
     i
 }
 
-/// The menu a Select field opens at `at`, on its current value; None for other controls.
+/// The menu a Select field (or a Text field with presets) opens at `at`, on its current value;
+/// None for other controls.
 fn field_menu(f: &FormField, at: gpui::Point<gpui::Pixels>) -> Option<menu::Menu> {
-    let Ctl::Select(entries, search) = &f.ctl else { return None };
-    let mut m = menu::Menu::new(entries.clone(), search.then(|| "Search…".to_string()), menu::Place::At(at));
-    m.selected = entries.iter().position(|e| e.id == f.value).unwrap_or(m.selected);
+    let (entries, search) = match &f.ctl {
+        Ctl::Select(entries, search) => (entries.clone(), *search),
+        Ctl::Text { presets, .. } if !presets.is_empty() => (presets.iter().map(|p| menu::Entry { id: p.to_string(), label: p.to_string(), ..Default::default() }).collect(), false),
+        _ => return None,
+    };
+    let mut m = menu::Menu::new(entries, search.then(|| "Search…".to_string()), menu::Place::At(at));
+    m.selected = m.entries.iter().position(|e| e.id.eq_ignore_ascii_case(f.value.trim())).unwrap_or(m.selected);
     Some(m)
+}
+
+/// The Focus form: Goal, Duration (presets on Down), Mode, and the Block token field.
+fn focus_form(goal: &str, duration: &str, mode: focus::Mode, picks: &[String]) -> Vec<FormField> {
+    let field = |label: &str, ctl: Ctl, value: String| FormField { label: label.to_string().into(), ctl, value, input: None, error: None };
+    let modes = vec![
+        menu::Entry { id: "block".into(), label: "Block Apps & Websites".into(), ..Default::default() },
+        menu::Entry { id: "allow".into(), label: "Allow Apps & Websites".into(), ..Default::default() },
+    ];
+    vec![
+        field("Goal", Ctl::Text { placeholder: "Goal".into(), icon: None, tall: false, presets: &[] }, goal.to_string()),
+        field("Duration", Ctl::Text { placeholder: "25 min".into(), icon: Some(g::CLOCK), tall: false, presets: &focus::DURATIONS }, duration.to_string()),
+        field("Mode", Ctl::Select(modes, true), if mode == focus::Mode::Allow { "allow" } else { "block" }.into()),
+        field("Block", Ctl::Tokens, focus::Picks(picks.to_vec()).value()),
+    ]
+}
+
+/// The Block menu: Focus Categories, then Applications (`apps`: file name and name), less
+/// what is picked already.
+fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], picks: &focus::Picks) -> Vec<menu::Entry> {
+    let cats = cats.iter().map(|c| menu::Entry { id: format!("cat:{}", c.name), label: c.name.clone(), icon: Some(focus::category_icon(&c.name)), section: Some("Focus Categories".into()), ..Default::default() });
+    let apps = apps.iter().map(|(exe, name)| menu::Entry { id: format!("app:{exe}"), label: name.clone(), icon: Some(g::APP), section: Some("Applications".into()), ..Default::default() });
+    cats.chain(apps).filter(|e| !picks.0.contains(&e.id)).collect()
+}
+
+/// Typed text that looks like a website puts "Block x.com" (or "Allow x.com", by `verb`) at
+/// the top of the Block menu, whatever the search matches.
+fn site_lead(entries: &mut Vec<menu::Entry>, verb: &str, typed: &str) {
+    entries.retain(|e| !e.always);
+    if let Some(host) = focus::typed_site(typed) {
+        entries.insert(0, menu::Entry { id: format!("site:{host}"), label: format!("{verb} {host}"), icon: Some(g::GLOBE), always: true, ..Default::default() });
+    }
 }
 
 /// An extension's Form field as a form row.
@@ -255,7 +297,7 @@ fn ext_field(f: &ext::Field, ev: &ExtView) -> FormField {
         _ => String::new(),
     };
     let ctl = match &f.kind {
-        FieldKind::Text | FieldKind::Password | FieldKind::TextArea => Ctl::Text { placeholder: f.placeholder.clone().into(), icon: None, tall: f.kind == FieldKind::TextArea },
+        FieldKind::Text | FieldKind::Password | FieldKind::TextArea => Ctl::Text { placeholder: f.placeholder.clone().into(), icon: None, tall: f.kind == FieldKind::TextArea, presets: &[] },
         FieldKind::Checkbox => Ctl::Check,
         FieldKind::Dropdown(opts) => Ctl::Select(opts.iter().map(|(v, t)| menu::Entry { id: v.clone(), label: t.clone(), ..Default::default() }).collect(), true),
         FieldKind::Description => Ctl::Note,
@@ -330,22 +372,24 @@ fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> 
 const EMPTY: &str = "\u{0}empty";
 /// The section of running timers and stopwatches at the head of root search.
 const RUNNING: &str = "Running";
+/// The Focus session's section, above Running.
+const FOCUS: &str = "Focus";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
 /// with the same section share one header.
 fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
-    // A header says something only when there is more than one section (Running, with its
-    // count, and Did you mean always head their rows), and "Results" right under the search
-    // field says nothing.
+    // A header says something only when there is more than one section (Focus, Running with
+    // its count, and Did you mean always head their rows), and "Results" right under the
+    // search field says nothing.
     let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
         if is_answer(items, i) {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last && (!one || sec == Some(RUNNING) || sec == Some(DID_YOU_MEAN)) && !(sec == Some("Results") && out.is_empty()) {
+        if sec.is_some() && sec != last && (!one || sec == Some(FOCUS) || sec == Some(RUNNING) || sec == Some(DID_YOU_MEAN)) && !(sec == Some("Results") && out.is_empty()) {
             out.push(None);
         }
         last = sec;
@@ -382,6 +426,24 @@ fn running_row(r: timers::Row) -> Item {
     it
 }
 
+/// The Focus session's row, heading root search: the goal, what it blocks, and the time left.
+/// Enter pauses or resumes, Ctrl+Enter (shown in the ActionBar) completes; Ctrl+K also edits,
+/// extends (a timed session), restarts or cancels.
+fn focus_row(s: &focus::Session, now: SystemTime) -> Item {
+    let (title, left) = s.row(now);
+    let cmd = |label: &str, c: FocusCmd| (label.to_string(), Act::Cmd(Cmd::Focus(c)));
+    let mut extra = vec![if s.running() { cmd("Pause", FocusCmd::Pause) } else { cmd("Resume", FocusCmd::Resume) }, cmd("Complete", FocusCmd::Complete), cmd("Edit", FocusCmd::Edit)];
+    if !s.unlimited() {
+        extra.push(("Extend".into(), Act::FocusExtend));
+    }
+    extra.extend([cmd("Restart", FocusCmd::Restart), cmd("Cancel", FocusCmd::Cancel)]);
+    let mut it = Item::new(title, focus::blocking_line(s), Icon::Vector(g::SHIELD_CHECK), extra[0].1.clone()).acc(left).sec(FOCUS).tinted(design::Tint::System);
+    it.extra = extra;
+    it.live = true;
+    it.bar_second = Some("Complete".into());
+    it
+}
+
 /// Root search as shown: Focus, Running and Next (`above`) head the results, except that the
 /// row the query names (an exact alias, or a command with its boxes: `search::heads`) goes
 /// first of all.
@@ -394,11 +456,12 @@ fn head_rows(mut above: Vec<Item>, mut found: Vec<Item>, query: &str, cfg: &Conf
 }
 
 /// Where root search's selection starts: on the row the query names (`search::heads`), so its
-/// boxes show; else, while something is typed, on the first row past the Running rows (Enter
-/// on "te" opens what was searched for, it never pauses a timer); else the top.
+/// boxes show; else, while something is typed, on the first row past the Focus and Running
+/// rows (Enter on "te" opens what was searched for, it never pauses a timer); else the top.
 fn root_selection(items: &[Item], query: &str, cfg: &Config) -> usize {
     let typed = !query.trim().is_empty();
-    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && it.section.as_deref() != Some(RUNNING))).unwrap_or(0)
+    let head = |it: &Item| matches!(it.section.as_deref(), Some(RUNNING | FOCUS));
+    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && !head(it))).unwrap_or(0)
 }
 
 /// The timer or stopwatch a Running row stands for.
@@ -645,11 +708,13 @@ fn lang_set_form(set: Option<&translate::LangSet>) -> Vec<FormField> {
 }
 
 /// An open Dropdown: the menu, its opener's `OnPick`, and the focus to return to when it closes.
+/// `site` ("Block" or "Allow"): the Focus form's Block menu, where a typed website shows as a row.
 struct OpenMenu {
     menu: menu::Menu,
     on_pick: OnPick,
     back: Option<gpui::FocusHandle>,
     scroll: ScrollHandle,
+    site: Option<&'static str>,
 }
 
 struct Launcher {
@@ -814,7 +879,11 @@ impl Launcher {
             cx.subscribe_in(&input, window, |this, _, _: &TextChanged, window, cx| this.query_changed(window, cx)),
             cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
                 if let Some(open) = &mut this.menu {
-                    open.menu.set_filter(input.read(cx).as_str());
+                    let typed = input.read(cx).as_str().to_string();
+                    if let Some(verb) = open.site {
+                        site_lead(&mut open.menu.entries, verb, &typed);
+                    }
+                    open.menu.set_filter(&typed);
                     cx.notify();
                 }
             }),
@@ -1070,12 +1139,12 @@ impl Launcher {
         };
         let key = it.key.clone().unwrap_or_else(|| it.title.clone());
         let mut seed = it.values.clone();
-        // Edit Focus Session starts from the running session's title and minutes.
+        // Edit Focus Session starts from the running session: goal, minutes and what it blocks.
         if seed.is_empty()
             && it.act == Act::Cmd(Cmd::Focus(FocusCmd::Edit))
             && let Some(s) = &self.focus.session
         {
-            seed = vec![s.title.clone(), s.minutes.to_string()];
+            seed = focus::edit_seed(s);
         }
         let kept = self.arg_memory.get(&key).filter(|(s, _)| *s == seed).map(|m| m.1.clone());
         if self.args_for.as_ref() == Some(&key) && kept.is_some() {
@@ -1169,19 +1238,12 @@ impl Launcher {
     /// When `act` is a row with arguments run without their values (a hotkey, a favourite,
     /// another command), asks for them in Mode::Args and says true.
     fn ask_args_for(&mut self, act: &Act, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(mut it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()).cloned() else { return false };
+        let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()).cloned() else { return false };
         if !self.asks_args(act) {
             if let Ok(act) = search::with_args(&it, &[]) {
                 self.run(act, None, window, cx);
             }
             return true;
-        }
-        if *act == Act::Cmd(Cmd::Focus(FocusCmd::Edit)) {
-            let Some(s) = &self.focus.session else {
-                self.say(Msg::error("No Focus session running: start one first"));
-                return true;
-            };
-            it.values = vec![s.title.clone(), s.minutes.to_string()];
         }
         self.ask_args(it, window, cx);
         true
@@ -1189,11 +1251,12 @@ impl Launcher {
 
     /// Whether running `act` without values opens its boxes. A command whose boxes are all
     /// optional and that shows nothing else (Start Stopwatch, Translate filled with the
-    /// selection, an extension command without a view) runs at once instead.
+    /// selection, Start and Edit Focus Session, which open their form, an extension command
+    /// without a view) runs at once instead.
     fn asks_args(&self, act: &Act) -> bool {
         let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()) else { return false };
         let at_once = match act {
-            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate) => true,
+            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate | Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => true,
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode != "view"),
             _ => false,
         };
@@ -1683,19 +1746,13 @@ impl Launcher {
         if let Some(s) = &self.focus.session
             && (q.is_empty() || s.title.to_lowercase().contains(&q))
         {
-            let (title, left) = s.row(SystemTime::now());
-            let (flip, label) = if s.running() { (FocusCmd::Pause, "Pause Session") } else { (FocusCmd::Resume, "Resume Session") };
-            let mut row = Item::new(title, "", Icon::Vector(g::SHIELD), Act::Cmd(Cmd::Focus(flip))).acc(left).sec("Focus");
-            row.extra = [(label, flip), ("Edit Session", FocusCmd::Edit), ("Restart Session", FocusCmd::Restart), ("Complete Session", FocusCmd::Complete), ("Cancel Session", FocusCmd::Cancel)]
-                .map(|(l, c)| (l.to_string(), Act::Cmd(Cmd::Focus(c))))
-                .to_vec();
-            rows.push(row);
+            rows.push(focus_row(s, SystemTime::now()));
         }
         if let Some(rest) = q.strip_prefix("focus ") {
-            for c in self.cfg.focus_category.iter().filter(|c| c.name.to_lowercase().contains(rest.trim())) {
+            for c in focus::categories(&self.cfg.focus_category).into_iter().filter(|c| c.name.to_lowercase().contains(rest.trim())) {
                 let start = |m| Act::FocusStart(c.name.clone(), m);
                 let sub = format!("{} apps · {} websites", c.apps.len(), c.sites.len());
-                let mut row = Item::new(c.name.clone(), sub, Icon::Vector(g::SHIELD), start(focus::Mode::Block)).acc("Focus category").sec("Focus Categories");
+                let mut row = Item::new(c.name.clone(), sub, Icon::Vector(focus::category_icon(&c.name)), start(focus::Mode::Block)).acc("Focus category").sec("Focus Categories");
                 row.extra = [focus::Mode::Block, focus::Mode::Allow].map(|m| (start(m).label().to_string(), start(m))).to_vec();
                 rows.push(row);
             }
@@ -1705,14 +1762,15 @@ impl Launcher {
 
     /// Starts (or, editing, replaces) the session; returns what to tell the user.
     fn focus_begin(&mut self, start: focus::Start, edit: bool) -> String {
-        let focus::Start { title, minutes, filter } = start;
+        let focus::Start { title, minutes, filter, picks } = start;
         let old = self.focus.session.take();
-        let (mode, apps, sites) = match (filter, &old) {
-            (Some(f), _) => f,
-            (None, Some(o)) if edit => (o.mode, o.apps.clone(), o.sites.clone()),
-            (None, _) => (focus::Mode::Block, vec![], vec![]),
+        let (mode, apps, sites, picks) = match (filter, &old) {
+            (Some((m, a, s)), _) => (m, a, s, picks),
+            (None, Some(o)) if edit => (o.mode, o.apps.clone(), o.sites.clone(), o.picks.clone()),
+            (None, _) => (focus::Mode::Block, vec![], vec![], vec![]),
         };
         let mut session = focus::Session::new(&title, mode, &apps, &sites, minutes, self.cfg.focus.allow_all_on_empty_sites, SystemTime::now());
+        session.picks = picks;
         // The apps already closed still come back at the end.
         session.closed = old.map(|o| o.closed).unwrap_or_default();
         let text = if minutes == 0 { format!("Focus started: {} (no limit)", session.title) } else { format!("Focus started: {} for {minutes} min", session.title) };
@@ -1735,11 +1793,28 @@ impl Launcher {
     }
 
     /// Enter with a Focus command's boxes: start (or edit) the session, or save the categories.
-    /// A refusal keeps the boxes and says why.
-    fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, cx: &mut Context<Self>) {
+    /// With Goal empty, Start and Edit open the form instead, from what the boxes hold (Edit run
+    /// on its own, from the session). A refusal keeps the boxes and says why.
+    fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let cats = focus::categories(&self.cfg.focus_category);
+        let start = matches!(f, FocusCmd::Start | FocusCmd::Edit) && !(f == FocusCmd::Edit && self.focus.session.is_none());
+        if start && got.first().is_none_or(|g| g.trim().is_empty()) {
+            let seed = match &self.focus.session {
+                Some(s) if f == FocusCmd::Edit && got.iter().all(|g| g.trim().is_empty()) => focus::edit_seed(s),
+                _ => got,
+            };
+            return match focus::parse_start(&seed, &cats, self.cfg.focus.default_minutes) {
+                Ok(s) => {
+                    let mode = s.filter.as_ref().map_or(focus::Mode::Block, |f| f.0);
+                    self.load_running();
+                    self.open_form(FormKind::Focus, focus_form(seed.first().map_or("", |g| g.trim()), &focus::minutes_label(s.minutes), mode, &s.picks), window, cx);
+                }
+                Err(e) => self.focus_refused(e, cx),
+            };
+        }
         let done = match f {
             FocusCmd::Edit if self.focus.session.is_none() => Err("No Focus session is running".to_string()),
-            FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &self.cfg.focus_category, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
+            FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &cats, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
             FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| self.focus_save_categories(&[c])),
             FocusCmd::ImportCategories => std::fs::read_to_string(got[0].trim().trim_matches('"'))
                 .map_err(|e| format!("Could not read the file: {e}"))
@@ -1752,11 +1827,112 @@ impl Launcher {
                 self.say(Msg::done(text));
                 self.hide(true, cx);
             }
+            Err(e) => self.focus_refused(e, cx),
+        }
+    }
+
+    /// Why a Focus command did nothing: in the ActionBar, or (run from a hotkey with the
+    /// window hidden) as a toast.
+    fn focus_refused(&mut self, e: String, cx: &mut Context<Self>) {
+        if !self.visible {
+            return self.say(Msg::error(e));
+        }
+        self.status = Some((Tone::Error, e));
+        cx.notify();
+    }
+
+    /// Ctrl+Enter in the Focus form: starts the session (replacing one that runs) and closes.
+    /// A Duration that does not parse stays, with why under it.
+    fn submit_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.form else { return };
+        let value = |label: &str| form.fields.iter().find(|f| f.label == label).map(|f| f.value.clone()).unwrap_or_default();
+        let (goal, duration, mode, picks) = (value("Goal"), value("Duration"), value("Mode"), focus::Picks::of(&value("Block")).0);
+        let cats = focus::categories(&self.cfg.focus_category);
+        let mut start = match focus::parse_start(&[goal, duration], &cats, self.cfg.focus.default_minutes) {
+            Ok(s) => s,
             Err(e) => {
-                self.status = Some((Tone::Error, e));
-                cx.notify();
+                if let Some(i) = form.fields.iter().position(|f| f.label == "Duration") {
+                    form.fields[i].error = Some(e);
+                    form.field = i;
+                }
+                return self.focus_field(window, cx);
+            }
+        };
+        let (apps, sites) = focus::resolve(&picks, &cats);
+        start.filter = Some((if mode == "allow" { focus::Mode::Allow } else { focus::Mode::Block }, apps, sites));
+        start.picks = picks;
+        let text = self.focus_begin(start, false);
+        self.say(Msg::done(text));
+        self.set_mode(Mode::Root, cx);
+        self.hide(true, cx);
+    }
+
+    /// Programs for the Block menu by file name, with their names: the running ones (as Quit
+    /// Applications lists them) and the installed ones that are programs, A to Z.
+    fn focus_apps(&self) -> Vec<(String, String)> {
+        let running = self.running.iter().flatten().map(|(r, _)| (focus::norm_app(&r.exe), r.name.clone()));
+        let installed = self.apps.iter().filter(|a| a.id.to_lowercase().ends_with(".exe")).map(|a| (focus::norm_app(&a.id), a.name.clone()));
+        let mut out: Vec<(String, String)> = vec![];
+        for (exe, name) in running.chain(installed) {
+            if !exe.is_empty() && !out.iter().any(|(e, _)| *e == exe) {
+                let name = if name.trim().is_empty() { focus::app_label(&exe) } else { name };
+                out.push((exe, name));
             }
         }
+        out.sort_by_key(|(_, n)| n.to_lowercase());
+        out
+    }
+
+    /// The Block menu's entries for form field `i`, and whether a typed website is blocked or allowed.
+    fn block_menu(&self, i: usize) -> (Vec<menu::Entry>, &'static str) {
+        let Some(form) = &self.form else { return (vec![], "Block") };
+        let picks = form.fields.get(i).map_or_else(focus::Picks::default, |f| focus::Picks::of(&f.value));
+        let verb = if form_values(&form.fields).get("Mode") == Some(&"allow") { "Allow" } else { "Block" };
+        (block_entries(&focus::categories(&self.cfg.focus_category), &self.focus_apps(), &picks), verb)
+    }
+
+    /// Opens the Block menu under token field `i`. A pick becomes a token and the menu opens
+    /// again, without it, for the next.
+    fn open_block_menu(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (entries, verb) = self.block_menu(i);
+        let m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::At(self.form_at.get()));
+        self.open_menu(
+            m,
+            move |this, id, window, cx| {
+                this.edit_picks(i, |p| p.add(&id));
+                this.open_block_menu(i, window, cx);
+            },
+            window,
+            cx,
+        );
+        if let Some(open) = &mut self.menu {
+            open.site = Some(verb);
+        }
+    }
+
+    /// Changes token field `i`'s picks.
+    fn edit_picks(&mut self, i: usize, f: impl FnOnce(&mut focus::Picks)) {
+        if let Some(field) = self.form.as_mut().and_then(|form| form.fields.get_mut(i)) {
+            let mut p = focus::Picks::of(&field.value);
+            f(&mut p);
+            field.value = p.value();
+        }
+    }
+
+    /// Backspace on the selected token field, or in its menu's empty search: the last token
+    /// goes back into the menu. False when the key is the text's (anywhere else).
+    fn pop_token(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(i) = self.form.as_ref().filter(|f| matches!(self.mode, Mode::Form(_)) && matches!(f.fields.get(f.field).map(|c| &c.ctl), Some(Ctl::Tokens))).map(|f| f.field) else { return false };
+        if self.menu.as_ref().is_some_and(|m| m.site.is_none() || !self.menu_input.read(cx).as_str().is_empty()) {
+            return false;
+        }
+        self.edit_picks(i, |p| _ = p.pop());
+        let (entries, _) = self.block_menu(i);
+        if let Some(open) = &mut self.menu {
+            open.menu.set_entries(entries);
+        }
+        cx.notify();
+        true
     }
 
     fn focus_cmd(&mut self, f: FocusCmd, window: &mut Window, cx: &mut Context<Self>) {
@@ -1854,7 +2030,7 @@ impl Launcher {
         }
         if self.visible && self.mode == Mode::Root {
             for it in &mut self.items {
-                if it.section.as_deref() == Some("Focus") && matches!(it.act, Act::Cmd(Cmd::Focus(FocusCmd::Pause | FocusCmd::Resume))) {
+                if it.section.as_deref() == Some(FOCUS) {
                     it.accessory = left.clone();
                 }
             }
@@ -2988,6 +3164,7 @@ impl Launcher {
                 let value = input.read(cx).as_str().to_string();
                 if let Some(f) = this.form.as_mut().and_then(|f| f.fields.get_mut(i)) {
                     f.value = value;
+                    f.error = None;
                 }
             }));
             f.input = Some(input);
@@ -3020,9 +3197,14 @@ impl Launcher {
         self.focus_field(window, cx);
     }
 
-    /// Down or Enter on a Select control: its menu under it. False for other controls.
+    /// Down or Enter on a Select control (or a token field), Down on a Text control with
+    /// presets: its menu under it. False for other controls.
     fn open_field_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some((fields, i)) = self.form_fields() else { return false };
+        if matches!(self.mode, Mode::Form(_)) && matches!(fields.get(i).map(|f| &f.ctl), Some(Ctl::Tokens)) {
+            self.open_block_menu(i, window, cx);
+            return true;
+        }
         let Some(m) = fields.get(i).and_then(|f| field_menu(f, self.form_at.get())) else { return false };
         // An extension may re-render while the menu is open: its field is known by id, not place.
         let ext_id = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.fields.get(i)).map(|f| f.id.clone());
@@ -3031,6 +3213,10 @@ impl Launcher {
             move |this, id, window, cx| match (&mut this.form, &ext_id) {
                 (Some(f), _) if matches!(this.mode, Mode::Form(_)) => {
                     if let Some(f) = f.fields.get_mut(i) {
+                        // A text box's preset is typed in.
+                        if let Some(input) = f.input.clone() {
+                            input.update(cx, |s, cx| s.emplace(&id, cx));
+                        }
                         f.value = id;
                     }
                     cx.notify();
@@ -3059,9 +3245,9 @@ impl Launcher {
 
     fn submit_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Mode::Form(kind) = self.mode {
-            // Each form acts on `form_values`: Task 12 starts the session, Task 15 fetches the feed.
+            // Each form acts on `form_values`: Task 15 fetches the feed.
             match kind {
-                FormKind::Focus => {}
+                FormKind::Focus => self.submit_focus(window, cx),
                 FormKind::AddCalendar => {}
                 FormKind::AddLanguageSet(edit) => self.save_lang_set(edit, window, cx),
             }
@@ -3119,7 +3305,7 @@ impl Launcher {
         }
         if let Some((fields, i)) = self.form_fields() {
             match fields.get(i).map(|f| &f.ctl) {
-                Some(Ctl::Select(..)) => _ = self.open_field_menu(window, cx),
+                Some(Ctl::Select(..) | Ctl::Tokens) => _ = self.open_field_menu(window, cx),
                 Some(Ctl::Check) => self.toggle_check(cx),
                 _ if Some(i) == fields.iter().rposition(FormField::focusable) => self.submit_form(window, cx),
                 _ => self.move_field(1, window, cx),
@@ -3198,12 +3384,19 @@ impl Launcher {
                 self.say(Msg::error(format!("{} is blocked until Focus ends", focus::host_of(&url).unwrap_or_default())));
             }
             Act::FocusStart(name, mode) => {
-                let Some(c) = focus::category(&self.cfg.focus_category, &name).cloned() else { return };
-                let start = focus::Start { title: name, minutes: self.cfg.focus.default_minutes, filter: Some((mode, c.apps, c.sites)) };
+                let Some(c) = focus::category(&focus::categories(&self.cfg.focus_category), &name).cloned() else { return };
+                let picks = vec![format!("cat:{}", c.name)];
+                let start = focus::Start { title: name, minutes: self.cfg.focus.default_minutes, filter: Some((mode, c.apps, c.sites)), picks };
                 let text = self.focus_begin(start, false);
                 self.say(Msg::done(text));
             }
             Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, window, cx),
+            Act::FocusExtend => {
+                self.focus.update(|s| s.extend(SystemTime::now()));
+                self.focus_push();
+                self.say(Msg::done("Focus extended by 5 min"));
+                return self.refresh(cx);
+            }
             Act::With(act, got) => return self.run_with(*act, got, window, cx),
             Act::Open(url) if self.cfg.search.existing_tab && key.as_deref().is_some_and(|k| k.starts_with("ql:")) && url.starts_with("http") && self.browsers.any() => {
                 win::allow_foreground();
@@ -3500,7 +3693,7 @@ impl Launcher {
                 self.mode = Mode::Root;
                 self.insert_snippet(template, got, erase, then, cx);
             }
-            Act::Cmd(Cmd::Focus(f)) => self.focus_args(f, got, cx),
+            Act::Cmd(Cmd::Focus(f)) => self.focus_args(f, got, window, cx),
             Act::Cmd(Cmd::StartStopwatch) => {
                 self.timers.stopwatch(got[0].clone());
                 self.watch_timers();
@@ -4069,7 +4262,8 @@ impl Launcher {
             return label;
         }
         match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
-            // A Running row's accessory is its time; its kind is the subtitle.
+            // A Running row's accessory is its time; its kind is the subtitle. The session row is Focus.
+            Some(it) if it.section.as_deref() == Some(FOCUS) => FOCUS.into(),
             Some(it) if it.live => it.subtitle.clone(),
             Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
             _ => "procast".into(),
@@ -4114,7 +4308,7 @@ impl Launcher {
             self.menu_input.update(cx, |s, cx| s.emplace("", cx));
             window.focus(&self.menu_input.focus_handle(cx), cx);
         }
-        self.menu = Some(OpenMenu { menu, on_pick: Box::new(on_pick), back, scroll: ScrollHandle::new() });
+        self.menu = Some(OpenMenu { menu, on_pick: Box::new(on_pick), back, scroll: ScrollHandle::new(), site: None });
         cx.notify();
     }
 
@@ -4206,12 +4400,12 @@ impl Launcher {
     }
 
     /// `.pc-form--center`: the rows centred under the bar, the selected control focused.
-    fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
+    fn render_form(&self, t: &Tokens, me: gpui::WeakEntity<Self>) -> gpui::AnyElement {
         let Some((fields, selected)) = self.form_fields() else { return div().into_any_element() };
         let rows = fields.into_iter().enumerate().map(|(i, f)| {
             let on = i == selected;
             let control = match &f.ctl {
-                Ctl::Text { placeholder, icon, tall } => match &f.input {
+                Ctl::Text { placeholder, icon, tall, .. } => match &f.input {
                     Some(input) => {
                         let text = text_input(SharedString::from(format!("field-{i}")))
                             .state(input.downgrade())
@@ -4238,6 +4432,22 @@ impl Launcher {
                         .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
                         .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.label.clone()))
                         .into_any_element()
+                }
+                // Each token's × removes it.
+                Ctl::Tokens => {
+                    let tokens = focus::Picks::of(&f.value).0.into_iter().map(|id| {
+                        let (glyph, name) = focus::pick_look(&id);
+                        let me = me.clone();
+                        let x = div().id(SharedString::from(format!("token-{id}"))).flex().child(design::token_x(t)).on_click(move |_, _, cx| {
+                            me.update(cx, |this, cx| {
+                                this.edit_picks(i, |p| p.remove(&id));
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                        design::token(glyph, &name, x, t).into_any_element()
+                    });
+                    design::token_field(on, tokens, t).into_any_element()
                 }
                 Ctl::Note if f.label.is_empty() => return design::form_note(f.value.clone(), t).into_any_element(),
                 Ctl::Note => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(f.value.clone()).into_any_element(),
@@ -4681,6 +4891,7 @@ impl Render for Launcher {
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
         let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());
+        let bar_second = selected_item.and_then(|it| it.bar_second.clone()).filter(|_| actions.len() > 1);
         let arg_row = self.arg_row().cloned();
         let arg_values = self.arg_values(cx);
         let arg_focus = self.arg_focused(window, cx);
@@ -4700,7 +4911,7 @@ impl Render for Launcher {
                 _ => format!("Press ↵ again to {}", it.title),
             },
             (None, Some(_)) => match &primary {
-                Some(p) if actions.len() > 1 => format!("{p}  ↵    Actions  Ctrl+K"),
+                Some(p) if actions.len() > 1 => format!("{p}  ↵    {}Actions  Ctrl+K", bar_second.as_ref().map(|s| format!("{s}  Ctrl+↵    ")).unwrap_or_default()),
                 Some(p) => format!("{p}  ↵"),
                 None => String::new(),
             },
@@ -4881,7 +5092,7 @@ impl Render for Launcher {
                 let glyph = if let Icon::Vector(c) = e.icon { c } else { g::SEARCH };
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
-            _ if self.panel.is_none() && self.is_form() => self.render_form(&t),
+            _ if self.panel.is_none() && self.is_form() => self.render_form(&t, cx.weak_entity()),
             (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail", None),
             (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
@@ -5027,6 +5238,9 @@ impl Render for Launcher {
             v
         } else if let Some(p) = &primary {
             let mut v = vec![keys(p, &["↵"])];
+            if let Some(second) = &bar_second {
+                v.extend([design::vdivider(&t).into_any_element(), keys(second, &["Ctrl", "↵"])]);
+            }
             if actions.len() > 1 {
                 v.extend([design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]);
             }
@@ -5085,14 +5299,9 @@ impl Render for Launcher {
             let me = cx.weak_entity();
             let outside = move |_: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| _ = this.close_menu(window, cx));
             let field = open.menu.search.as_ref().map(|placeholder| {
-                text_input("menu-search")
-                    .state(self.menu_input.downgrade())
-                    .placeholder(placeholder.clone())
-                    .placeholder_color(t.text_faint)
-                    .caret_color(t.accent)
-                    .flex_1()
-                    .whitespace_nowrap()
-                    .into_any_element()
+                let input = text_input("menu-search").state(self.menu_input.downgrade()).placeholder(placeholder.clone()).placeholder_color(t.text_faint).caret_color(t.accent).w_full().whitespace_nowrap();
+                // In the Block menu, Backspace in the empty search takes the last token.
+                div().flex_1().min_w_0().when(open.site.is_some(), |d| d.key_context("TokenMenu")).child(input).into_any_element()
             });
             design::pop_menu(&open.menu, field, &open.scroll, pick, outside, &t)
         });
@@ -5186,6 +5395,12 @@ impl Render for Launcher {
             .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
             // Tab and Shift+Tab move between the query and the boxes.
             .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
+            // Anywhere but a token field (or its menu's empty search), Backspace edits the text.
+            .on_action(cx.listener(|this, _: &PopToken, _, cx| {
+                if !this.pop_token(cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &NextBox, window, cx| if this.is_form() { this.move_field(1, window, cx) } else { this.step_arg(1, window, cx) }))
             .on_action(cx.listener(|this, _: &PrevBox, window, cx| if this.is_form() { this.move_field(-1, window, cx) } else { this.step_arg(-1, window, cx) }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
@@ -5205,7 +5420,10 @@ impl Render for Launcher {
                 }
             }))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
-                if this.menu.is_some() {
+                // The Block menu stays open between picks; Ctrl+Enter there still starts the session.
+                if this.menu.as_ref().is_some_and(|m| m.site.is_some()) {
+                    this.close_menu(window, cx);
+                } else if this.menu.is_some() {
                     return;
                 }
                 if this.is_form() && this.panel.is_none() {
@@ -5353,6 +5571,8 @@ fn main() {
             KeyBinding::new("ctrl-enter", Submit, Some("Form")),
             KeyBinding::new("escape", Dismiss, Some("Form")),
             KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
+            KeyBinding::new("backspace", PopToken, Some("Form")),
+            KeyBinding::new("backspace", PopToken, Some(&format!("TokenMenu > {DEFAULT_INPUT_CONTEXT}"))),
             // The settings window when no text field has focus.
             KeyBinding::new("up", SelectPrev, Some("Settings")),
             KeyBinding::new("down", SelectNext, Some("Settings")),
@@ -5543,7 +5763,7 @@ mod tests {
     }
 
     fn text(label: &'static str, value: &str) -> FormField {
-        field(label, Ctl::Text { placeholder: "".into(), icon: None, tall: false }, value)
+        field(label, Ctl::Text { placeholder: "".into(), icon: None, tall: false, presets: &[] }, value)
     }
 
     fn entry(id: &str, label: &str) -> menu::Entry {
@@ -5783,6 +6003,67 @@ mod tests {
         assert_eq!(root_selection(&rows, "te", &cfg), 1, "Enter on \"te\" opens Terminal, it does not pause tea");
         assert_eq!(root_selection(&rows, "", &cfg), 0, "an empty search starts on the top row");
         assert_eq!(root_selection(&rows[..1], "tea", &cfg), 0, "only Running rows: the first of them");
+    }
+
+    fn deep_work(minutes: u32) -> focus::Session {
+        let mut s = focus::Session::new("Deep work", focus::Mode::Block, &[], &[], minutes, false, SystemTime::now());
+        s.picks = vec!["cat:Messaging".into(), "cat:Social".into()];
+        s
+    }
+
+    #[test]
+    fn the_focus_row_heads_root_with_its_time_and_keys() {
+        let now = SystemTime::now();
+        let mut s = deep_work(25);
+        let it = focus_row(&s, now);
+        assert_eq!((it.title.as_str(), it.subtitle.as_str(), it.accessory.as_str(), it.section.as_deref()), ("Deep work", "Blocking 2 categories", "25:00 left", Some(FOCUS)));
+        assert!(matches!(it.icon, Icon::Vector(g::SHIELD_CHECK)) && it.tint == Some(design::Tint::System) && it.live);
+        let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        assert_eq!(labels(&it), ["Pause", "Complete", "Edit", "Extend", "Restart", "Cancel"]);
+        assert_eq!((it.act.clone(), it.actions()[1].1.clone(), it.bar_second.as_deref()), (Act::Cmd(Cmd::Focus(FocusCmd::Pause)), Act::Cmd(Cmd::Focus(FocusCmd::Complete)), Some("Complete")), "Enter pauses, Ctrl+Enter completes");
+        s.pause(now);
+        let paused = focus_row(&s, now);
+        assert_eq!((paused.act, paused.accessory.as_str()), (Act::Cmd(Cmd::Focus(FocusCmd::Resume)), "Paused · 25:00"));
+        assert!(!labels(&focus_row(&deep_work(0), now)).contains(&"Extend".to_string()), "no limit: nothing to extend");
+        // Focus heads root above Running, headed even alone; a typed query starts past both.
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let rows = vec![it, running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(display_rows(&rows[..1]), [None, Some(0)]);
+        assert_eq!(root_selection(&rows, "de", &Config::default()), 2);
+    }
+
+    #[test]
+    fn the_focus_form_starts_from_its_seed_and_reads_back() {
+        let picks = vec!["cat:Messaging".to_string(), "site:x.com".into()];
+        let fields = focus_form("Deep work", "1 hour 30 minutes", focus::Mode::Allow, &picks);
+        assert_eq!(fields.iter().map(|f| f.label.to_string()).collect::<Vec<_>>(), ["Goal", "Duration", "Mode", "Block"]);
+        let v = form_values(&fields);
+        assert_eq!((v["Goal"], v["Duration"], v["Mode"]), ("Deep work", "1 hour 30 minutes", "allow"));
+        assert_eq!(focus::Picks::of(v["Block"]).0, picks);
+        assert!(matches!(&fields[1].ctl, Ctl::Text { icon: Some(g::CLOCK), presets, .. } if presets.len() == 5));
+        let menu = field_menu(&fields[1], gpui::Point::default()).unwrap();
+        assert_eq!((menu.entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), menu.selected, menu.search.is_some()), (focus::DURATIONS.to_vec(), 3, false), "Down: the presets, on the current one");
+        let Ctl::Select(modes, search) = &fields[2].ctl else { panic!("Mode is a select") };
+        assert_eq!((modes.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), *search), (vec!["Block Apps & Websites", "Allow Apps & Websites"], true));
+        assert!(field_menu(&fields[3], gpui::Point::default()).is_none(), "the token field opens the Block menu instead");
+    }
+
+    #[test]
+    fn the_block_menu_lists_what_is_not_picked_and_a_typed_website() {
+        let cats = focus::categories(&[]);
+        let apps = vec![("discord.exe".to_string(), "Discord".to_string())];
+        let picks = focus::Picks(vec!["cat:Messaging".into(), "cat:Social".into()]);
+        let mut entries = block_entries(&cats, &apps, &picks);
+        let m = menu::Menu::new(entries.clone(), Some("Search…".into()), menu::Place::Right);
+        assert_eq!(m.rows()[0], menu::Row::Header("Focus Categories"));
+        assert_eq!(entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Streaming", "Travel", "News", "Shopping", "Gaming", "Discord"], "picked ones leave the menu");
+        assert_eq!((entries[0].id.as_str(), entries[0].icon, entries[5].id.as_str(), entries[5].section.as_deref()), ("cat:Streaming", Some(g::CIRCLE_PLAY), "app:discord.exe", Some("Applications")));
+        site_lead(&mut entries, "Block", "Reddit.com");
+        assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].always), ("Block reddit.com", "site:reddit.com", true));
+        site_lead(&mut entries, "Allow", "x.com");
+        assert_eq!((entries[0].label.as_str(), entries.len()), ("Allow x.com", 7), "the typed row is replaced, never stacked");
+        site_lead(&mut entries, "Block", "news");
+        assert_eq!(entries.len(), 6, "not a website: no row");
     }
 
     #[test]

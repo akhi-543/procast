@@ -17,7 +17,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
 };
 
-use crate::config::FocusCategory;
+use crate::{config::FocusCategory, design::g};
 
 /// Never closed or redirected, whatever the lists say: procast itself and the Windows shell.
 /// ApplicationFrameHost draws every Store app, so it can't tell them apart.
@@ -77,7 +77,13 @@ pub struct Session {
     /// Full paths of the apps Focus closed, to reopen at the end (`[focus] restore_apps`).
     #[serde(default)]
     pub closed: Vec<String>,
+    /// What the Block field held (`Picks` ids), for the row's "Blocking 3 categories" and Edit.
+    #[serde(default)]
+    pub picks: Vec<String>,
 }
+
+/// How much Extend adds.
+const EXTEND: Duration = Duration::from_secs(300);
 
 fn after(now: SystemTime, d: Duration) -> SystemTime {
     now.checked_add(d).unwrap_or(now)
@@ -98,6 +104,7 @@ impl Session {
             snoozed: HashMap::new(),
             allow_empty_sites,
             closed: vec![],
+            picks: vec![],
         }
     }
 
@@ -164,9 +171,20 @@ impl Session {
         self.snoozed.clear();
     }
 
+    /// Five more minutes, running or paused; a session with no limit has nothing to extend.
+    pub fn extend(&mut self, now: SystemTime) {
+        if let Some(u) = &mut self.until {
+            *u = after((*u).max(now), EXTEND);
+        } else if !self.unlimited()
+            && let Some(left) = &mut self.paused_left
+        {
+            *left += EXTEND;
+        }
+    }
+
     /// What Toggle starts again.
     pub fn preset(&self) -> Preset {
-        Preset { title: self.title.clone(), mode: self.mode, apps: self.apps.clone(), sites: self.sites.clone(), minutes: self.minutes }
+        Preset { title: self.title.clone(), mode: self.mode, apps: self.apps.clone(), sites: self.sites.clone(), minutes: self.minutes, picks: self.picks.clone() }
     }
 
     /// Lets `key` (an app's file name) through for `mins` minutes. The overlay's choices are 1, 3, 5, 10.
@@ -204,10 +222,12 @@ impl Session {
         (mode == Mode::Block) == sites.iter().any(|s| host == *s || host.ends_with(&format!(".{s}")))
     }
 
-    /// The root row: title and time left (or, with no limit, time run).
+    /// The root row: title, and time left as a timer says it (with no limit, the time run as
+    /// a stopwatch says it): "23:10 left", "Paused · 23:10".
     pub fn row(&self, now: SystemTime) -> (String, String) {
-        let time = if self.unlimited() { format!("{} elapsed", crate::timers::fmt_duration(self.elapsed(now))) } else { format!("{} left", crate::timers::fmt_duration(self.left(now))) };
-        (self.title.clone(), if self.paused_left.is_some() { format!("Paused · {time}") } else { time })
+        let time = crate::timers::fmt_duration(if self.unlimited() { self.elapsed(now) } else { self.left(now) });
+        let r = crate::timers::Row { id: 0, title: String::new(), stopwatch: self.unlimited(), paused: self.paused_left.is_some(), done: false, time };
+        (self.title.clone(), r.accessory())
     }
 }
 
@@ -219,11 +239,13 @@ pub struct Preset {
     pub apps: Vec<String>,
     pub sites: Vec<String>,
     pub minutes: u32,
+    #[serde(default)]
+    pub picks: Vec<String>,
 }
 
 impl Preset {
     pub fn start(self) -> Start {
-        Start { title: self.title, minutes: self.minutes, filter: Some((self.mode, self.apps, self.sites)) }
+        Start { title: self.title, minutes: self.minutes, filter: Some((self.mode, self.apps, self.sites)), picks: self.picks }
     }
 }
 
@@ -414,28 +436,182 @@ impl Focus {
 
 // ---- what the launcher asks ----------------------------------------------------------
 
-/// A session as asked for. `filter` None: the third answer was empty.
+/// A session as asked for. `filter` None: the third answer was empty. `picks`: what the Block
+/// field held (`Picks` ids).
 #[derive(Debug, PartialEq)]
 pub struct Start {
     pub title: String,
     pub minutes: u32,
     pub filter: Option<(Mode, Vec<String>, Vec<String>)>,
+    pub picks: Vec<String>,
+}
+
+/// The categories every install has: name, icon, apps, sites. A `[[focus_category]]` of the
+/// same name takes its place.
+pub const BUILT_IN: &[(&str, &str, &[&str], &[&str])] = &[
+    ("Messaging", g::MESSAGE_CIRCLE, &["discord.exe", "slack.exe", "telegram.exe", "whatsapp.exe", "signal.exe"], &["discord.com", "slack.com", "web.whatsapp.com", "web.telegram.org", "messenger.com"]),
+    ("Social", g::USERS, &[], &["facebook.com", "instagram.com", "x.com", "twitter.com", "tiktok.com", "reddit.com", "linkedin.com", "threads.net", "bsky.app"]),
+    ("Streaming", g::CIRCLE_PLAY, &["spotify.exe"], &["youtube.com", "netflix.com", "twitch.tv", "primevideo.com", "disneyplus.com"]),
+    ("Travel", g::PLANE, &[], &["booking.com", "airbnb.com", "expedia.com", "skyscanner.net"]),
+    ("News", g::NEWSPAPER, &[], &["news.google.com", "cnn.com", "bbc.com", "nytimes.com", "theguardian.com"]),
+    ("Shopping", g::SHOPPING_CART, &[], &["amazon.com", "ebay.com", "etsy.com", "aliexpress.com"]),
+    ("Gaming", g::GAMEPAD_2, &["steam.exe", "epicgameslauncher.exe", "battle.net.exe", "riotclientservices.exe"], &["store.steampowered.com", "epicgames.com"]),
+];
+
+/// The built-in categories (each replaced by the user's own of that name), then the user's others.
+pub fn categories(own: &[FocusCategory]) -> Vec<FocusCategory> {
+    let strings = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+    let built = BUILT_IN.iter().map(|&(name, _, apps, sites)| category(own, name).cloned().unwrap_or_else(|| FocusCategory { name: name.into(), apps: strings(apps), sites: strings(sites) }));
+    let rest = own.iter().filter(|c| !BUILT_IN.iter().any(|b| b.0.eq_ignore_ascii_case(&c.name)));
+    built.chain(rest.cloned()).collect()
+}
+
+/// A category's icon: the built-in one by name, `list-checks` for the user's own.
+pub fn category_icon(name: &str) -> &'static str {
+    BUILT_IN.iter().find(|b| b.0.eq_ignore_ascii_case(name.trim())).map_or(g::LIST_CHECKS, |b| b.1)
 }
 
 pub fn category<'a>(cats: &'a [FocusCategory], name: &str) -> Option<&'a FocusCategory> {
     cats.iter().find(|c| c.name.eq_ignore_ascii_case(name.trim()))
 }
 
-/// The answers to Start or Edit: title, minutes, and "<category> [allow|block]".
+/// The Block field's tokens in the order picked, as ids: "cat:<name>", "app:<exe>", "site:<host>".
+/// The form keeps them as its value, one per line.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Picks(pub Vec<String>);
+
+impl Picks {
+    pub fn of(value: &str) -> Self {
+        Picks(value.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+    }
+
+    pub fn value(&self) -> String {
+        self.0.join("\n")
+    }
+
+    pub fn add(&mut self, id: &str) {
+        if !self.0.iter().any(|p| p == id) {
+            self.0.push(id.to_string());
+        }
+    }
+
+    pub fn remove(&mut self, id: &str) {
+        self.0.retain(|p| p != id);
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        self.0.pop()
+    }
+}
+
+/// A token's icon and name.
+pub fn pick_look(id: &str) -> (&'static str, String) {
+    match id.split_once(':') {
+        Some(("cat", name)) => (category_icon(name), name.to_string()),
+        Some(("app", exe)) => (g::APP, app_label(exe)),
+        Some((_, host)) => (g::GLOBE, host.to_string()),
+        None => (g::GLOBE, id.to_string()),
+    }
+}
+
+/// Typed text in the Block menu that looks like a website ("x.com"), as its domain.
+pub fn typed_site(s: &str) -> Option<String> {
+    let s = s.trim();
+    (s.contains('.') && !s.contains(' ')).then(|| norm_site(s)).filter(|h| h.contains('.'))
+}
+
+/// "Messaging, steam.exe, reddit.com" as ids: a category's name, a program, or a website.
+pub fn pick_ids(text: &str, cats: &[FocusCategory]) -> Result<Vec<String>, String> {
+    list(text)
+        .iter()
+        .map(|p| match category(cats, p) {
+            Some(c) => Ok(format!("cat:{}", c.name)),
+            None if p.to_lowercase().ends_with(".exe") => Ok(format!("app:{}", norm_app(p))),
+            None => typed_site(p).map(|h| format!("site:{h}")).ok_or_else(|| format!("No category named {p}. Create it first")),
+        })
+        .collect()
+}
+
+/// The ids as `pick_ids` reads them.
+pub fn picks_text(ids: &[String]) -> String {
+    ids.iter().map(|id| id.split_once(':').map_or(id.as_str(), |(_, v)| v)).collect::<Vec<_>>().join(", ")
+}
+
+/// The programs and websites the ids stand for (a category's lists from `cats`).
+pub fn resolve(ids: &[String], cats: &[FocusCategory]) -> (Vec<String>, Vec<String>) {
+    let (mut apps, mut sites) = (vec![], vec![]);
+    for id in ids {
+        match id.split_once(':') {
+            Some(("cat", name)) => {
+                if let Some(c) = category(cats, name) {
+                    apps.extend(c.apps.iter().cloned());
+                    sites.extend(c.sites.iter().cloned());
+                }
+            }
+            Some(("app", exe)) => apps.push(exe.to_string()),
+            Some(("site", host)) => sites.push(host.to_string()),
+            _ => {}
+        }
+    }
+    (apps, sites)
+}
+
+/// The Duration menu's presets.
+pub const DURATIONS: [&str; 5] = ["25 min", "50 min", "1 hour", "1 hour 30 minutes", "No limit"];
+
+/// A length in the Duration field: "90" (minutes), "1h30", "1 hour 30 minutes", "50 min";
+/// Some(None) is no limit ("No limit", "0"); None does not parse.
+pub fn parse_minutes(s: &str) -> Option<Option<u32>> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("no limit") {
+        return Some(None);
+    }
+    if let Ok(n) = s.parse::<u32>() {
+        return Some((n > 0).then_some(n));
+    }
+    let secs = crate::timers::parse_duration(s)?.as_secs();
+    u32::try_from(secs.div_ceil(60)).ok().map(Some)
+}
+
+/// Minutes as the Duration field shows them: "25 min", "1 hour 30 minutes", "No limit" (0).
+pub fn minutes_label(m: u32) -> String {
+    let (h, r) = (m / 60, m % 60);
+    let hours = if h == 1 { "1 hour".to_string() } else { format!("{h} hours") };
+    match (h, r) {
+        (0, 0) => "No limit".into(),
+        (0, r) => format!("{r} min"),
+        (_, 0) => hours,
+        (_, r) => format!("{hours} {r} minutes"),
+    }
+}
+
+/// The session row's subtitle: "Blocking 3 categories", "Allowing 1 app, 2 websites". A
+/// session from before picks were kept counts its lists.
+pub fn blocking_line(s: &Session) -> String {
+    let count = |p: &str| s.picks.iter().filter(|id| id.starts_with(p)).count();
+    let (cats, apps, sites) = if s.picks.is_empty() { (0, s.apps.len(), s.sites.len()) } else { (count("cat:"), count("app:"), count("site:")) };
+    let n = |k: usize, one: &str, many: &str| (k > 0).then(|| format!("{k} {}", if k == 1 { one } else { many }));
+    let parts: Vec<String> = [n(cats, "category", "categories"), n(apps, "app", "apps"), n(sites, "website", "websites")].into_iter().flatten().collect();
+    let verb = if s.mode == Mode::Block { "Blocking" } else { "Allowing" };
+    format!("{verb} {}", if parts.is_empty() { "nothing".to_string() } else { parts.join(", ") })
+}
+
+/// Edit Focus Session's boxes, from the session: goal, minutes, and what it blocks (a session
+/// from before picks were kept: its programs and websites).
+pub fn edit_seed(s: &Session) -> Vec<String> {
+    let listed = || s.apps.iter().map(|a| format!("app:{a}")).chain(s.sites.iter().map(|h| format!("site:{h}"))).collect::<Vec<_>>();
+    let block = picks_text(&if s.picks.is_empty() { listed() } else { s.picks.clone() });
+    let block = if s.mode == Mode::Allow && !block.is_empty() { format!("{block} allow") } else { block };
+    vec![s.title.clone(), s.minutes.to_string(), block]
+}
+
+/// The answers to Start or Edit: title, minutes, and "<categories, apps, sites> [allow|block]".
 pub fn parse_start(got: &[String], cats: &[FocusCategory], default_minutes: u32) -> Result<Start, String> {
     let answer = |i: usize| got.get(i).map_or("", |s| s.trim());
     let title = if answer(0).is_empty() { "Focus".to_string() } else { answer(0).to_string() };
     let minutes = match answer(1) {
         "" => default_minutes,
-        t => match t.parse::<u32>() {
-            Ok(n) => n,
-            Err(_) => crate::timers::parse_duration(t).ok_or("Minutes: a number like 25 (0 for no limit), or 1h30m")?.as_secs().div_ceil(60) as u32,
-        },
+        t => parse_minutes(t).ok_or("Type a length: 25, 1h30, 1 hour 30 minutes, or 0 for no limit")?.unwrap_or(0),
     };
     let mut words: Vec<&str> = answer(2).split_whitespace().collect();
     let mode = match words.last().map(|w| w.to_lowercase()).as_deref() {
@@ -446,16 +622,12 @@ pub fn parse_start(got: &[String], cats: &[FocusCategory], default_minutes: u32)
     if mode.is_some() {
         words.pop();
     }
-    let name = words.join(" ");
-    let filter = match (name.is_empty(), mode) {
-        (true, None) => None,
-        (true, Some(m)) => Some((m, vec![], vec![])),
-        (false, m) => {
-            let c = category(cats, &name).ok_or_else(|| format!("No category named {name}. Create it first"))?;
-            Some((m.unwrap_or(Mode::Block), c.apps.clone(), c.sites.clone()))
-        }
-    };
-    Ok(Start { title, minutes, filter })
+    let picks = pick_ids(&words.join(" "), cats)?;
+    let filter = (mode.is_some() || !picks.is_empty()).then(|| {
+        let (apps, sites) = resolve(&picks, cats);
+        (mode.unwrap_or(Mode::Block), apps, sites)
+    });
+    Ok(Start { title, minutes, filter, picks })
 }
 
 /// "a, b ;c" -> ["a", "b", "c"].
@@ -657,17 +829,19 @@ mod tests {
         let mut s = session(Mode::Block, &[], &[], now);
         assert_eq!(s.row(now), ("Write".into(), "25:00 left".into()));
         s.pause(now + mins(5));
-        assert_eq!(s.row(now + mins(9)).1, "Paused · 20:00 left");
+        assert_eq!(s.row(now + mins(9)).1, "Paused · 20:00");
     }
 
     #[test]
     fn start_answers_parse() {
         let cats = vec![FocusCategory { name: "Deep Work".into(), apps: vec!["discord.exe".into()], sites: vec!["x.com".into()] }];
         let ask = |a: [&str; 3]| parse_start(&a.map(String::from), &cats, 25);
-        assert_eq!(ask(["", "", ""]), Ok(Start { title: "Focus".into(), minutes: 25, filter: None }));
+        assert_eq!(ask(["", "", ""]), Ok(Start { title: "Focus".into(), minutes: 25, filter: None, picks: vec![] }));
         let s = ask(["Essay", "50", "deep work"]).unwrap();
         assert_eq!((s.title.as_str(), s.minutes), ("Essay", 50));
         assert_eq!(s.filter, Some((Mode::Block, vec!["discord.exe".into()], vec!["x.com".into()])));
+        assert_eq!(s.picks, ["cat:Deep Work"]);
+        assert_eq!(ask(["", "1 hour 30 minutes", ""]).unwrap().minutes, 90);
         assert_eq!(ask(["", "1h", "Deep Work ALLOW"]).unwrap().minutes, 60);
         assert!(matches!(ask(["", "", "Deep Work allow"]).unwrap().filter, Some((Mode::Allow, ..))));
         assert_eq!(ask(["", "", "allow"]).unwrap().filter, Some((Mode::Allow, vec![], vec![])));
@@ -752,7 +926,7 @@ mod tests {
         f.set(Some(Session::new("Essay", Mode::Allow, &["Code.exe".into()], &["docs.rs".into()], 50, false, now)));
         f.set(None);
         let start = Focus::load(path.clone()).preset.unwrap().start();
-        assert_eq!(start, Start { title: "Essay".into(), minutes: 50, filter: Some((Mode::Allow, vec!["code.exe".into()], vec!["docs.rs".into()])) });
+        assert_eq!(start, Start { title: "Essay".into(), minutes: 50, filter: Some((Mode::Allow, vec!["code.exe".into()], vec!["docs.rs".into()])), picks: vec![] });
         let _ = fs::remove_file(path);
     }
 
@@ -764,10 +938,10 @@ mod tests {
         assert!(s.unlimited() && s.running() && s.until.is_none());
         let later = now + mins(60 * 24);
         assert!(s.active(later) && !s.expired(later) && s.blocked_app("notepad.exe", later));
-        assert_eq!(s.row(now + mins(3)), ("Open".into(), "3:00 elapsed".into()));
+        assert_eq!(s.row(now + mins(3)), ("Open".into(), "3:00".into()), "the time run, like a stopwatch");
         s.pause(now + mins(5));
         assert!(!s.running() && !s.blocked_app("notepad.exe", later), "paused: not blocking");
-        assert_eq!(s.row(later).1, "Paused · 5:00 elapsed", "a pause stops the clock");
+        assert_eq!(s.row(later).1, "Paused · 5:00", "a pause stops the clock");
         s.resume(now + mins(10));
         assert_eq!(s.elapsed(now + mins(12)), mins(7));
         assert!(s.blocked_app("notepad.exe", now + mins(12)));
@@ -813,6 +987,121 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
         assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn durations_parse_in_every_form_the_form_offers() {
+        for (s, want) in [
+            ("90", Some(Some(90))),
+            ("1h30", Some(Some(90))),
+            ("1 hour 30 minutes", Some(Some(90))),
+            ("50 min", Some(Some(50))),
+            ("2 hours", Some(Some(120))),
+            ("No limit", Some(None)),
+            ("no limit", Some(None)),
+            ("0", Some(None)),
+            ("soon", None),
+            ("5x", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_minutes(s), want, "{s}");
+        }
+        assert_eq!([25, 50, 60, 90, 0].map(minutes_label), DURATIONS, "the menu's presets");
+        assert_eq!(DURATIONS.map(parse_minutes), [Some(Some(25)), Some(Some(50)), Some(Some(60)), Some(Some(90)), Some(None)], "and read back");
+    }
+
+    #[test]
+    fn the_session_row_says_what_it_blocks() {
+        let now = SystemTime::now();
+        let ids = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut s = session(Mode::Block, &[], &[], now);
+        assert_eq!(blocking_line(&s), "Blocking nothing");
+        s.picks = ids(&["cat:Messaging", "cat:Social", "cat:Streaming"]);
+        assert_eq!(blocking_line(&s), "Blocking 3 categories");
+        s.picks = ids(&["app:discord.exe"]);
+        assert_eq!(blocking_line(&s), "Blocking 1 app");
+        s.picks = ids(&["cat:Social", "app:a.exe", "site:x.com", "site:y.com"]);
+        assert_eq!(blocking_line(&s), "Blocking 1 category, 1 app, 2 websites");
+        s.mode = Mode::Allow;
+        s.picks = ids(&["cat:News", "cat:Travel"]);
+        assert_eq!(blocking_line(&s), "Allowing 2 categories");
+        let old = session(Mode::Block, &["notepad.exe"], &["x.com", "y.com"], now);
+        assert_eq!(blocking_line(&old), "Blocking 1 app, 2 websites", "a session from before picks counts its lists");
+    }
+
+    #[test]
+    fn built_in_categories_have_their_icons_and_a_user_category_of_the_same_name_wins() {
+        let own = vec![
+            FocusCategory { name: "Social".into(), apps: vec!["x.exe".into()], sites: vec![] },
+            FocusCategory { name: "Work".into(), apps: vec![], sites: vec!["jira.com".into()] },
+        ];
+        let all = categories(&own);
+        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Messaging", "Social", "Streaming", "Travel", "News", "Shopping", "Gaming", "Work"]);
+        assert_eq!((all[1].apps.clone(), all[1].sites.clone()), (vec!["x.exe".to_string()], vec![]), "the user's lists, not the built-in ones");
+        assert_eq!(categories(&[])[0].apps, ["discord.exe", "slack.exe", "telegram.exe", "whatsapp.exe", "signal.exe"]);
+        use crate::design::g;
+        let icons: Vec<&str> = all.iter().map(|c| category_icon(&c.name)).collect();
+        assert_eq!(icons, [g::MESSAGE_CIRCLE, g::USERS, g::CIRCLE_PLAY, g::PLANE, g::NEWSPAPER, g::SHOPPING_CART, g::GAMEPAD_2, g::LIST_CHECKS]);
+    }
+
+    #[test]
+    fn extend_adds_five_minutes_running_or_paused() {
+        let now = SystemTime::now();
+        let mut s = session(Mode::Block, &[], &[], now);
+        s.extend(now);
+        assert_eq!(s.left(now), Duration::from_secs(25 * 60 + 300));
+        s.pause(now);
+        s.extend(now);
+        assert_eq!(s.left(now), Duration::from_secs(25 * 60 + 600));
+        let mut open = Session::new("Open", Mode::Block, &[], &[], 0, false, now);
+        open.extend(now);
+        assert_eq!((open.until, open.elapsed(now)), (None, Duration::ZERO), "no limit: nothing to extend");
+    }
+
+    #[test]
+    fn tokens_are_picked_and_removed() {
+        let mut p = Picks::of("");
+        p.add("cat:Messaging");
+        p.add("cat:Social");
+        p.add("cat:Messaging");
+        assert_eq!(p.0, ["cat:Messaging", "cat:Social"], "once each, in the order picked");
+        let mut back = Picks::of(&p.value());
+        assert_eq!(back, p, "the form value round-trips");
+        back.remove("cat:Messaging");
+        assert_eq!(back.0, ["cat:Social"]);
+        assert_eq!((back.pop(), back.pop()), (Some("cat:Social".into()), None), "Backspace takes the last one");
+        use crate::design::g;
+        assert_eq!(pick_look("cat:Social"), (g::USERS, "Social".into()));
+        assert_eq!(pick_look("app:discord.exe"), (g::APP, "Discord".into()));
+        assert_eq!(pick_look("site:x.com"), (g::GLOBE, "x.com".into()));
+    }
+
+    #[test]
+    fn picks_are_typed_resolved_and_shown_as_text() {
+        let cats = categories(&[]);
+        let ids = pick_ids("Messaging, steam.exe, https://www.Reddit.com/r", &cats).unwrap();
+        assert_eq!(ids, ["cat:Messaging", "app:steam.exe", "site:reddit.com"]);
+        assert_eq!(picks_text(&ids), "Messaging, steam.exe, reddit.com");
+        let (apps, sites) = resolve(&ids, &cats);
+        assert!(apps.contains(&"discord.exe".to_string()) && apps.contains(&"steam.exe".to_string()));
+        assert!(sites.contains(&"discord.com".to_string()) && sites.contains(&"reddit.com".to_string()));
+        assert!(pick_ids("nope", &cats).unwrap_err().contains("No category named nope"));
+        assert_eq!((typed_site("x.com"), typed_site("https://www.Reddit.com/r")), (Some("x.com".into()), Some("reddit.com".into())));
+        assert_eq!((typed_site("reddit"), typed_site("two words.com"), typed_site("x.")), (None, None, None));
+    }
+
+    #[test]
+    fn edit_starts_from_the_session_and_reads_back_as_it() {
+        let cats = categories(&[]);
+        let mut s = Session::new("Write", Mode::Allow, &[], &[], 50, false, SystemTime::now());
+        s.picks = vec!["cat:Social".into(), "site:x.com".into()];
+        let seed = edit_seed(&s);
+        assert_eq!(seed, ["Write", "50", "Social, x.com allow"]);
+        let back = parse_start(&seed, &cats, 25).unwrap();
+        assert_eq!((back.title.as_str(), back.minutes, back.picks.clone()), ("Write", 50, s.picks.clone()));
+        assert!(matches!(back.filter, Some((Mode::Allow, _, ref sites)) if sites.contains(&"x.com".to_string())));
+        let old = Session::new("Old", Mode::Block, &["notepad.exe".into()], &["x.com".into()], 25, false, SystemTime::now());
+        assert_eq!(edit_seed(&old)[2], "notepad.exe, x.com", "a session from before picks keeps its lists");
     }
 
     #[test]
