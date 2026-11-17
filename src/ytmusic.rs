@@ -2,7 +2,7 @@
 //! procast sends it, and the library lists kept on disk between runs.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -126,6 +126,235 @@ impl Filter {
     pub fn placeholder(self) -> String {
         format!("Search {}…", self.label().to_lowercase())
     }
+
+    /// InnerTube `params` for a filtered search. Same strings as `FILTERS` in `browser/ytmusic.js`.
+    pub fn params(self) -> &'static str {
+        match self {
+            Self::Songs => "EgWKAQIIAWoMEA4QChADEAQQCRAF",
+            Self::Albums => "EgWKAQIYAWoMEA4QChADEAQQCRAF",
+            Self::Artists => "EgWKAQIgAWoMEA4QChADEAQQCRAF",
+            Self::Playlists => "EgWKAQIoAWoMEA4QChADEAQQCRAF",
+        }
+    }
+}
+
+const RENDERERS: [&str; 2] = ["musicTwoRowItemRenderer", "musicResponsiveListItemRenderer"];
+
+/// Depth-first, document order. `visit` returning false skips that value's subtree.
+fn walk<'a>(node: &'a Value, visit: &mut dyn FnMut(&'a str, &'a Value) -> bool) {
+    match node {
+        Value::Array(xs) => {
+            for n in xs {
+                walk(n, visit);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if visit(k, v) {
+                    walk(v, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect<'a>(node: &'a Value, keys: &[&str]) -> Vec<&'a Value> {
+    let mut out = Vec::new();
+    walk(node, &mut |k, v| {
+        if keys.iter().any(|want| *want == k) {
+            out.push(v);
+        }
+        true
+    });
+    out
+}
+
+fn first<'a>(node: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    collect(node, keys).into_iter().next()
+}
+
+fn runs_of(text: &Value) -> &[Value] {
+    text.get("runs").and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[])
+}
+
+fn joined(runs: &[Value]) -> String {
+    runs.iter().filter_map(|r| r.get("text").and_then(Value::as_str)).collect()
+}
+
+fn last_thumb(node: &Value) -> String {
+    first(node, &["thumbnails"])
+        .and_then(Value::as_array)
+        .and_then(|t| t.last())
+        .and_then(|t| t.get("url"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn playlist_of(node: &Value) -> String {
+    collect(node, &["watchPlaylistEndpoint", "watchEndpoint"])
+        .into_iter()
+        .find_map(|e| e.get("playlistId").and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn fields(r: &Value) -> (Option<&Value>, Vec<&[Value]>) {
+    if r.get("flexColumns").is_none() {
+        return (runs_of(&r["title"]).first(), vec![runs_of(&r["subtitle"])]);
+    }
+    let Some(flex) = r["flexColumns"].as_array() else {
+        return (None, Vec::new());
+    };
+    let columns: Vec<&[Value]> = flex.iter().map(|c| runs_of(&c["musicResponsiveListItemFlexColumnRenderer"]["text"])).collect();
+    let title_run = columns.first().and_then(|c| c.first());
+    let rest = columns.iter().skip(1).copied().collect();
+    (title_run, rest)
+}
+
+fn is_duration(text: &str) -> bool {
+    let mut parts = text.split(':');
+    let Some(first) = parts.next() else { return false };
+    if first.is_empty() || !first.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let Some(second) = parts.next() else { return false };
+    if second.len() != 2 || !second.bytes().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(third) => third.len() == 2 && third.bytes().all(|c| c.is_ascii_digit()) && parts.next().is_none(),
+    }
+}
+
+fn duration_of(r: &Value, columns: &[&[Value]]) -> String {
+    let fixed = joined(runs_of(&r["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]["text"]));
+    if !fixed.is_empty() {
+        return fixed;
+    }
+    columns
+        .iter()
+        .copied()
+        .flatten()
+        .find_map(|run| {
+            let t = run.get("text").and_then(Value::as_str)?;
+            is_duration(t).then(|| t.to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn kind_of(browse: &Value) -> Option<Kind> {
+    let page_type = browse["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"].as_str();
+    match page_type {
+        Some("MUSIC_PAGE_TYPE_ALBUM" | "MUSIC_PAGE_TYPE_AUDIOBOOK") => return Some(Kind::Album),
+        Some("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL") => return Some(Kind::Artist),
+        Some("MUSIC_PAGE_TYPE_PLAYLIST") => return Some(Kind::Playlist),
+        _ => {}
+    }
+    let id = browse.get("browseId").and_then(Value::as_str)?;
+    if id.starts_with("MPRE") {
+        Some(Kind::Album)
+    } else if id.starts_with("UC") {
+        Some(Kind::Artist)
+    } else if id.starts_with("VL") {
+        Some(Kind::Playlist)
+    } else {
+        None
+    }
+}
+
+fn identity(r: &Value, title_run: Option<&Value>) -> Option<(Kind, String, String)> {
+    let watch = title_run.and_then(|t| t.pointer("/navigationEndpoint/watchEndpoint")).or_else(|| r.pointer("/navigationEndpoint/watchEndpoint"));
+    let video_id = r.pointer("/playlistItemData/videoId").and_then(Value::as_str).or_else(|| watch.and_then(|w| w.get("videoId")).and_then(Value::as_str));
+    if let Some(video_id) = video_id.filter(|s| !s.is_empty()) {
+        let playlist_id = watch.and_then(|w| w.get("playlistId")).and_then(Value::as_str).unwrap_or("").to_string();
+        return Some((Kind::Song, video_id.to_string(), playlist_id));
+    }
+    let browse = r.pointer("/navigationEndpoint/browseEndpoint").or_else(|| title_run.and_then(|t| t.pointer("/navigationEndpoint/browseEndpoint")))?;
+    let id = browse.get("browseId").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let kind = kind_of(browse)?;
+    let from = playlist_of(r);
+    let playlist_id = if !from.is_empty() {
+        from
+    } else if kind == Kind::Playlist {
+        id.strip_prefix("VL").unwrap_or(id).to_string()
+    } else {
+        String::new()
+    };
+    Some((kind, id.to_string(), playlist_id))
+}
+
+fn item(r: &Value) -> Option<MusicItem> {
+    let (title_run, columns) = fields(r);
+    let title = title_run?.get("text").and_then(Value::as_str)?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let (kind, id, playlist_id) = identity(r, title_run)?;
+    let subtitle = columns.iter().map(|runs| joined(runs)).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ").replace(" • ", " · ");
+    let thumb = {
+        let t = last_thumb(&r["thumbnail"]);
+        if t.is_empty() { last_thumb(&r["thumbnailRenderer"]) } else { t }
+    };
+    Some(MusicItem { kind, id, playlist_id, title: title.to_string(), subtitle: subtitle.trim().to_string(), thumb, duration: duration_of(r, &columns) })
+}
+
+fn kind_key(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Song => "song",
+        Kind::Album => "album",
+        Kind::Artist => "artist",
+        Kind::Playlist => "playlist",
+    }
+}
+
+/// InnerTube search/browse JSON → catalog rows. Port of `items()` in `browser/ytmusic.js`.
+pub fn parse_items(json: &Value) -> Vec<MusicItem> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in collect(json, &RENDERERS) {
+        let Some(it) = item(r) else { continue };
+        let key = format!("{}{}", kind_key(it.kind), it.id);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(it);
+    }
+    out
+}
+
+fn header(json: &Value) -> Option<&Value> {
+    let mut found = None;
+    walk(json, &mut |k, v| {
+        if found.is_some() || k.ends_with("ShelfRenderer") {
+            return false;
+        }
+        if k.ends_with("HeaderRenderer") && !runs_of(&v["title"]).is_empty() {
+            found = Some(v);
+        }
+        true
+    });
+    found
+}
+
+/// Page title and rows. Port of `page()` in `browser/ytmusic.js`, without header playlistId/thumb
+/// except copying the header thumb onto songs that have none.
+pub fn parse_page(json: &Value) -> (String, Vec<MusicItem>) {
+    let head = header(json);
+    let thumb = head.map(last_thumb).unwrap_or_default();
+    let title = head.and_then(|h| runs_of(&h["title"]).first()).and_then(|r| r.get("text")).and_then(Value::as_str).unwrap_or("").to_string();
+    let items = parse_items(json)
+        .into_iter()
+        .map(|mut it| {
+            if it.kind == Kind::Song && it.thumb.is_empty() {
+                it.thumb = thumb.clone();
+            }
+            it
+        })
+        .collect();
+    (title, items)
 }
 
 /// A part of the user's library.
@@ -505,5 +734,133 @@ mod tests {
         save_to(&path, "VLLM", &[song("d")]).unwrap();
         assert_eq!(load_from(&path, "VLLM").unwrap().0, [song("d")], "saving replaces a corrupt file");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn fixture(name: &str) -> Value {
+        let raw = match name {
+            "search-songs" => include_str!("../browser/test-fixtures/search-songs.json"),
+            "search-albums" => include_str!("../browser/test-fixtures/search-albums.json"),
+            "search-artists" => include_str!("../browser/test-fixtures/search-artists.json"),
+            "search-playlists" => include_str!("../browser/test-fixtures/search-playlists.json"),
+            "album" => include_str!("../browser/test-fixtures/album.json"),
+            _ => panic!("unknown fixture {name}"),
+        };
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn first_is(items: &[MusicItem], kind: Kind, id: &str, title: &str) {
+        let it = items.first().expect("expected at least one item");
+        assert_eq!((it.kind, it.id.as_str(), it.title.as_str()), (kind, id, title));
+    }
+
+    #[test]
+    fn songs_search_fixture() {
+        let items = parse_items(&fixture("search-songs"));
+        assert!(items.len() >= 3);
+        for it in &items {
+            assert_eq!(it.kind, Kind::Song);
+            assert_eq!(it.id.len(), 11);
+            assert!(!it.title.is_empty());
+            assert!(it.thumb.starts_with("https://"));
+            assert!(regex_duration(&it.duration), "{}", it.duration);
+        }
+        first_is(&items, Kind::Song, "pvC5YD-IjL0", "Holocene");
+    }
+
+    fn regex_duration(s: &str) -> bool {
+        let parts: Vec<&str> = s.split(':').collect();
+        matches!(parts.as_slice(), [m, sec] if !m.is_empty() && m.bytes().all(|c| c.is_ascii_digit()) && sec.len() == 2 && sec.bytes().all(|c| c.is_ascii_digit()))
+            || matches!(parts.as_slice(), [h, m, sec] if !h.is_empty() && h.bytes().all(|c| c.is_ascii_digit()) && m.len() == 2 && sec.len() == 2 && m.bytes().all(|c| c.is_ascii_digit()) && sec.bytes().all(|c| c.is_ascii_digit()))
+    }
+
+    #[test]
+    fn albums_search_fixture() {
+        let items = parse_items(&fixture("search-albums"));
+        assert!(items.len() >= 3);
+        for it in &items {
+            assert_eq!(it.kind, Kind::Album);
+            assert!(it.id.starts_with("MPRE"));
+            assert!(it.playlist_id.starts_with("OLAK5uy_"));
+        }
+        first_is(&items, Kind::Album, "MPREb_CV3KFsT8IdK", "Bon Iver, Bon Iver");
+    }
+
+    #[test]
+    fn artists_search_fixture() {
+        let items = parse_items(&fixture("search-artists"));
+        assert!(items.len() >= 1);
+        for it in &items {
+            assert_eq!(it.kind, Kind::Artist);
+            assert!(it.id.starts_with("UC"));
+        }
+        first_is(&items, Kind::Artist, "UCx-cwf1tCXoZr0KtnpaDwyA", "Bon Iver");
+    }
+
+    #[test]
+    fn playlists_search_fixture() {
+        let items = parse_items(&fixture("search-playlists"));
+        assert!(items.len() >= 1);
+        for it in &items {
+            assert_eq!(it.kind, Kind::Playlist);
+            assert!(!it.playlist_id.is_empty());
+            assert!(!it.playlist_id.starts_with("VL"));
+        }
+        first_is(&items, Kind::Playlist, "VLPLyVScyoi1XjMBUmsLaWv_xlOOBtphtc3q", "Bon Iver Radio");
+    }
+
+    #[test]
+    fn subtitles_use_the_middle_dot() {
+        for it in parse_items(&fixture("search-songs")) {
+            assert!(!it.subtitle.contains('•'), "{}", it.subtitle);
+        }
+    }
+
+    #[test]
+    fn album_page_fixture() {
+        let (title, items) = parse_page(&fixture("album"));
+        assert_eq!(title, "i,i");
+        let songs: Vec<_> = items.iter().filter(|it| it.kind == Kind::Song).collect();
+        assert!(songs.len() >= 3);
+        for song in &songs {
+            assert!(song.thumb.starts_with("https://"));
+        }
+        first_is(&items, Kind::Song, "XQCPmECH8IU", "Yi");
+    }
+
+    #[test]
+    fn malformed_renderer_is_skipped() {
+        let json = json!({"musicResponsiveListItemRenderer": {"flexColumns": []}});
+        assert_eq!(parse_items(&json).len(), 0);
+    }
+
+    #[test]
+    fn thumbnail_renderer_fills_empty_thumbnail() {
+        let json = json!({
+            "musicTwoRowItemRenderer": {
+                "title": {"runs": [{"text": "Album", "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_x"}}}]},
+                "thumbnail": {},
+                "thumbnailRenderer": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://t/a"}]}}}
+            }
+        });
+        assert_eq!(parse_items(&json)[0].thumb, "https://t/a");
+    }
+
+    #[test]
+    fn wrapped_playlist_header_title() {
+        let json = json!({
+            "header": {
+                "musicEditablePlaylistDetailHeaderRenderer": {
+                    "header": {
+                        "musicResponsiveHeaderRenderer": {
+                            "title": {"runs": [{"text": "Mine"}]},
+                            "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://t/small"}, {"url": "https://t/big"}]}}},
+                            "buttons": [{"watchPlaylistEndpoint": {"playlistId": "PL1"}}]
+                        }
+                    }
+                }
+            }
+        });
+        let (title, _) = parse_page(&json);
+        assert_eq!(title, "Mine");
     }
 }

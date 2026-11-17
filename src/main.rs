@@ -24,6 +24,7 @@ mod toast;
 mod win;
 mod ytmdesktop;
 mod ytmusic;
+mod ytmusic_api;
 
 use std::{
     collections::{HashMap, HashSet},
