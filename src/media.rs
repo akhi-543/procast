@@ -65,6 +65,7 @@ impl Media {
 fn run(events: Sender<Event>, rx: Receiver<Event>, out: UnboundedSender<Msg>) {
     unsafe { _ = RoInitialize(RO_INIT_MULTITHREADED) };
     let Ok(manager) = manager() else { return };
+    remove_old_covers();
     let _ = manager.SessionsChanged(&notify(&events, Event::SessionsChanged));
     let _ = manager.CurrentSessionChanged(&notify(&events, Event::SessionsChanged));
     let mut worker = Worker { events, out, tracked: None, sent: None };
@@ -221,9 +222,22 @@ fn cover_name(title: &str, artist: &str) -> String {
     format!("cover-{:016x}", hasher.finish())
 }
 
+fn covers_dir() -> PathBuf {
+    crate::config::dir().join("ytmusic")
+}
+
+fn remove_old_covers() {
+    let Ok(entries) = std::fs::read_dir(covers_dir()) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("cover-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn save_cover(properties: &Properties, title: &str, artist: &str) -> Option<PathBuf> {
     let bytes = thumbnail(properties)?;
-    let dir = crate::config::dir().join("ytmusic");
+    let dir = covers_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(cover_name(title, artist));
     std::fs::write(&path, bytes).ok()?;
