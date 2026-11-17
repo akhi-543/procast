@@ -43,8 +43,14 @@ pub struct Current {
     pub title: String,
     pub artist: String,
     pub playlist_id: String,
+    #[serde(deserialize_with = "percent")]
     pub volume: u32,
     pub muted: bool,
+}
+
+/// The page's player may report a fractional volume.
+fn percent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(f64::deserialize(d)?.round().clamp(0., 100.) as u32)
 }
 
 /// The companion's answer to one request.
@@ -404,6 +410,8 @@ mod tests {
         assert_eq!((r.req, r.op.as_str(), r.error), (4, "current", None));
         assert_eq!(r.items[0].kind, Kind::Playlist);
         assert_eq!(r.current, Some(Current { video_id: "abc".into(), title: "One".into(), artist: "Band".into(), volume: 40, muted: true, ..Default::default() }));
+        let level = |json: &str| serde_json::from_str::<Current>(json).unwrap().volume;
+        assert_eq!((level(r#"{"volume":33.4}"#), level(r#"{"volume":140}"#), level(r#"{"volume":-2.5}"#), level("{}")), (33, 100, 0, 0));
         let bare: Reply = serde_json::from_str(r#"{"req":1,"op":"like","current":null,"items":[{"title":"x"}]}"#).unwrap();
         assert_eq!((bare.current, bare.items[0].kind, bare.items[0].thumb.as_str()), (None, Kind::Song, ""));
     }

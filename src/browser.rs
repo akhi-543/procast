@@ -197,7 +197,13 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
 fn parse_reply(body: &[u8]) -> Reply {
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
     if v["t"] == "ytm" {
-        return Reply::Music(serde_json::from_value(v).unwrap_or_default());
+        let music = serde_json::from_value(v.clone()).unwrap_or_else(|_| crate::ytmusic::Reply {
+            req: v["req"].as_u64().unwrap_or_default(),
+            op: v["op"].as_str().unwrap_or_default().to_string(),
+            error: Some("Unexpected answer from the browser extension".into()),
+            ..Default::default()
+        });
+        return Reply::Music(music);
     }
     if let Some(e) = v["error"].as_str() {
         return Reply::Done(Err(e.to_string()));
@@ -279,6 +285,10 @@ mod tests {
         }
         match parse_reply(br#"{"t":"ytm","req":8,"op":"like","title":"","items":[],"current":null,"error":"Open YouTube Music first."}"#) {
             Reply::Music(r) => assert_eq!((r.req, r.op.as_str(), r.error.as_deref()), (8, "like", Some("Open YouTube Music first."))),
+            r => panic!("{r:?}"),
+        }
+        match parse_reply(br#"{"t":"ytm","req":9,"op":"browse","items":[{"kind":"podcast","id":"x"}]}"#) {
+            Reply::Music(r) => assert_eq!((r.req, r.op.as_str(), r.error.as_deref()), (9, "browse", Some("Unexpected answer from the browser extension"))),
             r => panic!("{r:?}"),
         }
     }
