@@ -304,6 +304,12 @@ fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], pick
     cats.chain(apps).filter(|e| !picks.0.contains(&e.id)).collect()
 }
 
+/// Add Calendar's answer for the submit from form `generation`: whether it drives the form on
+/// screen (`on_form`, the latest one, `form_gen`), and which fetch is still pending after it.
+fn add_answer(pending: Option<u64>, generation: u64, form_gen: u64, on_form: bool) -> (bool, Option<u64>) {
+    (on_form && generation == form_gen, pending.filter(|p| *p != generation))
+}
+
 /// The Add Calendar form: ICS address (focused), Name, Colour, and where to find the address.
 fn calendar_form() -> Vec<FormField> {
     let field = |label: &str, ctl: Ctl, value: &str| FormField { label: label.to_string().into(), ctl, value: value.into(), input: None, error: None };
@@ -417,6 +423,8 @@ const RUNNING: &str = "Running";
 const FOCUS: &str = "Focus";
 /// The next meeting's section, under Running.
 const NEXT: &str = "Next";
+/// The ActionBar while Add Calendar's fetch runs.
+const READING: &str = "Reading the calendar…";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
 /// with the same section share one header; `headed` heads a section even when it is the only
@@ -816,8 +824,10 @@ struct Launcher {
     hidden_events: HashSet<String>,
     /// A meeting reminder went out: the next open selects root's Next row, so Enter joins.
     pick_next: bool,
-    /// Add Calendar's fetch is on its way: Ctrl+Enter waits for it.
-    adding_calendar: bool,
+    /// Each `open_form` is a new form: an answer for an older one never drives the one on screen.
+    form_gen: u64,
+    /// The form (by `form_gen`) whose Add Calendar fetch is on its way: its Ctrl+Enter waits.
+    adding_calendar: Option<u64>,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
     matcher: Matcher,
@@ -987,7 +997,8 @@ impl Launcher {
             calendar: calendar::Calendar::default(),
             hidden_events: calendar::load_hidden(&config::dir().join(CALENDAR_HIDDEN)),
             pick_next: false,
-            adding_calendar: false,
+            form_gen: 0,
+            adding_calendar: None,
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -1755,7 +1766,10 @@ impl Launcher {
         let sections = calendar::sections(&self.calendar_events(), now);
         if sections.is_empty() {
             let text = if self.calendar.pending() { "Fetching your calendar…" } else { "Nothing on today or tomorrow" };
-            return vec![empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)])];
+            // Enter is Add Calendar only with no feed; here it waits under Ctrl+K.
+            let mut it = empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![]);
+            it.extra = vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)];
+            return vec![it];
         }
         let mut rows = vec![];
         for (name, events) in sections {
@@ -1797,42 +1811,57 @@ impl Launcher {
     /// Ctrl+Enter on Add Calendar: fetches the address once on the background executor; the
     /// answer comes back as `Msg::CalendarAdded`.
     fn add_calendar(&mut self, cx: &mut Context<Self>) {
-        let Some(form) = self.form.as_ref().filter(|_| !self.adding_calendar) else { return };
+        let Some(form) = &self.form else { return };
+        if self.adding_calendar == Some(self.form_gen) {
+            self.status = Some((Tone::Info, READING.into()));
+            return cx.notify();
+        }
         let v = form_values(&form.fields);
         let url = v["ICS address"].trim().to_string();
+        if self.cfg.calendar_feed.iter().any(|f| calendar::same_feed(&f.url, &url)) {
+            self.status = Some((Tone::Error, calendar::ALREADY_ADDED.into()));
+            return cx.notify();
+        }
         let name = match v["Name"].trim() {
             "" => calendar::provider(&url),
             n => n.to_string(),
         };
         let feed = config::CalendarFeed { name, colour: v["Colour"].to_string(), url };
-        self.adding_calendar = true;
-        self.status = Some((Tone::Info, "Reading the calendar…".into()));
+        let generation = self.form_gen;
+        self.adding_calendar = Some(generation);
+        self.status = Some((Tone::Info, READING.into()));
         let tx = self.tx.clone();
         cx.background_executor()
             .spawn(async move {
                 let r = std::panic::catch_unwind(|| calendar::fetch(&feed.url)).unwrap_or_else(|_| Err("the fetch failed".into()));
-                let _ = tx.unbounded_send(Msg::CalendarAdded(feed, r));
+                let _ = tx.unbounded_send(Msg::CalendarAdded(generation, feed, r));
             })
             .detach();
         cx.notify();
     }
 
-    /// Add Calendar's fetch came back: a calendar that reads is added and My Schedule opens on
-    /// it ("Added Work"); one that does not keeps the form, the ActionBar saying so.
-    fn calendar_added(&mut self, feed: config::CalendarFeed, result: Result<Vec<calendar::Event>, String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.adding_calendar = false;
-        let here = self.mode == Mode::Form(FormKind::AddCalendar);
-        let fields = [("url", feed.url.as_str()), ("name", feed.name.as_str()), ("colour", feed.colour.as_str())];
+    /// Add Calendar's fetch for form `generation` came back: a calendar that reads is added
+    /// ("Added Work") and, from the form still on screen, My Schedule opens on it; one that does
+    /// not keeps that form, the ActionBar saying so. An older form's answer only toasts.
+    fn calendar_added(&mut self, generation: u64, feed: config::CalendarFeed, result: Result<Vec<calendar::Event>, String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (here, pending) = add_answer(self.adding_calendar, generation, self.form_gen, self.mode == Mode::Form(FormKind::AddCalendar));
+        self.adding_calendar = pending;
+        if pending.is_none() && self.status.as_ref().is_some_and(|(_, s)| s == READING) {
+            self.status = None;
+        }
         let added = result
             .map_err(|_| "Couldn't read this calendar".to_string())
-            .and_then(|events| config::edit_file(&config::path(), |t| config::edit_table(t, "calendar_feed", config::TableEdit::Add(&fields))).map(|(c, _)| (c, events)));
+            .and_then(|events| calendar::save_feeds(&config::path(), |t| calendar::add_feed(t, &feed)).map(|(c, _)| (c, events)));
         let (c, events) = match added {
             Ok(v) => v,
             Err(e) if here => {
                 self.status = Some((Tone::Error, e));
                 return cx.notify();
             }
-            Err(e) => return self.say(Msg::error(e)),
+            Err(e) => {
+                self.say(Msg::error(format!("{}: {e}", feed.name)));
+                return cx.notify();
+            }
         };
         self.cfg.calendar_feed = c.calendar_feed;
         self.say(Msg::done(format!("Added {}", feed.name)));
@@ -2310,6 +2339,10 @@ impl Launcher {
         }
         if !matches!(mode, Mode::Form(_)) {
             self.form = None;
+        }
+        // Add Calendar's wait is the form's: it does not follow the user elsewhere.
+        if self.status.as_ref().is_some_and(|(_, s)| s == READING) {
+            self.status = None;
         }
         if mode != Mode::Ai && self.ai.take().is_some() {
             self.send(json!({"t": "aiStop"}));
@@ -3355,6 +3388,7 @@ impl Launcher {
         }
         let field = fields.iter().position(FormField::focusable).unwrap_or(0);
         self.form = Some(NativeForm { fields, field, _subs: subs });
+        self.form_gen += 1;
         if self.visible {
             self.set_mode(Mode::Form(kind), cx);
         } else {
@@ -4230,7 +4264,7 @@ impl Launcher {
             // The old index is dropped; a new one re-crawls the folders (never the saved copy)
             // and reconnects the helper, which scans every drive's MFT afresh.
             Msg::AddCalendar => self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
-            Msg::CalendarAdded(feed, result) => self.calendar_added(feed, result, window, cx),
+            Msg::CalendarAdded(generation, feed, result) => self.calendar_added(generation, feed, result, window, cx),
             Msg::RebuildIndex => {
                 self.files = start_files(&self.cfg, &self.tx);
                 self.refresh_index_status(cx);
@@ -4328,7 +4362,8 @@ impl Launcher {
                 if let Some(h) = self.settings_window {
                     drop(h.update(cx, |_, _, cx| cx.notify()));
                 }
-                if self.visible && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
+                // An armed row (Join's confirm) waits for its second Enter: a refresh would move it.
+                if self.visible && self.armed.is_none() && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
                     self.refresh(cx);
                 }
             }
@@ -6392,6 +6427,15 @@ mod tests {
         assert_eq!(first("backspace", &["Form"]), "PopToken", "on the token field itself");
         assert_eq!((first("left", &["Form"]), first("right", &["Form"])), ("SelectLeft".into(), "SelectRight".into()), "Left and Right move between swatches");
         assert_ne!(first("left", &["Form", input]), "SelectLeft", "a text box keeps its caret keys");
+    }
+
+    #[test]
+    fn an_add_calendar_answer_drives_only_the_form_that_asked() {
+        assert_eq!(add_answer(Some(1), 1, 1, true), (true, None), "the form on screen follows its answer");
+        assert_eq!(add_answer(Some(1), 1, 1, false), (false, None), "left for root: no form to drive");
+        // A was sent from form 1, Esc, form 2 sent B: A's answer only toasts and B still waits.
+        assert_eq!(add_answer(Some(2), 1, 2, true), (false, Some(2)));
+        assert_eq!(add_answer(Some(2), 2, 2, true), (true, None));
     }
 
     #[test]

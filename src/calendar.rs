@@ -634,6 +634,40 @@ pub fn provider(url: &str) -> String {
     name.into()
 }
 
+/// What Add Calendar says for an address that is a feed already.
+pub const ALREADY_ADDED: &str = "This calendar is already added";
+/// What a delete says when the file no longer has that feed at that place (Settings' copy is older).
+pub const FEED_MOVED: &str = "That calendar moved in config.toml; nothing was deleted";
+const SAVE_FAILED: &str = "Couldn't save config.toml";
+
+/// The same feed: the address as fetched (trimmed; `webcal://` is `https://`).
+pub fn same_feed(a: &str, b: &str) -> bool {
+    url_of(a) == url_of(b)
+}
+
+/// Adds `feed` as a `[[calendar_feed]]`, unless its address is one already.
+pub fn add_feed(text: &str, feed: &crate::config::CalendarFeed) -> Result<String, String> {
+    if crate::config::parse(text)?.calendar_feed.iter().any(|f| same_feed(&f.url, &feed.url)) {
+        return Err(ALREADY_ADDED.into());
+    }
+    crate::config::edit_table(text, "calendar_feed", crate::config::TableEdit::Add(&[("url", &feed.url), ("name", &feed.name), ("colour", &feed.colour)]))
+}
+
+/// Removes feed `i` only while it is still `url`: hand edits may have moved the feeds since
+/// the caller read them.
+pub fn remove_feed(text: &str, i: usize, url: &str) -> Result<String, String> {
+    if crate::config::parse(text)?.calendar_feed.get(i).is_none_or(|f| f.url != url) {
+        return Err(FEED_MOVED.into());
+    }
+    crate::config::edit_table(text, "calendar_feed", crate::config::TableEdit::Remove(i))
+}
+
+/// `config::edit_file` for the feeds. Its errors quote the failing line, which can be a secret
+/// feed address: they say only "Couldn't save config.toml" (the two above stay as they are).
+pub fn save_feeds(path: &std::path::Path, edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(crate::config::Config, String), String> {
+    crate::config::edit_file(path, edit).map_err(|e| if e == ALREADY_ADDED || e == FEED_MOVED { e } else { SAVE_FAILED.into() })
+}
+
 /// How long ago a feed last brought events: "updated 5 min ago", or "not fetched yet".
 pub fn updated_text(ago: Option<Duration>) -> String {
     ago.map_or_else(|| "not fetched yet".into(), |d| format!("updated {}", crate::timers::ago(d.as_secs())))
@@ -1063,6 +1097,29 @@ mod tests {
         c.added("b".into(), vec![ev(1, 2, "B")]);
         assert!(status.read().unwrap().contains_key("b") && c.pending(), "an added feed shows at once; the fetch still runs");
         assert_eq!(c.events(&["b".into()], &[], &HashSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn feeds_are_added_once_and_deleted_only_where_expected_without_quoting_the_file() {
+        let feed = |url: &str| crate::config::CalendarFeed { url: url.into(), name: "Work".into(), colour: "web".into() };
+        let one = add_feed("", &feed("https://calendar.google.com/a/basic.ics")).unwrap();
+        assert_eq!(crate::config::parse(&one).unwrap().calendar_feed, [feed("https://calendar.google.com/a/basic.ics")]);
+        assert_eq!(add_feed(&one, &feed(" webcal://calendar.google.com/a/basic.ics ")), Err(ALREADY_ADDED.into()), "the same address, as fetched");
+        let two = add_feed(&one, &feed("https://outlook.live.com/b.ics")).unwrap();
+        assert_eq!(remove_feed(&two, 0, "https://outlook.live.com/b.ics"), Err(FEED_MOVED.into()), "reordered by hand: nothing is deleted");
+        assert_eq!(remove_feed(&two, 5, "https://outlook.live.com/b.ics"), Err(FEED_MOVED.into()));
+        let left = remove_feed(&two, 1, "https://outlook.live.com/b.ics").unwrap();
+        assert_eq!(crate::config::parse(&left).unwrap().calendar_feed.len(), 1);
+        // A file that does not parse: the error must not show its (secret) line.
+        let path = std::env::temp_dir().join(format!("procast-feeds-{}.toml", std::process::id()));
+        std::fs::write(&path, "[[calendar_feed]]\nurl = \"https://cal.example.com/private-SECRET/basic.ics\"\nname = = 1\n").unwrap();
+        let e = save_feeds(&path, |t| add_feed(t, &feed("https://x.example/a.ics"))).unwrap_err();
+        assert_eq!(e, "Couldn't save config.toml");
+        let e = save_feeds(&path, |t| remove_feed(t, 0, "x")).unwrap_err();
+        assert!(!e.contains("SECRET"), "{e}");
+        std::fs::write(&path, &one).unwrap();
+        assert_eq!(save_feeds(&path, |t| add_feed(t, &feed("https://calendar.google.com/a/basic.ics"))).unwrap_err(), ALREADY_ADDED);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

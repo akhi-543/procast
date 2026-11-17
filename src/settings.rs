@@ -926,8 +926,26 @@ impl Settings {
             Some(i) => name_rows.get(i).or(name_rows.last()),
         };
         self.selected = at.copied().unwrap_or(0);
-        let what = if list == "calendar_feed" { "Calendar".to_string() } else { capital(list) };
-        self.status = Some((false, format!("{what} {verb}")));
+        self.status = Some((false, format!("{} {verb}", capital(list))));
+        self.focus_row(window, cx);
+    }
+
+    /// Delete (or the row's bin) on calendar `i`: removed only while config.toml still has
+    /// that address there; any other failure says no more than "Couldn't save config.toml".
+    fn delete_feed(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let url = config::shown_value(&self.text, &["calendar_feed".into(), i.to_string(), "url".into()]);
+        match crate::calendar::save_feeds(&config::path(), |t| crate::calendar::remove_feed(t, i, &url)) {
+            Ok((_, text)) => {
+                self.text = text;
+                self.status = Some((false, "Calendar deleted".into()));
+            }
+            Err(e) => {
+                // The list as the file has it now.
+                self.reread(cx);
+                self.status = Some((true, e));
+            }
+        }
+        self.selected = self.selected.min(self.rows().len().saturating_sub(1));
         self.focus_row(window, cx);
     }
 
@@ -1108,7 +1126,7 @@ impl Settings {
                 Kind::Command(i) if k.modifiers.control && k.key == "d" => self.toggle_enabled(i, cx),
                 Kind::TableItem(list, i) if k.modifiers.control && k.key == "d" => self.edit_table(list, config::TableEdit::Duplicate(i), window, cx),
                 Kind::TableItem(list, i) if k.key == "delete" && !k.modifiers.modified() => self.edit_table(list, config::TableEdit::Remove(i), window, cx),
-                Kind::Feed(Some(i)) if k.key == "delete" && !k.modifiers.modified() => self.edit_table("calendar_feed", config::TableEdit::Remove(i), window, cx),
+                Kind::Feed(Some(i)) if k.key == "delete" && !k.modifiers.modified() => self.delete_feed(i, window, cx),
                 _ => return,
             }
             return cx.stop_propagation();
@@ -1419,7 +1437,7 @@ impl Settings {
             let me = me.clone();
             let delete = div().id(("feed-delete", i)).flex().child(design::icon(g::DELETE, design::ic::MD, t.text_faint)).on_click(move |_, window, cx| {
                 cx.stop_propagation();
-                drop(me.update(cx, |this, cx| this.edit_table("calendar_feed", config::TableEdit::Remove(i), window, cx)));
+                drop(me.update(cx, |this, cx| this.delete_feed(i, window, cx)));
             });
             return base.child(design::feed_row(crate::calendar::tint(&field("colour")).hue(t), &r.label, &sub, on, delete, t)).into_any_element();
         }

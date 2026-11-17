@@ -72,8 +72,9 @@ pub enum Msg {
     RebuildIndex,
     /// Settings → Calendar → Add Calendar…: open the launcher's Add Calendar form.
     AddCalendar,
-    /// Add Calendar's one fetch finished: the feed to add, and its events or why it failed.
-    CalendarAdded(crate::config::CalendarFeed, Result<Vec<crate::calendar::Event>, String>),
+    /// Add Calendar's one fetch finished: the form it came from (`Launcher::form_gen`), the feed
+    /// to add, and its events or why it failed.
+    CalendarAdded(u64, crate::config::CalendarFeed, Result<Vec<crate::calendar::Event>, String>),
     /// The window's content height changed (compact mode); resize between updates.
     Resize,
     /// Something was installed or removed: the app list should be rescanned.
