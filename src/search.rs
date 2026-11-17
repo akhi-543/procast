@@ -127,6 +127,11 @@ pub enum Act {
     DeleteLangSet(usize),
     /// A row's own act with its argument boxes' values (`with_args`), for the acts that take them as they are.
     With(Box<Act>, Vec<String>),
+    /// A note, by id: show it in the Notes window; a deleted one: restore it, then show it, or
+    /// remove it for good (asks first).
+    OpenNote(String),
+    RestoreNote(String),
+    PurgeNote(String),
     /// Write `[games] auto_hdr` (root search's Auto HDR row).
     SetAutoHdr(bool),
     /// A row with nothing to do (loading, empty views).
@@ -160,7 +165,11 @@ impl Act {
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes) => "Open",
+            Act::Cmd(Cmd::CreateNote) => "Create Note",
+            Act::OpenNote(_) => "Open Note",
+            Act::RestoreNote(_) => "Restore",
+            Act::PurgeNote(_) => "Delete Permanently",
             Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) | Act::Layout(_) => "Run Command",
             Act::ExtFn(_) => "Run Action",
@@ -205,7 +214,7 @@ impl Act {
 
     /// Removes or ends something; the action panel draws these in `danger`.
     pub fn destructive(&self) -> bool {
-        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_) | Act::DeleteLangSet(_) | Act::DeleteShot(_)) || matches!(self, Act::Cmd(c) if c.destructive())
+        matches!(self, Act::DeleteClip(_) | Act::UninstallExt(_) | Act::ForceQuit(_) | Act::DeleteLangSet(_) | Act::DeleteShot(_) | Act::PurgeNote(_)) || matches!(self, Act::Cmd(c) if c.destructive())
     }
 }
 
@@ -580,6 +589,7 @@ fn command_args(cmd: Cmd, cfg: &Config) -> (Vec<Arg>, &'static [&'static str]) {
         Cmd::Focus(FocusCmd::CreateCategory) => (vec![Arg { missing: "Type a name for the category".into(), ..named() }, Arg { help: "Comma separated, e.g. discord.exe, slack.exe".into(), ..Arg::optional("Apps") }, Arg { help: "Comma separated, e.g. reddit.com, x.com".into(), ..Arg::optional("Sites") }], &[]),
         Cmd::Focus(FocusCmd::ImportCategories) => (vec![Arg { help: "A Raycast focus categories .json file".into(), missing: "Type the path to a .json file".into(), ..Arg::new("File") }], &[]),
         Cmd::Desktop(Desk::Rename) => (vec![Arg { missing: "Type a name for the desktop".into(), ..named() }], &[]),
+        Cmd::CreateNote => (vec![Arg::optional("Title")], &[]),
         _ => (vec![], &[]),
     }
 }
@@ -1184,7 +1194,7 @@ fallbacks = [\"define\"]").unwrap();
         )
         .unwrap();
         let cat = catalog(&apps, &scripts, &[(ext, Icon::glyph("•"))], &cfg);
-        let notes: Vec<_> = cat.iter().filter(|i| i.subtitle == "Notes").collect();
+        let notes: Vec<_> = cat.iter().filter(|i| i.subtitle == "Notes" && matches!(i.act, Act::ExtRun(..))).collect();
         assert_eq!(notes.len(), 2, "menu-bar commands open in the launcher");
         assert_eq!((notes[0].title.as_str(), &notes[0].act), ("Search Notes", &Act::ExtRun(0, 0)));
         assert_eq!(notes[0].actions()[1], ("Uninstall Notes".to_string(), Act::UninstallExt("notes".into())));
@@ -1331,7 +1341,9 @@ fallbacks = [\"define\"]").unwrap();
 
         cfg.launcher.sensitivity = "low".into();
         assert!(root("ntpd", &cat, &cfg, &frec, &mut m).iter().all(|h| h.title != "Notepad"), "low sensitivity wants the words as typed");
-        assert_eq!(root("note", &cat, &cfg, &frec, &mut m)[0].title, "Notepad");
+        let note = root("note", &cat, &cfg, &frec, &mut m);
+        assert!(note.iter().any(|h| h.title == "Notepad"));
+        assert!(note.iter().any(|h| h.act == Act::Cmd(Cmd::OpenNotes)), "\"note\" finds the Notes commands, not only apps");
     }
 
     #[test]

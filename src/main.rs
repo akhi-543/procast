@@ -18,8 +18,6 @@ mod hud;
 mod keys;
 mod menu;
 mod net;
-// Task 11 wires the notes window and commands to this; until then only the tests build it.
-#[cfg(test)]
 mod notes;
 mod ntfs;
 mod scripts;
@@ -72,6 +70,10 @@ use commands::{Cmd, Desk, FocusCmd};
 use config::Config;
 use design::{Tokens, g, px};
 use ext::FieldKind;
+use notes::{
+    store::{NoteMeta, Store},
+    window::{Notes, NotesWindow, Place, created},
+};
 use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
 use win::{BINDS, Bind, Msg, TrayCmd};
@@ -170,6 +172,15 @@ enum Mode {
     Form(FormKind),
     /// Manage Language Sets: the translator's sets, to pick, add, edit or delete.
     LanguageSets,
+    /// Search Notes or Recently Deleted Notes.
+    Notes(NotesList),
+}
+
+/// Which notes `Mode::Notes` lists.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NotesList {
+    All,
+    Deleted,
 }
 
 /// A native launcher form: what it is for, which names its title and primary action.
@@ -732,6 +743,38 @@ fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
     m
 }
 
+/// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
+/// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 d ago · 397 characters"
+/// ("Edited …" for a note never opened, "Deleted …" in Recently Deleted).
+fn note_rows(list: NotesList, rows: &[(NoteMeta, usize)], now: i64, searching: bool, keep_days: u32) -> Vec<Item> {
+    let ago = |t: i64| timers::ago(now.saturating_sub(t).max(0) as u64);
+    let items: Vec<Item> = rows
+        .iter()
+        .map(|(m, n)| {
+            let count = notes::window::char_count_text(*n);
+            let it = match (list, m.deleted_at) {
+                (NotesList::Deleted, Some(at)) => {
+                    let mut it = Item::new(&m.title, format!("Deleted {} · {count}", ago(at)), Icon::Vector(g::ARCHIVE_RESTORE), Act::RestoreNote(m.id.clone())).sec("Recently Deleted");
+                    it.extra = [Act::RestoreNote(m.id.clone()), Act::PurgeNote(m.id.clone())].map(|a| (a.label().to_string(), a)).to_vec();
+                    it
+                }
+                _ if m.opened > 0 => Item::new(&m.title, format!("Opened {} · {count}", ago(m.opened)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
+                _ => Item::new(&m.title, format!("Edited {} · {count}", ago(m.modified)), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes"),
+            };
+            it.tinted(design::Tint::Paste)
+        })
+        .collect();
+    if !items.is_empty() {
+        return items;
+    }
+    let row = match (list, searching) {
+        (_, true) => empty_row(g::SEARCH, "No matching notes".into(), String::new(), vec![]),
+        (NotesList::All, false) => empty_row(g::NOTEBOOK_TABS, "No notes yet".into(), "Create Note starts one".into(), vec![(Act::Cmd(Cmd::CreateNote).label().into(), Act::Cmd(Cmd::CreateNote))]),
+        (NotesList::Deleted, false) => empty_row(g::ARCHIVE_RESTORE, "No recently deleted notes".into(), format!("Deleted notes stay {keep_days} days"), vec![]),
+    };
+    vec![row]
+}
+
 /// Manage Language Sets: Add first, then every set, the current one ticked. Enter makes a set
 /// current; Ctrl+K also edits or deletes it (not the first: that one is Settings → Translator's).
 fn lang_set_rows(sets: &[translate::LangSet], current: usize) -> Vec<Item> {
@@ -832,6 +875,13 @@ struct Launcher {
     adding_calendar: Option<u64>,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
+    /// The note store's worker, and the Notes window once it has opened.
+    notes: Notes,
+    notes_window: Option<gpui::WindowHandle<NotesWindow>>,
+    /// `Mode::Notes`: the last answer for the search (None until the first), and the search's
+    /// number (older answers are dropped).
+    note_rows: Option<Vec<(NoteMeta, usize)>>,
+    note_gen: u64,
     matcher: Matcher,
     mode: Mode,
     items: Vec<Item>,
@@ -992,6 +1042,7 @@ impl Launcher {
         std::thread::spawn(|| _ = browser::register());
         let browsers = browser::serve(tx.clone());
         let auto_hdr = hdr::Auto::start(tx.clone());
+        let notes = Notes::start(cfg.notes.dir(), cx);
         let mut this = Self {
             input,
             hotkeys: {
@@ -1036,6 +1087,10 @@ impl Launcher {
             store: None,
             store_loading: false,
             settings_window: None,
+            notes,
+            notes_window: None,
+            note_rows: None,
+            note_gen: 0,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
             items: vec![],
@@ -1104,6 +1159,7 @@ impl Launcher {
         };
         this.load_extensions();
         this.watch_timers();
+        this.purge_old_notes(cx);
         this
     }
 
@@ -1353,7 +1409,7 @@ impl Launcher {
     fn asks_args(&self, act: &Act) -> bool {
         let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()) else { return false };
         let at_once = match act {
-            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate | Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => true,
+            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate | Cmd::CreateNote | Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => true,
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode != "view"),
             _ => false,
         };
@@ -1570,6 +1626,11 @@ impl Launcher {
                 None => vec![],
             },
             Mode::LanguageSets => search::filter(&query, lang_set_rows(&translate::sets(&self.cfg), translate::current(&self.cfg)), &mut self.matcher),
+            Mode::Notes(list) => {
+                // The store answers on its worker (`search_notes`); the last answer shows meanwhile.
+                self.search_notes(list, &query, cx);
+                self.note_items(list, &query)
+            }
             Mode::Define => match &self.define {
                 _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
                 Some(v) => define_rows(v, &self.cfg.search.fallback),
@@ -2415,6 +2476,9 @@ impl Launcher {
         }
         if mode == Mode::Running {
             self.load_running();
+        }
+        if matches!(mode, Mode::Notes(_)) {
+            self.note_rows = None;
         }
         if mode == Mode::Tabs {
             self.tabs.clear();
@@ -3886,6 +3950,55 @@ impl Launcher {
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
             Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
+            Act::Cmd(Cmd::SearchNotes) => return self.set_mode(Mode::Notes(NotesList::All), cx),
+            Act::Cmd(Cmd::RecentlyDeletedNotes) => return self.set_mode(Mode::Notes(NotesList::Deleted), cx),
+            Act::Cmd(Cmd::OpenNotes) => {
+                self.hide(false, cx);
+                // An open window already shows the note opened last.
+                if let Some(h) = self.notes_window
+                    && h.update(cx, |w, window, cx| w.has_note() && {
+                        w.reveal(window, cx);
+                        true
+                    })
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                return self.show_note(
+                    |s, now| {
+                        Ok(match s.last() {
+                            Some(id) => id,
+                            None => created(s.create(now)?),
+                        })
+                    },
+                    cx,
+                );
+            }
+            Act::OpenNote(id) => {
+                self.hide(false, cx);
+                return self.show_note(move |_, _| Ok(id), cx);
+            }
+            Act::RestoreNote(id) => {
+                self.hide(false, cx);
+                return self.show_note(move |s, _| s.restore(&id).map(|_| id), cx);
+            }
+            Act::PurgeNote(id) => {
+                let title = self.note_rows.iter().flatten().find(|(m, _)| m.id == id).map(|(m, _)| m.title.clone()).unwrap_or_default();
+                let then = move |this: &mut Launcher, cx: &mut Context<Launcher>| {
+                    this.notes.run(cx, move |s| s.purge(&id), |this, r, cx| {
+                        this.status = Some(match r {
+                            Ok(()) => (Tone::Ok, "Note deleted permanently".into()),
+                            Err(e) => (Tone::Error, format!("Couldn't delete the note: {e}")),
+                        });
+                        if matches!(this.mode, Mode::Notes(_)) {
+                            this.refresh_in_place(cx);
+                        }
+                    });
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Note Permanently?".into(), message: title, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
             Act::Join(_, url) => win::open(&url),
             Act::Cmd(Cmd::JoinMeeting) => match self.join_target(&Act::Cmd(Cmd::JoinMeeting)) {
                 Some((title, url)) => {
@@ -4152,6 +4265,20 @@ impl Launcher {
                 self.insert_snippet(template, got, erase, then, cx);
             }
             Act::Cmd(Cmd::Focus(f)) => self.focus_args(f, got, window, cx),
+            Act::Cmd(Cmd::CreateNote) => {
+                self.hide(false, cx);
+                let title = got[0].trim().to_string();
+                self.show_note(
+                    move |s, now| {
+                        let id = created(s.create(now)?);
+                        if !title.is_empty() {
+                            s.save(&id, &format!("# {title}\n"), now)?;
+                        }
+                        Ok(id)
+                    },
+                    cx,
+                );
+            }
             Act::Cmd(Cmd::StartStopwatch) => {
                 self.timers.stopwatch(got[0].clone());
                 self.watch_timers();
@@ -4222,7 +4349,7 @@ impl Launcher {
             // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
             Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
-            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -4264,6 +4391,94 @@ impl Launcher {
             }
         }
         self.run(it.act, it.key, window, cx);
+    }
+
+    /// Once at startup, on the store's worker: notes deleted longer ago than `[notes]
+    /// keep_deleted_days` go for good.
+    fn purge_old_notes(&mut self, cx: &mut Context<Self>) {
+        let (now, days) = (search::now() as i64, self.cfg.notes.keep_deleted_days);
+        self.notes.run(cx, move |s| s.purge_expired(now, days), |this, r, _| {
+            if let Err(e) = r {
+                this.say(Msg::error(format!("Notes: {e}")));
+            }
+        });
+    }
+
+    /// Shows a note in the Notes window, opening the window the first time. `pick` chooses the
+    /// note on the store's worker (and may change the store); the note is then marked opened
+    /// and read there too.
+    fn show_note(&mut self, pick: impl FnOnce(&mut Store, i64) -> std::io::Result<String> + Send + 'static, cx: &mut Context<Self>) {
+        let now = search::now() as i64;
+        let place = self.notes_window.is_none().then(notes::window::place_path);
+        self.notes.run(
+            cx,
+            move |s| {
+                let id = pick(s, now)?;
+                s.open_note(&id, now)?;
+                let text = s.text(&id)?;
+                Ok((id, text, place.and_then(|p| notes::window::load_place(&p))))
+            },
+            |this, r, cx| match r {
+                Ok((id, text, place)) => this.note_window(id, text, place, cx),
+                Err(e) => this.say(Msg::error(format!("Couldn't open the note: {e}"))),
+            },
+        );
+    }
+
+    /// The Notes window on note `id`: reused while it exists, else opened where it was last
+    /// (`place`, when that is still on a screen) or centred.
+    fn note_window(&mut self, id: String, text: String, place: Option<Place>, cx: &mut Context<Self>) {
+        if let Some(h) = self.notes_window
+            && h.update(cx, |w, window, cx| w.show(id.clone(), text.clone(), window, cx)).is_ok()
+        {
+            return;
+        }
+        let bounds = place
+            .map(Place::bounds)
+            .filter(|b| cx.displays().iter().any(|d| d.bounds().intersects(b)))
+            .unwrap_or_else(|| Bounds::centered(None, size(gpui::px(design::NOTES_W), gpui::px(design::NOTES_H)), cx));
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Hidden: the header is the caption (drag area and close).
+            titlebar: Some(gpui::TitlebarOptions { title: Some("Notes".into()), appears_transparent: true, ..Default::default() }),
+            windows_window_background: backdrop(design::refresh_glass()),
+            ..Default::default()
+        };
+        let (notes, tx, theme) = (self.notes.clone(), self.tx.clone(), self.cfg.theme.clone());
+        self.notes_window = cx.open_window(options, |window, cx| cx.new(|cx| NotesWindow::new(notes, tx, theme, window, cx))).ok();
+        match self.notes_window {
+            Some(h) => drop(h.update(cx, |w, window, cx| w.show(id, text, window, cx))),
+            None => self.say(Msg::error("Couldn't open the Notes window")),
+        }
+    }
+
+    /// Asks the store for `Mode::Notes`' rows; the answer replaces the list if nothing newer was asked.
+    fn search_notes(&mut self, list: NotesList, query: &str, cx: &mut Context<Self>) {
+        self.note_gen += 1;
+        let (generation, q) = (self.note_gen, query.to_string());
+        self.notes.run(cx, move |s| Ok(s.browse(list == NotesList::Deleted, &q)), move |this, r, cx| {
+            if this.note_gen != generation || this.mode != Mode::Notes(list) {
+                return;
+            }
+            this.note_rows = Some(r.unwrap_or_else(|e| {
+                this.status = Some((Tone::Error, format!("Couldn't read the notes: {e}")));
+                vec![]
+            }));
+            if this.confirm.is_none() {
+                let q = this.query(cx);
+                this.items = this.note_items(list, &q);
+                this.selected = this.selected.min(this.items.len().saturating_sub(1));
+                this.scroll_to_selected();
+            }
+            cx.notify();
+        });
+    }
+
+    fn note_items(&self, list: NotesList, query: &str) -> Vec<Item> {
+        match &self.note_rows {
+            None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
+            Some(rows) => note_rows(list, rows, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_deleted_days),
+        }
     }
 
     /// Brings up the settings window, reusing it if it's already open; on `page` when given.
@@ -4430,6 +4645,20 @@ impl Launcher {
                 }
                 if cfg.calendar_feed.iter().map(|f| &f.url).ne(self.cfg.calendar_feed.iter().map(|f| &f.url)) {
                     self.calendar.reset(&cfg.calendar_feed.iter().map(|f| f.url.clone()).collect::<Vec<_>>());
+                }
+                if cfg.notes.dir() != self.cfg.notes.dir() {
+                    self.notes = Notes::start(cfg.notes.dir(), cx);
+                    let notes = self.notes.clone();
+                    if let Some(h) = self.notes_window {
+                        drop(h.update(cx, |w, window, cx| w.use_store(notes, window, cx)));
+                    }
+                }
+                if let Some(h) = self.notes_window {
+                    let theme = cfg.theme.clone();
+                    drop(h.update(cx, |w, _, cx| {
+                        w.theme = theme;
+                        cx.notify();
+                    }));
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
@@ -4698,6 +4927,8 @@ impl Launcher {
             Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word)),
             Mode::Shots => Some("Search Screenshots".into()),
             Mode::Schedule => Some("My Schedule".into()),
+            Mode::Notes(NotesList::All) => Some("Search Notes".into()),
+            Mode::Notes(NotesList::Deleted) => Some("Recently Deleted Notes".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -4723,6 +4954,8 @@ impl Launcher {
             Mode::Define => "Word to define…".into(),
             Mode::Shots => "Filter screenshots by name:, text: or date:…".into(),
             Mode::Schedule => "Search events…".into(),
+            Mode::Notes(NotesList::All) => "Search notes…".into(),
+            Mode::Notes(NotesList::Deleted) => "Search deleted notes…".into(),
             Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
             Mode::LanguageSets => "Search language sets…".into(),
@@ -4789,6 +5022,8 @@ impl Launcher {
             Mode::Define => Icon::Vector(g::BOOK_OPEN),
             Mode::Shots => Icon::Vector(g::SCAN_SEARCH),
             Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
+            Mode::Notes(NotesList::All) => Icon::Vector(g::NOTEBOOK_TABS),
+            Mode::Notes(NotesList::Deleted) => Icon::Vector(g::ARCHIVE_RESTORE),
             Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
@@ -6512,6 +6747,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_rows_say_when_each_note_was_opened_and_how_long_it_is() {
+        let meta = |id: &str, title: &str, opened: i64, deleted_at: Option<i64>| NoteMeta { id: id.into(), pinned: false, created: 0, modified: 100, deleted_at, opened, title: title.into() };
+        let now = 3 * 86_400 + 100;
+        let rows = note_rows(NotesList::All, &[(meta("a", "Groceries", now - 120, None), 186), (meta("b", "Plans", 0, None), 1)], now, false, 30);
+        let line = |it: &Item| (it.title.clone(), it.subtitle.clone(), it.act.clone(), it.section.clone());
+        assert_eq!(line(&rows[0]), ("Groceries".into(), "Opened 2 min ago · 186 characters".into(), Act::OpenNote("a".into()), Some("Notes".into())));
+        assert_eq!(line(&rows[1]).1, "Edited 3 d ago · 1 character", "never opened: its last edit");
+        assert!(rows.iter().all(|it| it.tint == Some(design::Tint::Paste)));
+
+        let gone = note_rows(NotesList::Deleted, &[(meta("c", "Old", 0, Some(now - 86_400)), 0)], now, false, 30);
+        assert_eq!(line(&gone[0]), ("Old".into(), "Deleted 1 d ago · 0 characters".into(), Act::RestoreNote("c".into()), Some("Recently Deleted".into())));
+        let acts: Vec<(String, bool)> = gone[0].actions().into_iter().map(|(l, a)| (l, a.destructive())).collect();
+        assert_eq!(acts, [("Restore".to_string(), false), ("Delete Permanently".to_string(), true)]);
+
+        assert_eq!(note_rows(NotesList::All, &[], now, false, 30)[0].act, Act::Cmd(Cmd::CreateNote));
+        assert_eq!(note_rows(NotesList::All, &[], now, true, 30)[0].title, "No matching notes");
+        assert_eq!(note_rows(NotesList::Deleted, &[], now, false, 7)[0].subtitle, "Deleted notes stay 7 days");
+    }
+
+    #[test]
+    fn create_note_takes_an_optional_title_and_runs_from_a_hotkey_at_once() {
+        let cfg = Config::default();
+        let it = search::catalog(&[], &[], &[], &cfg).into_iter().find(|it| it.act == Act::Cmd(Cmd::CreateNote)).unwrap();
+        assert_eq!((it.args.len(), it.args[0].name.as_ref(), it.args[0].optional), (1, "Title", true));
+        assert_eq!(search::prefill(&it, "Create Note Groceries"), ["Groceries"]);
+        assert_eq!(search::with_args(&it, &["Groceries".into()]).ok(), Some(Act::With(Box::new(Act::Cmd(Cmd::CreateNote)), vec!["Groceries".into()])));
+    }
 
     #[test]
     fn an_older_hdr_read_never_replaces_a_newer_one() {

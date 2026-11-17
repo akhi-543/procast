@@ -40,7 +40,7 @@ use windows::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
                 GWL_STYLE, GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
                 SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_CAPTION,
-                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
+                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
                 MA_NOACTIVATE, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
             },
         },
@@ -417,6 +417,12 @@ pub fn place_toast(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
     let (w, h) = ((width * screen.dpi) as i32, (height * screen.dpi) as i32);
     let RECT { left, right, bottom, .. } = screen.work;
     unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), left + (right - left - w) / 2, bottom - h, w, h, SWP_NOACTIVATE) };
+}
+
+/// Keeps the window above every other one (`on`) or lets it go back among them, without moving
+/// or activating it.
+pub fn set_topmost(hwnd: HWND, on: bool) {
+    unsafe { _ = SetWindowPos(hwnd, Some(if on { HWND_TOPMOST } else { HWND_NOTOPMOST }), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
 }
 
 /// The window's place on the screen, physical px.

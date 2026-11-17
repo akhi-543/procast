@@ -154,6 +154,10 @@ pub mod sp {
 pub const POP_RIGHT_W: f32 = 290.;
 pub const POP_RIGHT_TOP: f32 = 50.;
 
+/// The Notes window's first size (`.pc-notes`).
+pub const NOTES_W: f32 = 560.;
+pub const NOTES_H: f32 = 440.;
+
 /// `.pc-form--center .pc-form__row`: a launcher form row's width, and its label column (`.pc-form__label`).
 pub const FORM_ROW: f32 = 500.;
 pub const FORM_LABEL: f32 = 120.;
@@ -403,6 +407,11 @@ names! {
     IMPORT = "import",
     CIRCLE_HELP = "circle-help",
     NOTEBOOK_PEN = "notebook-pen",
+    NOTEBOOK_TABS = "notebook-tabs",
+    SQUARE_PEN = "square-pen",
+    SQUARE_MENU = "square-menu",
+    ARCHIVE_RESTORE = "archive-restore",
+    TYPE = "type",
     EYE = "eye",
     BAN = "ban",
     PLUS = "plus",

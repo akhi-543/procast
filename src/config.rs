@@ -26,6 +26,7 @@ pub struct Config {
     pub translator: Translator,
     pub dictionary: Dictionary,
     pub screenshots: Screenshots,
+    pub notes: Notes,
     /// `[[translate]]`: commands that translate the selected text into one language.
     pub translate: Vec<TranslateCmd>,
     /// `[[language_set]]`: the translator's language sets after the first (see `translate::sets`).
@@ -555,6 +556,7 @@ impl Default for Config {
             translator: Translator::default(),
             dictionary: Dictionary::default(),
             screenshots: Screenshots::default(),
+            notes: Notes::default(),
             translate: vec![],
             language_set: vec![],
             clipboard: Clipboard::default(),
@@ -615,6 +617,28 @@ pub struct Screenshots {
 impl Default for Screenshots {
     fn default() -> Self {
         Self { folders: vec![], keep: "unlimited".into(), ocr: true, all_media: false, primary: "copy".into(), columns: 3, cloud: false }
+    }
+}
+
+/// Notes: one markdown file per note, shown in the Notes window.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Notes {
+    /// The notes folder. Empty = %APPDATA%\procast\notes.
+    pub folder: String,
+    /// Recently deleted notes are removed after this many days.
+    pub keep_deleted_days: u32,
+}
+
+impl Default for Notes {
+    fn default() -> Self {
+        Self { folder: String::new(), keep_deleted_days: 30 }
+    }
+}
+
+impl Notes {
+    pub fn dir(&self) -> PathBuf {
+        if self.folder.trim().is_empty() { dir().join("notes") } else { PathBuf::from(self.folder.trim()) }
     }
 }
 
@@ -842,6 +866,10 @@ all_media = false             # also list videos (their text is not read)
 primary = "copy"              # Enter: copy | paste (into the app you came from) | open
 columns = 3                   # thumbnails per row in Search Screenshots: 3 to 6
 cloud = false                 # also list OneDrive files kept only online; reading them downloads them
+
+[notes]
+folder = ""                   # one markdown file per note; empty = %APPDATA%\procast\notes
+keep_deleted_days = 30        # recently deleted notes are removed after this many days
 
 [clipboard]
 enabled = true                # text, images and copied files, encrypted at rest for your Windows account

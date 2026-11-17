@@ -99,6 +99,14 @@ pub enum Cmd {
     SearchScreenshots,
     /// Put the newest screenshot on the clipboard and paste it into the app you came from.
     PasteLatestScreenshot,
+    /// The Notes window, on the note it showed last (or a new one).
+    OpenNotes,
+    /// The notes, listed in the launcher.
+    SearchNotes,
+    /// A new note, titled by its one optional argument.
+    CreateNote,
+    /// Notes deleted in the last `[notes] keep_deleted_days`, to restore or remove for good.
+    RecentlyDeletedNotes,
     Quit,
 }
 
@@ -207,6 +215,10 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::JoinMeeting, "Join Meeting", "calendar meeting call video teams zoom meet webex link", g::VIDEO),
     (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::SCAN_SEARCH),
     (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::IMAGE_DOWN),
+    (Cmd::OpenNotes, "Open Notes", "note notes markdown write scratch pad floating", g::NOTEBOOK_PEN),
+    (Cmd::SearchNotes, "Search Notes", "note notes find list browse markdown", g::NOTEBOOK_TABS),
+    (Cmd::CreateNote, "Create Note", "new note notes write markdown", g::SQUARE_PEN),
+    (Cmd::RecentlyDeletedNotes, "Recently Deleted Notes", "note notes trash restore undelete removed", g::ARCHIVE_RESTORE),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -319,6 +331,7 @@ impl Cmd {
             Cmd::MySchedule | Cmd::JoinMeeting => "Calendar",
             Cmd::HdrSettings => "Windows Settings",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
+            Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => "Notes",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -329,7 +342,7 @@ impl Cmd {
         match self {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles | Cmd::SearchScreenshots => Tint::File,
-            Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot => Tint::Paste,
+            Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => Tint::Paste,
             Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
@@ -371,7 +384,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => {}
         }
     }
     Ok(None)
@@ -727,6 +740,10 @@ mod tests {
             (Cmd::JoinMeeting, g::VIDEO, Tint::System),
             (Cmd::SearchScreenshots, g::SCAN_SEARCH, Tint::File),
             (Cmd::PasteLatestScreenshot, g::IMAGE_DOWN, Tint::Paste),
+            (Cmd::OpenNotes, g::NOTEBOOK_PEN, Tint::Paste),
+            (Cmd::SearchNotes, g::NOTEBOOK_TABS, Tint::Paste),
+            (Cmd::CreateNote, g::SQUARE_PEN, Tint::Paste),
+            (Cmd::RecentlyDeletedNotes, g::ARCHIVE_RESTORE, Tint::Paste),
             (Cmd::ToggleHdr, g::SUN_MEDIUM, Tint::System),
             (Cmd::HdrSettings, g::MONITOR_COG, Tint::System),
             (Cmd::Focus(F::Start), g::SHIELD_CHECK, Tint::System),

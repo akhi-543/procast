@@ -24,6 +24,9 @@ pub struct NoteMeta {
     pub modified: i64,
     #[serde(default)]
     pub deleted_at: Option<i64>,
+    /// When the Notes window last showed it; 0 = never.
+    #[serde(default)]
+    pub opened: i64,
     /// First line without markdown; kept in memory only, rebuilt from the file.
     #[serde(skip)]
     pub title: String,
@@ -57,7 +60,7 @@ impl Store {
             let path = e.path();
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
             let md = path.extension().is_some_and(|x| x == "md");
-            if !md || id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) || metas.iter().any(|m| m.id == id) {
+            if !md || !valid(&id) || metas.iter().any(|m| m.id == id) {
                 continue;
             }
             let t = e
@@ -66,7 +69,7 @@ impl Store {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs() as i64);
-            metas.push(NoteMeta { id, pinned: false, created: t, modified: t, deleted_at: None, title: String::new() });
+            metas.push(NoteMeta { id, pinned: false, created: t, modified: t, deleted_at: None, opened: 0, title: String::new() });
             changed = true;
         }
         for m in &mut metas {
@@ -94,9 +97,15 @@ impl Store {
         v
     }
 
+    /// The live note the Notes window showed last; never opened, the newest edit.
+    pub fn last(&self) -> Option<Id> {
+        self.list().into_iter().max_by_key(|m| (m.opened, m.modified)).map(|m| m.id)
+    }
+
     /// The note's text. A missing file is an empty note; any other read error is passed on, so a
     /// transient lock can never look like an empty note (and get saved over the real one).
     pub fn text(&self, id: &str) -> io::Result<String> {
+        checked(id)?;
         match fs::read_to_string(self.path(id)) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
             r => r,
@@ -113,6 +122,7 @@ impl Store {
         self.add("", now).map(Ok)
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Duplicate Note"))]
     pub fn duplicate(&mut self, id: &str, now: i64) -> io::Result<Id> {
         self.index(id)?;
         let text = self.text(id)?;
@@ -129,6 +139,7 @@ impl Store {
         self.persist()
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Pin Note"))]
     pub fn pin(&mut self, id: &str, pinned: bool) -> io::Result<()> {
         let i = self.index(id)?;
         self.metas[i].pinned = pinned;
@@ -136,6 +147,7 @@ impl Store {
     }
 
     /// Soft delete: the note moves to `deleted()` until restored or purged.
+    #[cfg_attr(not(test), expect(dead_code, reason = "Task 20: Delete Note"))]
     pub fn delete(&mut self, id: &str, now: i64) -> io::Result<()> {
         let i = self.index(id)?;
         self.metas[i].deleted_at = Some(now);
@@ -148,9 +160,19 @@ impl Store {
         self.persist()
     }
 
-    /// Removes the note for good: file, history and metadata.
+    /// The Notes window shows the note now.
+    pub fn open_note(&mut self, id: &str, now: i64) -> io::Result<()> {
+        let i = self.index(id)?;
+        self.metas[i].opened = now;
+        self.persist()
+    }
+
+    /// Removes a deleted note for good: file, history and metadata. A live note is refused.
     pub fn purge(&mut self, id: &str) -> io::Result<()> {
         let i = self.index(id)?;
+        if self.metas[i].deleted_at.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "only a deleted note can be removed for good"));
+        }
         let md = self.path(id);
         if md.exists() {
             fs::remove_file(md)?;
@@ -160,7 +182,17 @@ impl Store {
         self.persist()
     }
 
+    /// Purges the notes deleted `days` days ago or longer; how many went.
+    pub fn purge_expired(&mut self, now: i64, days: u32) -> io::Result<usize> {
+        let old: Vec<Id> = self.deleted().into_iter().filter(|m| m.deleted_at.is_some_and(|d| now - d >= i64::from(days) * 86_400)).map(|m| m.id).collect();
+        for id in &old {
+            self.purge(id)?;
+        }
+        Ok(old.len())
+    }
+
     /// Snapshots, newest first, as (unix seconds, text).
+    #[cfg_attr(not(test), expect(dead_code, reason = "no screen restores a snapshot yet"))]
     pub fn history(&self, id: &str) -> Vec<(i64, String)> {
         let mut v: Vec<(i64, String)> = self
             .snapshots(id)
@@ -180,17 +212,33 @@ impl Store {
             .collect()
     }
 
+    /// Search Notes (`search`), or Recently Deleted Notes (whose title holds `q`, any case), each
+    /// with its length in characters. A note that can't be read counts 0.
+    pub fn browse(&self, deleted: bool, q: &str) -> Vec<(NoteMeta, usize)> {
+        let q = q.trim().to_lowercase();
+        // ponytail: reads every listed note per search; keep lengths in NoteMeta if folders grow large.
+        let notes = if deleted { self.deleted().into_iter().filter(|m| m.title.to_lowercase().contains(&q)).collect() } else { self.search(&q) };
+        notes
+            .into_iter()
+            .map(|m| {
+                let n = self.text(&m.id).map_or(0, |t| t.chars().count());
+                (m, n)
+            })
+            .collect()
+    }
+
     fn add(&mut self, text: &str, now: i64) -> io::Result<Id> {
         let n = ((now.max(0) as u64) * 1000).max(self.last + 1);
         let id = base36(n);
         write_atomic(&self.root.join(format!("{id}.md")), text)?;
         self.last = n;
-        self.metas.push(NoteMeta { id: id.clone(), pinned: false, created: now, modified: now, deleted_at: None, title: title_of(text) });
+        self.metas.push(NoteMeta { id: id.clone(), pinned: false, created: now, modified: now, deleted_at: None, opened: 0, title: title_of(text) });
         self.persist()?;
         Ok(id)
     }
 
     fn index(&self, id: &str) -> io::Result<usize> {
+        checked(id)?;
         self.metas
             .iter()
             .position(|m| m.id == id)
@@ -212,6 +260,9 @@ impl Store {
 
     /// Snapshot times of a note, oldest first.
     fn snapshots(&self, id: &str) -> Vec<i64> {
+        if !valid(id) {
+            return vec![];
+        }
         let mut v: Vec<i64> = fs::read_dir(self.history_dir(id))
             .into_iter()
             .flatten()
@@ -239,6 +290,16 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// An id is letters and digits only (base 36, or a stray file's plain name), so it can never
+/// name a path outside the notes folder.
+fn valid(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn checked(id: &str) -> io::Result<()> {
+    if valid(id) { Ok(()) } else { Err(io::Error::new(io::ErrorKind::InvalidInput, "not a note id")) }
 }
 
 fn base36(mut n: u64) -> String {
@@ -474,6 +535,7 @@ mod tests {
         s.save(&a, "x", 10).unwrap();
         s.save(&a, "y", 20).unwrap();
         assert_eq!(s.history(&a).len(), 1);
+        s.delete(&a, 30).unwrap();
         s.purge(&a).unwrap();
         assert!(s.history(&a).is_empty());
     }
@@ -566,6 +628,88 @@ mod tests {
         assert!(s.delete("zz", 1).is_err());
         assert!(s.restore("zz").is_err());
         assert_eq!(s.text("zz").unwrap(), "");
+    }
+
+    #[test]
+    fn purge_refuses_a_live_note_and_keeps_its_file() {
+        let mut s = open("purgelive");
+        let a = made(s.create(1));
+        s.save(&a, "keep", 2).unwrap();
+        assert!(s.purge(&a).is_err());
+        assert!(s.path(&a).exists());
+        assert_eq!(s.text(&a).unwrap(), "keep");
+        assert_eq!(s.list().len(), 1);
+    }
+
+    #[test]
+    fn purge_expired_removes_only_deleted_notes_older_than_the_limit() {
+        const DAY: i64 = 86_400;
+        let mut s = open("expired");
+        let now = 100 * DAY;
+        let old = made(s.create(1));
+        s.save(&old, "old", 1).unwrap();
+        s.delete(&old, now - 31 * DAY).unwrap();
+        let recent = made(s.create(2));
+        s.save(&recent, "recent", 2).unwrap();
+        s.delete(&recent, now - 29 * DAY).unwrap();
+        let live = made(s.create(3));
+        s.save(&live, "live and old", 3).unwrap();
+        assert_eq!(s.purge_expired(now, 30).unwrap(), 1);
+        assert!(!s.path(&old).exists());
+        assert_eq!(s.deleted().into_iter().map(|m| m.id).collect::<Vec<_>>(), [recent]);
+        assert_eq!(s.list().into_iter().map(|m| m.id).collect::<Vec<_>>(), [live]);
+    }
+
+    #[test]
+    fn opened_round_trips_and_old_metadata_without_it_loads() {
+        let dir = tmp("opened");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(1));
+        s.save(&a, "a", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "b", 2).unwrap();
+        assert_eq!(s.last(), Some(b.clone()), "never opened: the newest edit");
+        s.open_note(&a, 77).unwrap();
+        assert_eq!(s.last(), Some(a.clone()));
+        assert!(s.open_note("zz", 78).is_err());
+        let s2 = Store::open(dir.clone()).unwrap();
+        assert_eq!(s2.list().iter().find(|m| m.id == a).map(|m| m.opened), Some(77));
+        assert_eq!(s2.last(), Some(a.clone()));
+        drop((s, s2));
+        let old = format!(r#"[{{"id":"{a}","pinned":false,"created":1,"modified":1,"deleted_at":null}}]"#);
+        fs::write(dir.join("notes.json"), old).unwrap();
+        fs::remove_file(dir.join(format!("{b}.md"))).unwrap();
+        let s3 = Store::open(dir).unwrap();
+        assert_eq!(s3.list().len(), 1);
+        assert_eq!((s3.list()[0].opened, s3.list()[0].title.as_str()), (0, "a"));
+    }
+
+    #[test]
+    fn ids_that_are_not_plain_letters_and_digits_never_touch_a_path() {
+        let mut s = open("badid");
+        for id in ["../x", r"..\x", "a.b", "", "C:x", "a/b"] {
+            assert!(s.text(id).is_err(), "{id:?}");
+            assert!(s.save(id, "t", 1).is_err(), "{id:?}");
+            assert!(s.purge(id).is_err(), "{id:?}");
+            assert!(s.history(id).is_empty(), "{id:?}");
+        }
+        assert_eq!(s.text("zz9").unwrap(), "", "a valid id with no file is an empty note");
+    }
+
+    #[test]
+    fn browse_counts_characters_and_lists_live_or_deleted_notes() {
+        let mut s = open("browse");
+        let a = made(s.create(1));
+        s.save(&a, "# Café\nau lait", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "# Plans", 2).unwrap();
+        s.delete(&b, 3).unwrap();
+        let rows = |s: &Store, deleted, q| s.browse(deleted, q).into_iter().map(|(m, n)| (m.id, n)).collect::<Vec<_>>();
+        assert_eq!(rows(&s, false, ""), [(a.clone(), 14)]);
+        assert_eq!(rows(&s, false, "LAIT"), [(a.clone(), 14)], "live notes match their text too");
+        assert_eq!(rows(&s, true, ""), [(b.clone(), 7)]);
+        assert_eq!(rows(&s, true, "pla"), [(b, 7)]);
+        assert!(rows(&s, true, "café").is_empty());
     }
 
     #[test]
