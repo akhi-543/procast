@@ -340,8 +340,9 @@ pub fn delete(path: &Path) -> Result<(), String> {
     let mut op = SHFILEOPSTRUCTW { wFunc: FO_DELETE, pFrom: PCWSTR(from.as_ptr()), fFlags: flags.0 as u16, ..Default::default() };
     let failed = unsafe { SHFileOperationW(&mut op) };
     match (failed, op.fAnyOperationsAborted.as_bool()) {
+        // A cancelled "delete for good?" can come back with an error code too.
+        (_, true) => Err("Not deleted".into()),
         (0, false) => Ok(()),
-        (0, true) => Err("Not deleted".into()),
         _ => Err("Could not delete it".into()),
     }
 }
