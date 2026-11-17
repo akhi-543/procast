@@ -2320,6 +2320,7 @@ impl Launcher {
                 browser::Reply::Done(Ok(())) => {}
                 browser::Reply::Music(reply) => self.music_reply(reply, cx),
             },
+            Msg::Music(reply) => self.music_reply(reply, cx),
             Msg::Running(list) => {
                 for (r, icon) in &list {
                     self.exe_icons.insert(r.exe.clone(), icon.clone());

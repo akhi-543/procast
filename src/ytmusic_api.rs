@@ -13,8 +13,8 @@ use crate::config;
 use crate::ytmusic::{Filter, Reply, parse_items, parse_page};
 
 const ORIGIN: &str = "https://music.youtube.com";
-const SIGN_IN: &str = "Sign in to music.youtube.com in this browser to see your library";
-const UNREACHABLE: &str = "Couldn't reach YouTube Music";
+pub const SIGN_IN: &str = "Sign in to music.youtube.com in this browser to see your library";
+pub const UNREACHABLE: &str = "Couldn't reach YouTube Music";
 
 /// Cookie name → value, from `%APPDATA%\procast\ytmusic\session.json`.
 #[derive(Clone, Debug, Default)]
@@ -170,7 +170,6 @@ pub fn search(query: &str, filter: Filter) -> Result<Reply, String> {
     Ok(Reply { op: "search".into(), items: parse_items(&json), ..Default::default() })
 }
 
-#[allow(dead_code)]
 pub fn browse(id: &str) -> Result<Reply, String> {
     let json = call("browse", json!({"browseId": id}))?;
     Ok(browse_reply(id, &json, require_session(load_session()).is_ok()))

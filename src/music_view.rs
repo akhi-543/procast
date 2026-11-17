@@ -25,6 +25,7 @@ use crate::{
     win::Msg,
     ytmdesktop,
     ytmusic::{self, Control, Filter, Kind, MusicItem, Reply, Screen, Shelf},
+    ytmusic_api,
 };
 
 /// Rows past this many show a glyph instead of a cover, so the cover cache never churns.
@@ -122,13 +123,62 @@ enum Ask {
 }
 
 impl Ask {
-    fn request(&self, req: u64) -> Value {
+    fn catalog(&self) -> Catalog {
         match self {
-            Self::Search { query, filter } => ytmusic::search(req, query, *filter),
-            Self::Shelf(shelf) => ytmusic::browse(req, shelf.browse_id()),
-            Self::Page(id) => ytmusic::browse(req, id),
+            Self::Search { query, filter } => Catalog::Search { query: query.clone(), filter: *filter },
+            Self::Shelf(shelf) => Catalog::Browse { id: shelf.browse_id().into() },
+            Self::Page(id) => Catalog::Browse { id: id.clone() },
         }
     }
+
+    fn op(&self) -> &'static str {
+        match self {
+            Self::Search { .. } => "search",
+            Self::Shelf(_) | Self::Page(_) => "browse",
+        }
+    }
+}
+
+/// InnerTube search or browse, not a companion `{"t":"ytm"}` envelope.
+#[derive(Clone, Debug, PartialEq)]
+enum Catalog {
+    Search { query: String, filter: Filter },
+    Browse { id: String },
+}
+
+fn catalog_blocked_by_browsers(_connected: bool) -> bool {
+    false
+}
+
+fn catalog_reply(ask: &Ask, result: Result<Reply, String>) -> Reply {
+    match result {
+        Ok(reply) => reply,
+        Err(_) => Reply { op: ask.op().into(), error: Some(ytmusic_api::UNREACHABLE.into()), ..Default::default() },
+    }
+}
+
+fn playlists_from_desktop(list: Vec<(String, String)>) -> Vec<MusicItem> {
+    list.into_iter()
+        .map(|(id, title)| {
+            let playlist_id = id.strip_prefix("VL").unwrap_or(&id).to_string();
+            let id = if id.starts_with("VL") { id } else { format!("VL{playlist_id}") };
+            MusicItem { kind: Kind::Playlist, id, playlist_id, title, ..Default::default() }
+        })
+        .collect()
+}
+
+fn apply_desktop_playlists(shelf: Shelf, mut reply: Reply, desktop: Option<Vec<(String, String)>>) -> Reply {
+    if shelf != Shelf::Playlists {
+        return reply;
+    }
+    let needs = reply.error.as_deref() == Some(ytmusic_api::SIGN_IN) || reply.items.is_empty();
+    if !needs {
+        return reply;
+    }
+    let Some(list) = desktop else { return reply };
+    reply.items = playlists_from_desktop(list);
+    reply.error = None;
+    reply
 }
 
 /// A view request the companion has not answered yet; `shelf` is the library shelf it fetches.
@@ -426,9 +476,6 @@ impl Launcher {
         if searching && !typed {
             return vec![empty_row(g::SEARCH, "Search YouTube Music".into(), "Songs, albums, artists or playlists · Tab changes what to search".into(), vec![])];
         }
-        if !self.browsers.any() {
-            return vec![no_browser()];
-        }
         let waiting = view.loading || searching && query.trim() != view.searched;
         let (glyph, title, hint) = if let Some(error) = &view.error {
             (g::WARNING, "Couldn't load YouTube Music", error.as_str())
@@ -585,18 +632,31 @@ impl Launcher {
     }
 
     fn music_send(&mut self) {
-        if !self.browsers.any() {
+        if catalog_blocked_by_browsers(self.browsers.any()) {
             self.music.relay.flight = None;
+            return;
         }
         let Some(ask) = self.music.relay.next() else { return };
-        let sent = self.music_ask(|req| Some(ask.request(req)));
-        let view = &mut self.music.view;
-        if sent {
-            self.music.relay.sent(self.music.req, &ask);
-            view.pending = Some(self.music.req);
-        } else {
-            view.loading = false;
-        }
+        self.music.req += 1;
+        let req = self.music.req;
+        self.music.relay.sent(req, &ask);
+        self.music.view.pending = Some(req);
+        let tx = self.tx.clone();
+        let base = self.cfg.ytmusic.desktop_url.clone();
+        std::thread::spawn(move || {
+            let result = match ask.catalog() {
+                Catalog::Search { query, filter } => ytmusic_api::search(&query, filter),
+                Catalog::Browse { id } => ytmusic_api::browse(&id),
+            };
+            let mut reply = catalog_reply(&ask, result);
+            if let Ask::Shelf(Shelf::Playlists) = &ask {
+                let desktop = ytmdesktop::Desktop::new(&base);
+                let list = ytmdesktop::ensure_token(&desktop).and_then(|token| ytmdesktop::playlists(&token, &desktop.base)).ok();
+                reply = apply_desktop_playlists(Shelf::Playlists, reply, list);
+            }
+            reply.req = req;
+            let _ = tx.unbounded_send(Msg::Music(reply));
+        });
     }
 
     fn music_done(&mut self, sent: bool, cx: &mut Context<Self>) {
@@ -913,10 +973,6 @@ fn row_of(rows: &[Item], id: &str) -> Option<usize> {
     rows.iter().position(|row| music_id(&row.act) == Some(id))
 }
 
-fn no_browser() -> Item {
-    empty_row(g::GLOBE, "No browser connected".into(), "Run Set Up Browser Extension, then load the extension in Chrome, Edge or Brave".into(), vec![])
-}
-
 /// The playlist an album or playlist plays: its own, or the one its browse id names.
 fn playlist_of(item: &MusicItem) -> Option<String> {
     if !matches!(item.kind, Kind::Album | Kind::Playlist) {
@@ -1229,9 +1285,56 @@ mod tests {
         assert_eq!(relay.landed(2).unwrap().shelf, Some(Shelf::Playlists));
         relay.sent(3, &Ask::Page("MPREb_1".into()));
         assert_eq!(relay.landed(3).unwrap().shelf, None);
-        assert_eq!(Ask::Shelf(Shelf::Liked).request(4), ytmusic::browse(4, "VLLM"));
-        assert_eq!(Ask::Page("MPREb_1".into()).request(5), ytmusic::browse(5, "MPREb_1"));
-        assert_eq!(Ask::Search { query: "x".into(), filter: Filter::Albums }.request(6), ytmusic::search(6, "x", Filter::Albums));
+        assert_eq!(Ask::Shelf(Shelf::Liked).catalog(), Catalog::Browse { id: "VLLM".into() });
+        assert_eq!(Ask::Page("MPREb_1".into()).catalog(), Catalog::Browse { id: "MPREb_1".into() });
+        assert_eq!(Ask::Search { query: "x".into(), filter: Filter::Albums }.catalog(), Catalog::Search { query: "x".into(), filter: Filter::Albums });
+    }
+
+    #[test]
+    fn catalog_ask_is_innertube_not_companion() {
+        let companion = ytmusic::search(1, "daft punk", Filter::Albums);
+        assert_eq!((companion["t"].as_str(), companion["op"].as_str()), (Some("ytm"), Some("search")));
+        assert_eq!(
+            Ask::Search { query: "daft punk".into(), filter: Filter::Albums }.catalog(),
+            Catalog::Search { query: "daft punk".into(), filter: Filter::Albums }
+        );
+        assert_eq!(Ask::Shelf(Shelf::Albums).catalog(), Catalog::Browse { id: "FEmusic_liked_albums".into() });
+        assert_eq!(Ask::Shelf(Shelf::Playlists).catalog(), Catalog::Browse { id: "FEmusic_liked_playlists".into() });
+        assert_eq!(Ask::Shelf(Shelf::Artists).catalog(), Catalog::Browse { id: "FEmusic_library_corpus_track_artists".into() });
+        assert!(!catalog_blocked_by_browsers(false));
+        assert!(!catalog_blocked_by_browsers(true));
+    }
+
+    #[test]
+    fn catalog_failures_are_not_browser_extension_errors() {
+        let ask = Ask::Search { query: "x".into(), filter: Filter::Songs };
+        let reply = catalog_reply(&ask, Err("timeout".into()));
+        assert_eq!(reply.error.as_deref(), Some("Couldn't reach YouTube Music"));
+        assert_eq!(reply.op, "search");
+        let signed_out = Reply { op: "browse".into(), error: Some("Sign in to music.youtube.com in this browser to see your library".into()), ..Default::default() };
+        assert_eq!(catalog_reply(&Ask::Shelf(Shelf::Albums), Ok(signed_out.clone())).error, signed_out.error);
+    }
+
+    #[test]
+    fn playlists_shelf_can_fill_from_the_desktop_app() {
+        let sign_in = Some("Sign in to music.youtube.com in this browser to see your library");
+        let empty = Reply { op: "browse".into(), ..Default::default() };
+        let unsigned = Reply { op: "browse".into(), error: sign_in.map(str::to_string), ..Default::default() };
+        let rows = vec![("PLabc".into(), "Road Trip".into()), ("VLPL2".into(), "Focus".into())];
+        let items = playlists_from_desktop(rows.clone());
+        assert_eq!(items[0], MusicItem { kind: Kind::Playlist, id: "VLPLabc".into(), playlist_id: "PLabc".into(), title: "Road Trip".into(), ..Default::default() });
+        assert_eq!(items[1].id.as_str(), "VLPL2");
+        assert_eq!(items[1].playlist_id.as_str(), "PL2");
+        let filled = apply_desktop_playlists(Shelf::Playlists, unsigned.clone(), Some(rows.clone()));
+        assert!(filled.error.is_none());
+        assert_eq!(filled.items, items);
+        let from_empty = apply_desktop_playlists(Shelf::Playlists, empty, Some(rows.clone()));
+        assert_eq!(from_empty.items, items);
+        let albums = apply_desktop_playlists(Shelf::Albums, unsigned.clone(), Some(rows));
+        assert_eq!(albums.error.as_deref(), sign_in);
+        assert!(albums.items.is_empty());
+        let down = apply_desktop_playlists(Shelf::Playlists, unsigned, None);
+        assert_eq!(down.error.as_deref(), sign_in);
     }
 
     #[test]
