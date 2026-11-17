@@ -438,10 +438,12 @@ impl Calendar {
             .collect()
     }
 
-    /// The event root search's Next section shows: the first one starting within 15 minutes
-    /// (when `in_search`), or one a reminder announced, until it starts.
+    /// The event root search's Next section shows: the meeting a reminder announced, until it
+    /// starts (so Enter on Next joins it); else the first one starting within 15 minutes (when
+    /// `in_search`).
     pub fn next<'a>(&self, events: &'a [Event], now: i64, in_search: bool) -> Option<&'a Event> {
-        events.iter().filter(|e| !e.all_day && e.start > now).find(|e| (in_search && e.start - now <= NEXT_WITHIN) || self.fired.contains(&(e.start, e.title.clone())))
+        let upcoming = || events.iter().filter(|e| !e.all_day && e.start > now);
+        upcoming().find(|e| self.fired.contains(&(e.start, e.title.clone()))).or_else(|| upcoming().find(|e| in_search && e.start - now <= NEXT_WITHIN))
     }
 }
 
@@ -457,9 +459,10 @@ pub fn ignored(title: &str, ignore: &[String]) -> bool {
     ignore.iter().any(|w| !w.trim().is_empty() && title.contains(&w.trim().to_lowercase()))
 }
 
-/// What Hide This Event stores: the event's UID, or its start and title when it has none.
+/// What Hide This Event stores: the occurrence, by UID and start ("{uid}|{start}"; a repeating
+/// event's occurrences share the UID), or by start and title when it has no UID.
 pub fn hidden_key(e: &Event) -> String {
-    if e.uid.is_empty() { format!("{}|{}", e.start, e.title) } else { e.uid.clone() }
+    if e.uid.is_empty() { format!("{}|{}", e.start, e.title) } else { format!("{}|{}", e.uid, e.start) }
 }
 
 /// The hidden events' keys in `calendar-hidden.json` (a JSON list). A file that cannot be
@@ -777,7 +780,15 @@ mod tests {
         let hidden: HashSet<String> = [hidden_key(&ev(30, 40, "Review"))].into();
         assert_eq!(hidden_key(&ev(30, 40, "Review")), "30|Review");
         assert_eq!(c.events(&urls, &[], &hidden).iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), vec!["Focus Time"]);
-        assert_eq!(hidden_key(&Event { uid: "abc@google.com".into(), ..ev(1, 2, "X") }), "abc@google.com");
+        assert_eq!(hidden_key(&Event { uid: "abc@google.com".into(), ..ev(1, 2, "X") }), "abc@google.com|1");
+        // Hiding one week of a weekly 1:1 leaves the next week.
+        let ics = cal("BEGIN:VEVENT\r\nUID:w@google.com\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T093000Z\r\nRRULE:FREQ=WEEKLY;COUNT=2\r\nSUMMARY:1:1\r\nEND:VEVENT\r\n");
+        let weeks = parse_ics(&ics, 0, FAR);
+        let mut w = Calendar::default();
+        w.done(vec![("w".into(), Ok(weeks.clone()))], 0);
+        let hidden: HashSet<String> = [hidden_key(&weeks[0])].into();
+        let left: Vec<i64> = w.events(&["w".into()], &[], &hidden).iter().map(|e| e.start).collect();
+        assert_eq!(left, vec![weeks[1].start]);
         // Each event knows its feed's place in the list.
         c.done(vec![("v".into(), Ok(vec![ev(50, 60, "Gym")]))], 0);
         let feeds: Vec<usize> = c.events(&["u".into(), "v".into()], &[], &none).iter().map(|e| e.feed).collect();
@@ -828,6 +839,13 @@ mod tests {
         let later = [meet(4000, 5000, "Planning")];
         assert_eq!(c.due(&later, 4000 - 1800, 30).len(), 1);
         assert_eq!(c.next(&later, 4000 - 1800, false).map(|e| e.title.as_str()), Some("Planning"));
+        // The reminded meeting is Next even when an event without a link starts sooner.
+        let mut c = Calendar::default();
+        let both = [ev(1180, 2000, "No link"), meet(1300, 2000, "Standup")];
+        assert_eq!(c.due(&both, 1000, 5).len(), 1);
+        assert_eq!(c.next(&both, 1000, true).map(|e| e.title.as_str()), Some("Standup"));
+        // Without a reminder, the sooner one.
+        assert_eq!(Calendar::default().next(&both, 1000, true).map(|e| e.title.as_str()), Some("No link"));
     }
 
     #[test]

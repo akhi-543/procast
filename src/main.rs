@@ -1764,6 +1764,21 @@ impl Launcher {
         }
     }
 
+    /// Join Meeting's hotkey with `confirm_join`: root search opens on the meeting's row, armed,
+    /// so the bar asks "Join <title> on <host>? Press ↵ again" as Enter on the row does.
+    fn ask_join(&mut self, cx: &mut Context<Self>) {
+        let now = search::now() as i64;
+        let events = self.calendar_events();
+        let Some(e) = calendar::joinable(&events, now) else { return };
+        let row = if e.start <= now { self.event_row(e, calendar::until(e)).sec("Now") } else { self.event_row(e, calendar::in_minutes(e, now)).sec(NEXT) };
+        self.items.retain(|it| it.section.as_deref() != Some(NEXT));
+        self.items.insert(0, row);
+        self.selected = 0;
+        self.armed = Some(0);
+        self.scroll_to_selected();
+        cx.notify();
+    }
+
     /// Every 10 s: fetches the feeds when due (off the UI thread), reminds of meetings about to
     /// start, and keeps root's Next row current.
     fn calendar_tick(&mut self, cx: &mut Context<Self>) {
@@ -3582,7 +3597,10 @@ impl Launcher {
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
             Act::Join(_, url) => win::open(&url),
             Act::Cmd(Cmd::JoinMeeting) => match self.join_target(&Act::Cmd(Cmd::JoinMeeting)) {
-                Some((_, url)) => win::open(&url),
+                Some((title, url)) => {
+                    win::open(&url);
+                    self.say(Msg::done(format!("Joining {title}")));
+                }
                 None => self.say(Msg::error("No meeting with a link right now")),
             },
             Act::HideEvent(key) => {
@@ -3867,6 +3885,8 @@ impl Launcher {
         }
         match act {
             Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
+            // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
+            Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
             Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
@@ -3900,6 +3920,9 @@ impl Launcher {
         }
         if self.needs_window(&it.act) {
             self.show(Mode::Root, window, cx);
+            if it.act == Act::Cmd(Cmd::JoinMeeting) {
+                return self.ask_join(cx);
+            }
         } else if !self.visible {
             let fg = win::foreground();
             if fg != self.hwnd {

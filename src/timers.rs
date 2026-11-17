@@ -68,7 +68,6 @@ pub fn done_text(label: &str, length: Duration) -> String {
 /// A finished timer's accessory, until it is dismissed.
 pub const DONE: &str = "Done";
 
-/// The system "ding"; silent when there is no sound device.
 /// How long ago, from the seconds since: "just now", "3 min ago", "2 d ago".
 pub fn ago(secs: u64) -> String {
     match secs {
@@ -79,6 +78,7 @@ pub fn ago(secs: u64) -> String {
     }
 }
 
+/// The system "ding"; silent when there is no sound device.
 pub fn beep() {
     unsafe { _ = MessageBeep(MB_OK) };
 }
