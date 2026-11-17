@@ -739,16 +739,21 @@ fn fuzzy<'a>(q: &str, items: impl Iterator<Item = &'a Item>, frec: &Frecency, ma
             Some((s as f64 + in_title + 25. * boost, it))
         })
         .collect();
-    // A Windows Settings page never outranks a procast command whose title meets the query
-    // ("focus": the Focus page goes below every Focus Session command). It scores at most what
-    // the weakest such command does, and at a tie the command goes first.
+    // A Windows Settings page for a feature procast has itself (Focus, Clipboard) never outranks
+    // a procast command whose title meets the query by more than its initials ("focus": the Focus
+    // page goes below every Focus Session command). It scores at most what the weakest such
+    // command does, and at a tie the command goes first. Other pages ("display") keep their place.
     let page = |it: &Item| it.key.as_deref().is_some_and(|k| k.starts_with("ms:"));
-    if let Some(floor) = hits.iter().filter(|(_, it)| matches!(it.act, Act::Cmd(_)) && tier(&it.title, q) > 0.).map(|h| h.0).reduce(f64::min) {
-        hits.iter_mut().filter(|h| page(h.1)).for_each(|h| h.0 = h.0.min(floor));
+    let owned = |it: &Item| page(it) && OWNED_PAGES.iter().any(|w| it.title.to_lowercase().contains(w));
+    if let Some(floor) = hits.iter().filter(|(_, it)| matches!(it.act, Act::Cmd(_)) && tier(&it.title, q) >= 400.).map(|h| h.0).reduce(f64::min) {
+        hits.iter_mut().filter(|h| owned(h.1)).for_each(|h| h.0 = h.0.min(floor));
     }
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| page(a.1).cmp(&page(b.1))).then_with(|| a.1.title.len().cmp(&b.1.title.len())));
     hits
 }
+
+/// Windows Settings pages for features procast provides itself; their commands rank first.
+const OWNED_PAGES: &[&str] = &["focus", "clipboard"];
 
 /// How a query meets a title, strongest first: the whole title, a whole word ("ai" in
 /// "Ask AI"), the title's start, the start of a word, the initials. Scattered letters
@@ -1494,6 +1499,8 @@ fallbacks = [\"define\", \"web\"]").unwrap();
         }
         // With no command named, the page still leads.
         assert_eq!(ask("do not disturb")[0].key.as_deref(), Some("ms:quiethours"));
+        // A page for a feature procast doesn't have keeps its place over a command that names it.
+        assert_eq!(ask("display")[0].key.as_deref(), Some("ms:display"));
     }
 
     #[test]
