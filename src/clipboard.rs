@@ -231,6 +231,22 @@ impl History {
 pub fn render_image(png: &[u8], max: u32) -> Option<Arc<gpui::RenderImage>> {
     let img = image::load_from_memory(png).ok()?.to_rgba8();
     let img = if img.width() > max || img.height() > max { image::imageops::thumbnail(&img, max, max) } else { img };
+    to_render(img)
+}
+
+/// A picture scaled down to `width` wide, whatever its height (a grid thumbnail).
+pub fn render_width(bytes: &[u8], width: u32) -> Option<Arc<gpui::RenderImage>> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = width_fit(img.width(), img.height(), width);
+    to_render(if w < img.width() { image::imageops::thumbnail(&img, w, h) } else { img })
+}
+
+/// `w` x `h` scaled down to `width` wide, keeping its shape; as it is when narrower.
+fn width_fit(w: u32, h: u32, width: u32) -> (u32, u32) {
+    if w <= width { (w, h) } else { (width, (u64::from(h) * u64::from(width) / u64::from(w)).max(1) as u32) }
+}
+
+fn to_render(img: image::RgbaImage) -> Option<Arc<gpui::RenderImage>> {
     let (w, h) = img.dimensions();
     let mut buf = img.into_raw();
     for p in buf.chunks_exact_mut(4) {
@@ -594,6 +610,14 @@ pub fn tap(vk: VIRTUAL_KEY, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnails_fit_the_width() {
+        assert_eq!(width_fit(1920, 1200, 320), (320, 200));
+        assert_eq!(width_fit(1080, 2400, 320), (320, 711), "a portrait picture is 320 wide too");
+        assert_eq!(width_fit(200, 100, 320), (200, 100), "never scaled up");
+        assert_eq!(width_fit(5000, 1, 320), (320, 1));
+    }
 
     #[test]
     #[ignore = "Windows OCR on a picture: PROCAST_OCR_PNG=<file> cargo test ocr -- --ignored"]

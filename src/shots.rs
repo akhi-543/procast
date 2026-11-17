@@ -21,7 +21,7 @@ use crate::{
 const IMAGES: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
 const VIDEOS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "wmv", "m4v"];
 /// Bigger pictures are listed but not read for text.
-const MAX_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Shot {
@@ -86,6 +86,11 @@ fn video(path: &Path) -> bool {
     ext(path).is_some_and(|e| VIDEOS.contains(&e.as_str()))
 }
 
+/// A picture file, by its extension (what a thumbnail may be decoded from).
+pub fn picture(path: &Path) -> bool {
+    ext(path).is_some_and(|e| IMAGES.contains(&e.as_str()))
+}
+
 fn secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -97,7 +102,7 @@ fn scan(folders: &[PathBuf], all_media: bool) -> HashMap<PathBuf, u64> {
     let mut found = HashMap::new();
     for entry in folders.iter().filter_map(|f| fs::read_dir(f).ok()).flatten().flatten() {
         let path = entry.path();
-        let wanted = ext(&path).is_some_and(|e| IMAGES.contains(&e.as_str())) || (all_media && video(&path));
+        let wanted = picture(&path) || (all_media && video(&path));
         let Ok(meta) = entry.metadata() else { continue };
         // The index is stored as JSON: a path that isn't Unicode can't be.
         if wanted && meta.is_file() && path.to_str().is_some() {
@@ -142,26 +147,40 @@ impl ShotIndex {
     /// its text recognised: a picture that can't be recognised is remembered as `failed` and
     /// not tried again until it changes, but one that can't be read right now (locked by
     /// OneDrive or an antivirus) is left out so the next scan retries it. Without `opts.ocr`
-    /// nothing is read. A pin survives the file changing. Returns how many were indexed and
-    /// how many are left for later calls.
-    pub fn update(&mut self, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> (usize, usize) {
+    /// nothing is read. A pin survives the file changing. Returns how many were indexed.
+    /// (A scan plans once and indexes batch by batch: `scan_loop`.)
+    #[cfg(test)]
+    fn update(&mut self, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> usize {
+        let mut todo = self.plan(folders, opts);
+        self.index(&mut todo, opts, ocr)
+    }
+
+    /// Drops what is gone or too old; returns the new or changed files, oldest first (the
+    /// newest is popped first).
+    fn plan(&mut self, folders: &[PathBuf], opts: Opts) -> Vec<(PathBuf, u64)> {
         self.prune(opts.keep);
         let mut found = scan(folders, opts.all_media);
         if let Some(keep) = opts.keep {
             let at = cutoff(keep);
             found.retain(|_, m| *m >= at);
         }
-        let known: HashMap<&PathBuf, (u64, bool)> = self.entries.iter().map(|e| (&e.path, (e.mtime, e.pinned))).collect();
-        let mut todo: Vec<(PathBuf, u64)> = found.iter().filter(|(p, m)| known.get(p).map(|k| k.0) != Some(**m)).map(|(p, m)| (p.clone(), *m)).collect();
-        todo.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let (total, mut tried) = (todo.len(), 0);
+        self.entries.retain(|e| found.contains_key(&e.path));
+        let known: HashMap<&PathBuf, u64> = self.entries.iter().map(|e| (&e.path, e.mtime)).collect();
+        let mut todo: Vec<(PathBuf, u64)> = found.into_iter().filter(|(p, m)| known.get(p) != Some(m)).collect();
+        todo.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
+        todo
+    }
+
+    /// Indexes files from the end of `todo` (a `plan`) until `opts.batch` are indexed or none
+    /// are left; a file that can't be read right now is dropped from `todo`. Returns how many
+    /// were indexed.
+    fn index(&mut self, todo: &mut Vec<(PathBuf, u64)>, opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>) -> usize {
+        let pins: HashSet<&PathBuf> = self.entries.iter().filter(|e| e.pinned).map(|e| &e.path).collect();
         let mut fresh = Vec::new();
-        for (path, mtime) in todo {
-            if fresh.len() == opts.batch {
-                break;
-            }
-            tried += 1;
-            let pinned = known.get(&path).is_some_and(|k| k.1);
+        while fresh.len() < opts.batch
+            && let Some((path, mtime)) = todo.pop()
+        {
+            let pinned = pins.contains(&path);
             let (text, failed) = if video(&path) || !opts.ocr {
                 (String::new(), false)
             } else {
@@ -176,11 +195,11 @@ impl ShotIndex {
             fresh.push(Shot::new(path, mtime, text, failed, pinned));
         }
         let redo: HashSet<&PathBuf> = fresh.iter().map(|s| &s.path).collect();
-        self.entries.retain(|e| found.contains_key(&e.path) && !redo.contains(&e.path));
+        self.entries.retain(|e| !redo.contains(&e.path));
         let indexed = fresh.len();
         self.entries.extend(fresh);
         self.entries.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
-        (indexed, total - tried)
+        indexed
     }
 
     /// Entries of `kind` matching the filter `q` (`parse_filter`), newest first; all of
@@ -263,24 +282,26 @@ pub fn rescan(folders: &[PathBuf], keep: Option<Duration>, all_media: bool, ocr:
     scan_loop(&mut index, folders, opts, clipboard::recognise, show, ShotIndex::save);
 }
 
-/// Updates `index` batch by batch until nothing is left, showing it after each batch and,
-/// when reading text, saving it whenever it changed. A first pass that reads nothing counts
-/// what there is to read, so the progress is known before the first batch.
+/// Scans `folders` once, then indexes what changed batch by batch, showing the index before
+/// and after each batch with how many pictures have been read of how many (videos are never
+/// read) and, when reading text, saving it whenever it changed. Files added meanwhile wait
+/// for the next scan.
 fn scan_loop(index: &mut ShotIndex, folders: &[PathBuf], opts: Opts, ocr: impl Fn(&[u8]) -> Option<String>, mut show: impl FnMut(&ShotIndex, Option<(usize, usize)>), mut save: impl FnMut(&ShotIndex)) {
-    let progress = |done: usize, left: usize| opts.ocr.then_some((done, done + left));
-    let mut before = index.entries.len();
-    let (_, left) = index.update(folders, Opts { batch: 0, ..opts }, &ocr);
-    let mut done = 0;
-    show(index, progress(done, left));
+    let before = index.entries.len();
+    let mut todo = index.plan(folders, opts);
+    let pictures = |todo: &[(PathBuf, u64)]| todo.iter().filter(|(p, _)| !video(p)).count();
+    let of = pictures(&todo);
+    let progress = |todo: &[(PathBuf, u64)]| opts.ocr.then(|| (of - pictures(todo), of));
+    show(index, progress(&todo));
+    let mut gone = index.entries.len() != before;
     loop {
-        let (indexed, left) = index.update(folders, opts, &ocr);
-        done += indexed;
-        if opts.ocr && (indexed > 0 || index.entries.len() != before) {
+        let indexed = index.index(&mut todo, opts, &ocr);
+        if opts.ocr && (indexed > 0 || gone) {
             save(index);
         }
-        before = index.entries.len();
-        show(index, progress(done, left));
-        if indexed < opts.batch {
+        gone = false;
+        show(index, progress(&todo));
+        if todo.is_empty() {
             break;
         }
     }
@@ -417,14 +438,35 @@ pub fn caption(mtime: SystemTime, now: SystemTime) -> String {
 /// For a `text:` filter: the words of the picture's text that hold each of `words` (lower
 /// case), as written there; None unless every one is found.
 pub fn text_hit(shot: &Shot, words: &[String]) -> Option<String> {
-    let hits: Option<Vec<&str>> = words.iter().map(|w| shot.text.split_whitespace().find(|t| t.to_lowercase().contains(w.as_str()))).collect();
+    // The cached lower-case text lines up with the text byte for byte unless lowering changed
+    // a character's length; only then is each word lowered on its own.
+    let aligned = shot.ltext.len() == shot.text.len();
+    let hit = |w: &String| match shot.ltext.find(w.as_str()) {
+        Some(i) if aligned && shot.text.is_char_boundary(i) => Some(word_at(&shot.text, i)),
+        None if aligned => None,
+        _ => shot.text.split_whitespace().find(|t| t.to_lowercase().contains(w.as_str())),
+    };
+    let hits: Option<Vec<&str>> = words.iter().map(hit).collect();
     hits.filter(|h| !h.is_empty()).map(|h| h.join(" "))
+}
+
+/// The whitespace-separated word of `text` around byte `i`.
+fn word_at(text: &str, i: usize) -> &str {
+    let start = text[..i].char_indices().rev().find(|c| c.1.is_whitespace()).map_or(0, |(j, c)| j + c.len_utf8());
+    let end = text[i..].find(char::is_whitespace).map_or(text.len(), |j| i + j);
+    &text[start..end]
+}
+
+/// A grid cell's thumbnail key, `t:{mtime}|{path}` (the time, so a file saved over gets a
+/// fresh one); None for a video, whose file is never read for one.
+pub fn thumb_key(s: &Shot) -> Option<String> {
+    (!s.is_video()).then(|| format!("t:{}|{}", s.mtime, s.path.display()))
 }
 
 /// The grid's cells, newest first: the file name as title, the caption (or, for a `text:`
 /// filter, the words found) as accessory, and the primary action first (`primary`: copy |
-/// paste | open); videos only open.
-pub fn rows(index: &ShotIndex, query: &str, kind: Kind, primary: &str) -> Vec<Item> {
+/// paste | open); videos only open. With each, its `thumb_key`.
+pub fn rows(index: &ShotIndex, query: &str, kind: Kind, primary: &str) -> (Vec<Item>, Vec<Option<String>>) {
     let now = SystemTime::now();
     let words: Vec<String> = parse_filter(query).into_iter().filter(|f| f.0 == Field::Text).map(|f| f.1).collect();
     index
@@ -444,9 +486,9 @@ pub fn rows(index: &ShotIndex, query: &str, kind: Kind, primary: &str) -> Vec<It
             let icon = Icon::Vector(if s.is_video() { g::VIDEO } else { g::PICTURE });
             let mut it = Item::new(s.name(), "", icon, acts[0].clone()).acc(caption).tinted(Tint::File).sec(SECTION);
             it.extra = acts.into_iter().map(|a| (a.label().to_string(), a)).collect();
-            it
+            (it, thumb_key(s))
         })
-        .collect()
+        .unzip()
 }
 
 #[cfg(test)]
@@ -479,11 +521,11 @@ mod tests {
             calls.set(calls.get() + 1);
             Some("Invoice 42".to_string())
         };
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 1, "the picture, not the text file");
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 0);
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 1, "the picture, not the text file");
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 0);
         assert_eq!(calls.get(), 1, "an unchanged file is not read again");
         touch(&d.join("a.png"), 5);
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 1, "a changed file is");
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 1, "a changed file is");
         assert_eq!(calls.get(), 2);
         assert_eq!(idx.entries.len(), 1);
         fs::remove_file(d.join("a.png")).unwrap();
@@ -500,12 +542,12 @@ mod tests {
             calls.set(calls.get() + 1);
             None
         };
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 1);
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 1);
         assert!(idx.entries[0].failed && idx.entries[0].text.is_empty());
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 0);
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 0);
         assert_eq!(calls.get(), 1);
         touch(&d.join("a.png"), 1);
-        assert_eq!(idx.update(&[d], OPTS, ocr).0, 1);
+        assert_eq!(idx.update(&[d], OPTS, ocr), 1);
         assert_eq!(calls.get(), 2);
     }
 
@@ -577,9 +619,11 @@ mod tests {
         assert_eq!(text_hit(&s, &["total".into(), "zebra".into()]), None, "every word or none");
         assert_eq!(text_hit(&s, &[]), None);
         let mut idx = ShotIndex { entries: vec![s] };
-        assert_eq!(rows(&idx, "text:TOTAL", Kind::All, "copy")[0].accessory, "Total:", "the caption of a text: match");
+        assert_eq!(rows(&idx, "text:TOTAL", Kind::All, "copy").0[0].accessory, "Total:", "the caption of a text: match");
         idx.entries[0].mtime = secs(SystemTime::now());
-        assert!(rows(&idx, "total", Kind::All, "copy")[0].accessory.starts_with("Today, "), "a plain word keeps the time");
+        assert!(rows(&idx, "total", Kind::All, "copy").0[0].accessory.starts_with("Today, "), "a plain word keeps the time");
+        let odd = shot("b.png", SystemTime::now(), "\u{130}stanbul TOTAL");
+        assert_eq!(text_hit(&odd, &["total".into()]).as_deref(), Some("TOTAL"), "text whose lower case is longer still finds the word");
     }
 
     #[test]
@@ -611,7 +655,7 @@ mod tests {
         idx.update(std::slice::from_ref(&d), OPTS, |_| Some(String::new()));
         idx.entries[0].pinned = true;
         touch(&d.join("a.png"), 1);
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, |_| Some(String::new())).0, 1);
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, |_| Some(String::new())), 1);
         assert!(idx.entries[0].pinned);
     }
 
@@ -629,14 +673,14 @@ mod tests {
         };
         let day = Some(Duration::from_secs(86400));
         let first = Opts { batch: 1, keep: day, ..OPTS };
-        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr).0, 1);
+        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr), 1);
         assert_eq!(idx.entries[0].path.file_name().unwrap(), "c.png", "newest first");
-        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr).0, 1);
-        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr).0, 0, "older than keep, and videos, are not listed");
+        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr), 1);
+        assert_eq!(idx.update(std::slice::from_ref(&d), first, ocr), 0, "older than keep, and videos, are not listed");
         assert_eq!(idx.entries.len(), 2);
 
         let all = Opts { all_media: true, ..OPTS };
-        assert_eq!(idx.update(std::slice::from_ref(&d), all, ocr).0, 2, "the week-old picture and the video");
+        assert_eq!(idx.update(std::slice::from_ref(&d), all, ocr), 2, "the week-old picture and the video");
         let video = idx.entries.iter().find(|s| s.path.ends_with("clip.mp4")).unwrap();
         assert!(!video.failed && video.text.is_empty());
         assert_eq!(calls.get(), 3, "videos are listed, never read");
@@ -655,11 +699,13 @@ mod tests {
         let mut idx = ShotIndex::default();
         idx.update(std::slice::from_ref(&d), Opts { all_media: true, ..OPTS }, |_| Some("\n  Total due\nmore".into()));
         let label = |it: &Item| it.extra.iter().map(|a| a.0.as_str()).collect::<Vec<_>>().join(",");
-        let rows = rows(&idx, "", Kind::All, "paste");
+        let (rows, thumbs) = rows(&idx, "", Kind::All, "paste");
         assert_eq!(rows.iter().map(&label).collect::<Vec<_>>(), ["Open,Show in Explorer", "Paste Image,Copy to Clipboard,Open,Show in Explorer"], "a video can only open");
         assert_eq!((rows[1].title.as_str(), rows[1].section.as_deref()), ("a.png", Some(SECTION)), "the whole name, in the one section");
-        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "open")[0]), "Open,Copy to Clipboard,Paste Image,Show in Explorer");
-        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "copy")[0]), "Copy to Clipboard,Paste Image,Open,Show in Explorer");
+        let png = &idx.entries[1];
+        assert_eq!(thumbs, [None, Some(format!("t:{}|{}", png.mtime, png.path.display()))], "a video's file is never read for a thumbnail");
+        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "open").0[0]), "Open,Copy to Clipboard,Paste Image,Show in Explorer");
+        assert_eq!(label(&super::rows(&idx, "a.png", Kind::All, "copy").0[0]), "Copy to Clipboard,Paste Image,Open,Show in Explorer");
     }
 
     #[test]
@@ -675,11 +721,11 @@ mod tests {
         };
         // Held without sharing, like a file OneDrive or an antivirus has open.
         let lock = fs::File::options().read(true).share_mode(0).open(d.join("a.png")).unwrap();
-        assert_eq!(idx.update(std::slice::from_ref(&d), Opts { batch: 1, ..OPTS }, ocr).0, 1, "the batch is filled from the files that can be read");
+        assert_eq!(idx.update(std::slice::from_ref(&d), Opts { batch: 1, ..OPTS }, ocr), 1, "the batch is filled from the files that can be read");
         assert_eq!(idx.entries.len(), 1);
         assert!(idx.entries.iter().all(|s| !s.failed && s.path.ends_with("b.png")), "the locked one is not recorded as failed");
         drop(lock);
-        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr).0, 1, "and is read once it is free");
+        assert_eq!(idx.update(std::slice::from_ref(&d), OPTS, ocr), 1, "and is read once it is free");
         assert_eq!(idx.entries.len(), 2);
     }
 
@@ -718,6 +764,17 @@ mod tests {
         scan_loop(&mut idx, std::slice::from_ref(&d), Opts { batch: 2, ..OPTS }, |_| Some("x".into()), |_, p| shown.push(p), |_| saves.set(saves.get() + 1));
         assert_eq!((idx.entries.len(), saves.get()), (3, 2), "two batches, one save each");
         assert_eq!(shown, [Some((0, 3)), Some((2, 3)), Some((3, 3))], "read of to read, known before the first batch");
+    }
+
+    #[test]
+    fn progress_counts_pictures_only() {
+        let d = dir("progress");
+        touch(&d.join("a.png"), 10);
+        touch(&d.join("clip.mp4"), 5);
+        let (mut idx, mut shown) = (ShotIndex::default(), vec![]);
+        scan_loop(&mut idx, std::slice::from_ref(&d), Opts { all_media: true, ..OPTS }, |_| Some("x".into()), |_, p| shown.push(p), |_| {});
+        assert_eq!(idx.entries.len(), 2, "the video is listed");
+        assert_eq!(shown, [Some((0, 1)), Some((1, 1))], "but never counted as read");
     }
 
     #[test]

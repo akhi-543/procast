@@ -41,7 +41,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -866,9 +866,10 @@ struct Launcher {
     clip_images: HashMap<String, Option<Arc<RenderImage>>>,
     /// File Search detail pane: the selected file's information (read when the selection
     /// changes), and its decoded pictures (`p:`), shell icons (`i:`) and Search Screenshots'
-    /// thumbnails (`t:`) by path.
+    /// thumbnails (`t:`) by path, each with its last use (`file_tick`) for `evict`.
     file_info: Option<(String, Option<files::FileInfo>)>,
-    file_images: HashMap<String, Option<Arc<RenderImage>>>,
+    file_images: HashMap<String, (Option<Arc<RenderImage>>, u64)>,
+    file_tick: u64,
     /// Counts selection changes in File Search; a preview worker waits for its count to hold.
     file_seq: Arc<AtomicU64>,
     /// The emoji and screenshot grids' rows; only the ones on screen are laid out.
@@ -903,6 +904,11 @@ struct Launcher {
     shots_progress: Option<(usize, usize)>,
     /// The bar's dropdown: which screenshots show.
     shot_kind: shots::Kind,
+    /// Each grid cell's thumbnail key (`shots::thumb_key`; None for a video).
+    shot_thumbs: Vec<Option<String>>,
+    /// The grid row at the top of the screenshot grid: a decode for a row scrolled far from
+    /// it is dropped before it starts.
+    grid_top: Arc<AtomicUsize>,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -1040,6 +1046,7 @@ impl Launcher {
             clip_images: HashMap::new(),
             file_info: None,
             file_images: HashMap::new(),
+            file_tick: 0,
             file_seq: Arc::new(AtomicU64::new(0)),
             grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
@@ -1057,6 +1064,8 @@ impl Launcher {
             shots_busy: false,
             shots_progress: None,
             shot_kind: shots::Kind::All,
+            shot_thumbs: vec![],
+            grid_top: Arc::new(AtomicUsize::new(0)),
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -1509,7 +1518,11 @@ impl Launcher {
                 search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
-            Mode::Shots => shots::rows(&self.shots, &query, self.shot_kind, &self.cfg.screenshots.primary),
+            Mode::Shots => {
+                let (rows, thumbs) = shots::rows(&self.shots, &query, self.shot_kind, &self.cfg.screenshots.primary);
+                self.shot_thumbs = thumbs;
+                rows
+            }
             // A form draws its own body.
             Mode::Form(_) => vec![],
             Mode::Schedule => {
@@ -1638,19 +1651,24 @@ impl Launcher {
             self.items = vec![empty_row(g::PASTE, if query.trim().is_empty() { "Nothing copied yet" } else { "No matches" }.into(), hint.into(), vec![])];
         }
         if self.items.is_empty() && self.mode == Mode::Shots {
-            let (title, hint) = match (self.shots_busy, query.trim().is_empty()) {
-                (true, _) => ("Reading screenshots…", "Text in new pictures is found in the background".to_string()),
-                (_, false) => ("No matches", "Nothing in your screenshots matches".to_string()),
-                _ => ("No screenshots found", shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")),
+            let empty = shots_empty(self.shots_busy, !query.trim().is_empty() || self.shot_kind != shots::Kind::All);
+            let hint = match empty {
+                ShotsEmpty::Reading => "Text in new pictures is found in the background".to_string(),
+                ShotsEmpty::NoMatches => "Nothing in your screenshots matches".to_string(),
+                ShotsEmpty::NoScreenshots => shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", "),
             };
-            let add = (title == "No screenshots found").then(|| (Act::AddShotFolder.label().to_string(), Act::AddShotFolder));
-            self.items = vec![empty_row(g::SCAN_SEARCH, title.into(), hint, add.into_iter().collect())];
+            let add = (empty == ShotsEmpty::NoScreenshots).then(|| (Act::AddShotFolder.label().to_string(), Act::AddShotFolder));
+            self.items = vec![empty_row(g::SCAN_SEARCH, empty.title().into(), hint, add.into_iter().collect())];
         }
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
         }
         if matches!(self.mode, Mode::Emoji | Mode::Shots) {
-            self.grid_list.reset(grid_rows(&self.items, self.grid_cols()).len());
+            let n = grid_rows(&self.items, self.grid_cols()).len();
+            // A batch of read text keeps the screenshot grid where it is scrolled.
+            if self.mode == Mode::Emoji || n != self.grid_list.item_count() {
+                self.grid_list.reset(n);
+            }
         }
         let _ = max;
         self.selected = if keep_selection {
@@ -2345,6 +2363,9 @@ impl Launcher {
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode == Mode::Shots && mode != Mode::Shots {
+            self.drop_thumbs(cx);
+        }
         // A typed snippet keyword's erase belongs to its own Args session only.
         self.typed = Default::default();
         if mode != Mode::Ext {
@@ -2452,6 +2473,7 @@ impl Launcher {
         self.visible = false;
         self.pick_next = false;
         self.hidden_at = Some(Instant::now());
+        self.drop_thumbs(cx);
         self.panel = None;
         self.menu = None;
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
@@ -2489,42 +2511,66 @@ impl Launcher {
         self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
     }
 
-    /// A file's picture (`p:`, fitted), shell icon (`i:`) or grid thumbnail (`t:`, 320 px),
-    /// made off the UI thread: None until it arrives as Msg::FilePreview.
-    fn file_preview(&mut self, key: String, cx: &App) -> Option<Arc<RenderImage>> {
-        if self.file_images.len() > 300 {
-            self.file_images.clear();
+    /// `file_images[key]`, marked as just used; None when it was never asked for.
+    fn cached_image(&mut self, key: &str) -> Option<Option<Arc<RenderImage>>> {
+        self.file_tick += 1;
+        let entry = self.file_images.get_mut(key)?;
+        entry.1 = self.file_tick;
+        Some(entry.0.clone())
+    }
+
+    /// A file's picture (`p:`, fitted) or shell icon (`i:`), made on a worker thread: None
+    /// until it arrives as Msg::FilePreview.
+    fn file_preview(&mut self, key: String) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.cached_image(&key) {
+            return img;
         }
-        if let Some(img) = self.file_images.get(&key) {
-            return img.clone();
-        }
-        self.file_images.insert(key.clone(), None);
+        self.file_images.insert(key.clone(), (None, self.file_tick));
         let (tx, seq) = (self.tx.clone(), self.file_seq.clone());
-        let (at, thumb) = (seq.load(Ordering::Relaxed), key.starts_with("t:"));
-        let make = move || {
+        let at = seq.load(Ordering::Relaxed);
+        std::thread::spawn(move || {
+            // Settle first: arrowing through a folder only decodes where the selection stops.
+            std::thread::sleep(Duration::from_millis(100));
             if seq.load(Ordering::Relaxed) != at {
                 let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
                 return;
             }
             let path = &key[2..];
-            let img = match &key[..2] {
-                "p:" => std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)),
-                "t:" => std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, THUMB_PX)),
-                _ => win::file_icon(path),
-            };
+            let img = if key.starts_with("p:") { std::fs::read(path).ok().and_then(|b| clipboard::render_image(&b, 640)) } else { win::file_icon(path) };
             let _ = tx.unbounded_send(Msg::FilePreview(key, img));
-        };
-        if thumb {
-            // A grid's thumbnails are all wanted at once: no settle, on the shared pool.
-            cx.background_executor().spawn(async move { make() }).detach();
-        } else {
-            std::thread::spawn(move || {
-                // Settle first: arrowing through a folder only decodes where the selection stops.
-                std::thread::sleep(Duration::from_millis(100));
-                make();
-            });
-        }
+        });
         None
+    }
+
+    /// A screenshot grid cell's thumbnail (`shots::thumb_key`), `THUMB_PX` wide, for grid
+    /// row `row`: decoded on the background executor with no settle (a grid wants them all
+    /// at once), unless the grid has scrolled far from the row by its turn. Only a picture
+    /// no bigger than `shots::MAX_BYTES` is read. None until it arrives as Msg::FilePreview.
+    fn shot_thumb(&mut self, key: &str, row: usize, cx: &App) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.cached_image(key) {
+            return img;
+        }
+        self.file_images.insert(key.to_string(), (None, self.file_tick));
+        let (tx, top, key) = (self.tx.clone(), self.grid_top.clone(), key.to_string());
+        cx.background_executor()
+            .spawn(async move {
+                if !near(row, top.load(Ordering::Relaxed)) {
+                    // Asked again if it comes back into view.
+                    let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
+                    return;
+                }
+                let path = key.split_once('|').map(|(_, p)| std::path::Path::new(p)).filter(|p| shots::picture(p) && std::fs::metadata(p).is_ok_and(|m| m.len() <= shots::MAX_BYTES));
+                let img = path.and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_width(&b, THUMB_PX));
+                let _ = tx.unbounded_send(Msg::FilePreview(key, img));
+            })
+            .detach();
+        None
+    }
+
+    /// Forgets the screenshot thumbnails and frees their GPU textures (the grid closed).
+    fn drop_thumbs(&mut self, cx: &mut App) {
+        let gone = self.file_images.extract_if(|k, _| k.starts_with("t:")).filter_map(|(_, v)| v.0).collect();
+        release(gone, cx);
     }
 
     /// A snippet chosen in the launcher (`erase` 0) or typed in an app: asks for its
@@ -4413,7 +4459,12 @@ impl Launcher {
                 }
             }
             Msg::FilePreview(key, img) => {
-                self.file_images.insert(key, img);
+                match self.file_images.get_mut(&key) {
+                    Some(entry) => entry.0 = img,
+                    // Forgotten meanwhile (evicted, or the grid closed): not kept.
+                    None => release(img.into_iter().collect(), cx),
+                }
+                release(evict(&mut self.file_images, FILE_IMAGES_MAX, FILE_IMAGES_KEEP), cx);
                 if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
                 }
@@ -4941,7 +4992,7 @@ impl Launcher {
     }
 
     /// File Search's right-hand pane: a preview, then the file's information.
-    fn file_detail(&mut self, t: &Tokens, cx: &App) -> gpui::AnyElement {
+    fn file_detail(&mut self, t: &Tokens) -> gpui::AnyElement {
         let path = match self.items.get(self.selected).map(|it| &it.act) {
             Some(Act::File(p)) => p.clone(),
             _ => return div().flex_1().into_any_element(),
@@ -4962,13 +5013,13 @@ impl Launcher {
             files::Preview::Image(_) => (None, None, true),
             files::Preview::Icon => (None, None, false),
         };
-        let picture = if image { self.file_preview(format!("p:{path}"), cx) } else { None };
+        let picture = if image { self.file_preview(format!("p:{path}")) } else { None };
         let top = if let Some(s) = text {
             detail_lines(&s, true).into_any_element()
         } else if let Some(n) = count {
             detail_lines(&if n >= 10_000 { "10000+ items".to_string() } else if n == 1 { "1 item".to_string() } else { format!("{n} items") }, false).into_any_element()
         } else {
-            let icon = if picture.is_none() { self.file_preview(format!("i:{path}"), cx) } else { None };
+            let icon = if picture.is_none() { self.file_preview(format!("i:{path}")) } else { None };
             let shown = picture.map(|p| gpui::img(p).max_w_full().max_h(px(196.)).object_fit(gpui::ObjectFit::Contain)).or_else(|| icon.map(|i| gpui::img(i).size(px(design::ic::XL))));
             image_box(t).children(shown).into_any_element()
         };
@@ -5065,8 +5116,9 @@ impl Launcher {
         let cols = self.grid_cols();
         let me = cx.weak_entity();
         let (selected, t, count) = (self.selected, *t, self.items.len());
-        let cells: Rc<Vec<(String, String)>> = Rc::new(self.items.iter().map(|it| (shot_path(it).unwrap_or_default().to_string(), it.accessory.clone())).collect());
+        let cells: Rc<Vec<(Option<String>, String)>> = Rc::new(self.items.iter().enumerate().map(|(i, it)| (self.shot_thumbs.get(i).cloned().flatten(), it.accessory.clone())).collect());
         let rows = Rc::new(grid_rows(&self.items, cols));
+        self.grid_top.store(self.grid_list.logical_scroll_top().item_ix, Ordering::Relaxed);
         let last = rows.len().saturating_sub(1);
         let list = gpui::list(self.grid_list.clone(), move |k, _, cx| match &rows[k] {
             GridRow::Header(s) => design::section_header(s, Some(count), &t).into_any_element(),
@@ -5077,8 +5129,8 @@ impl Launcher {
                 .pb(px(if k == last { design::sp::S8 } else { design::sp::S12 }))
                 .gap(px(design::sp::S12))
                 .children(row.iter().map(|&i| {
-                    let (path, caption) = &cells[i];
-                    let image = me.update(cx, |this, cx| this.file_preview(format!("t:{path}"), cx)).ok().flatten();
+                    let (key, caption) = &cells[i];
+                    let image = key.as_ref().and_then(|key| me.update(cx, |this, cx| this.shot_thumb(key, k, cx)).ok().flatten());
                     let me = me.clone();
                     design::thumb(image, caption, i == selected, &t)
                         .id(("shot", i))
@@ -5094,7 +5146,7 @@ impl Launcher {
                 .children((row.len()..cols).map(|_| div().flex_1().into_any_element()))
                 .into_any_element(),
         });
-        div().flex_1().min_h_0().flex().flex_col().py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
+        div().flex_1().min_h_0().flex().flex_col().child(list.flex_1().min_h_0()).into_any_element()
     }
 
     /// Search Screenshots' dropdown: All, Screenshots, Recordings, Pinned.
@@ -5110,16 +5162,66 @@ impl Launcher {
     }
 }
 
-/// A screenshot cell's file.
-fn shot_path(it: &Item) -> Option<&str> {
-    match &it.act {
-        Act::CopyShot(p) | Act::PasteShot(p) | Act::File(p) => Some(p),
-        _ => None,
+/// The width a screenshot thumbnail is decoded at.
+const THUMB_PX: u32 = 320;
+/// A thumbnail decode is dropped when its row is further than this from the grid's top row.
+const NEAR_ROWS: usize = 12;
+/// `file_images` past `FILE_IMAGES_MAX` entries is cut to the `FILE_IMAGES_KEEP` used last.
+const FILE_IMAGES_MAX: usize = 300;
+const FILE_IMAGES_KEEP: usize = 200;
+
+/// Whether grid row `row` is near enough to `top` (the row at the top of the view) to decode.
+fn near(row: usize, top: usize) -> bool {
+    row + NEAR_ROWS >= top && row <= top + NEAR_ROWS
+}
+
+/// Past `max` entries, forgets the least recently used (by tick) down to `keep`; returns the
+/// images among them, for `release`.
+fn evict<V>(cache: &mut HashMap<String, (Option<V>, u64)>, max: usize, keep: usize) -> Vec<V> {
+    if cache.len() <= max {
+        return vec![];
+    }
+    let mut old: Vec<(u64, String)> = cache.iter().map(|(k, v)| (v.1, k.clone())).collect();
+    old.sort_unstable();
+    old.truncate(cache.len() - keep);
+    old.into_iter().filter_map(|(_, k)| cache.remove(&k)?.0).collect()
+}
+
+/// Frees images' GPU textures (gpui keeps an image's atlas entry until `drop_image`). Deferred
+/// until no window is being drawn, so every window lets go of them.
+fn release(images: Vec<Arc<RenderImage>>, cx: &mut App) {
+    if !images.is_empty() {
+        cx.defer(move |cx| images.into_iter().for_each(|i| cx.drop_image(i, None)));
     }
 }
 
-/// The width a screenshot thumbnail is decoded at.
-const THUMB_PX: u32 = 320;
+/// What Search Screenshots says with nothing to show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ShotsEmpty {
+    Reading,
+    NoMatches,
+    /// The only one whose Enter is Add Folder.
+    NoScreenshots,
+}
+
+impl ShotsEmpty {
+    fn title(self) -> &'static str {
+        match self {
+            ShotsEmpty::Reading => "Reading screenshots…",
+            ShotsEmpty::NoMatches => "No matches",
+            ShotsEmpty::NoScreenshots => "No screenshots found",
+        }
+    }
+}
+
+/// `filtered`: a query, or a dropdown choice other than All, may be what hides them.
+fn shots_empty(busy: bool, filtered: bool) -> ShotsEmpty {
+    match (busy, filtered) {
+        (true, _) => ShotsEmpty::Reading,
+        (_, true) => ShotsEmpty::NoMatches,
+        _ => ShotsEmpty::NoScreenshots,
+    }
+}
 
 /// An emoji cell's height.
 const EMOJI_CELL: f32 = 56.;
@@ -5267,7 +5369,7 @@ impl Render for Launcher {
         let lt = if self.mode == Mode::Translate && self.translation.as_ref().is_some_and(|tr| tr.busy) { Tokens { text: t.text_faint, text_muted: t.text_faint, ..t } } else { t };
         let side = match self.mode {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
-            Mode::Files if empty.is_none() => Some(self.file_detail(&t, cx)),
+            Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
             _ => None,
@@ -6311,6 +6413,32 @@ mod tests {
         let fields = lang_set_form(Some(set));
         let v = form_values(&fields);
         assert_eq!(translate::LangSet::new(v["Source language"], &[v["Target language 1"].into(), v["Target language 2"].into()]), *set, "Edit is prefilled");
+    }
+
+    #[test]
+    fn screenshots_say_no_matches_when_a_filter_hides_them() {
+        assert_eq!(shots_empty(false, false), ShotsEmpty::NoScreenshots, "only then Add Folder");
+        assert_eq!(shots_empty(false, true), ShotsEmpty::NoMatches, "a query or Pinned / Recordings");
+        assert_eq!(shots_empty(true, true), ShotsEmpty::Reading);
+    }
+
+    #[test]
+    fn thumbnail_cache_forgets_the_least_recently_used() {
+        let mut cache: HashMap<String, (Option<u32>, u64)> = (0..10u32).map(|i| (format!("t:{i}"), ((i % 2 == 0).then_some(i), u64::from(i)))).collect();
+        assert!(evict(&mut cache, 10, 4).is_empty(), "at the limit nothing goes");
+        cache.insert("t:new".into(), (Some(99), 20));
+        let mut gone = evict(&mut cache, 10, 4);
+        gone.sort_unstable();
+        assert_eq!(gone, [0, 2, 4, 6], "the oldest seven go; their images come back to be freed");
+        let mut kept: Vec<&String> = cache.keys().collect();
+        kept.sort();
+        assert_eq!(kept, ["t:7", "t:8", "t:9", "t:new"]);
+    }
+
+    #[test]
+    fn far_rows_are_not_decoded() {
+        assert!(near(0, 0) && near(12, 0) && !near(13, 0));
+        assert!(near(28, 40) && !near(27, 40) && near(52, 40));
     }
 
     #[test]
