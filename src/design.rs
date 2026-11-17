@@ -157,6 +157,15 @@ pub const POP_RIGHT_TOP: f32 = 50.;
 /// The Notes window's first size (`.pc-notes`).
 pub const NOTES_W: f32 = 560.;
 pub const NOTES_H: f32 = 440.;
+/// `.pc-notes__box`: a task's check box, and its border.
+pub const NOTE_BOX: f32 = 14.;
+pub const NOTE_BOX_BORDER: f32 = 1.5;
+/// A quote's bar on the left of its line.
+pub const QUOTE_BAR: f32 = 2.;
+/// The Notes editor's caret width.
+pub const CARET: f32 = 1.5;
+/// An underline's or a strikethrough's stroke.
+pub const TEXT_LINE: f32 = 1.;
 
 /// `.pc-form--center .pc-form__row`: a launcher form row's width, and its label column (`.pc-form__label`).
 pub const FORM_ROW: f32 = 500.;
@@ -907,7 +916,7 @@ pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
 const STICKER_LIGHT: f32 = 0.2;
 const STICKER_DEEP: f32 = 0.18;
 
-fn alpha(color: Hsla, a: f32) -> Hsla {
+pub fn alpha(color: Hsla, a: f32) -> Hsla {
     Hsla { alpha: a, ..color }
 }
 

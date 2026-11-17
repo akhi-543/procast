@@ -5,6 +5,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    rc::Rc,
     time::Duration,
 };
 
@@ -15,16 +16,20 @@ use futures::{
         oneshot,
     },
 };
-use gpui::{App, Bounds, Context, FocusHandle, FontWeight, KeyDownEvent, Pixels, Subscription, Window, WindowControlArea, div, prelude::*};
+use gpui::{
+    App, Bounds, ClipboardItem, Context, FocusHandle, FontStyle, FontWeight, HighlightStyle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, StrikethroughStyle, StyledText, Subscription, TextLayout, UnderlineStyle, Window, WindowControlArea,
+    PaintQuad, canvas, div, point, prelude::*, size,
+};
+use gpui_ce_elements::editable_text::BLINK_INTERVAL_500MS;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    editor::Buffer,
+    editor::{self, Block, Buffer, Mark, Span, SpanCache, Style},
     store::{Exists, Id, Store, title_of},
 };
 use crate::{
     config,
-    design::{self, Tokens, g, ic, px, sp, ts},
+    design::{self, Tint, Tokens, g, ic, mix, px, r, sp, ts},
     focus,
     win::{self, Msg},
 };
@@ -175,6 +180,126 @@ fn failed(doc: Option<&mut Doc>, id: Id, text: String) -> Option<(Id, String)> {
     }
 }
 
+/// What an editor key did. The window finishes the clipboard ones: `Copy` goes to the
+/// clipboard (a cut has already left the note), `Paste` inserts the clipboard's text.
+#[derive(Debug, PartialEq)]
+enum Did {
+    Moved,
+    Edited,
+    Copy { text: String, cut: bool },
+    Paste,
+}
+
+/// Applies a key to the note; `None` when the key is not the editor's.
+fn press(b: &mut Buffer, k: &Keystroke) -> Option<Did> {
+    let m = k.modifiers;
+    let (shift, plain, cmd) = (m.shift, !m.control && !m.alt, m.control && !m.alt);
+    // Ctrl+Alt is also AltGr: a key that types a character with it types it.
+    let chord = m.control && m.alt && k.key_char.is_none();
+    let end = b.text().len();
+    Some(match k.key.as_str() {
+        "enter" if plain => {
+            b.newline();
+            Did::Edited
+        }
+        "backspace" if plain => {
+            b.backspace();
+            Did::Edited
+        }
+        "delete" if plain => {
+            b.delete();
+            Did::Edited
+        }
+        "left" | "right" | "up" | "down" | "home" | "end" if !m.alt => {
+            match (k.key.as_str(), m.control) {
+                ("left", false) => b.left(shift),
+                ("left", true) => b.word_left(shift),
+                ("right", false) => b.right(shift),
+                ("right", true) => b.word_right(shift),
+                ("up", _) => b.up(shift),
+                ("down", _) => b.down(shift),
+                ("home", false) => b.home(shift),
+                ("home", true) => b.set_cursor(0, shift),
+                ("end", false) => b.end(shift),
+                _ => b.set_cursor(end, shift),
+            }
+            Did::Moved
+        }
+        "a" if cmd && !shift => {
+            b.set_cursor(0, false);
+            b.set_cursor(end, true);
+            Did::Moved
+        }
+        "c" | "x" if cmd => {
+            let (from, to) = b.selection();
+            if from == to {
+                return Some(Did::Moved);
+            }
+            let text = b.text()[from..to].to_owned();
+            let cut = k.key == "x";
+            if cut {
+                b.backspace();
+            }
+            Did::Copy { text, cut }
+        }
+        "v" if cmd => Did::Paste,
+        "z" if cmd => {
+            if shift { b.redo() } else { b.undo() }
+            Did::Edited
+        }
+        "y" if cmd && !shift => {
+            b.redo();
+            Did::Edited
+        }
+        "b" if cmd => {
+            if shift { b.set_block(Block::Quote) } else { b.toggle_mark(Mark::Bold) }
+            Did::Edited
+        }
+        "i" | "u" | "e" if cmd && !shift => {
+            b.toggle_mark(match k.key.as_str() {
+                "i" => Mark::Italic,
+                "u" => Mark::Underline,
+                _ => Mark::Code,
+            });
+            Did::Edited
+        }
+        "s" | "m" if cmd && shift => {
+            b.toggle_mark(if k.key == "s" { Mark::Strike } else { Mark::Highlight });
+            Did::Edited
+        }
+        "c" | "0" | "1" | "2" | "3" if chord => {
+            b.set_block(match k.key.as_str() {
+                "c" => Block::Code,
+                "0" => Block::Paragraph,
+                "1" => Block::H1,
+                "2" => Block::H2,
+                _ => Block::H3,
+            });
+            Did::Edited
+        }
+        _ => {
+            // ponytail: key_char only, EntityInputHandler for IME
+            let text = k.key_char.as_deref().filter(|_| plain || (m.control && m.alt))?;
+            b.insert(text);
+            Did::Edited
+        }
+    })
+}
+
+/// Clipboard text as the note keeps it: `\n` line ends.
+fn pasted(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// A line as drawn, for the mouse: where it starts in the note, how many display bytes it has,
+/// its display-to-source map (`None`: drawn as typed), and its laid-out text.
+struct Row {
+    start: usize,
+    len: usize,
+    map: Option<Rc<[usize]>>,
+    layout: TextLayout,
+}
+
 pub struct NotesWindow {
     notes: Notes,
     tx: UnboundedSender<Msg>,
@@ -184,6 +309,15 @@ pub struct NotesWindow {
     edits: u64,
     moves: u64,
     focus: FocusHandle,
+    cache: SpanCache,
+    /// The lines the last frame drew.
+    rows: Vec<Row>,
+    scroll: ScrollHandle,
+    /// A press in the body is dragging out a selection.
+    selecting: bool,
+    /// The caret's blink phase, and the blink loop's generation (bumping it stops the loop).
+    caret_on: bool,
+    blink: u64,
     _subs: Vec<Subscription>,
 }
 
@@ -192,6 +326,8 @@ impl NotesWindow {
         win::round_corners(win::hwnd(window));
         let subs = vec![
             cx.observe_window_bounds(window, |this, window, cx| this.moved(window, cx)),
+            // The caret blinks only while the window is active.
+            cx.observe_window_activation(window, |this, window, cx| if window.is_window_active() { this.wake(cx) } else { this.blink += 1 }),
             // Quitting writes what the last settle didn't (the worker runs it after any save before it).
             cx.on_app_quit(|this, _| {
                 let written = this.doc.as_ref().and_then(Doc::unsaved).map(|(id, text)| this.notes.ask(move |s| s.save(&id, &text, now())));
@@ -208,7 +344,22 @@ impl NotesWindow {
             _ = me.update(cx, |this, cx| this.hide(window, cx));
             false
         });
-        NotesWindow { notes, tx, theme, doc: None, edits: 0, moves: 0, focus: cx.focus_handle(), _subs: subs }
+        NotesWindow {
+            notes,
+            tx,
+            theme,
+            doc: None,
+            edits: 0,
+            moves: 0,
+            focus: cx.focus_handle(),
+            cache: SpanCache::default(),
+            rows: Vec::new(),
+            scroll: ScrollHandle::new(),
+            selecting: false,
+            caret_on: true,
+            blink: 0,
+            _subs: subs,
+        }
     }
 
     pub fn has_note(&self) -> bool {
@@ -236,7 +387,32 @@ impl NotesWindow {
         window.activate();
         window.focus(&self.focus, cx);
         win::set_topmost(win::hwnd(window), true);
+        self.wake(cx);
         cx.notify();
+    }
+
+    /// Shows the caret and (re)starts its blink.
+    fn wake(&mut self, cx: &mut Context<Self>) {
+        self.caret_on = true;
+        self.blink += 1;
+        let n = self.blink;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK_INTERVAL_500MS).await;
+                let live = this.update(cx, |this, cx| {
+                    let live = this.blink == n;
+                    if live {
+                        this.caret_on = !this.caret_on;
+                        cx.notify();
+                    }
+                    live
+                });
+                if live.ok() != Some(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Esc, ×, Alt+F4: the note and the window's place are written, the window hides.
@@ -244,6 +420,7 @@ impl NotesWindow {
         self.save(cx);
         let place = Place::of(window.window_bounds().get_bounds());
         cx.background_executor().spawn(async move { drop(save_place(&place_path(), place)) }).detach();
+        self.blink += 1;
         window.set_visible(false);
     }
 
@@ -256,7 +433,6 @@ impl NotesWindow {
     }
 
     /// The editor changed the note: it is written once typing has paused for `SETTLE`.
-    #[expect(dead_code, reason = "Task 19's editor calls it after every change")]
     fn edited(&mut self, cx: &mut Context<Self>) {
         self.edits += 1;
         let n = self.edits;
@@ -340,9 +516,165 @@ impl NotesWindow {
         match k.key.as_str() {
             "escape" if !m.modified() => self.hide(window, cx),
             "n" if m.control && !m.shift && !m.alt => self.new_note(cx),
-            _ => return,
+            _ => {
+                let Some(doc) = self.doc.as_mut() else { return };
+                let Some(did) = press(&mut doc.buffer, k) else { return };
+                let edited = match did {
+                    Did::Moved => false,
+                    Did::Edited => true,
+                    Did::Copy { text, cut } => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        cut
+                    }
+                    Did::Paste => {
+                        let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+                        doc.buffer.insert(&pasted(&text));
+                        true
+                    }
+                };
+                let b = &doc.buffer;
+                self.scroll.scroll_to_item(b.text()[..b.cursor()].matches('\n').count());
+                self.changed(edited, cx);
+            }
         }
         cx.stop_propagation();
+    }
+
+    /// After a key or a click: the caret shows, and an edit is saved once typing pauses.
+    fn changed(&mut self, edited: bool, cx: &mut Context<Self>) {
+        self.wake(cx);
+        if edited { self.edited(cx) } else { cx.notify() }
+    }
+
+    /// The note offset under `p` (window coordinates), through the lines the last frame drew.
+    fn offset_at(&self, p: Point<Pixels>) -> Option<usize> {
+        let row = self.rows.iter().find(|r| p.y < r.layout.bounds().bottom()).or(self.rows.last())?;
+        let b = row.layout.bounds();
+        let shaped = row.layout.line_layout_for_index(0)?;
+        let i = shaped.closest_byte_index_for_pixel_point(p - b.origin, row.layout.line_height()).unwrap_or_else(|i| i).min(row.len);
+        Some(row.start + row.map.as_ref().map_or(i, |m| m[i]))
+    }
+
+    /// A press in the body puts the cursor there (Shift: extends the selection) and starts a drag.
+    fn press_at(&mut self, p: Point<Pixels>, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        let Some(at) = self.offset_at(p) else { return };
+        let Some(doc) = self.doc.as_mut() else { return };
+        doc.buffer.set_cursor(at, extend);
+        self.selecting = true;
+        self.changed(false, cx);
+    }
+
+    fn drag_to(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.selecting = false;
+        }
+        if !self.selecting {
+            return;
+        }
+        let Some(at) = self.offset_at(ev.position) else { return };
+        let Some(doc) = self.doc.as_mut() else { return };
+        doc.buffer.set_cursor(at, true);
+        self.changed(false, cx);
+    }
+
+    /// A task's box was clicked: the task on the line at `at` flips, the cursor stays.
+    fn tick(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc.as_mut() else { return };
+        let b = &mut doc.buffer;
+        let (cursor, anchor) = (b.cursor(), b.anchor());
+        b.set_cursor(at, false);
+        b.toggle_task(false);
+        // a flip keeps the text's length, so both ends are still where they were
+        b.set_cursor(anchor, false);
+        b.set_cursor(cursor, true);
+        self.changed(true, cx);
+    }
+
+    /// The note, a line per row: marks hidden except on the cursor's line, fenced code as typed.
+    fn body(&mut self, t: &Tokens, caret: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let body = div()
+            .id("body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .p(px(sp::S16))
+            .flex()
+            .flex_col()
+            .text_color(t.text)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| this.press_at(ev.position, ev.modifiers.shift, window, cx)))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| this.drag_to(ev, cx)))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.selecting = false));
+        self.rows.clear();
+        let Some(doc) = &self.doc else { return body.child(div().text_color(t.text_faint).child("Start writing…")) };
+        let text = doc.buffer.text();
+        let (cursor, (sel_from, sel_to)) = (doc.buffer.cursor(), doc.buffer.selection());
+        let here = text[..cursor].matches('\n').count();
+        let empty = text.is_empty();
+        let (mut start, mut fenced) = (0, false);
+        let mut lines = Vec::new();
+        // ponytail: every line is laid out each frame (only changed lines are restyled); a
+        // virtual list (gpui `list`) when notes run to thousands of lines.
+        for (i, line) in text.split('\n').enumerate() {
+            let fence = editor::is_fence(line);
+            let code = fenced || fence;
+            fenced ^= fence;
+            let raw = i == here;
+            let (len, map, st, style) = if code {
+                // off the cursor's line a fence is hidden: the block's padding
+                let shown = if fence && !raw { "" } else { line };
+                (shown.len(), None, styled(shown, &[], t), Style::default())
+            } else {
+                let s = self.cache.get(line);
+                let style = s.spans.first().map_or_else(Style::default, |s| s.style);
+                if raw { (line.len(), None, styled(line, &s.spans, t), style) } else { (s.shown.len(), Some(s.map.clone()), styled(&s.shown, &s.hidden, t), style) }
+            };
+            let to_shown = |src: usize| map.as_ref().map_or(src, |m| m.partition_point(|&v| v < src));
+            let end = start + line.len();
+            let (from, to) = (sel_from.max(start), sel_to.min(end));
+            let sel = (from < to).then(|| (to_shown(from - start), to_shown(to - start)));
+            let st = if empty { StyledText::new("Start writing…") } else { st };
+            let layout = st.layout().clone();
+            let check = style.task.filter(|_| !raw).map(|done| {
+                div()
+                    .flex_none()
+                    .size(px(design::NOTE_BOX))
+                    .rounded(px(r::XS))
+                    .border(px(design::NOTE_BOX_BORDER))
+                    .border_color(if done { t.accent } else { t.text_muted })
+                    .when(done, |d| d.bg(t.accent))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.tick(start, cx);
+                        }),
+                    )
+            });
+            let heading = match style.heading {
+                0 => None,
+                1 => Some(ts::DISPLAY),
+                2 => Some(ts::HEADING),
+                _ => Some(ts::BODY),
+            };
+            lines.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(sp::S8))
+                    .when_some(heading, |d, size| d.text_size(px(size)).font_weight(FontWeight::SEMIBOLD))
+                    .when(style.quote, |d| d.border_l(px(design::QUOTE_BAR)).border_color(t.hairline).pl(px(sp::S8)).text_color(t.text_muted))
+                    .when(code, |d| d.font_family(design::FONT_MONO).text_size(px(ts::BODY_SM)).bg(t.surface).px(px(sp::S8)).text_color(t.text_muted))
+                    .when(empty, |d| d.text_color(t.text_faint))
+                    .children(check)
+                    .child(div().relative().flex_1().min_w_0().child(overlay(layout.clone(), sel, (raw && caret).then_some(cursor - start), t)).child(st)),
+            );
+            self.rows.push(Row { start, len: if empty { 0 } else { len }, map, layout });
+            start = end + 1;
+        }
+        self.cache.sweep();
+        body.children(lines)
     }
 
     fn header(&self, title: String, t: &Tokens, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -377,14 +709,74 @@ impl NotesWindow {
     }
 }
 
-/// The note's lines as plain text (Task 19 renders the markdown); an empty note, the placeholder.
-fn body(text: &str, t: &Tokens) -> impl IntoElement + use<> {
-    let b = div().flex_1().min_h_0().overflow_hidden().p(px(sp::S16)).flex().flex_col();
-    if text.is_empty() {
-        return b.child(div().text_color(t.text_faint).child("Start writing…"));
+/// The line's text with its spans' styles (`spans` in the text's bytes); an empty line is a
+/// space, so it keeps a line's height and a place for the caret.
+fn styled(text: &str, spans: &[Span], t: &Tokens) -> StyledText {
+    let hl: Vec<_> = spans.iter().map(|s| (s.range.clone(), highlight(s.style, t))).collect();
+    let mono: Vec<_> = spans.iter().filter(|s| s.style.code).map(|s| (s.range.clone(), SharedString::from(design::FONT_MONO))).collect();
+    StyledText::new(if text.is_empty() { " ".to_owned() } else { text.to_owned() }).with_highlights(hl).with_font_family_overrides(mono)
+}
+
+/// One span's look. A heading's size and weight, a quote's bar and a task's box are the row's.
+fn highlight(s: Style, t: &Tokens) -> HighlightStyle {
+    let stroke = || px(design::TEXT_LINE);
+    let mut h = HighlightStyle::default();
+    if s.bold {
+        h.font_weight = Some(FontWeight::SEMIBOLD);
     }
-    // An empty line still takes a line's height.
-    b.text_color(t.text).children(text.lines().map(|l| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })))
+    if s.italic {
+        h.font_style = Some(FontStyle::Italic);
+    }
+    if s.underline {
+        h.underline = Some(UnderlineStyle { thickness: stroke(), ..Default::default() });
+    }
+    // a done task's line is struck and faint, like strike
+    if s.strike || s.task == Some(true) {
+        h.strikethrough = Some(StrikethroughStyle { thickness: stroke(), ..Default::default() });
+        h.color = Some(t.text_faint);
+    }
+    if s.highlight {
+        h.background_color = Some(design::alpha(Tint::Paste.hue(t), mix::TAG_FILL));
+    }
+    if s.code {
+        h.background_color = Some(t.surface);
+    }
+    if s.link {
+        h.color = Some(t.accent);
+    }
+    h
+}
+
+/// The selection and the caret (display bytes) under the line's text. It paints from the
+/// text's layout, which every element has by the time anything paints.
+fn overlay(layout: TextLayout, sel: Option<(usize, usize)>, caret: Option<usize>, t: &Tokens) -> impl IntoElement {
+    let (sel_color, caret_color) = (t.sel_ring, t.accent);
+    canvas(
+        |_, _, _| {},
+        move |_, (), window, _| {
+            let (lh, b) = (layout.line_height(), layout.bounds());
+            if let Some((from, to)) = sel
+                && let (Some(p), Some(q)) = (layout.position_for_index(from), layout.position_for_index(to))
+            {
+                let band = |x0: Pixels, y0: Pixels, x1: Pixels, y1: Pixels| PaintQuad::new(Bounds::from_corners(point(x0, y0), point(x1, y1))).background(sel_color);
+                if p.y == q.y {
+                    window.paint_quad(band(p.x, p.y, q.x, p.y + lh));
+                } else {
+                    // wrapped: to the right edge, whole lines between, then from the left edge
+                    window.paint_quad(band(p.x, p.y, b.right(), p.y + lh));
+                    window.paint_quad(band(b.left(), p.y + lh, b.right(), q.y));
+                    window.paint_quad(band(b.left(), q.y, q.x, q.y + lh));
+                }
+            }
+            if let Some(c) = caret
+                && let Some(p) = layout.position_for_index(c)
+            {
+                window.paint_quad(PaintQuad::new(Bounds::new(p, size(px(design::CARET), lh))).background(caret_color));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 /// The character count centred; the Text style toggle on the right (Task 20 shows its bar).
@@ -408,6 +800,7 @@ impl Render for NotesWindow {
         design::scale_settings();
         let t = Tokens::from_theme(&self.theme, window);
         let text = self.doc.as_ref().map_or(String::new(), |d| d.buffer.text().to_owned());
+        let caret = self.caret_on && window.is_window_active();
         design::glass_window(&t)
             .size_full()
             .font_family(design::FONT_UI)
@@ -415,7 +808,7 @@ impl Render for NotesWindow {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| this.on_key(ev, window, cx)))
             .child(self.header(title_of(&text), &t, cx))
-            .child(body(&text, &t))
+            .child(self.body(&t, caret, cx))
             .child(footer(&text, &t))
     }
 }
@@ -476,6 +869,103 @@ mod tests {
         assert_eq!(failed(Some(&mut b), "a".into(), "lost?".into()), Some(("a".into(), "lost?".into())), "moved on: tried again");
         assert_eq!(b.saved.as_deref(), Some("other"), "the note on screen is not touched");
         assert_eq!(failed(None, "a".into(), "t".into()), Some(("a".into(), "t".into())));
+    }
+
+    fn key(b: &mut Buffer, spec: &str) -> Option<Did> {
+        press(b, &Keystroke::parse(spec).unwrap())
+    }
+
+    /// Types `s` as the keyboard sends it: each character as its key's `key_char`.
+    fn typed(b: &mut Buffer, s: &str) {
+        for c in s.chars() {
+            let k = if c == ' ' { "space".to_owned() } else { c.to_lowercase().to_string() };
+            assert_eq!(key(b, &format!("{k}->{c}")), Some(Did::Edited), "{c}");
+        }
+    }
+
+    #[test]
+    fn typing_and_editing_keys_change_the_note() {
+        let mut b = Buffer::new("");
+        typed(&mut b, "# Title");
+        assert_eq!(key(&mut b, "enter"), Some(Did::Edited));
+        typed(&mut b, "**bold** x");
+        assert_eq!(b.text(), "# Title\n**bold** x");
+        assert_eq!(key(&mut b, "backspace"), Some(Did::Edited));
+        assert_eq!(key(&mut b, "home"), Some(Did::Moved));
+        assert_eq!(key(&mut b, "delete"), Some(Did::Edited));
+        assert_eq!(b.text(), "# Title\n*bold** ");
+        assert_eq!(key(&mut b, "ctrl-z"), Some(Did::Edited));
+        assert_eq!(b.text(), "# Title\n**bold** ");
+        assert_eq!(key(&mut b, "ctrl-y"), Some(Did::Edited));
+        assert_eq!(b.text(), "# Title\n*bold** ");
+        key(&mut b, "ctrl-z");
+        assert_eq!(key(&mut b, "ctrl-shift-z"), Some(Did::Edited), "Ctrl+Shift+Z redoes too");
+        assert_eq!(b.text(), "# Title\n*bold** ");
+        // AltGr is Ctrl+Alt: a character it types is typed, not a shortcut
+        assert_eq!(key(&mut b, "ctrl-alt-0->}"), Some(Did::Edited));
+        assert_eq!(b.text(), "# Title
+}*bold** ");
+        // not the editor's: left to the window (Tab, Alt+letter, unknown chords)
+        assert_eq!(key(&mut b, "tab"), None);
+        assert_eq!(key(&mut b, "alt-a->a"), None);
+        assert_eq!(key(&mut b, "ctrl-q"), None);
+    }
+
+    #[test]
+    fn moves_select_with_shift_and_never_edit() {
+        let mut b = Buffer::new("one two\nthree");
+        for (k, at) in [("ctrl-home", 0), ("ctrl-right", 3), ("right", 4), ("end", 7), ("down", 13), ("up", 7), ("ctrl-left", 4), ("left", 3), ("ctrl-end", 13), ("home", 8)] {
+            assert_eq!(key(&mut b, k), Some(Did::Moved), "{k}");
+            assert_eq!(b.cursor(), at, "{k}");
+        }
+        assert_eq!(key(&mut b, "shift-end"), Some(Did::Moved));
+        assert_eq!(b.selection(), (8, 13));
+        key(&mut b, "ctrl-shift-home");
+        assert_eq!((b.cursor(), b.anchor()), (0, 8));
+        key(&mut b, "ctrl-a");
+        assert_eq!(b.selection(), (0, 13));
+        let doc = Doc { id: "a".into(), buffer: b, saved: Some("one two\nthree".into()) };
+        assert_eq!(doc.unsaved(), None, "moving writes nothing");
+    }
+
+    #[test]
+    fn mark_and_block_shortcuts() {
+        for (k, out) in [
+            ("ctrl-b", "a **b**"),
+            ("ctrl-i", "a *b*"),
+            ("ctrl-u", "a <u>b</u>"),
+            ("ctrl-shift-s", "a ~~b~~"),
+            ("ctrl-e", "a `b`"),
+            ("ctrl-shift-m", "a ==b=="),
+            ("ctrl-shift-b", "> a b"),
+            ("ctrl-alt-1", "# a b"),
+            ("ctrl-alt-2", "## a b"),
+            ("ctrl-alt-3", "### a b"),
+            ("ctrl-alt-c", "```\na b\n```"),
+        ] {
+            let mut b = Buffer::new("a b");
+            key(&mut b, "shift-left");
+            assert_eq!(key(&mut b, k), Some(Did::Edited), "{k}");
+            assert_eq!(b.text(), out, "{k}");
+            key(&mut b, "ctrl-z");
+            assert_eq!(b.text(), "a b", "{k} undoes");
+        }
+        let mut b = Buffer::new("## a");
+        key(&mut b, "ctrl-alt-0");
+        assert_eq!(b.text(), "a", "Paragraph");
+    }
+
+    #[test]
+    fn copy_cut_and_paste_go_through_the_window() {
+        let mut b = Buffer::new("héllo");
+        assert_eq!(key(&mut b, "ctrl-c"), Some(Did::Moved), "nothing selected: nothing copied");
+        key(&mut b, "ctrl-a");
+        assert_eq!(key(&mut b, "ctrl-c"), Some(Did::Copy { text: "héllo".into(), cut: false }));
+        assert_eq!(b.text(), "héllo");
+        assert_eq!(key(&mut b, "ctrl-x"), Some(Did::Copy { text: "héllo".into(), cut: true }));
+        assert_eq!(b.text(), "");
+        assert_eq!(key(&mut b, "ctrl-v"), Some(Did::Paste));
+        assert_eq!(pasted("a\r\nb\rc"), "a\nb\nc");
     }
 
     /// Autosave and hide write `Doc::unsaved` through `Store::save`, as `NotesWindow::save` does.

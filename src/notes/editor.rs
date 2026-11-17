@@ -2,7 +2,7 @@
 //! operations (marks, blocks, tasks, list continuation) and `spans` for live styling.
 //! Pure logic; the notes window renders it. Offsets are bytes on char boundaries.
 
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range, rc::Rc};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mark {
@@ -156,7 +156,7 @@ fn continuation(prefix: &str, block: Block) -> Option<String> {
     }
 }
 
-fn is_fence(line: &str) -> bool {
+pub fn is_fence(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 
@@ -579,6 +579,8 @@ pub struct Style {
     pub underline: bool,
     pub highlight: bool,
     pub link: bool,
+    /// On a `> ` line.
+    pub quote: bool,
     /// `Some(checked)` on a task line.
     pub task: Option<bool>,
 }
@@ -633,8 +635,8 @@ fn find_unmasked(line: &str, from: usize, ch: char, mask: &[bool]) -> Option<usi
     line[from..].char_indices().find(|&(i, c)| c == ch && !mask[from + i]).map(|(i, _)| from + i)
 }
 
-/// `[text](url)` ranges, with code-masked bytes never part of the link's brackets.
-fn links(line: &str, mask: &[bool]) -> Vec<(usize, usize)> {
+/// `[text](url)` as (`[`, `]`, end), with code-masked bytes never part of the link's brackets.
+fn links(line: &str, mask: &[bool]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(p) = line[i..].find('[').map(|x| x + i) {
@@ -647,7 +649,7 @@ fn links(line: &str, mask: &[bool]) -> Vec<(usize, usize)> {
             continue;
         }
         if let Some(e) = find_unmasked(line, r + 2, ')', mask) {
-            out.push((p, e + 1));
+            out.push((p, r, e + 1));
             i = e + 1;
         }
     }
@@ -657,45 +659,68 @@ fn links(line: &str, mask: &[bool]) -> Vec<(usize, usize)> {
 /// Longest line `spans` styles, in bytes.
 const STYLE_MAX: usize = 2048;
 
-fn paint(st: &mut [Style], ranges: &[(usize, usize)], f: impl Fn(&mut Style)) {
-    for &(s, e) in ranges {
-        st[s..e].iter_mut().for_each(&f);
+/// What a construct adds to the style of its bytes.
+type Paint = fn(&mut Style);
+
+/// One inline construct: its bytes (markers included), its opener's and closer's lengths, and
+/// the style it adds.
+struct Inline {
+    range: (usize, usize),
+    open: usize,
+    close: usize,
+    paint: Paint,
+}
+
+/// Every inline construct of one line. Code is found first and masks the others' markers.
+fn inlines(line: &str) -> Vec<Inline> {
+    let none = vec![false; line.len()];
+    let code = pairs(line, "`", "`", &none, false, false);
+    let mut mask = none;
+    for &(s, e) in &code {
+        mask[s..e].fill(true);
     }
+    let mut out: Vec<Inline> = code.into_iter().map(|range| Inline { range, open: 1, close: 1, paint: |s| s.code = true }).collect();
+    let marks: [(&str, &str, bool, Paint); 6] = [
+        ("***", "***", false, |s| (s.bold, s.italic) = (true, true)),
+        ("**", "**", false, |s| s.bold = true),
+        ("*", "*", true, |s| s.italic = true),
+        ("~~", "~~", false, |s| s.strike = true),
+        ("<u>", "</u>", false, |s| s.underline = true),
+        ("==", "==", false, |s| s.highlight = true),
+    ];
+    for (o, c, solo, paint) in marks {
+        out.extend(pairs(line, o, c, &mask, solo, true).into_iter().map(|range| Inline { range, open: o.len(), close: c.len(), paint }));
+    }
+    out.extend(links(line, &mask).into_iter().map(|(p, r, e)| Inline { range: (p, e), open: 1, close: e - r, paint: |s| s.link = true }));
+    out
 }
 
 /// Styled byte ranges of one line, sorted and not overlapping; unstyled text has no span.
 /// Nested marks give one span per stretch with all its styles. Code suppresses other marks
-/// inside it, and a marker without its partner is plain text.
+/// inside it, and a marker without its partner is plain text. Heading, quote and task cover
+/// the whole line.
 pub fn spans(line: &str) -> Vec<Span> {
     // ponytail: marker matching rescans to the end of the line for each unmatched opener, so
     // cost grows with the square of the line; longer lines (pasted blobs) go unstyled.
     if line.len() > STYLE_MAX {
         return Vec::new();
     }
-    let n = line.len();
-    let mut st = vec![Style::default(); n];
-    let none = vec![false; n];
-    let code = pairs(line, "`", "`", &none, false, false);
-    paint(&mut st, &code, |s| s.code = true);
-    let mut mask = none;
-    for &(s, e) in &code {
-        mask[s..e].fill(true);
+    let mut st = vec![Style::default(); line.len()];
+    for i in inlines(line) {
+        st[i.range.0..i.range.1].iter_mut().for_each(i.paint);
     }
-    paint(&mut st, &pairs(line, "***", "***", &mask, false, true), |s| (s.bold, s.italic) = (true, true));
-    paint(&mut st, &pairs(line, "**", "**", &mask, false, true), |s| s.bold = true);
-    paint(&mut st, &pairs(line, "*", "*", &mask, true, true), |s| s.italic = true);
-    paint(&mut st, &pairs(line, "~~", "~~", &mask, false, true), |s| s.strike = true);
-    paint(&mut st, &pairs(line, "<u>", "</u>", &mask, false, true), |s| s.underline = true);
-    paint(&mut st, &pairs(line, "==", "==", &mask, false, true), |s| s.highlight = true);
-    paint(&mut st, &links(line, &mask), |s| s.link = true);
     let t = line.trim_start();
     let hashes = t.bytes().take_while(|&b| b == b'#').count();
     if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
-        paint(&mut st, &[(0, n)], |s| s.heading = hashes as u8);
+        st.iter_mut().for_each(|s| s.heading = hashes as u8);
     }
-    if let Some((ind, _, Block::Task)) = parse_prefix(line) {
-        let checked = line.as_bytes()[ind + 3] != b' ';
-        paint(&mut st, &[(0, n)], |s| s.task = Some(checked));
+    match parse_prefix(line) {
+        Some((ind, _, Block::Task)) => {
+            let checked = line.as_bytes()[ind + 3] != b' ';
+            st.iter_mut().for_each(|s| s.task = Some(checked));
+        }
+        Some((_, _, Block::Quote)) => st.iter_mut().for_each(|s| s.quote = true),
+        _ => {}
     }
     let mut out: Vec<Span> = Vec::new();
     for (i, style) in st.into_iter().enumerate() {
@@ -708,6 +733,106 @@ pub fn spans(line: &str) -> Vec<Span> {
         }
     }
     out
+}
+
+/// Byte ranges of the line's markdown markers, sorted: the block prefix (`# `, `> `, `- `,
+/// `1. `, `- [ ] `) and each styled construct's opener and closer (a link's `[` and `](url)`).
+/// Markers that share bytes (`***` is bold's and italic's) are one range.
+pub fn marks(line: &str) -> Vec<Range<usize>> {
+    if line.len() > STYLE_MAX {
+        return Vec::new();
+    }
+    let mut all: Vec<Range<usize>> = parse_prefix(line).map(|(ind, len, _)| ind..ind + len).into_iter().collect();
+    for i in inlines(line) {
+        all.push(i.range.0..i.range.0 + i.open);
+        all.push(i.range.1 - i.close..i.range.1);
+    }
+    all.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for r in all {
+        match out.last_mut() {
+            Some(l) if r.start < l.end => l.end = l.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// How a hidden bullet marker draws.
+const BULLET: &str = "• ";
+
+/// The line as drawn, and the source byte of each display byte (plus the line's end). With
+/// `hide` the marks are left out, except a list's: a bullet draws as a dot and a number stays.
+pub fn display(line: &str, hide: bool) -> (String, Vec<usize>) {
+    let (mut out, mut map) = (String::new(), Vec::new());
+    let list = parse_prefix(line).filter(|p| matches!(p.2, Block::Bullet | Block::Numbered));
+    let mut at = 0;
+    for r in if hide { marks(line) } else { Vec::new() } {
+        out.push_str(&line[at..r.start]);
+        map.extend(at..r.start);
+        match list {
+            Some((ind, len, block)) if r == (ind..ind + len) => {
+                let drawn = if block == Block::Bullet { BULLET } else { &line[r.clone()] };
+                out.push_str(drawn);
+                map.extend(if block == Block::Bullet { vec![r.start; BULLET.len()] } else { r.clone().collect() });
+            }
+            _ => {}
+        }
+        at = r.end;
+    }
+    out.push_str(&line[at..]);
+    map.extend(at..=line.len());
+    (out, map)
+}
+
+/// `spans` in the display bytes of `display`'s `map`; a span of hidden markers only is gone.
+pub fn to_display(spans: &[Span], map: &[usize]) -> Vec<Span> {
+    let at = |src: usize| map.partition_point(|&m| m < src);
+    spans
+        .iter()
+        .map(|s| Span { range: at(s.range.start)..at(s.range.end), style: s.style })
+        .filter(|s| !s.range.is_empty())
+        .collect()
+}
+
+/// One line ready to draw: its `spans` as typed, and the line with its marks hidden (`shown`,
+/// the display-to-source `map`, and the `hidden` spans in display bytes).
+pub struct Styled {
+    pub spans: Vec<Span>,
+    pub shown: String,
+    pub map: Rc<[usize]>,
+    pub hidden: Vec<Span>,
+}
+
+/// Styled lines keyed by their text, so a keystroke restyles only the line it changed (and the
+/// lines an Enter moves down keep theirs). `sweep` after each frame drops lines it didn't draw.
+#[derive(Default)]
+pub struct SpanCache {
+    lines: HashMap<String, (bool, Styled)>,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl SpanCache {
+    pub fn get(&mut self, line: &str) -> &Styled {
+        if !self.lines.contains_key(line) {
+            #[cfg(test)]
+            {
+                self.misses += 1;
+            }
+            let spans = spans(line);
+            let (shown, map) = display(line, true);
+            let hidden = to_display(&spans, &map);
+            self.lines.insert(line.to_owned(), (false, Styled { spans, shown, map: map.into(), hidden }));
+        }
+        let (used, styled) = self.lines.get_mut(line).expect("inserted above");
+        *used = true;
+        styled
+    }
+
+    pub fn sweep(&mut self) {
+        self.lines.retain(|_, (used, _)| std::mem::take(used));
+    }
 }
 
 #[cfg(test)]
@@ -1251,6 +1376,111 @@ mod tests {
         assert!(styled("[t](u").is_empty());
         assert!(styled("[](u)").is_empty());
         assert!(styled("").is_empty());
+    }
+
+    fn marked(line: &str) -> Vec<&str> {
+        marks(line).into_iter().map(|r| &line[r]).collect()
+    }
+
+    #[test]
+    fn marks_find_every_marker() {
+        assert_eq!(marked("# a"), ["# "]);
+        assert_eq!(marked("### a"), ["### "]);
+        assert_eq!(marked("> a"), ["> "]);
+        assert_eq!(marked("- a"), ["- "]);
+        assert_eq!(marked("  1. a"), ["1. "]);
+        assert_eq!(marked("- [ ] a"), ["- [ ] "]);
+        assert_eq!(marked("- [x] a"), ["- [x] "]);
+        assert_eq!(marked("a **b** c"), ["**", "**"]);
+        assert_eq!(marked("*i*"), ["*", "*"]);
+        assert_eq!(marked("~~s~~"), ["~~", "~~"]);
+        assert_eq!(marked("`c`"), ["`", "`"]);
+        assert_eq!(marked("==h=="), ["==", "=="]);
+        assert_eq!(marked("<u>u</u>"), ["<u>", "</u>"]);
+        assert_eq!(marked("see [docs](http://a.b) now"), ["[", "](http://a.b)"]);
+        // bold-italic shares its stars with bold and italic: one marker each side
+        assert_eq!(marked("***x***"), ["***", "***"]);
+        // a prefix right before an opener stays its own marker
+        assert_eq!(marked("- **b**"), ["- ", "**", "**"]);
+        assert!(marked("plain").is_empty());
+        assert!(marked("**unclosed").is_empty());
+        assert!(marked(&format!("**b** {}", "a".repeat(STYLE_MAX))).is_empty(), "too long to style: drawn as typed");
+    }
+
+    #[test]
+    fn display_hides_marks_and_maps_back_to_the_source() {
+        for (line, shown) in [
+            ("# Title", "Title"),
+            ("a **b** *ï* `c`", "a b ï c"),
+            ("- [x] done ~~é~~", "done é"),
+            ("> said [it](u)", "said it"),
+            ("<u>u</u>==h==", "uh"),
+            ("  3. item", "  3. item"),
+        ] {
+            let (text, map) = display(line, true);
+            assert_eq!(text, shown, "{line}");
+            assert_eq!(map.len(), text.len() + 1);
+            assert_eq!(map[text.len()], line.len(), "the end maps to the line's end");
+            for (d, c) in text.char_indices() {
+                assert_eq!(line[map[d]..].chars().next(), Some(c), "{line} @{d}");
+            }
+        }
+        // a bullet's marker draws as a dot, which maps to the marker
+        let (text, map) = display("- **b**", true);
+        assert_eq!(text, "• b");
+        assert_eq!(map, [0, 0, 0, 0, 4, 7]);
+        // not hidden: as typed, byte for byte
+        let (text, map) = display("**b**", false);
+        assert_eq!((text.as_str(), map), ("**b**", vec![0, 1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn a_heading_keeps_its_style_with_its_marks_hidden() {
+        let (text, map) = display("## **Big** day", true);
+        let s = to_display(&spans("## **Big** day"), &map);
+        assert_eq!(text, "Big day");
+        assert!(s.iter().all(|s| s.style.heading == 2));
+        assert_eq!(s.first().map(|s| s.range.start), Some(0));
+        assert_eq!(s.last().map(|s| s.range.end), Some(text.len()));
+        assert_eq!(s.iter().find(|s| s.style.bold).map(|s| &text[s.range.clone()]), Some("Big"));
+        // a span made only of hidden markers is gone
+        let (_, map) = display("****", true);
+        assert!(to_display(&spans("****"), &map).iter().all(|s| !s.range.is_empty()));
+    }
+
+    #[test]
+    fn quote_lines_are_styled_as_quotes() {
+        let s = styled("> said **so**");
+        assert!(s.iter().all(|(_, st)| st.quote));
+        assert_eq!(s[0].0, "> said ");
+        assert!(styled("not > a quote").is_empty());
+    }
+
+    #[test]
+    fn the_cache_restyles_only_changed_lines() {
+        let mut c = SpanCache::default();
+        let lines = ["# Title", "**bold**", "plain"];
+        for l in lines {
+            c.get(l);
+        }
+        assert_eq!(c.misses, 3);
+        c.sweep();
+        for l in lines {
+            c.get(l);
+        }
+        assert_eq!(c.misses, 3, "nothing changed: nothing restyled");
+        c.sweep();
+        // one line edited, and a new line typed above the rest (which all move down one)
+        for l in ["", "# Title", "**bold** x", "plain"] {
+            c.get(l);
+        }
+        assert_eq!(c.misses, 5, "only the edited and the new line");
+        assert_eq!(c.get("# Title").shown, "Title");
+        assert_eq!(c.get("# Title").hidden[0].style.heading, 1);
+        c.sweep();
+        c.sweep();
+        c.get("# Title");
+        assert_eq!(c.misses, 6, "a line no frame drew is dropped");
     }
 
     #[test]
