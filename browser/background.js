@@ -3,6 +3,10 @@
 //   {t: "tabs"}                      -> {t: "tabs", browser, tabs: [{id, window, title, url, icon}]}
 //   {t: "activate", id, window}      -> {t: "activate", ok}
 //   {t: "open", url}                 -> {t: "open", ok, existing}: the tab already showing url, else a new one
+//   {t: "ytm", req, op, ...}         -> {t: "ytm", req, op, title, items, current, error?}: YouTube Music, see ytmusic.js
+
+importScripts("ytmusic.js");
+ytm.setup();
 
 const HOST = "com.procast.browser";
 let port = null;
@@ -52,6 +56,8 @@ async function handle(req) {
       }
       return { t: "open", ok: true, existing: !!same };
     }
+    case "ytm":
+      return ytm.handle(req);
     default:
       return { t: req.t, error: "unknown request" };
   }

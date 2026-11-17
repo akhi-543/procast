@@ -37,6 +37,7 @@ const HOST: &str = "com.procast.browser";
 pub const EXTENSION_ID: &str = "mdbobfibhbhbeeogppclpodmbkjkbkal";
 const MANIFEST: &str = include_str!("../browser/manifest.json");
 const SCRIPT: &str = include_str!("../browser/background.js");
+const YTMUSIC: &str = include_str!("../browser/ytmusic.js");
 /// Chrome's own cap on a message to the browser; anything bigger is a broken stream.
 const MAX_FRAME: u32 = 64 << 20;
 
@@ -214,6 +215,7 @@ pub fn register() -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.json"), MANIFEST)?;
     std::fs::write(dir.join("background.js"), SCRIPT)?;
+    std::fs::write(dir.join("ytmusic.js"), YTMUSIC)?;
     let exe = std::env::current_exe()?;
     let manifest = json!({
         "name": HOST,
@@ -260,7 +262,11 @@ mod tests {
     #[test]
     fn manifest_has_a_key_and_native_messaging() {
         let m: Value = serde_json::from_str(MANIFEST).unwrap();
-        assert!(m["permissions"].as_array().unwrap().iter().any(|p| p == "nativeMessaging"));
+        let permissions = m["permissions"].as_array().unwrap();
+        for p in ["nativeMessaging", "cookies", "scripting", "declarativeNetRequestWithHostAccess"] {
+            assert!(permissions.iter().any(|x| x == p), "{p}");
+        }
+        assert!(m["host_permissions"].as_array().unwrap().iter().any(|h| h == "https://music.youtube.com/*"));
         assert!(m["key"].as_str().is_some_and(|k| k.len() > 300));
         assert_eq!(EXTENSION_ID.len(), 32);
     }
