@@ -828,6 +828,12 @@ mod tests {
     }
 
     #[test]
+    fn items_follow_object_key_parse_order() {
+        let json: Value = serde_json::from_str(r#"{"z":{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Zed","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREb_z"}}}]}}},"a":{"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Aye","navigationEndpoint":{"browseEndpoint":{"browseId":"MPREb_a"}}}]}}}}"#).unwrap();
+        first_is(&parse_items(&json), Kind::Album, "MPREb_z", "Zed");
+    }
+
+    #[test]
     fn malformed_renderer_is_skipped() {
         let json = json!({"musicResponsiveListItemRenderer": {"flexColumns": []}});
         assert_eq!(parse_items(&json).len(), 0);
