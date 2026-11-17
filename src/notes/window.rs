@@ -967,7 +967,8 @@ impl NotesWindow {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let m = k.modifiers;
-        if let Some(id) = shortcut(k) {
+        // The Delete question is modal: it takes every key until answered.
+        if let Some(id) = shortcut(k).filter(|_| self.confirm.is_none()) {
             self.act(id, window, cx);
             return cx.stop_propagation();
         }
