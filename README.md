@@ -102,6 +102,11 @@ extensions run, so these figures are for a fresh start.<br>
 
 **Browser companion**: search open tabs in Chrome, Edge or Brave and switch to an open tab instead of opening a new one
 
+**YouTube Music**
+- Search songs, albums, artists and playlists; browse your library (albums, playlists, artists, liked songs) in a cover grid
+- Now Playing and Quick Actions (like, dislike, play/pause, next, previous, volume, shuffle, repeat), each bindable to a hotkey
+- Optional tray player; runs inside procast with no extra process, and controls music.youtube.com in Chrome, Edge or Brave
+
 **AI**: Quick AI from the search bar with follow-ups, running the Claude Agent SDK on your own Claude Code login
 
 **Settings and themes**
@@ -167,6 +172,7 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | AI commands, agents, MCP servers, automations | ✅ | ⬜ |
 | Dictation | ✅ | ⬜ |
 | **Built-in tools** | | |
+| YouTube Music controls and library | ⬜ (macOS-only store extension) | ✅ |
 | Translator, dictionary, calendar, contacts | ✅ | ⬜ |
 | Floating notes, focus sessions, timer, screenshot search | ✅ | ⬜ |
 | Taskbar widget, auto HDR | ✅ | ⬜ |
@@ -216,6 +222,7 @@ Press <kbd>Alt</kbd>+<kbd>Space</kbd>. procast lives in the tray and can start a
 - Whole-drive file search: run **Enable Fast File Search** once (asks for admin), then turn on Settings → Files → Search whole drives
 - Extensions: **Browse Extension Store**, or **Install Extension** with a store name (`obsidian`) or a local folder
 - Browser tabs: run **Set Up Browser Extension**, then in Chrome, Edge or Brave load `%APPDATA%\procast\browser-extension` with "Load unpacked"
+- YouTube Music: run **Set Up Browser Extension** (or click Reload on it in `chrome://extensions` if it's already loaded, so it gets the new permissions), sign in to music.youtube.com in that browser, then run **YouTube Music Library**. Settings → YouTube Music turns on the tray player
 - Quick AI: sign in to [Claude Code](https://claude.com/claude-code) once; procast uses that login
 
 Settings live in `%APPDATA%\procast\config.toml`. Edit them in the Settings window or by hand; changes apply within two seconds.
