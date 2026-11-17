@@ -10,8 +10,8 @@ mod desktops;
 mod ext;
 mod files;
 mod keys;
-#[allow(dead_code)]
 mod media;
+mod music_view;
 mod net;
 mod ntfs;
 mod scripts;
@@ -21,7 +21,6 @@ mod snippets;
 mod system;
 mod toast;
 mod win;
-#[allow(dead_code)]
 mod ytmusic;
 
 use std::{
@@ -126,6 +125,8 @@ enum Mode {
     Running,
     /// Tabs open in connected browsers.
     Tabs,
+    /// A YouTube Music screen (see `Launcher::music`).
+    Music,
     /// A Quick AI answer (see `Launcher::ai`).
     Ai,
 }
@@ -308,6 +309,9 @@ struct Launcher {
     browsers: browser::Browsers,
     /// Search Browser Tabs: (connection, browser name, tab) as they answer.
     tabs: Vec<(u32, String, browser::Tab)>,
+    music: music_view::MusicState,
+    /// Started the first time YouTube Music is used.
+    media: Option<media::Media>,
     /// Quit Applications: the running apps, once listed (None while loading).
     running: Option<Vec<(apps::Running, Option<Arc<RenderImage>>)>>,
     /// Program icons by path, so the running list fills in at once next time.
@@ -402,6 +406,8 @@ impl Launcher {
             running: None,
             browsers,
             tabs: vec![],
+            music: Default::default(),
+            media: None,
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
             frec: Frecency::load(config::dir().join("frecency.json")),
@@ -814,6 +820,7 @@ impl Launcher {
                     search::filter(&query, rows, &mut self.matcher)
                 }
             }
+            Mode::Music => self.music_rows(&query),
             Mode::Install => {
                 let what = query.trim();
                 let title = if what.is_empty() { "Install an extension".to_string() } else { format!("Install {what}") };
@@ -1789,6 +1796,9 @@ impl Launcher {
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
             Act::Cmd(Cmd::SearchTabs) => return self.set_mode(Mode::Tabs, cx),
+            Act::Cmd(Cmd::YtMusic(screen)) => return self.music_open(screen, cx),
+            Act::Cmd(Cmd::YtControl(control)) => return self.music_act(music_view::MusicAct::Control(control), cx),
+            Act::Music(act) => return self.music_act(act, cx),
             Act::Cmd(Cmd::BrowserSetup) => {
                 if let Err(e) = browser::register() {
                     self.status = Some((Tone::Error, format!("Could not set up the extension: {e}")));
@@ -1899,7 +1909,7 @@ impl Launcher {
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::YtMusic(_) | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -2227,7 +2237,7 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
-            Msg::NowPlaying(_) => {}
+            Msg::NowPlaying(now) => self.music_now(now, cx),
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2261,7 +2271,7 @@ impl Launcher {
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
-                if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs) {
+                if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs | Mode::Music) {
                     self.refresh(cx);
                 }
             }
@@ -2290,7 +2300,7 @@ impl Launcher {
                     let _ = self.tx.unbounded_send(Msg::Toast(false, e));
                 }
                 browser::Reply::Done(Ok(())) => {}
-                browser::Reply::Music(_) => {}
+                browser::Reply::Music(reply) => self.music_reply(reply, cx),
             },
             Msg::Running(list) => {
                 for (r, icon) in &list {
@@ -2341,6 +2351,7 @@ impl Launcher {
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
             Mode::Tabs => Some("Browser Tabs".into()),
+            Mode::Music => Some(self.music_label()),
             Mode::Args => self.pending.as_ref().map(|p| match p {
                 Pending::Script(i, _) => self.scripts[*i].title.clone(),
                 Pending::Snippet { name, .. } => name.clone(),
@@ -2365,6 +2376,7 @@ impl Launcher {
             Mode::Store => "Search the extension store…".into(),
             Mode::Running => "Search running apps…".into(),
             Mode::Tabs => "Search open tabs…".into(),
+            Mode::Music => self.music_placeholder().into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self
                 .pending
@@ -2430,6 +2442,7 @@ impl Launcher {
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
             Mode::Tabs => Icon::Vector(g::GLOBE),
+            Mode::Music => Icon::Vector(g::PLAY),
             Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
         }
@@ -2455,6 +2468,7 @@ impl Launcher {
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
             self.send(json!({"t": "pop", "run": run}));
+        } else if self.mode == Mode::Music && self.music_back(cx) {
         } else if self.mode == Mode::Root {
             self.hide(true, cx)
         } else if self.cfg.launcher.escape == "close" {

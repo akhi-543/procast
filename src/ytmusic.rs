@@ -65,6 +65,28 @@ pub struct Reply {
     pub error: Option<String>,
 }
 
+/// A view of YouTube Music inside the launcher; also what the root commands open.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Screen {
+    Search,
+    Library,
+    #[default]
+    NowPlaying,
+    QuickActions,
+}
+
+impl Screen {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Library => "library",
+            Self::NowPlaying => "now",
+            Self::QuickActions => "actions",
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Filter {
     Songs,
@@ -73,6 +95,7 @@ pub enum Filter {
     Playlists,
 }
 
+#[allow(dead_code)]
 impl Filter {
     pub fn next(self) -> Self {
         match self {
@@ -103,6 +126,7 @@ impl Filter {
 }
 
 /// A part of the user's library.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Shelf {
     Albums,
@@ -111,6 +135,7 @@ pub enum Shelf {
     Liked,
 }
 
+#[allow(dead_code)]
 impl Shelf {
     pub fn next(self) -> Self {
         match self {
@@ -192,6 +217,24 @@ impl Control {
         }
     }
 
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Dislike => "dislike",
+            Self::PlayPause => "play-pause",
+            Self::Next => "next",
+            Self::Previous => "previous",
+            Self::Mute => "mute",
+            Self::VolumeLow => "volume-low",
+            Self::VolumeMedium => "volume-medium",
+            Self::VolumeHigh => "volume-high",
+            Self::VolumeUp => "volume-up",
+            Self::VolumeDown => "volume-down",
+            Self::Shuffle => "shuffle",
+            Self::Repeat => "repeat",
+        }
+    }
+
     pub fn subtitle(self, step: u32) -> String {
         match self {
             Self::Like => "Like the current track".into(),
@@ -211,10 +254,12 @@ impl Control {
     }
 }
 
+#[allow(dead_code)]
 pub fn search(req: u64, query: &str, filter: Filter) -> Value {
     json!({"t": "ytm", "req": req, "op": "search", "query": query, "filter": filter.name()})
 }
 
+#[allow(dead_code)]
 pub fn browse(req: u64, id: &str) -> Value {
     json!({"t": "ytm", "req": req, "op": "browse", "id": id})
 }
@@ -251,6 +296,7 @@ pub fn play(req: u64, video: Option<&str>, playlist: Option<&str>, radio: bool) 
     v
 }
 
+#[allow(dead_code)]
 pub fn current(req: u64) -> Value {
     json!({"t": "ytm", "req": req, "op": "current"})
 }
@@ -282,6 +328,7 @@ pub fn watch_url(video: &str, playlist: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn playlist_url(playlist: &str) -> String {
     format!("https://music.youtube.com/watch?list={playlist}")
 }
@@ -300,6 +347,7 @@ impl MusicItem {
 }
 
 /// Library lists older than this are fetched again.
+#[allow(dead_code)]
 pub const STALE: Duration = Duration::from_secs(600);
 
 #[derive(Serialize, Deserialize)]
@@ -308,15 +356,18 @@ struct Saved {
     items: Vec<MusicItem>,
 }
 
+#[allow(dead_code)]
 pub fn cache_path() -> PathBuf {
     config::dir().join("ytmusic").join("library.json")
 }
 
 /// The saved list of browse id `id` and how long ago it was saved.
+#[allow(dead_code)]
 pub fn load_cached(id: &str) -> Option<(Vec<MusicItem>, Duration)> {
     load_from(&cache_path(), id)
 }
 
+#[allow(dead_code)]
 pub fn save_cached(id: &str, items: &[MusicItem]) {
     let _ = save_to(&cache_path(), id, items);
 }
@@ -376,6 +427,17 @@ mod tests {
         assert_eq!(sent(Control::Next), None);
         assert_eq!(Control::VolumeDown.subtitle(15), "Decrease the volume by 15%");
         assert_eq!(Control::ALL.len(), 13);
+    }
+
+    #[test]
+    fn slugs_are_unique() {
+        let mut slugs: Vec<_> = Control::ALL.iter().map(|c| c.slug()).collect();
+        slugs.extend([Screen::Search, Screen::Library, Screen::NowPlaying, Screen::QuickActions].map(Screen::slug));
+        let before = slugs.len();
+        slugs.sort();
+        slugs.dedup();
+        assert_eq!(slugs.len(), before);
+        assert_eq!((Control::VolumeLow.slug(), Screen::NowPlaying.slug()), ("volume-low", "now"));
     }
 
     #[test]

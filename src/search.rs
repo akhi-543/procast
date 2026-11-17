@@ -77,6 +77,8 @@ pub enum Act {
     ForceQuit(u32),
     /// Switch to a browser tab: (browser connection, tab id).
     Tab(u32, i64),
+    /// Something in YouTube Music (see music_view.rs).
+    Music(crate::music_view::MusicAct),
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -95,7 +97,8 @@ impl Act {
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::YtMusic(_)) => "Open",
+            Act::Music(act) => act.label(),
             Act::Install(_) => "Install",
             Act::Cmd(_) | Act::ExtRun(..) | Act::Layout(_) => "Run Command",
             Act::ExtFn(_) => "Run Action",
@@ -297,6 +300,7 @@ fn items(apps: &[App], scripts: &[Script], exts: &[(crate::ext::Extension, Icon)
         if matches!(cmd, Cmd::ClipboardHistory | Cmd::ClearClipboardHistory) && !cfg.clipboard.enabled
             || cmd == Cmd::SearchFiles && !cfg.files.enabled
             || matches!(cmd, Cmd::Desktop(_)) && !desktops::supported()
+            || matches!(cmd, Cmd::YtMusic(_) | Cmd::YtControl(_)) && !cfg.ytmusic.enabled
         {
             continue;
         }
@@ -889,5 +893,15 @@ mod tests {
             let hits = root(title, &cat, &cfg, &Frecency::default(), &mut m);
             assert_eq!(hits.first().map(|h| &h.act), Some(&Act::Cmd(cmd)), "{title}");
         }
+    }
+
+    #[test]
+    fn music_commands_follow_the_setting() {
+        let count = |toml: &str| {
+            let cat = catalog(&[], &[], &[], &crate::config::parse(toml).unwrap());
+            cat.iter().filter(|it| matches!(it.act, Act::Cmd(Cmd::YtMusic(_) | Cmd::YtControl(_)))).count()
+        };
+        assert_eq!(count(""), 17);
+        assert_eq!(count("[ytmusic]\nenabled = false"), 0);
     }
 }

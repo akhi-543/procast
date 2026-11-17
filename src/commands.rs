@@ -7,6 +7,7 @@ use crate::{
     design::Tint,
     desktops,
     system::{self, RadioOf, Volume},
+    ytmusic::{Control, Screen},
 };
 use windows::{
     Win32::{
@@ -75,6 +76,10 @@ pub enum Cmd {
     SearchTabs,
     /// Show the browser extension's folder, to load it in the browser.
     BrowserSetup,
+    /// Open a YouTube Music screen.
+    YtMusic(Screen),
+    /// Control YouTube Music playback, from anywhere.
+    YtControl(Control),
     Desktop(Desk),
     Quit,
 }
@@ -139,6 +144,23 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::SPARKLES),
     (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::PANELS_TOP_LEFT),
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
+    (Cmd::YtMusic(Screen::Search), "Search YouTube Music", "youtube music song album artist playlist find", g::SEARCH),
+    (Cmd::YtMusic(Screen::Library), "YouTube Music Library", "youtube music liked songs albums playlists artists", g::BULLETS),
+    (Cmd::YtMusic(Screen::NowPlaying), "YouTube Music Now Playing", "youtube music current track song playing", g::PLAY),
+    (Cmd::YtMusic(Screen::QuickActions), "YouTube Music Quick Actions", "youtube music controls volume like shuffle repeat", g::SLIDERS_HORIZONTAL),
+    (Cmd::YtControl(Control::PlayPause), "Play/Pause Music", "youtube music song resume stop toggle", g::PLAY),
+    (Cmd::YtControl(Control::Next), "Next Track", "youtube music song skip forward", g::FORWARD),
+    (Cmd::YtControl(Control::Previous), "Previous Track", "youtube music song skip back", g::BACK),
+    (Cmd::YtControl(Control::Like), "Like Current Song", "youtube music song favorite thumbs up", g::STAR),
+    (Cmd::YtControl(Control::Dislike), "Dislike Current Song", "youtube music song thumbs down", g::CANCEL),
+    (Cmd::YtControl(Control::Mute), "Mute Music", "youtube music song volume silence", g::VOLUME_X),
+    (Cmd::YtControl(Control::VolumeLow), "Music Volume Low", "youtube music song quiet sound", g::VOLUME_1),
+    (Cmd::YtControl(Control::VolumeMedium), "Music Volume Medium", "youtube music song sound", g::VOLUME_2),
+    (Cmd::YtControl(Control::VolumeHigh), "Music Volume High", "youtube music song loud sound", g::VOLUME_2),
+    (Cmd::YtControl(Control::VolumeUp), "Music Volume Up", "youtube music song louder sound", g::VOLUME_2),
+    (Cmd::YtControl(Control::VolumeDown), "Music Volume Down", "youtube music song quieter sound", g::VOLUME_1),
+    (Cmd::YtControl(Control::Shuffle), "Shuffle Music", "youtube music song queue random", g::REFRESH_CCW),
+    (Cmd::YtControl(Control::Repeat), "Repeat Mode", "youtube music song loop one all", g::ROTATE_CW),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -228,7 +250,11 @@ impl Cmd {
     }
 
     pub fn key(self) -> String {
-        format!("cmd:{self:?}")
+        match self {
+            Cmd::YtMusic(screen) => format!("ytm:{}", screen.slug()),
+            Cmd::YtControl(control) => format!("ytm:{}", control.slug()),
+            _ => format!("cmd:{self:?}"),
+        }
     }
 
     /// The group a command belongs to, shown after its title.
@@ -241,6 +267,7 @@ impl Cmd {
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
+            Cmd::YtMusic(_) | Cmd::YtControl(_) => "YouTube Music",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -252,7 +279,7 @@ impl Cmd {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi => Tint::Web,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::YtMusic(_) | Cmd::YtControl(_) => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -290,7 +317,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::YtMusic(_) | Cmd::YtControl(_) => {}
         }
     }
     Ok(None)
@@ -770,6 +797,21 @@ mod tests {
         assert_eq!((titles[0], titles[9], titles[10], titles[19]), ("Open Desktop 1", "Open Desktop 10", "Move to Desktop 1", "Move to Desktop 10"));
         assert!(ALL.iter().any(|&(c, t, ..)| c == Cmd::Desktop(Desk::Rename) && t == "Rename Desktop"));
         assert!(ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).all(|&(c, ..)| c.subtitle() == "Window"));
+    }
+
+    #[test]
+    fn music_commands_are_listed_with_their_own_keys() {
+        let music: Vec<_> = ALL.iter().filter(|(c, ..)| matches!(c, Cmd::YtMusic(_) | Cmd::YtControl(_))).collect();
+        assert_eq!(music.len(), 4 + Control::ALL.len());
+        assert!(Control::ALL.iter().all(|&c| music.iter().any(|&&(cmd, ..)| cmd == Cmd::YtControl(c))));
+        assert!(music.iter().all(|&&(c, ..)| c.subtitle() == "YouTube Music" && c.key().starts_with("ytm:")));
+        assert_eq!(Cmd::YtMusic(Screen::QuickActions).key(), "ytm:actions");
+        assert_eq!(Cmd::YtControl(Control::PlayPause).key(), "ytm:play-pause");
+        assert_eq!(Cmd::Lock.key(), "cmd:Lock");
+        let mut keys: Vec<String> = ALL.iter().map(|&(c, ..)| c.key()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), ALL.len(), "every command has its own key");
     }
 
     #[test]
