@@ -115,6 +115,12 @@ fn authorization_header(session: &Session, ts: u64) -> Option<String> {
     session.sapisid().map(|sid| authorization(sid, ts))
 }
 
+/// `Authorization`, `Cookie`, and `Origin` for a signed InnerTube call. Empty when the session has no SAPISID.
+fn signed_headers(session: &Session, ts: u64) -> Vec<(String, String)> {
+    let Some(auth) = authorization_header(session, ts) else { return Vec::new() };
+    vec![("Authorization".into(), auth), ("Cookie".into(), session.cookie_header()), ("Origin".into(), ORIGIN.into())]
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into()
 }
@@ -199,8 +205,8 @@ fn call(endpoint: &str, rest: Value) -> Result<Value, String> {
     let url = format!("{ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false");
     let mut req = agent().post(&url).header("Content-Type", "application/json").header("X-Origin", ORIGIN).header("X-Goog-AuthUser", "0");
     if let Some(session) = load_session() {
-        if let Some(header) = authorization_header(&session, unix_secs()) {
-            req = req.header("Authorization", header).header("Cookie", session.cookie_header());
+        for (name, value) in signed_headers(&session, unix_secs()) {
+            req = req.header(&name, &value);
         }
     }
     let mut resp = req.send(body.to_string()).map_err(|_| UNREACHABLE.to_string())?;
@@ -270,9 +276,28 @@ mod tests {
     use super::*;
     use crate::ytmusic::Kind;
 
+    fn session_from(pairs: &[(&str, &str)]) -> Session {
+        let mut cookies = BTreeMap::new();
+        for (name, value) in pairs {
+            cookies.insert((*name).to_string(), (*value).to_string());
+        }
+        Session { cookies }
+    }
+
     #[test]
     fn sapisidhash_matches_the_node_vector() {
         assert_eq!(authorization("secret", 1700000000), "SAPISIDHASH 1700000000_d2a0deeb95ea263a68778d9e9ac8840dce59d800");
+    }
+
+    #[test]
+    fn signed_headers_include_origin_and_sapisidhash() {
+        let session = session_from(&[("SAPISID", "secret"), ("HSID", "h")]);
+        let headers = signed_headers(&session, 1700000000);
+        let get = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        assert_eq!(get("Authorization"), Some("SAPISIDHASH 1700000000_d2a0deeb95ea263a68778d9e9ac8840dce59d800"));
+        assert_eq!(get("Origin"), Some("https://music.youtube.com"));
+        assert!(get("Cookie").unwrap().contains("SAPISID=secret"));
+        assert!(signed_headers(&session_from(&[("HSID", "h")]), 1).is_empty());
     }
 
     #[test]
