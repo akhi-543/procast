@@ -106,8 +106,6 @@ pub fn keep_secs(keep: &str) -> Option<u64> {
     })
 }
 
-pub const KEEP: &[&str] = &["count", "1h", "1d", "7d", "30d", "90d", "180d", "365d", "unlimited"];
-
 impl History {
     pub fn load(path: PathBuf, cap: usize, keep: &str) -> Self {
         let entries = fs::read(&path).ok().and_then(|b| unprotect(&b)).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -233,6 +231,32 @@ impl History {
 pub fn render_image(png: &[u8], max: u32) -> Option<Arc<gpui::RenderImage>> {
     let img = image::load_from_memory(png).ok()?.to_rgba8();
     let img = if img.width() > max || img.height() > max { image::imageops::thumbnail(&img, max, max) } else { img };
+    to_render(img)
+}
+
+/// A picture scaled down to `width` wide (a grid thumbnail). A very tall one keeps only its
+/// middle, at most twice as tall as wide: the cover-fit cell crops it anyway, and a full-page
+/// capture would otherwise pass the GPU atlas limit.
+pub fn render_width(bytes: &[u8], width: u32) -> Option<Arc<gpui::RenderImage>> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    let keep = tall_crop(iw, ih);
+    let img = if keep < ih { image::imageops::crop_imm(&img, 0, (ih - keep) / 2, iw, keep).to_image() } else { img };
+    let (w, h) = width_fit(img.width(), img.height(), width);
+    to_render(if w < img.width() { image::imageops::thumbnail(&img, w, h) } else { img })
+}
+
+/// `w` x `h` scaled down to `width` wide, keeping its shape; as it is when narrower.
+fn width_fit(w: u32, h: u32, width: u32) -> (u32, u32) {
+    if w <= width { (w, h) } else { (width, (u64::from(h) * u64::from(width) / u64::from(w)).max(1) as u32) }
+}
+
+/// The height kept of a `w` x `h` picture: at most `2 * w`.
+fn tall_crop(w: u32, h: u32) -> u32 {
+    h.min(w.saturating_mul(2).max(1))
+}
+
+fn to_render(img: image::RgbaImage) -> Option<Arc<gpui::RenderImage>> {
     let (w, h) = img.dimensions();
     let mut buf = img.into_raw();
     for p in buf.chunks_exact_mut(4) {
@@ -300,8 +324,14 @@ pub fn watch(tx: UnboundedSender<Msg>) {
     });
 }
 
+/// Whether Windows can read text at all (an OCR language is installed). Call on a thread
+/// that has initialised WinRT.
+pub(crate) fn ocr_ready() -> bool {
+    windows::Media::Ocr::OcrEngine::TryCreateFromUserProfileLanguages().is_ok()
+}
+
 /// The text Windows' own OCR finds in an image (offline, in your Windows display languages).
-fn recognise(png: &[u8]) -> Option<String> {
+pub(crate) fn recognise(png: &[u8]) -> Option<String> {
     use windows::{
         Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},
         Media::Ocr::OcrEngine,
@@ -590,6 +620,16 @@ pub fn tap(vk: VIRTUAL_KEY, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnails_fit_the_width() {
+        assert_eq!(width_fit(1920, 1200, 320), (320, 200));
+        assert_eq!(width_fit(1080, 2400, 320), (320, 711), "a portrait picture is 320 wide too");
+        assert_eq!(width_fit(200, 100, 320), (200, 100), "never scaled up");
+        assert_eq!(width_fit(5000, 1, 320), (320, 1));
+        assert_eq!(tall_crop(1080, 60000), 2160, "a full-page capture keeps its middle, twice as tall as wide");
+        assert_eq!(tall_crop(1080, 2000), 2000);
+    }
 
     #[test]
     #[ignore = "Windows OCR on a picture: PROCAST_OCR_PNG=<file> cargo test ocr -- --ignored"]

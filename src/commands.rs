@@ -47,6 +47,10 @@ pub enum Cmd {
     SignOut,
     EmptyBin,
     ToggleDarkMode,
+    /// Flip HDR on every HDR-capable display.
+    ToggleHdr,
+    HdrSettings,
+    GameModeSettings,
     Volume(Volume),
     Radio(RadioOf),
     ToggleHiddenFiles,
@@ -76,6 +80,33 @@ pub enum Cmd {
     /// Show the browser extension's folder, to load it in the browser.
     BrowserSetup,
     Desktop(Desk),
+    Focus(FocusCmd),
+    /// Ask for a duration and label in the search bar (`timer 5m tea`).
+    StartTimer,
+    StartStopwatch,
+    /// Translate text typed in the search bar (`translate hola`), or the selection.
+    Translate,
+    /// Translate the selection to the primary language and copy it, or paste it over the selection.
+    InstantTranslateCopy,
+    InstantTranslatePaste,
+    /// Ask for a word in the search bar (`define dog`).
+    Define,
+    /// Today's and tomorrow's events from the calendar feeds.
+    MySchedule,
+    /// Open the link of the meeting on now, or of the next one within 15 minutes.
+    JoinMeeting,
+    /// Search the screenshot folders by the text in each picture.
+    SearchScreenshots,
+    /// Put the newest screenshot on the clipboard and paste it into the app you came from.
+    PasteLatestScreenshot,
+    /// The Notes window, on the note it showed last (or a new one).
+    OpenNotes,
+    /// The notes, listed in the launcher.
+    SearchNotes,
+    /// A new note, titled by its one optional argument.
+    CreateNote,
+    /// Notes deleted in the last `[notes] keep_deleted_days`, to restore or remove for good.
+    RecentlyDeletedNotes,
     Quit,
 }
 
@@ -92,6 +123,29 @@ pub enum Desk {
     Close,
     /// Needs a name: the launcher asks for it, then calls `desktops::rename`.
     Rename,
+}
+
+/// A Focus session command (see focus.rs); all of them run on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FocusCmd {
+    /// Asks for a title, minutes and category.
+    Start,
+    /// Completes the session, or asks for a new one when none runs.
+    Toggle,
+    Pause,
+    Resume,
+    Complete,
+    Cancel,
+    Restart,
+    /// Asks again, starting from the session's answers.
+    Edit,
+    /// Lets the app Focus just closed run for `[focus] snooze_minutes`.
+    Snooze,
+    /// Lists categories in the search bar (`focus work`).
+    SearchCategories,
+    CreateCategory,
+    /// Reads a Raycast focus categories export.
+    ImportCategories,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,6 +193,32 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::AskAi, "Ask AI", "chat question claude assistant", g::SPARKLES),
     (Cmd::SearchTabs, "Search Browser Tabs", "chrome edge brave open tabs switch web pages", g::PANELS_TOP_LEFT),
     (Cmd::BrowserSetup, "Set Up Browser Extension", "chrome edge brave install companion tabs", g::PUZZLE),
+    (Cmd::Focus(FocusCmd::Start), "Start Focus Session", "block distractions apps websites concentrate pomodoro", g::SHIELD_CHECK),
+    (Cmd::Focus(FocusCmd::Toggle), "Toggle Focus Session", "start stop block distractions concentrate", g::SHIELD),
+    (Cmd::Focus(FocusCmd::Pause), "Pause Focus Session", "break block distractions", g::PAUSE),
+    (Cmd::Focus(FocusCmd::Resume), "Resume Focus Session", "continue block distractions", g::PLAY),
+    (Cmd::Focus(FocusCmd::Complete), "Complete Focus Session", "finish end done block distractions", g::CIRCLE_CHECK),
+    (Cmd::Focus(FocusCmd::Cancel), "Cancel Focus Session", "stop end abort block distractions", g::SHIELD_OFF),
+    (Cmd::Focus(FocusCmd::Restart), "Restart Focus Session", "again reset block distractions", g::ROTATE_CCW),
+    (Cmd::Focus(FocusCmd::Edit), "Edit Focus Session", "change title minutes category block distractions", g::EDIT),
+    (Cmd::Focus(FocusCmd::Snooze), "Snooze Focus Session", "allow blocked app temporarily unblock", g::COFFEE),
+    (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::LIST_CHECKS),
+    (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::LIST_PLUS),
+    (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::IMPORT),
+    (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::ALARM_CLOCK),
+    (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
+    (Cmd::Translate, "Translate", "translator google language tr", g::LANGUAGES),
+    (Cmd::InstantTranslateCopy, "Instant Translate Copy", "translator google language selection selected text clipboard", g::LANGUAGES),
+    (Cmd::InstantTranslatePaste, "Instant Translate Paste", "translator google language selection selected text replace", g::LANGUAGES),
+    (Cmd::Define, "Define", "dictionary word meaning wordnet lookup", g::BOOK_OPEN),
+    (Cmd::MySchedule, "My Schedule", "calendar events meetings agenda today tomorrow ics", g::CALENDAR_CLOCK),
+    (Cmd::JoinMeeting, "Join Meeting", "calendar meeting call video teams zoom meet webex link", g::VIDEO),
+    (Cmd::SearchScreenshots, "Search Screenshots", "ocr text images pictures find capture snip", g::SCAN_SEARCH),
+    (Cmd::PasteLatestScreenshot, "Paste Latest Screenshot", "newest recent image picture capture snip", g::IMAGE_DOWN),
+    (Cmd::OpenNotes, "Open Notes", "note notes markdown write scratch pad floating", g::NOTEBOOK_PEN),
+    (Cmd::SearchNotes, "Search Notes", "note notes find list browse markdown", g::NOTEBOOK_TABS),
+    (Cmd::CreateNote, "Create Note", "new note notes write markdown", g::SQUARE_PEN),
+    (Cmd::RecentlyDeletedNotes, "Recently Deleted Notes", "note notes trash restore undelete removed", g::ARCHIVE_RESTORE),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -146,6 +226,9 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::SignOut, "Sign Out", "log out logoff", g::SIGN_OUT),
     (Cmd::EmptyBin, "Empty Recycle Bin", "trash", g::DELETE),
     (Cmd::ToggleDarkMode, "Toggle Dark Mode", "theme appearance light", g::SUN_MOON),
+    (Cmd::ToggleHdr, "Toggle HDR", "high dynamic range display monitor screen color", g::SUN_MEDIUM),
+    (Cmd::HdrSettings, "HDR Settings", "high dynamic range display monitor windows settings", g::MONITOR_COG),
+    (Cmd::GameModeSettings, "Game Mode Settings", "games gaming performance windows settings", g::GAMEPAD_2),
     (Cmd::Volume(Volume::Up), "Volume Up", "sound louder audio", g::VOLUME_2),
     (Cmd::Volume(Volume::Down), "Volume Down", "sound quieter audio", g::VOLUME_1),
     (Cmd::Volume(Volume::Mute), "Toggle Mute", "sound volume silence audio unmute", g::VOLUME_X),
@@ -241,6 +324,14 @@ impl Cmd {
             Cmd::ClearSearchHistory => "Search",
             Cmd::QuitApps => "Apps",
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
+            Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
+            Cmd::Focus(_) => "Focus",
+            Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste => "Translator",
+            Cmd::Define => "Dictionary",
+            Cmd::MySchedule | Cmd::JoinMeeting => "Calendar",
+            Cmd::HdrSettings => "Windows Settings",
+            Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
+            Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => "Notes",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -250,9 +341,9 @@ impl Cmd {
     pub fn tint(self) -> Tint {
         match self {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
-            Cmd::SearchFiles => Tint::File,
-            Cmd::ClipboardHistory | Cmd::Emoji => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi => Tint::Web,
+            Cmd::SearchFiles | Cmd::SearchScreenshots => Tint::File,
+            Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => Tint::Paste,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -278,10 +369,13 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             Cmd::SignOut => drop(ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_NONE)),
             Cmd::EmptyBin => drop(SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)),
             Cmd::ToggleDarkMode => toggle_dark_mode(),
+            Cmd::ToggleHdr => return crate::hdr::toggle().map(Some),
+            Cmd::HdrSettings => crate::win::open("ms-settings:display-hdr"),
+            Cmd::GameModeSettings => crate::win::open("ms-settings:gaming-gamemode"),
             Cmd::Snap(s) => snap(target, s, w),
-            Cmd::Desktop(Desk::MoveTo(_) | Desk::MoveNext | Desk::MovePrev) if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
+            Cmd::Desktop(Desk::MoveTo(_) | Desk::MoveNext | Desk::MovePrev) if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on: click one, then try again".into()),
             Cmd::Desktop(d) => return desktop(d, target).map(|_| None),
-            Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on".into()),
+            Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize if !IsWindow(Some(target)).as_bool() || is_shell(target) => return Err("No window to act on: click one, then try again".into()),
             Cmd::Minimize => _ = ShowWindow(target, SW_MINIMIZE),
             Cmd::ToggleMaximize => _ = ShowWindow(target, if IsZoomed(target).as_bool() { SW_RESTORE } else { SW_MAXIMIZE }),
             Cmd::MinimizeOthers => others(target).into_iter().for_each(|h| _ = ShowWindow(h, SW_MINIMIZE)),
@@ -290,7 +384,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => {}
         }
     }
     Ok(None)
@@ -631,6 +725,47 @@ fn snap_with(hwnd: HWND, s: Snap, w: &config::Window, cycle: bool, on: Option<HM
 mod tests {
     use super::*;
 
+    /// Glyph and tile hue of the feature commands, as the design system's Icon map gives them.
+    #[test]
+    fn feature_commands_follow_the_icon_map() {
+        use FocusCmd as F;
+        let map = [
+            (Cmd::StartTimer, g::ALARM_CLOCK, Tint::System),
+            (Cmd::StartStopwatch, g::TIMER, Tint::System),
+            (Cmd::Translate, g::LANGUAGES, Tint::Web),
+            (Cmd::InstantTranslateCopy, g::LANGUAGES, Tint::Web),
+            (Cmd::InstantTranslatePaste, g::LANGUAGES, Tint::Web),
+            (Cmd::Define, g::BOOK_OPEN, Tint::Web),
+            (Cmd::MySchedule, g::CALENDAR_CLOCK, Tint::System),
+            (Cmd::JoinMeeting, g::VIDEO, Tint::System),
+            (Cmd::SearchScreenshots, g::SCAN_SEARCH, Tint::File),
+            (Cmd::PasteLatestScreenshot, g::IMAGE_DOWN, Tint::Paste),
+            (Cmd::OpenNotes, g::NOTEBOOK_PEN, Tint::Paste),
+            (Cmd::SearchNotes, g::NOTEBOOK_TABS, Tint::Paste),
+            (Cmd::CreateNote, g::SQUARE_PEN, Tint::Paste),
+            (Cmd::RecentlyDeletedNotes, g::ARCHIVE_RESTORE, Tint::Paste),
+            (Cmd::ToggleHdr, g::SUN_MEDIUM, Tint::System),
+            (Cmd::HdrSettings, g::MONITOR_COG, Tint::System),
+            (Cmd::Focus(F::Start), g::SHIELD_CHECK, Tint::System),
+            (Cmd::Focus(F::Toggle), g::SHIELD, Tint::System),
+            (Cmd::Focus(F::Pause), g::PAUSE, Tint::System),
+            (Cmd::Focus(F::Resume), g::PLAY, Tint::System),
+            (Cmd::Focus(F::Complete), g::CIRCLE_CHECK, Tint::System),
+            (Cmd::Focus(F::Cancel), g::SHIELD_OFF, Tint::System),
+            (Cmd::Focus(F::Restart), g::ROTATE_CCW, Tint::System),
+            (Cmd::Focus(F::Edit), g::EDIT, Tint::System),
+            (Cmd::Focus(F::Snooze), g::COFFEE, Tint::System),
+            (Cmd::Focus(F::SearchCategories), g::LIST_CHECKS, Tint::System),
+            (Cmd::Focus(F::CreateCategory), g::LIST_PLUS, Tint::System),
+            (Cmd::Focus(F::ImportCategories), g::IMPORT, Tint::System),
+        ];
+        for (cmd, glyph, tint) in map {
+            let (_, title, _, icon) = ALL.iter().find(|(c, ..)| *c == cmd).unwrap_or_else(|| panic!("{cmd:?} not in ALL"));
+            assert_eq!(*icon, glyph, "{title}");
+            assert_eq!(cmd.tint(), tint, "{title}");
+        }
+    }
+
     fn rc(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: l, top: t, right: r, bottom: b }
     }
@@ -770,6 +905,11 @@ mod tests {
         assert_eq!((titles[0], titles[9], titles[10], titles[19]), ("Open Desktop 1", "Open Desktop 10", "Move to Desktop 1", "Move to Desktop 10"));
         assert!(ALL.iter().any(|&(c, t, ..)| c == Cmd::Desktop(Desk::Rename) && t == "Rename Desktop"));
         assert!(ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).all(|&(c, ..)| c.subtitle() == "Window"));
+    }
+
+    #[test]
+    fn hdr_settings_says_where_it_goes() {
+        assert_eq!(Cmd::HdrSettings.subtitle(), "Windows Settings");
     }
 
     #[test]

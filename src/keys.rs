@@ -1,7 +1,7 @@
 //! A low-level keyboard hook for what RegisterHotKey can't do: the Hyper key (one key
 //! held = Ctrl+Alt+Shift+Win), double-tapping a modifier to open procast, and snippet
-//! keywords typed in any app (snippets.rs).
-//! The hook runs only while one of them is switched on; its callback must stay quick,
+//! keywords typed in any app (snippets.rs), and Esc closing a sticky toast (toast.rs).
+//! The hook runs only while one of them is on; its callback must stay quick,
 //! since every keystroke on the machine passes through it.
 
 use std::{
@@ -19,18 +19,13 @@ use windows::Win32::{
             SendInput, ToUnicodeEx, VIRTUAL_KEY,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PostThreadMessageW,
+            CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
             SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
         },
     },
 };
 
 use crate::{snippets::Expander, win::Msg};
-
-/// Keys the Hyper key can be. Values are what config.toml stores.
-pub const HYPER_KEYS: &[&str] = &["off", "capslock", "rightalt", "rightctrl", "scrolllock"];
-/// Modifiers a double tap can use.
-pub const TAP_KEYS: &[&str] = &["off", "ctrl", "shift", "alt"];
 
 const CTRL: u16 = 0xA2;
 const RCTRL: u16 = 0xA3;
@@ -39,6 +34,7 @@ const RSHIFT: u16 = 0xA1;
 const ALT: u16 = 0xA4;
 const RALT: u16 = 0xA5;
 const LWIN: u16 = 0x5B;
+const ESC: u16 = 0x1B;
 /// `dwExtraInfo` on every key procast sends, so the hook can tell them from typing.
 pub const OURS: usize = 0x7072_6f63;
 /// Unassigned virtual key: pressed between Win down and up so Windows doesn't open Start.
@@ -78,6 +74,10 @@ struct State {
     /// The tap modifier went down at, with no other key since.
     tap_down: Option<Instant>,
     last_tap: Option<Instant>,
+    /// A sticky toast is showing: the next bare Esc closes it.
+    sticky: bool,
+    /// Ctrl, Alt, Shift or Win is held (the hook reads it just before an Esc).
+    mods: bool,
 }
 
 /// What the hook should do with one key event.
@@ -90,10 +90,16 @@ enum Out {
     Swallow,
     /// Pass it on; the double tap just completed.
     Open,
+    /// Swallow it and close the sticky toast.
+    CloseToast,
 }
 
 impl State {
     fn key(&mut self, vk: u16, down: bool, now: Instant) -> Out {
+        if vk == ESC && down && self.sticky && !self.mods && !self.holding {
+            self.sticky = false;
+            return Out::CloseToast;
+        }
         if Some(vk) == self.hyper {
             return match (down, self.holding) {
                 (true, true) => Out::Swallow, // auto-repeat
@@ -142,28 +148,55 @@ struct Shared {
 }
 
 static SHARED: Mutex<Shared> =
-    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None }, expander: None, window: 0, tx: None });
+    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None, sticky: false, mods: false }, expander: None, window: 0, tx: None });
 static THREAD: Mutex<u32> = Mutex::new(0);
 
 /// Applies the settings: starts the hook when any feature is on, stops it otherwise.
 pub fn configure(hyper: &str, double_tap: &str, expander: Option<Expander>, tx: UnboundedSender<Msg>) {
-    let (hyper, tap) = (hyper_vk(hyper), tap_vks(double_tap));
-    let expander = expander.filter(|x| !x.is_idle());
-    let expands = expander.is_some();
-    {
-        let mut s = SHARED.lock().unwrap();
-        s.state = State { hyper, tap, ..Default::default() };
-        s.expander = expander;
-        s.tx = Some(tx);
+    // A dev instance installs no global keyboard hook (see `win::dev`).
+    if crate::win::dev() {
+        return;
     }
+    let wanted = {
+        let mut s = SHARED.lock().unwrap();
+        s.state = State { hyper: hyper_vk(hyper), tap: tap_vks(double_tap), sticky: s.state.sticky, ..Default::default() };
+        s.expander = expander.filter(|x| !x.is_idle());
+        s.tx = Some(tx);
+        wanted(&s)
+    };
+    run(wanted);
+}
+
+/// A sticky toast showed (true) or closed: while one shows, the hook runs to catch Esc, since
+/// the toast never has focus to get it.
+pub fn sticky(on: bool) {
+    if crate::win::dev() {
+        return;
+    }
+    let wanted = {
+        let mut s = SHARED.lock().unwrap();
+        s.state.sticky = on;
+        wanted(&s)
+    };
+    run(wanted);
+}
+
+fn wanted(s: &Shared) -> bool {
+    s.state.hyper.is_some() || !s.state.tap.is_empty() || s.expander.is_some() || s.state.sticky
+}
+
+/// Starts or stops the hook's thread.
+fn run(wanted: bool) {
     let mut thread = THREAD.lock().unwrap();
-    let wanted = hyper.is_some() || !tap.is_empty() || expands;
     if wanted && *thread == 0 {
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
-            let _ = tid_tx.send(GetCurrentThreadId());
-            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else { return };
+            // The queue and the hook come first, so a WM_QUIT posted right after this start
+            // always lands (no hook left behind with THREAD at 0). On failure, the id is 0.
             let mut msg = MSG::default();
+            _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else { return };
+            let _ = tid_tx.send(GetCurrentThreadId());
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
             let _ = UnhookWindowsHookEx(hook);
         });
@@ -184,6 +217,10 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let (out, tx, hit) = {
                 let mut s = SHARED.lock().unwrap();
+                if k.vkCode as u16 == ESC {
+                    let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+                    s.state.mods = [0x10, 0x11, 0x12, LWIN, 0x5C].into_iter().any(held);
+                }
                 let out = if injected { Out::Pass } else { s.state.key(k.vkCode as u16, down, Instant::now()) };
                 let hit = if down && out == Out::Pass { typed(&mut s, k) } else { None };
                 (out, s.tx.clone(), hit)
@@ -199,6 +236,12 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                     }
                 }
                 Out::Swallow => return LRESULT(1),
+                Out::CloseToast => {
+                    if let Some(tx) = tx {
+                        let _ = tx.unbounded_send(Msg::ToastClose);
+                    }
+                    return LRESULT(1);
+                }
                 Out::Hyper { down, nothing } => {
                     send_hyper(down, nothing);
                     return LRESULT(1);
@@ -306,5 +349,31 @@ mod tests {
         s.key(CTRL, false, ms(3600)); // held, not tapped
         s.key(CTRL, true, ms(3700));
         assert_eq!(s.key(CTRL, false, ms(3750)), Out::Pass);
+    }
+
+    #[test]
+    fn a_sticky_toast_takes_the_first_esc() {
+        let now = Instant::now();
+        let mut s = State::default();
+        assert_eq!(s.key(ESC, true, now), Out::Pass, "no sticky toast: Esc is the app's");
+        s.sticky = true;
+        assert_eq!(s.key(b'A' as u16, true, now), Out::Pass, "typing goes on");
+        assert_eq!(s.key(ESC, false, now), Out::Pass, "a key-up alone does nothing");
+        assert_eq!(s.key(ESC, true, now), Out::CloseToast);
+        assert!(!s.sticky);
+        assert_eq!(s.key(ESC, true, now), Out::Pass, "only the first Esc");
+
+        // A shortcut with Esc (Ctrl+Shift+Esc, Alt+Esc, Win+Esc, Hyper+Esc) is never taken.
+        s.sticky = true;
+        s.mods = true;
+        assert_eq!(s.key(ESC, true, now), Out::Pass, "Ctrl, Alt, Shift or Win held");
+        s.mods = false;
+        let mut h = State { hyper: hyper_vk("capslock"), sticky: true, ..Default::default() };
+        h.key(0x14, true, now);
+        assert_eq!(h.key(ESC, true, now), Out::Pass, "Hyper held");
+        assert_eq!(h.key(0x14, false, now), Out::Hyper { down: false, nothing: false }, "Hyper+Esc counts as using Hyper");
+        assert!(h.sticky, "the toast still waits for a bare Esc");
+        assert_eq!(h.key(ESC, true, now), Out::CloseToast);
+        assert_eq!(s.key(ESC, true, now), Out::CloseToast, "bare Esc again");
     }
 }

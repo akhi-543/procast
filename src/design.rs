@@ -87,6 +87,12 @@ pub const LIST_PAD: f32 = 4.;
 pub const ACCESSORY_MAX: f32 = 220.;
 /// The Settings sidebar's width.
 pub const SIDEBAR: f32 = 192.;
+/// `.pc-split`: the list's share of a split view's width; the detail takes the rest.
+pub const SPLIT_LIST: f32 = 0.4;
+/// `.pc-tag`: a small tinted label's height.
+pub const TAG: f32 = 20.;
+/// `.pc-setrow`: a Settings row's least height.
+pub const SET_ROW: f32 = 56.;
 
 /// The type scale. Views use only these sizes for text.
 pub mod ts {
@@ -124,6 +130,8 @@ pub mod r {
 
 /// Glyph sizes.
 pub mod ic {
+    /// The ▾ beside a Notes formatting bar item.
+    pub const XS: f32 = 10.;
     /// Inside key caps, chips and dropdowns.
     pub const SM: f32 = 12.;
     /// The action bar, action-panel rows, notices.
@@ -133,6 +141,89 @@ pub mod ic {
     /// Empty states and dialogs.
     pub const XL: f32 = 40.;
 }
+
+/// The `--space-*` steps.
+pub mod sp {
+    pub const S2: f32 = 2.;
+    pub const S4: f32 = 4.;
+    pub const S8: f32 = 8.;
+    pub const S12: f32 = 12.;
+    pub const S16: f32 = 16.;
+    pub const S24: f32 = 24.;
+}
+
+/// `.pc-pop--right`: the menu under the bar's Dropdown.
+pub const POP_RIGHT_W: f32 = 290.;
+pub const POP_RIGHT_TOP: f32 = 50.;
+/// `.pc-pop--center`: the Notes action list over the note, and `.pc-pop--top`: Browse Notes
+/// just under the header.
+pub const POP_CENTER_W: f32 = 320.;
+pub const POP_CENTER_TOP: f32 = 64.;
+pub const POP_CENTER_TOP_HEAD: f32 = 36.;
+
+/// The Notes window's first size (`.pc-notes`).
+pub const NOTES_W: f32 = 560.;
+pub const NOTES_H: f32 = 440.;
+/// `.pc-notes__box`: a task's check box, and its border.
+pub const NOTE_BOX: f32 = 14.;
+pub const NOTE_BOX_BORDER: f32 = 1.5;
+/// A quote's bar on the left of its line.
+pub const QUOTE_BAR: f32 = 2.;
+/// The Notes editor's caret width.
+pub const CARET: f32 = 1.5;
+/// An underline's or a strikethrough's stroke.
+pub const TEXT_LINE: f32 = 1.;
+
+/// `.pc-form--center .pc-form__row`: a launcher form row's width, and its label column (`.pc-form__label`).
+pub const FORM_ROW: f32 = 500.;
+pub const FORM_LABEL: f32 = 120.;
+/// `.pc-form__note`: a form note lines up with the controls (label column plus the row gap).
+pub const FORM_NOTE_INDENT: f32 = 132.;
+
+/// `.pc-swatch`: a colour to pick (Add Calendar's Colour); the picked one has a `bg_solid` gap
+/// ring inside an `accent` ring.
+pub const SWATCH: f32 = 20.;
+const SWATCH_GAP: f32 = 2.;
+const SWATCH_RING: f32 = 4.;
+/// `.pc-feed__dot`: a calendar's colour in Settings → Calendar.
+pub const FEED_DOT: f32 = 10.;
+
+/// `.pc-field--tokens`: the token field's least height, and its chevron's drop to line up with
+/// the first row of tokens.
+pub const TOKEN_FIELD_MIN: f32 = 52.;
+const TOKEN_CHEVRON_TOP: f32 = 3.;
+/// `.pc-token`: one token's height.
+pub const TOKEN: f32 = 22.;
+
+/// `.pc-arg`: an argument box's width grows with its text between these.
+pub const ARG_MIN: f32 = 72.;
+pub const ARG_MAX: f32 = 200.;
+
+/// The width of the focus ring around a field (and the missing ring around an argument box,
+/// and the selected thumbnail's accent ring).
+const RING: f32 = 2.;
+
+/// `.pc-thumb__img`: a thumbnail's width to height.
+const THUMB_ASPECT: f32 = 16. / 10.;
+
+/// `color-mix` shares: how much of a colour a wash keeps.
+pub mod mix {
+    /// `.pc-arg.is-missing`: the danger ring.
+    pub const MISSING_RING: f32 = 0.32;
+    /// `.pc-tag`: the hue's share of its fill, and of its text (mixed into `text`).
+    pub const TAG_FILL: f32 = 0.18;
+    pub const TAG_TEXT: f32 = 0.72;
+    /// `.pc-hud__time`: the hue's share of the Focus pill's time capsule.
+    pub const HUD_FILL: f32 = 0.3;
+}
+
+/// `.pc-hud`: the Focus timer pill's height, and its time capsule's.
+pub const HUD: f32 = 32.;
+const HUD_TIME: f32 = 24.;
+/// The widest the pill's goal grows before an ellipsis cuts it.
+const HUD_GOAL_MAX: f32 = 320.;
+/// `.pc-notice`: the time-up notice's width.
+pub const NOTICE_W: f32 = 440.;
 
 /// What kind of thing a row is. The icon tile takes the kind's hue, so a list reads at a
 /// glance: window moves are teal, system actions amber, clipboard blue, and so on.
@@ -242,6 +333,7 @@ names! {
     SQUARE = "square",
     BELL = "bell",
     BLUETOOTH = "bluetooth",
+    BOOK_OPEN = "book-open",
     BRUSH = "brush",
     CLIPBOARD_X = "clipboard-x",
     CPU = "cpu",
@@ -259,6 +351,8 @@ names! {
     GAUGE = "gauge",
     HARD_DRIVE = "hard-drive",
     HASH = "hash",
+    LANGUAGES = "languages",
+    AUDIO_LINES = "audio-lines",
     MONITOR = "monitor",
     OCTAGON_X = "octagon-x",
     PACKAGE_PLUS = "package-plus",
@@ -311,6 +405,44 @@ names! {
     WRENCH = "wrench",
     ZAP = "zap",
     ZAP_OFF = "zap-off",
+    ALARM_CLOCK = "alarm-clock",
+    CALENDAR_CLOCK = "calendar-clock",
+    SCAN_SEARCH = "scan-search",
+    SCAN_TEXT = "scan-text",
+    IMAGE_DOWN = "image-down",
+    SUN_MEDIUM = "sun-medium",
+    MONITOR_COG = "monitor-cog",
+    SHIELD_CHECK = "shield-check",
+    PAUSE = "pause",
+    CIRCLE_CHECK = "circle-check",
+    SHIELD_OFF = "shield-off",
+    ROTATE_CCW = "rotate-ccw",
+    COFFEE = "coffee",
+    LIST_CHECKS = "list-checks",
+    LIST_PLUS = "list-plus",
+    IMPORT = "import",
+    CIRCLE_HELP = "circle-help",
+    NOTEBOOK_PEN = "notebook-pen",
+    NOTEBOOK_TABS = "notebook-tabs",
+    SQUARE_PEN = "square-pen",
+    SQUARE_MENU = "square-menu",
+    ARCHIVE_RESTORE = "archive-restore",
+    TYPE = "type",
+    HEADING = "heading",
+    QUOTE = "quote",
+    LIST_ORDERED = "list-ordered",
+    EYE = "eye",
+    BAN = "ban",
+    PLUS = "plus",
+    ARROW_UP_DOWN = "arrow-up-down",
+    CLIPBOARD_PASTE = "clipboard-paste",
+    MESSAGE_CIRCLE = "message-circle",
+    USERS = "users",
+    CIRCLE_PLAY = "circle-play",
+    PLANE = "plane",
+    NEWSPAPER = "newspaper",
+    SHOPPING_CART = "shopping-cart",
+    CLOUD = "cloud",
 }
 
 #[derive(Clone, Copy)]
@@ -496,7 +628,7 @@ fn shadow(x: f32, y: f32, blur: f32, spread: f32, hex: u32) -> BoxShadow {
 /// stays solid. gpui's ring, not a spread shadow: a shadow fills the whole rect under a
 /// see-through control.
 fn focus_ring(el: Div, color: Hsla) -> Div {
-    el.ring(px(2.)).ring_color(alpha(color, 0.32))
+    el.ring(px(RING)).ring_color(alpha(color, 0.32))
 }
 
 /// The deep, close shadow of an ActionPanel or Dialog.
@@ -544,23 +676,37 @@ macro_rules! icon_files {
 }
 
 icon_files![
+    "alarm-clock",
     "app",
     "archive",
+    "archive-restore",
+    "arrow-up-down",
     "audio",
+    "audio-lines",
     "back",
+    "ban",
     "bell",
     "bluetooth",
+    "bold",
+    "book-open",
     "brush",
     "calculator",
     "calendar",
+    "calendar-clock",
     "cancel",
     "check",
     "checkbox",
     "checkbox-on",
     "chevron-down",
+    "circle-check",
+    "circle-help",
+    "circle-play",
+    "clipboard-paste",
     "clipboard-x",
     "clock",
+    "cloud",
     "code",
+    "coffee",
     "copy",
     "cpu",
     "delete",
@@ -577,6 +723,7 @@ icon_files![
     "emoji",
     "eraser",
     "extension",
+    "eye",
     "eye-off",
     "file",
     "file-cog",
@@ -588,46 +735,73 @@ icon_files![
     "gauge",
     "hard-drive",
     "hash",
+    "heading",
+    "image-down",
+    "import",
     "info",
     "keyboard",
+    "languages",
     "link",
     "list",
+    "list-checks",
+    "list-ordered",
+    "list-plus",
     "lock",
     "mail",
+    "message-circle",
     "minus",
     "monitor",
+    "monitor-cog",
     "network",
+    "newspaper",
+    "notebook-pen",
+    "notebook-tabs",
     "octagon-x",
     "package-plus",
     "panels-top-left",
     "paste",
+    "pause",
     "personalize",
     "picture",
     "pin",
+    "plane",
     "play",
+    "plus",
     "power",
     "power-off",
+    "quote",
     "refresh-ccw",
     "restart",
     "return",
+    "rotate-ccw",
     "rotate-cw",
+    "scan-search",
+    "scan-text",
     "search",
     "settings",
     "shield",
+    "shield-check",
+    "shield-off",
+    "shopping-cart",
     "sign-out",
     "sleep",
     "sliders-horizontal",
     "sparkles",
     "square",
+    "square-menu",
+    "square-pen",
     "star",
     "store",
+    "sun-medium",
     "sun-moon",
     "terminal",
     "text-cursor-input",
     "tiles",
     "timer",
+    "type",
     "up",
     "usb",
+    "users",
     "video",
     "volume-1",
     "volume-2",
@@ -752,7 +926,7 @@ pub fn icon_view(icon: &Icon, t: &Tokens, selected: bool) -> AnyElement {
 const STICKER_LIGHT: f32 = 0.2;
 const STICKER_DEEP: f32 = 0.18;
 
-fn alpha(color: Hsla, a: f32) -> Hsla {
+pub fn alpha(color: Hsla, a: f32) -> Hsla {
     Hsla { alpha: a, ..color }
 }
 
@@ -905,8 +1079,63 @@ pub fn section_header(title: &str, count: Option<usize>, t: &Tokens) -> Div {
         .text_size(px(ts::SMALL))
         .text_color(t.text_faint)
         .child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(title.to_string()))
-        .children(count.map(|n| div().flex_none().child(n.to_string())))
+        .children(count.map(|n| div().flex_none().child(thousands(n))))
         .child(div().ml(px(4.)).flex_1().h(px(1.)).bg(t.hairline))
+}
+
+/// A count with a comma every three digits: 1050 -> "1,050".
+pub fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `.pc-thumb`: a picture (cover-fit in a 16:10 `surface` box with a hairline edge; `surface`
+/// alone until it has loaded) over its one-line caption. Selected: a 2 px `accent` ring and
+/// the caption in `text`, no fill.
+pub fn thumb(image: Option<std::sync::Arc<gpui::RenderImage>>, caption: &str, on: bool, t: &Tokens) -> Div {
+    let picture = div()
+        .w_full()
+        .aspect_ratio(THUMB_ASPECT)
+        .rounded(px(r::MD))
+        .bg(t.surface)
+        .border_1()
+        .border_color(t.hairline)
+        .when(on, |d| d.ring(px(RING)).ring_color(t.accent))
+        .children(image.map(|i| img(i).size_full().rounded(px(r::MD)).object_fit(gpui::ObjectFit::Cover)));
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(sp::S4))
+        .child(picture)
+        .child(div().truncate().text_size(px(ts::BODY_SM)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(if on { t.text } else { t.text_muted }).child(caption.to_string()))
+}
+
+/// `.pc-banner`: a one-row notice under the bar (the icon muted, then `text`, then `meta`
+/// faint), static.
+pub fn banner(glyph: &'static str, text: &str, meta: &str, t: &Tokens) -> Div {
+    div()
+        .h(px(ROW))
+        .flex_none()
+        .px(px(sp::S16))
+        .flex()
+        .items_center()
+        .gap(px(sp::S8))
+        .border_b_1()
+        .border_color(t.hairline)
+        .text_size(px(ts::BODY_SM))
+        .text_color(t.text)
+        .child(icon(glyph, ic::MD, t.text_muted))
+        .child(text.to_string())
+        .child(div().text_color(t.text_faint).child(meta.to_string()))
 }
 
 /// Centred icon, title and hint for empty views.
@@ -937,6 +1166,61 @@ pub fn field(focused: bool, t: &Tokens) -> Div {
         .border_1()
         .border_color(if focused { t.accent } else { t.border })
         .when(focused, |d| focus_ring(d, t.accent))
+}
+
+/// `.pc-field` holding `body`, with `glyph` after it in text_muted (a select's chevron, a duration's clock).
+pub fn field_with_icon(focused: bool, body: impl IntoElement, glyph: Option<&'static str>, t: &Tokens) -> Div {
+    field(focused, t).gap(px(sp::S8)).child(div().flex_1().min_w_0().truncate().child(body)).children(glyph.map(|g| icon(g, ic::MD, t.text_muted)))
+}
+
+/// `.pc-token`: a picked category or app in a token field: its icon, its name, then the ×
+/// (`remove`, the element the host makes clickable).
+pub fn token(glyph: &'static str, name: &str, remove: impl IntoElement, t: &Tokens) -> Div {
+    div()
+        .flex_none()
+        .h(px(TOKEN))
+        .pl(px(sp::S8))
+        .pr(px(sp::S4))
+        .flex()
+        .items_center()
+        .gap(px(sp::S4))
+        .rounded(px(r::XS))
+        .bg(t.surface_strong)
+        .text_color(t.text)
+        .text_size(px(ts::SMALL))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(icon(glyph, ic::SM, t.text_muted))
+        .child(name.to_string())
+        .child(remove)
+}
+
+/// The token's × (`cancel`, 12).
+pub fn token_x(t: &Tokens) -> Svg {
+    icon(g::CANCEL, ic::SM, t.text_muted)
+}
+
+/// `.pc-field--tokens`: a field that grows with its tokens, wrapping them, a chevron at the right.
+pub fn token_field(focused: bool, tokens: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> Div {
+    field(focused, t)
+        .h_auto()
+        .min_h(px(TOKEN_FIELD_MIN))
+        .items_start()
+        .py(px(sp::S4))
+        .gap(px(sp::S8))
+        .child(div().flex_1().min_w_0().flex().flex_wrap().gap(px(sp::S4)).children(tokens))
+        .child(icon(g::CHEVRON_DOWN, ic::MD, t.text_muted).mt(px(TOKEN_CHEVRON_TOP)))
+}
+
+/// `.pc-form__row`: the label right-aligned in its column at control height, then the control
+/// column (the control, and what goes under it such as an error).
+pub fn form_row(label: impl Into<SharedString>, control: impl IntoIterator<Item = AnyElement>, t: &Tokens) -> Div {
+    let label = div().w(px(FORM_LABEL)).flex_none().h(px(CONTROL)).flex().items_center().justify_end().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(label.into());
+    div().w(px(FORM_ROW)).max_w_full().flex().items_start().gap(px(sp::S12)).child(label).child(div().flex_1().min_w_0().flex().flex_col().gap(px(sp::S4)).children(control))
+}
+
+/// `.pc-form__note`: faint text under the controls, lined up with them.
+pub fn form_note(text: impl Into<SharedString>, t: &Tokens) -> Div {
+    div().w(px(FORM_ROW)).max_w_full().pl(px(FORM_NOTE_INDENT)).text_size(px(ts::BODY_SM)).text_color(t.text_faint).child(text.into())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1059,19 +1343,26 @@ pub fn glass_window(t: &Tokens) -> Div {
     }
 }
 
-/// The Toast pill: an error's warning icon in `danger` (or a result's check in `success`), then one line of text. On `bg_elevated`,
+/// The Toast pill: an icon that alone carries the kind's colour (error: warning in `danger`, done:
+/// check in `success`, info: info in `text_muted`), then one line of text. On `bg_elevated`,
 /// not the glass `bg`: its window has no OS blur behind it, and the thin pane alone would not
 /// hold 4.5:1 over a busy wallpaper. Unscaled: it lives on the desktop, not in the launcher.
-pub fn toast(text: &str, ok: bool, t: &Tokens) -> Div {
+pub fn toast(text: &str, kind: crate::toast::Kind, t: &Tokens) -> Div {
+    use crate::toast::Kind;
     let p = gpui::px;
+    let (glyph, tint) = match kind {
+        Kind::Done => (g::CHECK, t.success),
+        Kind::Error => (g::WARNING, t.danger),
+        Kind::Info => (g::INFO, t.text_muted),
+    };
     div()
         .h(p(ROW))
         .max_w(p(480.))
-        .pl(p(12.))
-        .pr(p(16.))
+        .pl(p(sp::S12))
+        .pr(p(sp::S16))
         .flex()
         .items_center()
-        .gap(p(8.))
+        .gap(p(sp::S8))
         .rounded_full()
         .bg(t.bg_elevated)
         .border_1()
@@ -1080,8 +1371,32 @@ pub fn toast(text: &str, ok: bool, t: &Tokens) -> Div {
         .font_family(FONT_UI)
         .text_size(p(ts::BODY_SM))
         .text_color(t.text)
-        .child(svg().path(format!("icons/{}.svg", if ok { g::CHECK } else { g::WARNING })).size(p(ic::MD)).flex_none().text_color(if ok { t.success } else { t.danger }))
+        .child(svg().path(format!("icons/{glyph}.svg")).size(p(ic::MD)).flex_none().text_color(tint))
         .child(div().min_w_0().truncate().child(text.to_string()))
+}
+
+/// The Focus timer pill (`.pc-hud`): the time in a System-tinted capsule (tabular figures, so
+/// it never jitters), then the goal. On `bg_elevated` like the toast: it floats on the desktop.
+/// `.pc-hud`'s border is the plain `border`.
+pub fn hud(time: &str, goal: &str, t: &Tokens) -> Div {
+    let capsule = div().h(px(HUD_TIME)).px(px(sp::S8)).flex().items_center().rounded(px(r::SM)).bg(alpha(Tint::System.hue(t), mix::HUD_FILL)).font_features(tabular()).child(time.to_string());
+    div()
+        .h(px(HUD))
+        .pl(px(sp::S4))
+        .pr(px(sp::S12))
+        .flex()
+        .items_center()
+        .gap(px(sp::S8))
+        .rounded(px(r::MD))
+        .bg(t.bg_elevated)
+        .border_1()
+        .border_color(t.border)
+        .shadow([rim(t), float(t)].concat())
+        .text_size(px(ts::BODY_SM))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(t.text)
+        .child(capsule)
+        .child(div().max_w(px(HUD_GOAL_MAX)).truncate().child(goal.to_string()))
 }
 
 /// An ActionPanel or Dialog surface: `bg_elevated`, `r::LG`, the rim border, `rim` and `float`
@@ -1108,8 +1423,9 @@ pub fn back_tile(t: &Tokens) -> Div {
     div().size(px(TILE)).flex_none().flex().items_center().justify_center().rounded(px(r::SM)).bg(t.surface).hover(move |s| s.bg(hover)).child(icon(g::BACK, ic::MD, t.text))
 }
 
-/// The search bar's filter dropdown: the current choice between a filter and a chevron.
-pub fn dropdown(label: &str, t: &Tokens) -> Div {
+/// The search bar's dropdown: the current choice between `glyph` (the filter icon, or
+/// Search Screenshots' list) and a chevron.
+pub fn dropdown(glyph: &'static str, label: &str, t: &Tokens) -> Div {
     div()
         .flex_none()
         .h(px(CONTROL))
@@ -1121,9 +1437,255 @@ pub fn dropdown(label: &str, t: &Tokens) -> Div {
         .border_1()
         .border_color(t.border)
         .text_size(px(ts::BODY_SM))
-        .child(icon(g::FILTER, ic::SM, t.text_muted))
+        .child(icon(glyph, ic::SM, t.text_muted))
         .child(div().max_w(px(180.)).truncate().child(label.to_string()))
         .child(icon(g::CHEVRON_DOWN, ic::SM, t.text_muted))
+}
+
+/// `.pc-setrow`: a Settings row: the untinted icon, the title over its muted description, then
+/// what the caller adds (the control, on the right).
+pub fn set_row(glyph: &'static str, title: &str, desc: &str, t: &Tokens) -> Div {
+    div()
+        .min_h(px(SET_ROW))
+        .px(px(sp::S16))
+        .py(px(sp::S8))
+        .flex()
+        .items_center()
+        .gap(px(sp::S12))
+        .child(icon(glyph, ic::LG, t.text_muted))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(sp::S2))
+                .child(div().child(title.to_string()))
+                .when(!desc.is_empty(), |d| d.child(div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(desc.to_string()))),
+        )
+}
+
+/// `.pc-swatch`: a round colour, inset with a hairline; `on` rings it (`.is-on`).
+pub fn swatch(tint: Tint, on: bool, t: &Tokens) -> Div {
+    // Later shadows paint on top: the gap ring covers the accent ring's inner part.
+    let ring = |w: f32, color: Hsla| BoxShadow::new(px(0.), px(0.), color).spread_radius(px(w));
+    let shadows = if on { vec![ring(SWATCH_RING, t.accent), ring(SWATCH_GAP, t.bg_solid)] } else { vec![inset_ring(t.hairline)] };
+    div().size(px(SWATCH)).flex_none().rounded_full().bg(tint.hue(t)).shadow(shadows)
+}
+
+/// `.pc-feed`: a row of Settings → Calendar's Calendars list (the host adds the hairline).
+fn feed(t: &Tokens) -> Div {
+    div().h(px(ROW)).px(px(sp::S16)).flex().items_center().gap(px(sp::S12)).text_color(t.text)
+}
+
+/// A calendar: its colour dot, its name, "Google · updated 5 min ago", then `delete` in
+/// text_faint (the host makes it clickable), shown on hover or when `on`.
+pub fn feed_row(colour: Hsla, name: &str, sub: &str, on: bool, delete: impl IntoElement, t: &Tokens) -> Div {
+    feed(t)
+        .group("feed")
+        .child(div().size(px(FEED_DOT)).flex_none().rounded_full().bg(colour))
+        .child(div().flex_none().font_weight(gpui::FontWeight::SEMIBOLD).child(name.to_string()))
+        .child(div().flex_1().min_w_0().truncate().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(sub.to_string()))
+        .child(div().flex().when(!on, |d| d.invisible().group_hover("feed", |s| s.visible())).child(delete))
+}
+
+/// `.pc-feed--add`: the list's last row, Add Calendar….
+pub fn feed_add(t: &Tokens) -> Div {
+    feed(t).text_color(t.text_muted).child(icon(g::PLUS, ic::MD, t.text_muted)).child("Add Calendar…")
+}
+
+/// `.pc-tag`: a small label tinted with a kind's hue ("Auto-Detect", "German").
+pub fn tag(label: &str, hue: Tint, t: &Tokens) -> Div {
+    let h = hue.hue(t);
+    div()
+        .flex_none()
+        .h(px(TAG))
+        .px(px(sp::S8))
+        .flex()
+        .items_center()
+        .rounded(px(r::XS))
+        .bg(alpha(h, mix::TAG_FILL))
+        .text_size(px(ts::SMALL))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(over(alpha(h, mix::TAG_TEXT), t.text))
+        .child(label.to_string())
+}
+
+/// `.pc-pop__rule`: a hairline between groups of menu rows.
+pub fn pop_rule(t: &Tokens) -> Div {
+    div().flex_none().h(px(1.)).my(px(sp::S4)).bg(t.hairline)
+}
+
+/// One menu row (`.pc-pop .pc-sel`): icon, label (over a muted second line when `two_line`),
+/// the faint `sub` and the `keys` as caps on the right. An `off` row is faint; a `danger` one
+/// is in `danger` like `panel_row`.
+pub fn pop_row(e: &crate::menu::Entry, on: bool, t: &Tokens) -> Div {
+    let label = div().min_w_0().truncate().when(e.danger && !on, |d| d.text_color(t.danger)).child(e.label.clone());
+    let text = match &e.two_line {
+        Some(line) => div().flex_1().min_w_0().flex().flex_col().gap(px(sp::S2)).child(label).child(div().min_w_0().truncate().text_size(px(ts::SMALL)).text_color(t.text_muted).child(line.clone())),
+        None => div().flex_1().min_w_0().flex().child(label),
+    };
+    selectable(CONTROL, on, t)
+        .flex_none()
+        .gap(px(sp::S8))
+        .when(e.two_line.is_some(), |d| d.h_auto().py(px(sp::S4)))
+        .when(e.off, |d| d.text_color(t.text_faint))
+        .children(e.icon.map(|g| icon(g, ic::MD, if e.danger { t.danger } else { t.text_muted })))
+        .child(text)
+        .when(!e.sub.is_empty(), |d| d.child(div().flex_none().text_color(t.text_faint).child(e.sub.clone())))
+        .when(!e.keys.is_empty(), |d| d.child(key_caps(e.keys, t)))
+}
+
+/// The open Dropdown (`.pc-pop`) over the whole window: a transparent layer that takes clicks
+/// outside the menu (the host closes on `on_outside`), and the menu at `m.place`, capped at the
+/// room below its top so its list scrolls. `search` is the search input, drawn when
+/// `m.search` is set; `scroll` tracks the list (one child per `m.rows()`). `on_pick` gets the index into `m.entries` of a clicked row.
+/// `trail(i, selected)` may end entry `i`'s row with the host's buttons (Browse Notes' Pin and
+/// Delete); a row is the group "pop-row", so they can show on hover.
+pub fn pop_menu(
+    m: &crate::menu::Menu,
+    search: Option<AnyElement>,
+    scroll: &gpui::ScrollHandle,
+    on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_outside: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+    trail: impl Fn(usize, bool) -> Option<AnyElement>,
+    t: &Tokens,
+) -> gpui::Stateful<Div> {
+    use crate::menu::{Place, Row};
+    let on_pick = std::rc::Rc::new(on_pick);
+    let rows = m.rows().into_iter().map(|r| match r {
+        Row::Header(s) => section_header(s, None, t).flex_none().px(px(sp::S8)).into_any_element(),
+        Row::Rule => pop_rule(t).into_any_element(),
+        Row::Item(i) => {
+            let e = &m.entries[i];
+            let row = pop_row(e, i == m.selected, t).group("pop-row").children(trail(i, i == m.selected)).id(("pop", i));
+            let pick = on_pick.clone();
+            if e.off { row.into_any_element() } else { row.on_click(move |_, window, cx| pick(i, window, cx)).into_any_element() }
+        }
+    });
+    let pop = elevated(t)
+        .rounded(px(r::MD))
+        .border_color(t.border)
+        .min_h_0()
+        .p(px(sp::S4))
+        .gap(px(sp::S2))
+        .occlude()
+        .children(search.filter(|_| m.search.is_some()).map(|f| field(true, t).flex_none().mb(px(sp::S4)).child(f)))
+        .child(div().id("pop-list").min_h_0().flex().flex_col().gap(px(sp::S2)).overflow_y_scroll().track_scroll(scroll).children(rows));
+    let layer = div().id("pop-layer").absolute().inset_0().flex().flex_col().pb(px(sp::S12)).occlude().on_mouse_down(gpui::MouseButton::Left, on_outside);
+    match m.place {
+        Place::Right => layer.items_end().pt(px(POP_RIGHT_TOP)).pr(px(sp::S12)).child(pop.w(px(POP_RIGHT_W))),
+        Place::Under(left) => layer.items_start().pt(px(POP_RIGHT_TOP)).pl(left).child(pop.w(px(POP_RIGHT_W))),
+        Place::At(at) => layer.items_start().pt(at.y).pl(at.x).child(pop.w(px(POP_RIGHT_W))),
+        Place::Center(top) => layer.items_center().pt(top).child(pop.w(px(POP_CENTER_W))),
+        Place::Above(bottom) => layer.items_center().justify_end().pb(bottom).child(pop.w(px(POP_CENTER_W))),
+    }
+}
+
+/// How wide `text` draws in Space Grotesk at `size` (scaled).
+pub fn text_width(text: &str, size: f32, window: &Window) -> Pixels {
+    shaped_width(text, size, gpui::font(FONT_UI), window)
+}
+
+fn shaped_width(text: &str, size: f32, font: gpui::Font, window: &Window) -> Pixels {
+    let run = gpui::TextRun { len: text.len(), font, color: Hsla::default(), background_color: None, underline: None, strikethrough: None, letter_spacing: None };
+    window.text_system().shape_line(text.to_string().into(), px(size), &[run]).width
+}
+
+/// The widest form a live accessory takes (a paused timer of ten hours or more); its width is
+/// kept for every form, so crossing an hour never changes the row's width.
+// ponytail: 100 h or more is wider; widen this if timers that long turn up.
+const LIVE_WIDEST: &str = "Paused · 00:00:00";
+
+/// Tabular figures: every digit as wide as the others, so a ticking time does not jitter.
+fn tabular() -> gpui::FontFeatures {
+    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
+}
+
+/// The live accessory's width: `LIVE_WIDEST` in tabular figures at the accessory's size.
+pub fn live_width(window: &Window) -> Pixels {
+    shaped_width(LIVE_WIDEST, ts::BODY_SM, gpui::Font { features: tabular(), ..gpui::font(FONT_UI) }, window)
+}
+
+/// A live accessory (`.pc-live`): tabular figures, right-aligned in at least `width`
+/// (`live_width`), so the row never changes width while it ticks.
+pub fn live(text: &str, width: Pixels, color: Hsla) -> Div {
+    div().min_w(width).flex().justify_end().font_features(tabular()).text_color(color).child(text.to_string())
+}
+
+/// An argument box's look: `width` from `arg_width`; the "optional" tag while it is empty and
+/// optional; the help mark's tooltip; `dots` drawn over a secret's (transparent) text.
+pub struct ArgBox {
+    pub width: Pixels,
+    pub tag: bool,
+    pub help: Option<SharedString>,
+    pub dots: Option<String>,
+    pub focused: bool,
+    pub missing: bool,
+}
+
+/// `.pc-arg`'s width for `text` (its value, or its placeholder while empty): the text, the
+/// padding, the tag and the help mark, kept between `ARG_MIN` and `ARG_MAX` (past that the
+/// input scrolls).
+pub fn arg_width(text: &str, tag: bool, help: bool, window: &Window) -> Pixels {
+    // The 1 px border on each side, and room for the caret.
+    let mut w = text_width(text, ts::BODY, window) + px(2. * sp::S8 + 2. + sp::S2);
+    if tag {
+        w += text_width("optional", ts::CAPTION, window) + px(2. * sp::S4 + sp::S4);
+    }
+    if help {
+        w += px(ic::SM + sp::S4);
+    }
+    w.clamp(px(ARG_MIN), px(ARG_MAX))
+}
+
+/// `.pc-arg`: an argument box in the search bar around its `input`. Focused: the accent border
+/// and ring; missing: the danger border and a `mix::MISSING_RING` danger ring.
+pub fn arg_box(i: usize, input: impl IntoElement, b: ArgBox, t: &Tokens) -> gpui::Stateful<Div> {
+    let tip = *t;
+    // Focused, the description shows under the box without hovering (drawn on top, unclipped).
+    let focus_tip = b.help.clone().filter(|_| b.focused).map(|h| gpui::deferred(div().absolute().left_0().top(px(CONTROL + sp::S4)).child(Tip::view(h, t))));
+    let tag = div().flex_none().px(px(sp::S4)).rounded(px(r::XS)).bg(t.surface).text_size(px(ts::CAPTION)).text_color(t.text_faint).child("optional");
+    let help = b.help.map(|h| div().id(("arg-help", i)).flex_none().flex().child(icon(g::CIRCLE_HELP, ic::SM, t.text_faint)).tooltip(move |_, cx| cx.new(|_| Tip(h.clone(), tip)).into()));
+    let dots = b.dots.map(|d| div().absolute().left(px(sp::S8)).top_0().bottom_0().flex().items_center().text_color(t.text).child(d));
+    div()
+        .relative()
+        .flex_none()
+        .w(b.width)
+        .h(px(CONTROL))
+        .px(px(sp::S8))
+        .flex()
+        .items_center()
+        .gap(px(sp::S4))
+        .overflow_hidden()
+        .rounded(px(r::SM))
+        .bg(t.surface)
+        .border_1()
+        .border_color(if b.missing { t.danger } else if b.focused { t.accent } else { t.border })
+        .map(|d| if b.missing { d.ring(px(RING)).ring_color(alpha(t.danger, mix::MISSING_RING)) } else if b.focused { focus_ring(d, t.accent) } else { d })
+        .text_size(px(ts::BODY))
+        .text_color(t.text)
+        .child(div().flex_1().min_w_0().child(input))
+        .children(dots)
+        .when(b.tag, |d| d.child(tag))
+        .children(help)
+        .children(focus_tip)
+        .id(("arg", i))
+}
+
+/// A help mark's tooltip: its text on `bg_elevated`.
+struct Tip(SharedString, Tokens);
+
+impl Tip {
+    fn view(text: SharedString, t: &Tokens) -> Div {
+        elevated(t).rounded(px(r::SM)).px(px(sp::S8)).py(px(sp::S4)).font_family(FONT_UI).text_size(px(ts::SMALL)).whitespace_nowrap().child(text)
+    }
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        Tip::view(self.0.clone(), &self.1)
+    }
 }
 
 /// The bare compact bar's hint, "Recent" and a key cap: what the key does.
@@ -1195,7 +1757,38 @@ pub fn action_panel(head: impl IntoElement, rows: impl IntoIterator<Item = impl 
         .max_h(px(320.))
         .p(px(4.))
         .child(head)
-        .child(div().id("panel").flex().flex_col().overflow_y_scroll().children(rows))
+        .child(div().id("panel").min_h_0().flex().flex_col().overflow_y_scroll().children(rows))
+}
+
+/// The ActionPanel's search field (a panel of more than six actions), at its bottom edge
+/// over a hairline: the search glyph, then `input`.
+pub fn panel_search(input: impl IntoElement, t: &Tokens) -> Div {
+    div()
+        .h(px(CONTROL))
+        .mt(px(sp::S4))
+        .px(px(sp::S8))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(sp::S12))
+        .border_t_1()
+        .border_color(t.hairline)
+        .text_size(px(ts::BODY_SM))
+        .child(icon(g::SEARCH, ic::MD, t.text_muted))
+        .child(div().flex_1().min_w_0().child(input))
+}
+
+/// One cell of the Column count picker's little grids.
+pub const MINI_CELL: f32 = 6.;
+/// The gap between a little grid's cells.
+pub const MINI_GAP: f32 = 2.;
+
+/// The Column count picker's segment for `n` columns: a little grid of `n` cells in place of
+/// a label, lit (accent cells) when picked.
+pub fn columns_segment(n: usize, on: bool, t: &Tokens) -> Div {
+    let cell = if on { t.accent } else { t.text_muted };
+    let grid = div().flex().gap(px(MINI_GAP)).children((0..n).map(|_| div().w(px(MINI_CELL)).h(px(MINI_CELL + MINI_GAP)).rounded(px(MINI_GAP / 2.)).bg(cell)));
+    segment("", on, t).child(grid)
 }
 
 /// The panel's header: the item's icon tile and title over a hairline.
@@ -1249,8 +1842,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn counts_take_a_comma_every_three_digits() {
+        assert_eq!([0, 7, 999, 1050, 12345, 1_000_000].map(thousands), ["0", "7", "999", "1,050", "12,345", "1,000,000"]);
+    }
+
+    #[test]
     fn every_icon_name_is_served() {
-        for name in g::ALL {
+        // Named icons, and the files no view names yet (a later screen adds the `g::` name on first use).
+        for name in g::ALL.iter().chain(ICONS.iter().map(|(n, _)| n)) {
             for (suffix, stroke) in [("", "1.75"), ("@pane", "1.75"), ("@tile", "2.25"), ("@xl", "1.25"), ("@cap", "2")] {
                 let svg = Icons.load(&format!("icons/{name}{suffix}.svg")).unwrap().unwrap_or_else(|| panic!("no icon {name}{suffix}"));
                 assert!(String::from_utf8_lossy(&svg).contains(&format!("stroke-width=\"{stroke}\"")), "{name}{suffix}");
@@ -1271,6 +1870,32 @@ mod tests {
         let win = pane("win-left-half");
         assert!(win.contains(r#"stroke="none"><rect x="3" y="4" width="18" height="16" rx="3"/></g>"#), "{win}");
         assert_eq!(win.matches("width=\"6.11\"").count(), 1);
+    }
+
+    /// Every accessory a Running row can show fits in `live_width`: digits drawn as wide as
+    /// "0" (tabular figures), up to 99 hours.
+    #[test]
+    fn the_live_width_holds_every_running_form() {
+        gpui_ce_platform::application().run(|cx| {
+            register_fonts(cx);
+            let text = cx.text_system();
+            let font = text.resolve_font(&gpui::font(FONT_UI));
+            let width = |s: &str| s.chars().map(|c| text.advance(font, px(ts::BODY_SM), if c.is_ascii_digit() { '0' } else { c }).map_or(0., |a| f32::from(a.width))).sum::<f32>();
+            let row = |paused, done, stopwatch, time: &str| crate::timers::Row { id: 0, title: String::new(), stopwatch, paused, done, time: time.into() }.accessory();
+            for time in ["0:00", "00:00", "0:00:00", "00:00:00"] {
+                for form in [row(false, false, false, time), row(true, false, false, time), row(false, false, true, time), row(false, true, false, time)] {
+                    assert!(width(&form) <= width(LIVE_WIDEST) + 0.01, "{form} is wider than {LIVE_WIDEST}");
+                }
+            }
+            // My Schedule's accessories; "until 00:00" is drawn at weight 600 (`.pc-now`).
+            for form in ["00:00 – 00:00", "All day", "in 00 min"] {
+                assert!(width(form) <= width(LIVE_WIDEST) + 0.01, "{form} is wider than {LIVE_WIDEST}");
+            }
+            let bold = text.resolve_font(&gpui::Font { weight: gpui::FontWeight::SEMIBOLD, ..gpui::font(FONT_UI) });
+            let until = "until 00:00".chars().map(|c| text.advance(bold, px(ts::BODY_SM), if c.is_ascii_digit() { '0' } else { c }).map_or(0., |a| f32::from(a.width))).sum::<f32>();
+            assert!(until <= width(LIVE_WIDEST) + 0.01, "until 00:00 is wider than {LIVE_WIDEST}");
+            cx.quit();
+        });
     }
 
     /// The family name the embedded font reports is the one `FONT_UI` asks for.

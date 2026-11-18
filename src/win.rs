@@ -9,12 +9,13 @@ use futures::channel::mpsc::UnboundedSender;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, POINT, RECT, SIZE},
+        Foundation::{COLORREF, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
             Dwm::{DWMWA_CLOAK, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetMonitorInfoW,
-                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
+                CreateRoundRectRgn, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
+                SetWindowRgn,
             },
         },
         Storage::FileSystem::{
@@ -33,14 +34,14 @@ use windows::{
             Shell::{
                 BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory, KF_FLAG_DEFAULT,
                 SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
-                SIIGBF_ICONONLY, ShellExecuteW,
+                DefSubclassProc, SIIGBF_ICONONLY, SetWindowSubclass, ShellExecuteW,
             },
             WindowsAndMessaging::{
                 ASFW_ANY, AllowSetForegroundWindow, GWL_EXSTYLE, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
                 GWL_STYLE, GetWindowLongPtrW, MSG, PostThreadMessageW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
                 SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_APP, WM_HOTKEY, WS_CAPTION,
-                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+                WS_EX_TOOLWINDOW, WS_EX_WINDOWEDGE, WS_POPUP, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
+                MA_NOACTIVATE, WM_MOUSEACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
             },
         },
     },
@@ -69,6 +70,13 @@ pub enum Msg {
     FilePreviewDropped(String),
     /// Settings → Files → Rebuild: start the file index over.
     RebuildIndex,
+    /// Settings → Calendar → Add Calendar…: open the launcher's Add Calendar form.
+    AddCalendar,
+    /// Browse Notes' Recently Deleted row: open the launcher on Recently Deleted Notes.
+    RecentlyDeletedNotes,
+    /// Add Calendar's one fetch finished: the form it came from (`Launcher::form_gen`), the feed
+    /// to add, and its events or why it failed.
+    CalendarAdded(u64, crate::config::CalendarFeed, Result<Vec<crate::calendar::Event>, String>),
     /// The window's content height changed (compact mode); resize between updates.
     Resize,
     /// Something was installed or removed: the app list should be rescanned.
@@ -81,20 +89,76 @@ pub enum Msg {
     Install(String, Option<bool>),
     /// Time to check for extension commands with an `interval`.
     Tick,
+    /// A second passed while a timer or stopwatch runs.
+    TimerTick,
+    /// A translation came back (or failed): the request number (older ones are dropped), what
+    /// was asked, whether the launcher was hidden meanwhile, and Google's answer (one translation
+    /// per target for the translator view).
+    Translated { seq: u64, job: crate::translate::Job, hidden: bool, result: Result<Vec<crate::translate::Translation>, String> },
+    /// A calendar fetch finished: each feed's address and its events, or why it failed.
+    Calendar(Vec<(String, Result<Vec<crate::calendar::Event>, String>)>),
+    /// A word was looked up (or the dictionary could not be fetched): the request number, the word, the answer.
+    Defined { seq: u64, word: String, result: Result<Option<crate::dict::Answer>, String> },
+    /// Whether the dictionary is downloaded, checked each time the launcher shows.
+    DictReady(bool),
+    /// The displays' HDR state, read each time the launcher shows and after Toggle HDR: the
+    /// read's number (older ones are dropped) and what it found.
+    Hdr(u64, Vec<crate::hdr::HdrDisplay>),
+    /// A root Define row's subtitle: the request number, the word (lowercase), its first short sense.
+    Sense { seq: u64, word: String, sense: Option<String> },
+    /// Screenshot search: the scan's number and the index so far, or None when the scan is
+    /// over; and how many pictures have had their text read, of how many (None when none are).
+    Shots(u64, Option<crate::shots::ShotIndex>, Option<(usize, usize)>),
+    /// A screenshot delete finished: its path, the grid cell it was in, and how it went.
+    ShotDeleted(PathBuf, usize, Result<(), String>),
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
     /// The store index finished loading.
     Store(Vec<crate::ext::StoreEntry>),
     /// Quit Applications: running apps with their icons.
     Running(Vec<(crate::apps::Running, Option<Arc<gpui::RenderImage>>)>),
+    /// A browser just connected (see browser.rs): it knows nothing of procast's state yet.
+    BrowserUp,
     /// A connected browser's answer (see browser.rs), by connection id.
     Browser(u32, crate::browser::Reply),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
-    /// A command's result (true) or why it failed (false): shown as a toast that fades away.
-    Toast(bool, String),
+    /// The foreground window changed: its handle, whether it is a game, and its program's file
+    /// name in lower case, empty if Windows won't say (see foreground.rs).
+    Foreground { hwnd: isize, game: bool, exe: String },
+    /// A command's result, or why it failed: shown as a toast (toast.rs). Build it with
+    /// `Msg::done`, `Msg::error`, `Msg::info` or `Msg::sticky`.
+    Toast(crate::toast::Kind, crate::toast::Stay, String),
+    /// Esc was pressed while a sticky toast showed (keys.rs).
+    ToastClose,
+    /// The Focus pill or notice was clicked (hud.rs).
+    Hud(crate::hud::Click),
+}
+
+impl Msg {
+    pub fn done(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Done, text)
+    }
+
+    /// Stays until Esc, a click or the launcher opening; say what to do next.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Error, text)
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::toast(crate::toast::Kind::Info, text)
+    }
+
+    /// Any kind, staying until dismissed.
+    pub fn sticky(kind: crate::toast::Kind, text: impl Into<String>) -> Self {
+        Self::Toast(kind, crate::toast::Stay::Sticky, text.into())
+    }
+
+    fn toast(kind: crate::toast::Kind, text: impl Into<String>) -> Self {
+        Self::Toast(kind, kind.stay(), text.into())
+    }
 }
 
 pub enum TrayCmd {
@@ -136,6 +200,10 @@ pub struct Hotkeys {
 impl Hotkeys {
     pub fn spawn(specs: Vec<String>, tx: UnboundedSender<Msg>) -> Self {
         let wanted = Arc::new(Mutex::new(specs));
+        // No thread, so nothing registers; `set` posts to thread 0, which goes nowhere.
+        if dev() {
+            return Self { thread: 0, wanted };
+        }
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let shared = wanted.clone();
         std::thread::spawn(move || unsafe {
@@ -206,13 +274,48 @@ pub fn make_tool_window(hwnd: HWND) {
     }
 }
 
-/// A toast's window: never activated, and clicks fall through to whatever is beneath
-/// (layered + transparent; fully opaque as a layer, gpui's own alpha does the see-through).
-pub fn make_overlay(hwnd: HWND) {
+/// A window on top that never takes focus, even when clicked. WS_EX_NOACTIVATE alone is not
+/// enough: gpui answers WM_MOUSEACTIVATE with MA_ACTIVATE, so that one message is answered here
+/// first. Call on the window's own (UI) thread.
+pub fn make_hud(hwnd: HWND) {
+    unsafe extern "system" fn no_activate(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM, _: usize, _: usize) -> LRESULT {
+        if msg == WM_MOUSEACTIVATE { LRESULT(MA_NOACTIVATE as isize) } else { unsafe { DefSubclassProc(hwnd, msg, w, l) } }
+    }
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0 | WS_EX_TOPMOST.0) as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0) as isize);
+        _ = SetWindowSubclass(hwnd, Some(no_activate), 1, 0);
+    }
+}
+
+/// A toast's window: a HUD window (`make_hud`) that clicks fall through to whatever is beneath
+/// (layered + transparent; fully opaque as a layer, gpui's own alpha does the see-through).
+pub fn make_overlay(hwnd: HWND) {
+    make_hud(hwnd);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0) as isize);
         _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    }
+}
+
+/// Where an overlay (`make_overlay`) takes clicks: only inside `pill` (physical px in the
+/// window, round ends), or nowhere (None). The region also clips what the window shows.
+/// Call between updates: it sends the window messages synchronously.
+pub fn clickable(hwnd: HWND, pill: Option<[i32; 4]>) {
+    unsafe {
+        // The system owns the region once set.
+        let rgn = pill.map(|[l, t, r, b]| CreateRoundRectRgn(l, t, r + 1, b + 1, b - t, b - t));
+        SetWindowRgn(hwnd, rgn, true);
+    }
+    click_through(hwnd, pill.is_none());
+}
+
+/// Whether clicks pass through an overlay (`make_overlay`) to what is beneath.
+pub fn click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & !(WS_EX_TRANSPARENT.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, if on { ex | WS_EX_TRANSPARENT.0 as isize } else { ex });
     }
 }
 
@@ -250,14 +353,6 @@ pub fn cloak(hwnd: HWND, on: bool) {
 
 pub fn foreground() -> HWND {
     unsafe { GetForegroundWindow() }
-}
-
-/// A full-screen app or game has focus (game mode turns hotkeys off then).
-/// ponytail: the hotkey is still registered, so the key never reaches the game; unregister
-/// on a foreground-change hook if that matters.
-pub fn full_screen_app() -> bool {
-    use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
-    unsafe { SHQueryUserNotificationState() }.is_ok_and(|s| [QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE].contains(&s))
 }
 
 pub fn focus(hwnd: HWND) {
@@ -324,6 +419,25 @@ pub fn place_toast(hwnd: HWND, screen: &Screen, width: f32, height: f32) {
     let (w, h) = ((width * screen.dpi) as i32, (height * screen.dpi) as i32);
     let RECT { left, right, bottom, .. } = screen.work;
     unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), left + (right - left - w) / 2, bottom - h, w, h, SWP_NOACTIVATE) };
+}
+
+/// Keeps the window above every other one (`on`) or lets it go back among them, without moving
+/// or activating it.
+pub fn set_topmost(hwnd: HWND, on: bool) {
+    unsafe { _ = SetWindowPos(hwnd, Some(if on { HWND_TOPMOST } else { HWND_NOTOPMOST }), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+}
+
+/// The window's place on the screen, physical px.
+pub fn rect(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    unsafe { _ = GetWindowRect(hwnd, &mut r) };
+    r
+}
+
+/// Moves and sizes a HUD window (physical px), on top of everything, without activating it.
+/// Call between updates (see `place`).
+pub fn set_rect(hwnd: HWND, r: RECT) {
+    unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE) };
 }
 
 /// Changes only the window's height (logical px), keeping its top-left corner.
@@ -722,6 +836,12 @@ pub fn reveal(path: &str) {
     shell("open", "explorer.exe".into(), format!("/select,\"{path}\"").into());
 }
 
+/// The Windows "Open with" picker for a file. OpenAs_RunDLL takes the rest of the command
+/// line as the path, so it goes unquoted.
+pub fn open_with(path: &str) {
+    shell("open", "rundll32.exe".into(), format!("shell32.dll,OpenAs_RunDLL {path}").into());
+}
+
 /// ShellExecute for paths, URLs and shell: targets.
 pub fn open(target: &str) {
     shell("open", target.into(), HSTRING::new());
@@ -742,15 +862,26 @@ fn shell(verb: &'static str, file: HSTRING, args: HSTRING) {
 
 // ---- process ------------------------------------------------------------------------
 
-/// False when another procast is already running.
+/// A dev instance (`PROCAST_DEV` set) runs beside the user's procast: its own instance mutex, and
+/// no global hotkeys, keyboard hook, browser host or start-at-login entry. The caller points it at
+/// scratch config by setting `APPDATA`, which `config::dir` reads.
+pub fn dev() -> bool {
+    std::env::var_os("PROCAST_DEV").is_some()
+}
+
+/// False when another procast (for a dev instance: another dev instance) is already running.
 pub fn single_instance() -> bool {
+    let name = if dev() { w!("Local\\procast-dev-instance") } else { w!("Local\\procast-single-instance") };
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\procast-single-instance"));
+        let _ = CreateMutexW(None, true, name);
         GetLastError() != ERROR_ALREADY_EXISTS
     }
 }
 
 pub fn set_start_at_login(on: bool) {
+    if dev() {
+        return;
+    }
     let key = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     unsafe {
         if on {

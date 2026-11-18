@@ -37,6 +37,9 @@ const HOST: &str = "com.procast.browser";
 pub const EXTENSION_ID: &str = "mdbobfibhbhbeeogppclpodmbkjkbkal";
 const MANIFEST: &str = include_str!("../browser/manifest.json");
 const SCRIPT: &str = include_str!("../browser/background.js");
+/// Where Focus sends a blocked site's tab.
+const BLOCKED_PAGE: &str = include_str!("../browser/blocked.html");
+const BLOCKED_SCRIPT: &str = include_str!("../browser/blocked.js");
 /// Chrome's own cap on a message to the browser; anything bigger is a broken stream.
 const MAX_FRAME: u32 = 64 << 20;
 
@@ -168,6 +171,7 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
             let mut pipe = unsafe { File::from_raw_handle(h.0) };
             let (q, requests) = channel::<Value>();
             list.0.lock().unwrap().push((id, q));
+            let _ = tx.unbounded_send(Msg::BrowserUp);
             let (tx, list) = (tx.clone(), list.clone());
             std::thread::spawn(move || {
                 for req in requests {
@@ -210,10 +214,16 @@ pub fn extension_dir() -> std::path::PathBuf {
 /// Registers procast.exe as the native messaging host for Chrome, Edge and Brave, and
 /// unpacks the extension. Cheap and repeated at every start, so a moved exe stays registered.
 pub fn register() -> std::io::Result<()> {
+    // The user's procast owns the host registration (see `win::dev`).
+    if crate::win::dev() {
+        return Err(std::io::Error::other("not in a dev instance"));
+    }
     let dir = extension_dir();
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.json"), MANIFEST)?;
     std::fs::write(dir.join("background.js"), SCRIPT)?;
+    std::fs::write(dir.join("blocked.html"), BLOCKED_PAGE)?;
+    std::fs::write(dir.join("blocked.js"), BLOCKED_SCRIPT)?;
     let exe = std::env::current_exe()?;
     let manifest = json!({
         "name": HOST,
@@ -255,6 +265,16 @@ mod tests {
         }
         assert!(matches!(parse_reply(br#"{"t":"open","ok":true}"#), Reply::Done(Ok(()))));
         assert!(matches!(parse_reply(br#"{"t":"activate","error":"No tab with id: 9."}"#), Reply::Done(Err(_))));
+    }
+
+    #[test]
+    fn the_blocked_page_says_what_is_blocked_and_offers_snooze() {
+        assert!(BLOCKED_PAGE.contains(r#"src="blocked.js""#) && !BLOCKED_PAGE.contains("<script>"), "no inline script (manifest v3); inline style is allowed");
+        assert!(BLOCKED_PAGE.contains("End your focus session to open this page.") && BLOCKED_PAGE.contains("/* bg_solid */"));
+        assert!(BLOCKED_SCRIPT.contains("is blocked by procast`") && BLOCKED_SCRIPT.contains("Snooze for ") && BLOCKED_SCRIPT.contains(r#"type: "snooze""#));
+        assert!(SCRIPT.contains("blocked.html") && SCRIPT.contains(r#"case "focusSites""#) && SCRIPT.contains(r#"msg.type !== "snooze""#));
+        assert!(SCRIPT.contains(r#"typeof msg.site !== "string""#) && SCRIPT.contains(r#"sender.url.startsWith(chrome.runtime.getURL("blocked.html"))"#), "Snooze only from the blocked page, with a site");
+        assert!(SCRIPT.contains(r#"rule.mode === "off""#) && SCRIPT.contains("snoozed.clear()"), "a session's snoozes end with it");
     }
 
     #[test]

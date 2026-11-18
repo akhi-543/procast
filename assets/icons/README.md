@@ -6,3 +6,176 @@ UI icons, as in the design system's Assets, Icons group. Only the icons in use s
 - Draw at `ic-sm` 12, `ic-md` 14, `ic-lg` 16 or `ic-xl` 40, with stroke `ic-stroke` (1.75); 1.25 at 40 px; 2 inside a KeyCap.
 - The glass pane (every closed shape filled at 20%) is not in the files: `design::Icons` adds it at 16 px and up.
 - Which icon goes with which command: the design system's Icon map. Add an icon from the same family and version only.
+
+## Files
+
+One line per stem. A procast stem that differs from its Lucide name gives the Lucide name.
+
+- `alarm-clock`
+- `app`: Lucide `app-window`
+- `archive-restore`
+- `archive`: Lucide `file-archive`
+- `arrow-up-down`
+- `audio-lines`
+- `audio`: Lucide `music`
+- `back`: Lucide `arrow-left`
+- `ban`
+- `bell`
+- `bluetooth`
+- `bold`
+- `book-open`
+- `brush`
+- `calculator`
+- `calendar-clock`
+- `calendar`
+- `cancel`: Lucide `x`
+- `check`
+- `checkbox-on`: Lucide `square-check`
+- `checkbox`: Lucide `square`
+- `chevron-down`
+- `circle-check`
+- `circle-help`
+- `circle-play`
+- `clipboard-paste`
+- `clipboard-x`
+- `clock`
+- `cloud`
+- `code`
+- `coffee`
+- `copy`
+- `cpu`
+- `delete`: Lucide `trash-2`
+- `desk-close`: drawn by procast
+- `desk-move-to`: drawn by procast
+- `desk-next`: drawn by procast
+- `desk-open`: drawn by procast
+- `desk-prev`: drawn by procast
+- `desk-rename`: drawn by procast
+- `document`: Lucide `file-text`
+- `down`: Lucide `arrow-down`
+- `download`
+- `edit`: Lucide `pencil`
+- `emoji`: Lucide `smile`
+- `eraser`
+- `extension`: Lucide `puzzle`
+- `eye-off`
+- `eye`
+- `file-cog`
+- `file`
+- `filter`: Lucide `list-filter`
+- `folder-search`
+- `folder`
+- `forward`: Lucide `arrow-right`
+- `gamepad-2`
+- `gauge`
+- `hard-drive`
+- `hash`
+- `heading`
+- `image-down`
+- `import`
+- `info`
+- `keyboard`
+- `languages`
+- `link`
+- `list-checks`
+- `list-ordered`
+- `list-plus`
+- `list`
+- `lock`
+- `mail`
+- `message-circle`
+- `minus`
+- `monitor-cog`
+- `monitor`
+- `network`
+- `newspaper`
+- `notebook-pen`
+- `notebook-tabs`
+- `octagon-x`
+- `package-plus`
+- `panels-top-left`
+- `paste`: Lucide `clipboard`
+- `pause`
+- `personalize`: Lucide `palette`
+- `picture`: Lucide `image`
+- `pin`
+- `plane`
+- `play`
+- `plus`
+- `power-off`
+- `power`
+- `quote`
+- `refresh-ccw`
+- `restart`: Lucide `refresh-cw`
+- `return`: Lucide `corner-down-left`
+- `rotate-ccw`
+- `rotate-cw`
+- `scan-search`
+- `scan-text`
+- `search`
+- `settings`
+- `shield-check`
+- `shield-off`
+- `shield`
+- `shopping-cart`
+- `sign-out`: Lucide `log-out`
+- `sleep`: Lucide `moon`
+- `sliders-horizontal`
+- `sparkles`
+- `square-menu`
+- `square-pen`
+- `square`
+- `star`
+- `store`
+- `sun-medium`
+- `sun-moon`
+- `terminal`
+- `text-cursor-input`
+- `tiles`: Lucide `layout-grid`
+- `timer`
+- `type`
+- `up`: Lucide `arrow-up`
+- `usb`
+- `users`
+- `video`
+- `volume-1`
+- `volume-2`
+- `volume-x`
+- `warning`: Lucide `triangle-alert`
+- `web`: Lucide `globe`
+- `wifi`
+- `win-almost-maximize`: drawn by procast
+- `win-bottom-center-sixth`: drawn by procast
+- `win-bottom-half`: drawn by procast
+- `win-bottom-left-quarter`: drawn by procast
+- `win-bottom-left-sixth`: drawn by procast
+- `win-bottom-right-quarter`: drawn by procast
+- `win-bottom-right-sixth`: drawn by procast
+- `win-bottom-third`: drawn by procast
+- `win-center-third`: drawn by procast
+- `win-center`: drawn by procast
+- `win-close-others`: drawn by procast
+- `win-first-third`: drawn by procast
+- `win-first-two-thirds`: drawn by procast
+- `win-last-third`: drawn by procast
+- `win-last-two-thirds`: drawn by procast
+- `win-left-half`: drawn by procast
+- `win-maximize`: drawn by procast
+- `win-middle-third`: drawn by procast
+- `win-minimize-others`: drawn by procast
+- `win-minimize`: drawn by procast
+- `win-next-display`: drawn by procast
+- `win-reasonable`: drawn by procast
+- `win-restore`: drawn by procast
+- `win-right-half`: drawn by procast
+- `win-toggle-maximize`: drawn by procast
+- `win-top-center-sixth`: drawn by procast
+- `win-top-half`: drawn by procast
+- `win-top-left-quarter`: drawn by procast
+- `win-top-left-sixth`: drawn by procast
+- `win-top-right-quarter`: drawn by procast
+- `win-top-right-sixth`: drawn by procast
+- `win-top-third`: drawn by procast
+- `wrench`
+- `zap-off`
+- `zap`

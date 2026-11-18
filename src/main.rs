@@ -2,32 +2,44 @@
 
 mod apps;
 mod browser;
+mod calendar;
 mod clipboard;
 mod commands;
 mod config;
 mod design;
+mod dict;
 mod desktops;
 mod ext;
 mod files;
+mod focus;
+mod foreground;
+mod hdr;
+mod hud;
 mod keys;
+mod menu;
 mod net;
+mod notes;
 mod ntfs;
 mod scripts;
 mod search;
 mod settings;
+mod shots;
 mod snippets;
 mod system;
+mod timers;
 mod toast;
+mod translate;
 mod win;
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -37,7 +49,7 @@ use futures::{
     channel::mpsc::{self, UnboundedSender},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
+    App, Bounds, ClipboardItem, Context, Entity, Focusable, FontWeight, KeyBinding, QuitMode, RenderImage,
     ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds, WindowKind, WindowOptions,
     actions, div, prelude::*, size, uniform_list,
 };
@@ -54,10 +66,14 @@ use tray_icon::{
 };
 use windows::Win32::Foundation::HWND;
 
-use commands::{Cmd, Desk};
+use commands::{Cmd, Desk, FocusCmd};
 use config::Config;
 use design::{Tokens, g, px};
 use ext::FieldKind;
+use notes::{
+    store::{NoteMeta, Store},
+    window::{Notes, NotesWindow, Place, created},
+};
 use scripts::{Output, Script};
 use search::{Act, Frecency, Icon, Item};
 use win::{BINDS, Bind, Msg, TrayCmd};
@@ -65,10 +81,19 @@ use win::{BINDS, Bind, Msg, TrayCmd};
 actions!(procast, [SelectPrev, SelectNext, Dismiss, Launch, ToggleActions, Submit, NextSection, PrevSection]);
 // Left and Right in the emoji grid (the search bar keeps them elsewhere).
 actions!(procast, [SelectLeft, SelectRight]);
+// Ctrl+P: the search bar's Dropdown (the translator's language sets).
+actions!(procast, [OpenDropdown]);
+// Tab and Shift+Tab while argument boxes show.
+actions!(procast, [NextBox, PrevBox]);
+// Backspace on a token field (or in its menu's empty search) takes the last token.
+actions!(procast, [PopToken]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
+// An action's own shortcut (`search::act_keys`) on the selected row: Ctrl+O, Ctrl+Shift+O, Ctrl+Y, Ctrl+Alt+O.
+actions!(procast, [KeyOpen, KeyOpenWith, KeyQuickLook, KeyReveal]);
 
 use design::{BAR, FOOTER, LIST_PAD, ROW};
+use search::MAX_ARGS;
 
 fn window_height(cfg: &Config) -> f32 {
     // The window's 1 px border top and bottom, the bar, whole rows (results plus a section
@@ -102,13 +127,24 @@ enum Tone {
     Error,
 }
 
+impl Tone {
+    fn of(kind: toast::Kind) -> Self {
+        match kind {
+            toast::Kind::Done => Tone::Ok,
+            toast::Kind::Error => Tone::Error,
+            toast::Kind::Info => Tone::Info,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Root,
     Clipboard,
     Emoji,
     Files,
-    /// Collecting script or snippet arguments (see `Launcher::pending`).
+    /// One command row with its argument boxes focused (see `Launcher::args_row`): a hotkey,
+    /// a snippet keyword typed in an app, or a command run from elsewhere.
     Args,
     /// Showing a script's output (see `Launcher::output`).
     Output,
@@ -124,6 +160,214 @@ enum Mode {
     Tabs,
     /// A Quick AI answer (see `Launcher::ai`).
     Ai,
+    /// A translation (see `Launcher::translation`).
+    Translate,
+    /// A dictionary answer (see `Launcher::define`).
+    Define,
+    /// Screenshot search (see `Launcher::shots`).
+    Shots,
+    /// My Schedule: today's and tomorrow's events.
+    Schedule,
+    /// A native form (see `Launcher::form`).
+    Form(FormKind),
+    /// Manage Language Sets: the translator's sets, to pick, add, edit or delete.
+    LanguageSets,
+    /// Search Notes or Recently Deleted Notes.
+    Notes(NotesList),
+}
+
+/// Which notes `Mode::Notes` lists.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NotesList {
+    All,
+    Deleted,
+}
+
+/// A native launcher form: what it is for, which names its title and primary action.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FormKind {
+    Focus,
+    AddCalendar,
+    /// Some(i) edits language set `i`.
+    AddLanguageSet(Option<usize>),
+}
+
+impl FormKind {
+    /// The ActionBar's icon and title on the left, and the primary action (Ctrl+Enter) on the right.
+    fn bar(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            FormKind::Focus => (g::SHIELD_CHECK, "Focus", "Start Focus Session"),
+            FormKind::AddCalendar => (g::CALENDAR_CLOCK, "Add Calendar", "Add Calendar"),
+            FormKind::AddLanguageSet(None) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
+            FormKind::AddLanguageSet(Some(_)) => (g::LANGUAGES, "Edit Language Set", "Save Language Set"),
+        }
+    }
+}
+
+/// One control of a launcher form.
+#[derive(Clone)]
+enum Ctl {
+    /// A text box, two lines high when `tall`, with `icon` after the text; Down opens a menu of
+    /// `presets` when there are any, and the pick is typed in.
+    Text { placeholder: SharedString, icon: Option<&'static str>, tall: bool, presets: &'static [&'static str] },
+    /// Picks one entry's id from a menu; true gives the menu a search field.
+    Select(Vec<menu::Entry>, bool),
+    /// A checkbox named by the field's label; its value is "true" when on.
+    Check,
+    /// A token field (Focus's Block): the value is the picked `focus::Picks`, one id a line.
+    Tokens,
+    /// Add Calendar's colours (`calendar::COLOURS`): the value is the picked one's name; Left
+    /// and Right move.
+    Swatches,
+    /// Muted text (the value); with no label it is a `form_note`.
+    Note,
+    Rule,
+}
+
+/// One row of a launcher form, native or an extension's.
+#[derive(Clone)]
+struct FormField {
+    label: SharedString,
+    ctl: Ctl,
+    /// The text typed, or the picked entry's id.
+    value: String,
+    /// A Text control's box.
+    input: Option<Entity<EditableTextState>>,
+    error: Option<String>,
+}
+
+impl FormField {
+    fn focusable(&self) -> bool {
+        !matches!(self.ctl, Ctl::Note | Ctl::Rule)
+    }
+}
+
+/// A native form's values by label: the text typed, or the picked id.
+fn form_values(fields: &[FormField]) -> HashMap<&str, &str> {
+    fields.iter().filter(|f| f.focusable()).map(|f| (f.label.as_ref(), f.value.as_str())).collect()
+}
+
+/// The field Tab (`d` 1) or Shift+Tab (-1) moves to from `i`, past notes and rules, wrapping at either end.
+fn next_field(fields: &[FormField], i: usize, d: isize) -> usize {
+    let n = fields.len() as isize;
+    let mut k = i as isize;
+    for _ in 0..n {
+        k = (k + d).rem_euclid(n);
+        if fields[k as usize].focusable() {
+            return k as usize;
+        }
+    }
+    i
+}
+
+/// The menu a Select field (or a Text field with presets) opens at `at`, on its current value;
+/// None for other controls.
+fn field_menu(f: &FormField, at: gpui::Point<gpui::Pixels>) -> Option<menu::Menu> {
+    let (entries, search) = match &f.ctl {
+        Ctl::Select(entries, search) => (entries.clone(), *search),
+        Ctl::Text { presets, .. } if !presets.is_empty() => (presets.iter().map(|p| menu::Entry { id: p.to_string(), label: p.to_string(), ..Default::default() }).collect(), false),
+        _ => return None,
+    };
+    let mut m = menu::Menu::new(entries, search.then(|| "Search…".to_string()), menu::Place::At(at));
+    m.selected = m.entries.iter().position(|e| e.id.eq_ignore_ascii_case(f.value.trim())).unwrap_or(m.selected);
+    Some(m)
+}
+
+/// The Focus form: Goal, Duration (presets on Down), Mode, and the Block token field.
+fn focus_form(goal: &str, duration: &str, mode: focus::Mode, picks: &[String]) -> Vec<FormField> {
+    let field = |label: &str, ctl: Ctl, value: String| FormField { label: label.to_string().into(), ctl, value, input: None, error: None };
+    let modes = vec![
+        menu::Entry { id: "block".into(), label: "Block Apps & Websites".into(), ..Default::default() },
+        menu::Entry { id: "allow".into(), label: "Allow Apps & Websites".into(), ..Default::default() },
+    ];
+    vec![
+        field("Goal", Ctl::Text { placeholder: "Goal".into(), icon: None, tall: false, presets: &[] }, goal.to_string()),
+        field("Duration", Ctl::Text { placeholder: "25 min".into(), icon: Some(g::CLOCK), tall: false, presets: &focus::DURATIONS }, duration.to_string()),
+        field("Mode", Ctl::Select(modes, true), if mode == focus::Mode::Allow { "allow" } else { "block" }.into()),
+        field("Block", Ctl::Tokens, focus::Picks(picks.to_vec()).value()),
+    ]
+}
+
+/// The form Start or Edit Focus Session opens with these box values, prefilled; None to act at
+/// once. Start opens it with Goal empty; Edit (with a session) also when its boxes are empty or
+/// still hold the session as `edit_seed` fills them, and then starts from the session, its mode too.
+fn focus_form_for(f: FocusCmd, got: &[String], session: Option<&focus::Session>, cats: &[config::FocusCategory], default_minutes: u32) -> Option<Result<Vec<FormField>, String>> {
+    let edit = match (f, session) {
+        (FocusCmd::Edit, Some(s)) => Some(s),
+        (FocusCmd::Start, _) => None,
+        _ => return None,
+    };
+    let blank = got.iter().all(|g| g.trim().is_empty());
+    let seed = match edit {
+        Some(s) if blank || got.iter().map(|g| g.trim()).eq(focus::edit_seed(s).iter().map(|g| g.trim())) => focus::edit_seed(s),
+        _ if got.first().is_none_or(|g| g.trim().is_empty()) => got.to_vec(),
+        _ => return None,
+    };
+    Some(focus::parse_start(&seed, cats, default_minutes).map(|start| {
+        let mode = start.filter.as_ref().map(|f| f.0).or(edit.map(|s| s.mode)).unwrap_or(focus::Mode::Block);
+        focus_form(seed.first().map_or("", |g| g.trim()), &focus::minutes_label(start.minutes), mode, &start.picks)
+    }))
+}
+
+/// The Block menu: Focus Categories, then Applications (`apps`: file name and name), less
+/// what is picked already.
+fn block_entries(cats: &[config::FocusCategory], apps: &[(String, String)], picks: &focus::Picks) -> Vec<menu::Entry> {
+    let cats = cats.iter().map(|c| menu::Entry { id: format!("cat:{}", c.name), label: c.name.clone(), icon: Some(focus::category_icon(&c.name)), section: Some("Focus Categories".into()), ..Default::default() });
+    let apps = apps.iter().map(|(exe, name)| menu::Entry { id: format!("app:{exe}"), label: name.clone(), icon: Some(g::APP), section: Some("Applications".into()), ..Default::default() });
+    cats.chain(apps).filter(|e| !picks.0.contains(&e.id)).collect()
+}
+
+/// Add Calendar's answer for the submit from form `generation`: whether it drives the form on
+/// screen (`on_form`, the latest one, `form_gen`), and which fetch is still pending after it.
+fn add_answer(pending: Option<u64>, generation: u64, form_gen: u64, on_form: bool) -> (bool, Option<u64>) {
+    (on_form && generation == form_gen, pending.filter(|p| *p != generation))
+}
+
+/// The Add Calendar form: ICS address (focused), Name, Colour, and where to find the address.
+fn calendar_form() -> Vec<FormField> {
+    let field = |label: &str, ctl: Ctl, value: &str| FormField { label: label.to_string().into(), ctl, value: value.into(), input: None, error: None };
+    let text = |placeholder: &'static str, icon: Option<&'static str>| Ctl::Text { placeholder: placeholder.into(), icon, tall: false, presets: &[] };
+    vec![
+        field("ICS address", text("https://calendar.google.com/…/basic.ics", Some(g::LINK)), ""),
+        field("Name", text("Work", None), ""),
+        field("Colour", Ctl::Swatches, calendar::COLOURS[0].0),
+        field("", Ctl::Note, "Google: Settings → your calendar → Secret address in iCal format. Outlook: Settings → Shared calendars → Publish → ICS."),
+    ]
+}
+
+/// Typed text that looks like a website or names a program puts "Block x.com" / "Block
+/// steam.exe" (or "Allow …", by `verb`) at the top of the Block menu, whatever the search matches.
+fn site_lead(entries: &mut Vec<menu::Entry>, verb: &str, typed: &str) {
+    entries.retain(|e| !e.always);
+    if let Some(id) = focus::typed_pick(typed) {
+        let (glyph, _) = focus::pick_look(&id);
+        let name = id.split_once(':').map_or("", |(_, v)| v);
+        entries.insert(0, menu::Entry { label: format!("{verb} {name}"), icon: Some(glyph), always: true, id, ..Default::default() });
+    }
+}
+
+/// An extension's Form field as a form row.
+fn ext_field(f: &ext::Field, ev: &ExtView) -> FormField {
+    let value = match ev.values.get(&f.id).unwrap_or(&f.value) {
+        Value::String(s) => s.clone(),
+        Value::Bool(true) => "true".into(),
+        _ => String::new(),
+    };
+    let ctl = match &f.kind {
+        FieldKind::Text | FieldKind::Password | FieldKind::TextArea => Ctl::Text { placeholder: f.placeholder.clone().into(), icon: None, tall: f.kind == FieldKind::TextArea, presets: &[] },
+        FieldKind::Checkbox => Ctl::Check,
+        FieldKind::Dropdown(opts) => Ctl::Select(opts.iter().map(|(v, t)| menu::Entry { id: v.clone(), label: t.clone(), ..Default::default() }).collect(), true),
+        FieldKind::Description => Ctl::Note,
+        FieldKind::Separator => Ctl::Rule,
+    };
+    FormField { label: f.title.clone().into(), ctl, value, input: ev.inputs.get(&f.id).cloned(), error: f.error.clone() }
+}
+
+/// A native form's rows and the selected one (Mode::Form).
+struct NativeForm {
+    fields: Vec<FormField>,
+    field: usize,
+    _subs: Vec<Subscription>,
 }
 
 /// A Quick AI chat: one Claude session, kept while the view is open.
@@ -181,23 +425,36 @@ fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> 
     cfg.files.enabled.then(|| files::Files::start(&cfg.files, tx.clone()))
 }
 
+/// Hide This Event's store, in `config::dir()`.
+const CALENDAR_HIDDEN: &str = "calendar-hidden.json";
+
 /// Section marker for a row that stands in for an empty view (drawn as an empty state).
 const EMPTY: &str = "\u{0}empty";
+/// The section of running timers and stopwatches at the head of root search.
+const RUNNING: &str = "Running";
+/// The Focus session's section, above Running.
+const FOCUS: &str = "Focus";
+/// The next meeting's section, under Running.
+const NEXT: &str = "Next";
+/// The ActionBar while Add Calendar's fetch runs.
+const READING: &str = "Reading the calendar…";
 
 /// List slots for items: None = a section header, Some(i) = item i. Consecutive items
-/// with the same section share one header.
-fn display_rows(items: &[Item]) -> Vec<Option<usize>> {
+/// with the same section share one header; `headed` heads a section even when it is the only
+/// one (My Schedule's Now, Today and Tomorrow).
+fn display_rows(items: &[Item], headed: bool) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(items.len() + 4);
     let mut last: Option<&str> = None;
-    // A header says something only when there is more than one section, and "Results"
-    // right under the search field says nothing.
+    // A header says something only when there is more than one section (Focus, Running with
+    // its count, Next and Did you mean always head their rows), and "Results" right under the
+    // search field says nothing.
     let one = items.windows(2).all(|w| w[0].section == w[1].section);
     for (i, it) in items.iter().enumerate() {
         if is_answer(items, i) {
             continue;
         }
         let sec = it.section.as_deref().filter(|s| *s != EMPTY);
-        if sec.is_some() && sec != last && !one && sec != Some("Results") {
+        if sec.is_some() && sec != last && (!one || headed || matches!(sec, Some(FOCUS | RUNNING | NEXT | DID_YOU_MEAN))) && !(sec == Some("Results") && out.is_empty()) {
             out.push(None);
         }
         last = sec;
@@ -211,20 +468,135 @@ fn is_answer(items: &[Item], i: usize) -> bool {
     i == 0 && items.first().is_some_and(|it| it.accessory == "Calculator")
 }
 
+/// A timer's or stopwatch's name and icon.
+fn timer_kind(stopwatch: bool) -> (&'static str, &'static str) {
+    if stopwatch { ("Stopwatch", g::TIMER) } else { ("Timer", g::ALARM_CLOCK) }
+}
+
+/// One Running row. Enter pauses or resumes, Ctrl+Enter (the second action) stops, Ctrl+K
+/// also offers Restart, Rename and Add 5 min; a done timer's Enter or Ctrl+Enter dismisses it.
+fn running_row(r: timers::Row) -> Item {
+    let id = r.id;
+    let (kind, glyph) = timer_kind(r.stopwatch);
+    let acts = if r.done {
+        // Enter or Ctrl+Enter (Stop) silences it; only Ctrl+K restarts it.
+        vec![("Dismiss", Act::StopTimer(id)), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id))]
+    } else {
+        let flip = if r.paused { Act::ResumeTimer(id) } else { Act::PauseTimer(id) };
+        vec![(flip.label(), flip), ("Stop", Act::StopTimer(id)), ("Restart", Act::RestartTimer(id)), ("Rename", Act::RenameTimer(id)), ("Add 5 min", Act::AddTime(id, 300))]
+    };
+    let mut it = Item::new(&r.title, kind, Icon::Vector(glyph), acts[0].1.clone()).acc(r.accessory()).sec(RUNNING).tinted(design::Tint::System);
+    it.extra = acts.into_iter().map(|(l, a)| (l.to_string(), a)).collect();
+    it.live = true;
+    it
+}
+
+/// The Focus session's row, heading root search: the goal, what it blocks, and the time left.
+/// Enter pauses or resumes, Ctrl+Enter (shown in the ActionBar) completes; Ctrl+K also edits,
+/// extends (a timed session), restarts or cancels.
+fn focus_row(s: &focus::Session, now: SystemTime) -> Item {
+    let (title, left) = s.row(now);
+    let cmd = |label: &str, c: FocusCmd| (label.to_string(), Act::Cmd(Cmd::Focus(c)));
+    let mut extra = vec![if s.running() { cmd("Pause", FocusCmd::Pause) } else { cmd("Resume", FocusCmd::Resume) }, cmd("Complete", FocusCmd::Complete), cmd("Edit", FocusCmd::Edit)];
+    if !s.unlimited() {
+        extra.push(("Extend".into(), Act::FocusExtend));
+    }
+    extra.extend([cmd("Restart", FocusCmd::Restart), cmd("Cancel", FocusCmd::Cancel)]);
+    let mut it = Item::new(title, focus::blocking_line(s), Icon::Vector(g::SHIELD_CHECK), extra[0].1.clone()).acc(left).sec(FOCUS).tinted(design::Tint::System);
+    it.extra = extra;
+    it.live = true;
+    it.bar_second = Some("Complete".into());
+    it
+}
+
+/// Root search as shown: Focus, Running and Next (`above`) head the results, except that the
+/// row the query names (an exact alias, or a command with its boxes: `search::heads`) goes
+/// first of all.
+fn head_rows(mut above: Vec<Item>, mut found: Vec<Item>, query: &str, cfg: &Config) -> Vec<Item> {
+    if let Some(i) = found.iter().position(|it| search::heads(it, query.trim_start(), cfg)) {
+        above.insert(0, found.remove(i));
+    }
+    above.extend(found);
+    above
+}
+
+/// Where root search's selection starts: on the row the query names (`search::heads`), so its
+/// boxes show; else, while something is typed, on the first row past the Focus and Running
+/// rows (Enter on "te" opens what was searched for, it never pauses a timer); else on the Next
+/// row after a meeting reminder (`pick_next`), so Enter joins; else the top.
+fn root_selection(items: &[Item], query: &str, cfg: &Config, pick_next: bool) -> usize {
+    let typed = !query.trim().is_empty();
+    let head = |it: &Item| matches!(it.section.as_deref(), Some(RUNNING | FOCUS | NEXT));
+    let next = || items.iter().position(|it| pick_next && !typed && it.section.as_deref() == Some(NEXT));
+    items.iter().position(|it| search::heads(it, query.trim_start(), cfg)).or_else(|| items.iter().position(|it| typed && !head(it))).or_else(next).unwrap_or(0)
+}
+
+/// Where the row `was` sits in the rebuilt `items`: the same timer, else the same frecency key
+/// (or, without one, the same title) in the same section.
+fn same_row(items: &[Item], was: &Item) -> Option<usize> {
+    if let Some(id) = timer_id(was) {
+        return items.iter().position(|it| timer_id(it) == Some(id));
+    }
+    items.iter().position(|it| it.section == was.section && it.key == was.key && (was.key.is_some() || it.title == was.title))
+}
+
+/// The action bar's left text for the selected row: what kind of thing it is.
+fn row_footer(it: Option<&Item>) -> String {
+    match it.filter(|it| it.section.as_deref() != Some(EMPTY)) {
+        // A Running row's accessory is its time; its kind is the subtitle. The session row is Focus.
+        Some(it) if it.section.as_deref() == Some(FOCUS) => FOCUS.into(),
+        Some(it) if it.section.as_deref() == Some(NEXT) => "My Schedule".into(),
+        Some(it) if it.live => it.subtitle.clone(),
+        // A clipboard row's accessory is when it was copied ("yesterday"), not a kind.
+        Some(it) if !it.accessory.is_empty() && !matches!(it.act, Act::Clip(_)) => it.accessory.clone(),
+        _ => "procast".into(),
+    }
+}
+
+/// The timer or stopwatch a Running row stands for.
+fn timer_id(it: &Item) -> Option<u64> {
+    it.live.then(|| it.extra.iter().find_map(|(_, a)| if let Act::StopTimer(id) = a { Some(*id) } else { None })).flatten()
+}
+
+/// Toggle HDR says the state Enter would change, in its subtitle and its ActionBar label.
+/// Until the first read is in (`None`), it keeps its plain subtitle and label.
+fn hdr_state(items: &mut [Item], status: Option<&[hdr::HdrDisplay]>) {
+    let Some(status) = status else { return };
+    for it in items.iter_mut().filter(|it| it.act == Act::Cmd(Cmd::ToggleHdr)) {
+        it.subtitle = hdr::subtitle(status);
+        it.extra = vec![(hdr::bar_label(status).into(), it.act.clone())];
+    }
+}
+
+/// Takes an HDR read into `cache` unless a newer one was asked for since (`asked`, the last
+/// read's number); false when it is dropped.
+fn take_hdr_read(cache: &mut Option<Vec<hdr::HdrDisplay>>, asked: u64, seq: u64, status: Vec<hdr::HdrDisplay>) -> bool {
+    if seq != asked {
+        return false;
+    }
+    *cache = Some(status);
+    true
+}
+
+/// Root search shows the Auto HDR row for a query with "hdr" in it (or a start of it: "hd").
+fn wants_auto_hdr(query: &str) -> bool {
+    query.split_whitespace().any(|w| {
+        let w = w.to_lowercase();
+        w.contains("hdr") || (w.len() > 1 && "hdr".starts_with(&w))
+    })
+}
+
+/// Root search's Auto HDR row: Enter flips `[games] auto_hdr`.
+fn auto_hdr_row(on: bool) -> Item {
+    let mut it = Item::new("Auto HDR for games", "On while a full-screen game is in front", Icon::Vector(g::SUN_MEDIUM), Act::SetAutoHdr(!on)).tinted(design::Tint::System).sec("Auto HDR");
+    it.toggle = Some(on);
+    it
+}
+
 fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(String, Act)>) -> Item {
     let mut it = Item::new(title, hint, Icon::Vector(glyph), actions.first().map(|a| a.1.clone()).unwrap_or(Act::None)).sec(EMPTY);
     it.extra = actions;
     it
-}
-
-/// Something waiting for its arguments, typed one at a time in the search bar.
-enum Pending {
-    /// A script (index) and what it has so far.
-    Script(usize, Vec<String>),
-    /// A snippet with `{argument}`s; `erase` and `then` as in `snippets::Job` (typed keywords).
-    Snippet { name: String, template: String, args: Vec<snippets::Arg>, got: Vec<String>, erase: usize, then: String },
-    /// The name for the current virtual desktop.
-    RenameDesktop,
 }
 
 /// Hook settings: Hyper, double tap, and the snippet keywords and emoji shortcodes typed anywhere.
@@ -266,6 +638,206 @@ struct Confirm {
     primary: String,
     /// The primary action destroys something (the extension says so).
     danger: bool,
+    /// A native confirm: what Confirm does. None: an extension's confirmAlert, answered by reply.
+    then: Option<OnConfirm>,
+}
+
+type OnConfirm = Box<dyn FnOnce(&mut Launcher, &mut Context<Launcher>)>;
+
+/// A confirm drawn as a dialog; these two rows only drive selection and Enter.
+fn confirm_rows(c: &Confirm) -> Vec<Item> {
+    let mut ok = Item::new(c.primary.clone(), "", Icon::Vector(g::CHECK), Act::Confirm(true));
+    ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
+    vec![ok, Item::new("Cancel", "", Icon::Vector(g::CANCEL), Act::Confirm(false))]
+}
+
+/// What a menu's opener does with the picked `Entry.id`.
+type OnPick = Box<dyn Fn(&mut Launcher, String, &mut Window, &mut Context<Launcher>)>;
+
+/// The translator view: the newest request (its text is what the bar holds) and the answers
+/// shown, with the one picked on open. While `busy`, those are the previous answers, dimmed.
+struct TrView {
+    job: translate::Job,
+    rows: Vec<translate::Translation>,
+    first: usize,
+    busy: bool,
+}
+
+impl TrView {
+    /// The language the text is in: as Google recognised it, else as asked.
+    fn detected(&self) -> String {
+        self.rows.first().map(|t| t.detected.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| self.job.from.clone())
+    }
+}
+
+/// How long typing must pause before the translator asks again.
+const TYPING_QUIET: Duration = Duration::from_millis(300);
+
+/// The section of other spellings in the define view; headed even when it is the only one.
+const DID_YOU_MEAN: &str = "Did you mean";
+
+/// The define view: the word shown, whether its lookup downloads the dictionary first, and the
+/// answer (None while the lookup runs; Ok(None): the dictionary is not downloaded yet).
+struct DefView {
+    word: String,
+    fetch: bool,
+    answer: Option<Result<Option<dict::Answer>, String>>,
+}
+
+/// The define view's list: senses by part of speech (Enter copies the gloss), then Did you
+/// mean; or an empty view that says what to do. `web` is the web search URL with `{query}`.
+fn define_rows(v: &DefView, web: &str) -> Vec<Item> {
+    let word = &v.word;
+    match &v.answer {
+        None => {
+            let title = if v.fetch { "Downloading the dictionary (16 MB, once)…" } else { "Looking it up…" };
+            vec![empty_row(g::CLOCK, title.into(), String::new(), vec![])]
+        }
+        Some(Err(e)) => vec![empty_row(g::WARNING, e.clone(), String::new(), vec![])],
+        Some(Ok(None)) => vec![empty_row(g::DOWNLOAD, "Download Dictionary".into(), "WordNet, 16 MB, downloaded once".into(), vec![("Download Dictionary".into(), Act::DownloadDictionary(word.clone()))])],
+        Some(Ok(Some(a))) if a.senses.is_empty() && a.maybe.is_empty() => {
+            let search = ("Search the Web".to_string(), Act::Open(web.replace("{query}", &search::url_encode(word))));
+            vec![empty_row(g::BOOK_OPEN, dict::missing_title(word), "Check the spelling, or search the web".into(), vec![search])]
+        }
+        Some(Ok(Some(a))) => {
+            let senses = dict::group(&a.senses).into_iter().flat_map(|(_, s)| s).map(|s| {
+                let mut it = Item::new(&s.gloss, "", Icon::Vector(g::BOOK_OPEN), Act::Copy(s.gloss.clone())).sec(s.pos.name()).tinted(design::Tint::Web);
+                let similar = (!s.synonyms.is_empty()).then(|| ("Define Similar Word".to_string(), Act::SimilarWords(s.synonyms.clone())));
+                it.extra = [Some(("Copy Definition".to_string(), it.act.clone())), Some(("Copy Word".into(), Act::Copy(word.clone()))), similar, Some(("Open in Browser".into(), Act::Open(dict::wiktionary(word))))].into_iter().flatten().collect();
+                it
+            });
+            let maybe = a.maybe.iter().map(|(w, pos)| Item::new(w, pos.name(), Icon::Vector(g::SEARCH), Act::Define(w.clone())).sec(DID_YOU_MEAN));
+            senses.chain(maybe).collect()
+        }
+    }
+}
+
+/// The word typing in the define view asks for once it pauses: the bar trimmed, unless it is
+/// empty or the word already shown.
+fn typed_word<'a>(shown: &str, query: &'a str) -> Option<&'a str> {
+    Some(query.trim()).filter(|w| !w.is_empty() && *w != shown)
+}
+
+/// The word a root Define row's box holds, given the box values shown for it.
+fn define_word<'a>(it: &Item, values: &'a [String]) -> Option<&'a str> {
+    values.first().map(|v| v.trim()).filter(|v| it.act == Act::Cmd(Cmd::Define) && !v.is_empty())
+}
+
+/// The translator's list: a row per target (title the translation, accessory the language),
+/// then the pronunciation when Google gives one. Enter copies or pastes per `action`;
+/// Ctrl+Enter does the other.
+fn translation_rows(tr: &TrView, cfg: &config::Translator) -> Vec<Item> {
+    let source = &tr.job.text;
+    let detected = tr.detected();
+    let mut items: Vec<Item> = tr
+        .rows
+        .iter()
+        .map(|t| {
+            let copy = ("Copy Translation".to_string(), Act::Copy(t.text.clone()));
+            let paste = ("Paste to Active App".to_string(), Act::Paste(t.text.clone()));
+            let (enter, other) = if cfg.action == "paste" { (paste, copy) } else { (copy, paste) };
+            // The other way round, this once: the translation becomes the text.
+            let swap = translate::Job { text: t.text.clone(), from: t.to.clone(), to: vec![detected.clone()], ..tr.job.clone() };
+            let mut it = Item::new(t.text.replace('\n', " "), "", Icon::Vector(g::LANGUAGES), enter.1.clone()).acc(translate::language_name(&t.to)).tinted(design::Tint::Web);
+            it.extra = vec![
+                enter,
+                other,
+                ("Copy Source".into(), Act::Copy(source.clone())),
+                ("Swap Languages".into(), Act::Translate(swap)),
+                ("Open in Google Translate".into(), Act::Open(translate::google_url(&tr.job.from, &t.to, source))),
+                ("Change Target".into(), Act::LangMenu),
+            ];
+            it
+        })
+        .collect();
+    let say = tr.rows.iter().find_map(|t| t.pronunciation.clone());
+    items.extend(say.map(|p| Item::new(&p, "Pronunciation", Icon::Vector(g::AUDIO_LINES), Act::Copy(p.clone())).acc(translate::language_name(&detected))));
+    items
+}
+
+/// The translator bar's Dropdown menu: a search field, Manage Language Sets…, a rule, then
+/// every set with the current one selected. Ids: "manage", or the set's index.
+fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
+    let manage = menu::Entry { id: "manage".into(), label: "Manage Language Sets…".into(), icon: Some(g::EDIT), rule_after: true, ..Default::default() };
+    let sets = sets.iter().enumerate().map(|(i, s)| menu::Entry { id: i.to_string(), label: s.label(), icon: Some(g::LANGUAGES), ..Default::default() });
+    let mut m = menu::Menu::new(std::iter::once(manage).chain(sets).collect(), Some("Search…".into()), menu::Place::Right);
+    m.selected = current + 1;
+    m
+}
+
+/// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
+/// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 days ago · 397
+/// characters" ("● Current · 186 characters" for the Notes window's note, `current`, counted
+/// with its edits; "Edited …" for a note never opened; "Deleted …" in Recently Deleted).
+fn note_rows(list: NotesList, rows: &[(NoteMeta, usize)], current: Option<(String, usize)>, now: i64, searching: bool, keep_days: u32) -> Vec<Item> {
+    let ago = |t: i64| timers::ago(now.saturating_sub(t).max(0) as u64);
+    let items: Vec<Item> = rows
+        .iter()
+        .map(|(m, n)| {
+            let it = match (list, m.deleted_at) {
+                (NotesList::Deleted, Some(at)) => {
+                    let mut it = Item::new(&m.title, format!("Deleted {} · {}", ago(at), notes::window::char_count_text(*n)), Icon::Vector(g::ARCHIVE_RESTORE), Act::RestoreNote(m.id.clone())).sec("Recently Deleted");
+                    it.extra = [Act::RestoreNote(m.id.clone()), Act::PurgeNote(m.id.clone())].map(|a| (a.label().to_string(), a)).to_vec();
+                    it
+                }
+                _ => {
+                    let cur = current.as_ref().filter(|(id, _)| list == NotesList::All && *id == m.id).map(|(_, n)| *n);
+                    Item::new(&m.title, notes::window::note_line(m, *n, cur, now), Icon::Vector(g::NOTEBOOK_PEN), Act::OpenNote(m.id.clone())).sec("Notes")
+                }
+            };
+            it.tinted(design::Tint::Paste)
+        })
+        .collect();
+    if !items.is_empty() {
+        return items;
+    }
+    let row = match (list, searching) {
+        (_, true) => empty_row(g::SEARCH, "No matching notes".into(), String::new(), vec![]),
+        (NotesList::All, false) => empty_row(g::NOTEBOOK_TABS, "No notes yet".into(), "Create Note starts one".into(), vec![(Act::Cmd(Cmd::CreateNote).label().into(), Act::Cmd(Cmd::CreateNote))]),
+        (NotesList::Deleted, false) => empty_row(g::ARCHIVE_RESTORE, "No recently deleted notes".into(), format!("Deleted notes stay {keep_days} days"), vec![]),
+    };
+    vec![row]
+}
+
+/// Manage Language Sets: Add first, then every set, the current one ticked. Enter makes a set
+/// current; Ctrl+K also edits or deletes it (not the first: that one is Settings → Translator's).
+fn lang_set_rows(sets: &[translate::LangSet], current: usize) -> Vec<Item> {
+    let add = Item::new("Add Language Set…", "", Icon::Vector(g::PLUS), Act::EditLangSet(None));
+    let rows = sets.iter().enumerate().map(|(i, s)| {
+        let on = i == current;
+        let mut it = Item::new(s.label(), "", Icon::Vector(if on { g::CHECK } else { g::LANGUAGES }), Act::UseLangSet(i)).acc(if on { "Current" } else { "" });
+        let delete = (i > 0).then_some(Act::DeleteLangSet(i));
+        it.extra = [Act::UseLangSet(i), Act::EditLangSet(Some(i))].into_iter().chain(delete).map(|a| (a.label().to_string(), a)).collect();
+        it
+    });
+    std::iter::once(add).chain(rows).collect()
+}
+
+/// The Add (or Edit) Language Set form: three selects with search, on `set` or Auto-Detect → English.
+fn lang_set_form(set: Option<&translate::LangSet>) -> Vec<FormField> {
+    let select = |label: &str, lead: &[(&str, &str)], value: String| FormField {
+        label: label.to_string().into(),
+        ctl: Ctl::Select(translate::language_entries(lead.iter().map(|(id, l)| (id.to_string(), l.to_string()))), true),
+        value,
+        input: None,
+        error: None,
+    };
+    let to = |n: usize, or: &str| set.and_then(|s| s.to.get(n).cloned()).unwrap_or_else(|| or.into());
+    vec![
+        select("Source language", &[("auto", "Auto-Detect")], set.map_or_else(|| "auto".into(), |s| s.from.clone())),
+        select("Target language 1", &[], to(0, "en")),
+        select("Target language 2", &[("", "None")], to(1, "")),
+    ]
+}
+
+/// An open Dropdown: the menu, its opener's `OnPick`, and the focus to return to when it closes.
+/// `site` ("Block" or "Allow"): the Focus form's Block menu, where a typed website shows as a row.
+struct OpenMenu {
+    menu: menu::Menu,
+    on_pick: OnPick,
+    back: Option<gpui::FocusHandle>,
+    scroll: ScrollHandle,
+    site: Option<&'static str>,
 }
 
 struct Launcher {
@@ -309,8 +881,31 @@ struct Launcher {
     /// Program icons by path, so the running list fills in at once next time.
     exe_icons: HashMap<String, Option<Arc<RenderImage>>>,
     autoquit: apps::AutoQuit,
+    /// Running timers and stopwatches, and the flag that stops the 1 s tick thread (present
+    /// only while something runs).
+    timers: timers::Timers,
+    timer_tick: Option<Arc<AtomicBool>>,
+    /// The Focus session; its countdown rides on the same tick.
+    focus: focus::Focus,
+    /// Calendar feeds' events; fetched and reminded of on the 10 s `Msg::Tick`.
+    calendar: calendar::Calendar,
+    /// Hide This Event's keys (`calendar::hidden_key`), from `calendar-hidden.json`.
+    hidden_events: HashSet<String>,
+    /// A meeting reminder went out: the next open selects root's Next row, so Enter joins.
+    pick_next: bool,
+    /// Each `open_form` is a new form: an answer for an older one never drives the one on screen.
+    form_gen: u64,
+    /// The form (by `form_gen`) whose Add Calendar fetch is on its way: its Ctrl+Enter waits.
+    adding_calendar: Option<u64>,
     store_loading: bool,
     settings_window: Option<gpui::WindowHandle<settings::Settings>>,
+    /// The note store's worker, and the Notes window once it has opened.
+    notes: Notes,
+    notes_window: Option<gpui::WindowHandle<NotesWindow>>,
+    /// `Mode::Notes`: the last answer for the search (None until the first), and the search's
+    /// number (older answers are dropped).
+    note_rows: Option<Vec<(NoteMeta, usize)>>,
+    note_gen: u64,
     matcher: Matcher,
     mode: Mode,
     items: Vec<Item>,
@@ -318,23 +913,88 @@ struct Launcher {
     scroll: UniformListScrollHandle,
     /// Ctrl+K: the selected item's actions and which one is highlighted.
     panel: Option<(Item, usize)>,
+    /// An open Dropdown; it takes the keys before anything else. Its search text is `menu_input`.
+    menu: Option<OpenMenu>,
+    /// The native form on screen (Mode::Form).
+    form: Option<NativeForm>,
+    /// Holds the keys while a form's selected control has no text box.
+    form_focus: gpui::FocusHandle,
+    /// Below the selected form control's left edge, as last drawn: its menu opens here.
+    form_at: Rc<Cell<gpui::Point<gpui::Pixels>>>,
+    menu_input: Entity<EditableTextState>,
     /// Destructive command waiting for a second Enter.
     armed: Option<usize>,
-    pending: Option<Pending>,
-    /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`).
-    clip_images: HashMap<String, Option<Arc<RenderImage>>>,
+    /// A timer rebuild skipped while a panel or armed row waited; done on the next free tick.
+    timers_stale: bool,
+    /// The selected row's argument boxes (`arg_row`, at most `MAX_ARGS` show), and that row's key.
+    args: Vec<Entity<EditableTextState>>,
+    args_for: Option<String>,
+    /// The box Enter found empty; it rings in danger until it is typed in.
+    arg_missing: Option<usize>,
+    /// By row key, this visit: the query values the boxes were last filled from, and what they hold.
+    arg_memory: HashMap<String, (Vec<String>, Vec<String>)>,
+    /// Each box's left edge as last drawn: a list opens under it.
+    arg_left: Rc<[Cell<gpui::Pixels>; MAX_ARGS]>,
+    /// Mode::Args: its one row, and for a snippet keyword typed in an app, what to erase and type after.
+    args_row: Option<Item>,
+    typed: (usize, String),
+    /// The query before its last change: a space typed after a command's name jumps into its boxes.
+    last_query: String,
+    /// Clipboard image thumbnails (by image id, `t:`) and previews (`p:`), each with its last
+    /// use (`file_tick`) for `evict`.
+    clip_images: HashMap<String, (Option<Arc<RenderImage>>, u64)>,
     /// File Search detail pane: the selected file's information (read when the selection
-    /// changes), and its decoded pictures (`p:`) and shell icons (`i:`) by path.
+    /// changes), and its decoded pictures (`p:`), shell icons (`i:`) and Search Screenshots'
+    /// thumbnails (`t:`) by path, each with its last use (`file_tick`) for `evict`.
     file_info: Option<(String, Option<files::FileInfo>)>,
-    file_images: HashMap<String, Option<Arc<RenderImage>>>,
-    /// Counts selection changes in File Search; a preview worker waits for its count to hold.
+    file_images: HashMap<String, (Option<Arc<RenderImage>>, u64)>,
+    file_tick: u64,
+    /// Counts selection changes in File Search (and Quick Look's pictures asked for); a preview
+    /// worker waits for its count to hold.
     file_seq: Arc<AtomicU64>,
-    /// Emoji picker: the grid's scroll position, by grid row.
-    /// The emoji grid's rows; only the ones on screen are laid out.
+    /// The emoji and screenshot grids' rows; only the ones on screen are laid out.
     grid_list: gpui::ListState,
     /// Script output view: (index, output, still running).
     output: Option<(usize, String, bool)>,
     ai: Option<AiChat>,
+    /// The translator view (None until it first opens).
+    translation: Option<TrView>,
+    /// Number of the newest translation request; answers to older ones are dropped.
+    translate_seq: u64,
+    /// The language set in use before the last switch, for Enter in the empty translator.
+    prev_set: Option<usize>,
+    /// The define view (None until it first opens).
+    define: Option<DefView>,
+    /// Number of the newest lookup; answers to older ones are dropped.
+    define_seq: u64,
+    /// Number of the newest change typed in the define view; a pause timer older than it does nothing.
+    define_typed: u64,
+    /// Whether the dictionary is downloaded, checked off the UI thread each time the launcher
+    /// shows (None until that check answers).
+    dict_ready: Option<bool>,
+    /// The root Define row's subtitles: each word's first short sense (None: not in the
+    /// dictionary), and the newest request's number.
+    senses: HashMap<String, Option<String>>,
+    sense_seq: u64,
+    /// Screenshot search: the index as last scanned, the newest scan's number (older scans' answers are dropped) and whether it is still reading pictures.
+    shots: shots::ShotIndex,
+    shots_seq: u64,
+    shots_busy: bool,
+    /// How many pictures the scan has read of how many, while it reads them: the banner.
+    shots_progress: Option<(usize, usize)>,
+    /// The bar's dropdown: which screenshots show.
+    shot_kind: shots::Kind,
+    /// Each grid cell's thumbnail key (`shots::thumb_key`; None for a video).
+    shot_thumbs: Vec<Option<String>>,
+    /// The pinned screenshots (`shots::pins`), read as each scan starts.
+    shot_pins: HashSet<PathBuf>,
+    /// Quick Look (Ctrl+Y): the selected screenshot shows large in place of the grid.
+    quick_look: bool,
+    /// The path Quick Look shows and its `shots::detail` line, read once per shot.
+    quick_look_detail: (String, String),
+    /// The grid row at the top of the screenshot grid: a decode for a row scrolled far from
+    /// it is dropped before it starts.
+    grid_top: Arc<AtomicUsize>,
     ai_scroll: ScrollHandle,
     /// Short-lived message in the footer.
     /// The action bar message, with how it should look.
@@ -345,8 +1005,17 @@ struct Launcher {
     hwnd: HWND,
     prev: HWND,
     visible: bool,
+    /// The toast window (toast.rs), set once it exists.
+    toast: Option<gpui::WindowHandle<toast::Toast>>,
     /// The procast notification-area icon (Settings → General → Show in tray).
     tray_icon: Option<TrayIcon>,
+    /// Auto HDR (own thread).
+    hdr: hdr::Auto,
+    /// The displays' HDR state for Toggle HDR's row, read off the UI thread (`Msg::Hdr`);
+    /// None until the first read is in.
+    hdr_status: Option<Vec<hdr::HdrDisplay>>,
+    /// The number of the last HDR read asked for (`hdr_read`).
+    hdr_seq: u64,
     /// When the window last closed, for "pop to root" after a timeout.
     hidden_at: Option<Instant>,
     /// Earlier root searches (oldest first) and which one Up last restored.
@@ -362,22 +1031,45 @@ struct Launcher {
 impl Launcher {
     fn new(cfg: Config, notice: Option<String>, tx: UnboundedSender<Msg>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
-        let subs = vec![
-            cx.subscribe(&input, |this, _, _: &TextChanged, cx| this.query_changed(cx)),
+        let menu_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let args: Vec<_> = (0..MAX_ARGS).map(|_| cx.new(|cx| EditableTextState::new(StringStorage::default(), cx))).collect();
+        let mut subs = vec![
+            cx.subscribe_in(&input, window, |this, _, _: &TextChanged, window, cx| this.query_changed(window, cx)),
+            cx.subscribe(&menu_input, |this, input, _: &TextChanged, cx| {
+                if let Some(open) = &mut this.menu {
+                    let typed = input.read(cx).as_str().to_string();
+                    if let Some(verb) = open.site {
+                        site_lead(&mut open.menu.entries, verb, &typed);
+                    }
+                    open.menu.set_filter(&typed);
+                    cx.notify();
+                } else if let Some((_, sel)) = &mut this.panel {
+                    // The ActionPanel's search field: its first match is selected.
+                    *sel = 0;
+                    cx.notify();
+                }
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if this.visible && !window.is_window_active() {
                     this.hide(false, cx);
                 }
             }),
         ];
+        for (i, a) in args.iter().enumerate() {
+            subs.push(cx.subscribe_in(a, window, move |this, _, _: &TextChanged, window, cx| this.arg_changed(i, window, cx)));
+        }
         clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
         clipboard::watch(tx.clone());
         for (dir, recursive) in win::app_dirs() {
             let tx = tx.clone();
             std::thread::spawn(move || win::watch_dir(&dir, recursive, |_| tx.unbounded_send(Msg::AppsChanged).is_ok()));
         }
+        foreground::set_games(&cfg.games.list);
+        foreground::watch(tx.clone());
         std::thread::spawn(|| _ = browser::register());
         let browsers = browser::serve(tx.clone());
+        let auto_hdr = hdr::Auto::start(tx.clone());
+        let notes = Notes::start(cfg.notes.dir(), cx);
         let mut this = Self {
             input,
             hotkeys: {
@@ -400,6 +1092,14 @@ impl Launcher {
             tabs: vec![],
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
+            timers: timers::Timers::load(config::dir().join("timers.json")),
+            timer_tick: None,
+            focus: focus::Focus::load(config::dir().join("focus.json")),
+            calendar: calendar::Calendar::default(),
+            hidden_events: calendar::load_hidden(&config::dir().join(CALENDAR_HIDDEN)),
+            pick_next: false,
+            form_gen: 0,
+            adding_calendar: None,
             frec: Frecency::load(config::dir().join("frecency.json")),
             file_gen: 0,
             host: None,
@@ -414,20 +1114,57 @@ impl Launcher {
             store: None,
             store_loading: false,
             settings_window: None,
+            notes,
+            notes_window: None,
+            note_rows: None,
+            note_gen: 0,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
             items: vec![],
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             panel: None,
+            menu: None,
+            menu_input,
+            form: None,
+            form_focus: cx.focus_handle(),
+            form_at: Rc::new(Cell::new(gpui::Point::default())),
             armed: None,
-            pending: None,
+            timers_stale: false,
+            args,
+            args_for: None,
+            arg_missing: None,
+            arg_memory: HashMap::new(),
+            arg_left: Rc::new(std::array::from_fn(|_| Cell::new(gpui::px(0.)))),
+            args_row: None,
+            typed: (0, String::new()),
+            last_query: String::new(),
             clip_images: HashMap::new(),
             file_info: None,
             file_images: HashMap::new(),
+            file_tick: 0,
             file_seq: Arc::new(AtomicU64::new(0)),
             grid_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(200.)),
             output: None,
+            translation: None,
+            translate_seq: 0,
+            prev_set: None,
+            define: None,
+            define_seq: 0,
+            define_typed: 0,
+            dict_ready: None,
+            senses: HashMap::new(),
+            sense_seq: 0,
+            shots: shots::ShotIndex::default(),
+            shots_seq: 0,
+            shots_busy: false,
+            shots_progress: None,
+            shot_kind: shots::Kind::All,
+            shot_thumbs: vec![],
+            shot_pins: HashSet::new(),
+            quick_look: false,
+            quick_look_detail: Default::default(),
+            grid_top: Arc::new(AtomicUsize::new(0)),
             ai: None,
             ai_scroll: ScrollHandle::new(),
             status: None,
@@ -436,7 +1173,11 @@ impl Launcher {
             hwnd: HWND::default(),
             prev: HWND::default(),
             visible: false,
+            toast: None,
             tray_icon: None,
+            hdr: auto_hdr,
+            hdr_status: None,
+            hdr_seq: 0,
             hidden_at: None,
             searches: std::fs::read_to_string(config::dir().join("search-history.txt")).unwrap_or_default().lines().map(String::from).collect(),
             search_pos: None,
@@ -445,6 +1186,8 @@ impl Launcher {
             _subs: subs,
         };
         this.load_extensions();
+        this.watch_timers();
+        this.purge_old_notes(cx);
         this
     }
 
@@ -512,10 +1255,9 @@ impl Launcher {
 
     /// Writes `[launcher] <name>` (favourites / hidden) and applies it at once.
     fn save_launcher_list(&mut self, name: &str, list: Vec<String>, cx: &mut Context<Self>) {
-        let text = std::fs::read_to_string(config::path()).unwrap_or_default();
         let value = toml_edit::Value::Array(list.iter().map(String::as_str).collect());
-        match config::write_value(&text, &["launcher".into(), name.into()], value).and_then(|t| std::fs::write(config::path(), t).map_err(|e| e.to_string())) {
-            Ok(()) => {
+        match config::edit_file(&config::path(), |t| config::write_value(t, &["launcher".into(), name.into()], value)) {
+            Ok(_) => {
                 if name == "favorites" {
                     self.cfg.launcher.favorites = list;
                 } else {
@@ -528,11 +1270,178 @@ impl Launcher {
         cx.notify();
     }
 
-    fn query_changed(&mut self, cx: &mut Context<Self>) {
+    fn query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let q = self.query(cx);
+        let space_typed = q.strip_suffix(' ') == Some(self.last_query.as_str());
+        self.last_query = q.clone();
         self.panel = None;
         self.send_search(cx);
+        if self.mode == Mode::Translate {
+            self.translate_soon(cx);
+        }
+        if self.mode == Mode::Define {
+            self.define_soon(cx);
+        }
         self.selected = 0;
         self.refresh(cx);
+        if space_typed && self.arg_row().is_some_and(|it| search::named_in(it, q.trim_start(), &self.cfg) == Some("")) {
+            self.focus_arg(0, window, cx);
+        }
+    }
+
+    // ---- argument boxes (the decisions are in search.rs) ----------------------------
+
+    /// The row whose boxes show: the selected one in root search (or Mode::Args), when it has arguments.
+    fn arg_row(&self) -> Option<&Item> {
+        matches!(self.mode, Mode::Root | Mode::Args).then(|| self.items.get(self.selected)).flatten().filter(|it| !it.args.is_empty())
+    }
+
+    fn arg_values(&self, cx: &App) -> Vec<String> {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        self.args[..n].iter().map(|a| a.read(cx).as_str().to_string()).collect()
+    }
+
+    /// The box with keyboard focus, if one shows.
+    fn arg_focused(&self, window: &Window, cx: &App) -> Option<usize> {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        self.args[..n].iter().position(|a| a.focus_handle(cx).is_focused(window))
+    }
+
+    fn focus_arg(&self, i: usize, window: &mut Window, cx: &mut App) {
+        window.focus(&self.args[i].focus_handle(cx), cx);
+    }
+
+    /// Fills the boxes when another row is selected or the query fills them anew: a new query
+    /// value wins, else what this row's boxes held earlier in the visit.
+    fn sync_args(&mut self, cx: &mut Context<Self>) {
+        let Some(it) = self.arg_row() else {
+            self.args_for = None;
+            return;
+        };
+        let key = it.key.clone().unwrap_or_else(|| it.title.clone());
+        let mut seed = it.values.clone();
+        // Edit Focus Session starts from the running session: goal, minutes and what it blocks.
+        if seed.is_empty()
+            && it.act == Act::Cmd(Cmd::Focus(FocusCmd::Edit))
+            && let Some(s) = &self.focus.session
+        {
+            seed = focus::edit_seed(s);
+        }
+        let kept = self.arg_memory.get(&key).filter(|(s, _)| *s == seed).map(|m| m.1.clone());
+        if self.args_for.as_ref() == Some(&key) && kept.is_some() {
+            return;
+        }
+        let values = kept.unwrap_or_else(|| seed.clone());
+        self.arg_memory.insert(key.clone(), (seed, values.clone()));
+        self.args_for = Some(key);
+        self.arg_missing = None;
+        for (i, a) in self.args.iter().enumerate() {
+            let v = values.get(i).cloned().unwrap_or_default();
+            a.update(cx, |s, cx| s.emplace(&v, cx));
+        }
+    }
+
+    /// Box `i` changed: it is no longer missing, a space in a one-word box moves on, and the
+    /// row remembers the values.
+    fn arg_changed(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(arg) = self.arg_row().and_then(|it| it.args.get(i)).cloned() else { return };
+        if self.arg_missing == Some(i) {
+            self.arg_missing = None;
+            self.status = None;
+        }
+        let text = self.args[i].read(cx).as_str().to_string();
+        if arg.word
+            && let Some((w, rest)) = text.split_once(' ')
+        {
+            let (w, rest) = (w.to_string(), rest.trim().to_string());
+            self.args[i].update(cx, |s, cx| s.emplace(&w, cx));
+            if i + 1 < self.arg_row().map_or(0, |it| it.args.len()) {
+                if !rest.is_empty() {
+                    self.args[i + 1].update(cx, |s, cx| s.emplace(&rest, cx));
+                }
+                self.focus_arg(i + 1, window, cx);
+            }
+            return;
+        }
+        let values = self.arg_values(cx);
+        if let Some(m) = self.args_for.as_ref().and_then(|k| self.arg_memory.get_mut(k)) {
+            m.1 = values;
+        }
+        self.ask_sense(cx);
+        cx.notify();
+    }
+
+    /// Tab (+1) and Shift+Tab (-1) while boxes show: from the query into box 0, box to box,
+    /// from box 0 back to the query. Never to another row.
+    fn step_arg(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.arg_row().map_or(0, |it| it.args.len());
+        match (self.arg_focused(window, cx), d) {
+            _ if self.menu.is_some() => {}
+            (None, 1) => self.focus_arg(0, window, cx),
+            (Some(0), -1) => window.focus(&self.input.focus_handle(cx), cx),
+            (Some(i), 1) if i + 1 < n => self.focus_arg(i + 1, window, cx),
+            (Some(i), -1) => self.focus_arg(i - 1, window, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Down on a list box, or a click on it: its menu with a search field, under the box.
+    /// Typing goes to that field, never to the query behind it.
+    fn open_choice(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(search::ArgKind::Choice(opts)) = self.arg_row().and_then(|it| it.args.get(i)).map(|a| a.kind.clone()) else { return };
+        let cur = self.args[i].read(cx).as_str().trim().to_string();
+        let entries = opts
+            .iter()
+            .enumerate()
+            .map(|(k, (id, label))| menu::Entry { id: label.clone(), label: label.clone(), off: id.is_empty(), rule_after: opts.get(k + 1).is_some_and(|n| n.0.is_empty()), ..Default::default() })
+            .collect();
+        // Kept inside the window on the right.
+        let room = window.viewport_size().width - px(design::POP_RIGHT_W + design::sp::S12);
+        let left = self.arg_left[i].get();
+        let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Under(if left > room { room } else { left }));
+        m.selected = opts.iter().position(|o| o.1.eq_ignore_ascii_case(&cur)).unwrap_or(m.selected);
+        self.focus_arg(i, window, cx);
+        self.open_menu(m, move |this, label, _, cx| this.args[i].update(cx, |s, cx| s.emplace(&label, cx)), window, cx);
+    }
+
+    /// Opens `it` alone with its boxes, box 0 focused (Mode::Args).
+    fn ask_args(&mut self, it: Item, window: &mut Window, cx: &mut Context<Self>) {
+        self.args_row = Some(it);
+        if self.visible {
+            self.set_mode(Mode::Args, cx);
+        } else {
+            self.show(Mode::Args, window, cx);
+        }
+        self.focus_arg(0, window, cx);
+    }
+
+    /// When `act` is a row with arguments run without their values (a hotkey, a favourite,
+    /// another command), asks for them in Mode::Args and says true.
+    fn ask_args_for(&mut self, act: &Act, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()).cloned() else { return false };
+        if !self.asks_args(act) {
+            if let Ok(act) = search::with_args(&it, &[]) {
+                self.run(act, None, window, cx);
+            }
+            return true;
+        }
+        self.ask_args(it, window, cx);
+        true
+    }
+
+    /// Whether running `act` without values opens its boxes. A command whose boxes are all
+    /// optional and that shows nothing else (Start Stopwatch, Translate filled with the
+    /// selection, Start and Edit Focus Session, which open their form, an extension command
+    /// without a view) runs at once instead.
+    fn asks_args(&self, act: &Act) -> bool {
+        let Some(it) = self.catalog.iter().find(|it| it.act == *act && !it.args.is_empty()) else { return false };
+        let at_once = match act {
+            Act::Cmd(Cmd::StartStopwatch | Cmd::Translate | Cmd::CreateNote | Cmd::Focus(FocusCmd::Start | FocusCmd::Edit)) => true,
+            Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode != "view"),
+            _ => false,
+        };
+        !(at_once && it.args.iter().all(|a| a.optional))
     }
 
     /// Passes the search text to an extension that filters itself, once per change. Also
@@ -620,12 +1529,6 @@ impl Launcher {
     }
 
     fn ext_rows(&mut self, query: &str) -> Vec<Item> {
-        if let Some(c) = &self.confirm {
-            // Drawn as a dialog; these two rows only drive selection and Enter.
-            let mut ok = Item::new(c.primary.clone(), "", Icon::Vector(g::CHECK), Act::Confirm(true));
-            ok.extra = vec![(c.primary.clone(), Act::Confirm(true))];
-            return vec![ok, Item::new("Cancel", "", Icon::Vector(g::CANCEL), Act::Confirm(false))];
-        }
         let Some(ev) = &self.extv else { return vec![] };
         let (ext, view) = (ev.ext, ev.view.clone());
         let view_actions: Vec<(String, Act)> =
@@ -681,6 +1584,7 @@ impl Launcher {
         let keep_selection = self.mode == Mode::Ext;
         self.armed = None;
         self.items = match self.mode {
+            _ if let Some(c) = &self.confirm => confirm_rows(c),
             Mode::Root => {
                 // Matching files arrive later (Msg::Files) and slot in above the fallbacks.
                 if self.cfg.launcher.files
@@ -690,17 +1594,41 @@ impl Launcher {
                     self.file_gen += 1;
                     f.search(self.file_gen, &query, 5);
                 }
-                search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher)
+                let mut rows = self.focus_rows(&query);
+                rows.extend(self.timer_rows(&query));
+                if query.trim().is_empty() {
+                    rows.extend(self.next_rows());
+                }
+                let found = search::root(&query, &self.catalog, &self.cfg, &self.frec, &mut self.matcher);
+                let mut rows = head_rows(rows, found, &query, &self.cfg);
+                hdr_state(&mut rows, self.hdr_status.as_deref());
+                if wants_auto_hdr(&query) {
+                    // Under the results, above the "Use … with" fallbacks.
+                    let at = rows.iter().position(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use \""))).unwrap_or(rows.len());
+                    rows.insert(at, auto_hdr_row(self.cfg.games.auto_hdr));
+                }
+                rows
             }
             Mode::Clipboard => {
-                if self.clip_images.len() > 300 {
-                    self.clip_images.clear();
-                }
-                let (history, cache) = (&self.history, &mut self.clip_images);
-                let mut thumb = |id: &str| cache.entry(format!("t:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 64))).clone();
-                search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb)
+                let (history, cache, tick) = (&self.history, &mut self.clip_images, &mut self.file_tick);
+                let mut thumb = |id: &str| used(cache, tick, format!("t:{id}"), || history.png(id).and_then(|p| clipboard::render_image(&p, 64)));
+                let rows = search::clipboard(&query, &history.entries, 200, &mut self.matcher, &mut thumb);
+                // After the rows took theirs, so the ones on screen are the newest used.
+                release(evict(&mut self.clip_images, FILE_IMAGES_MAX, FILE_IMAGES_KEEP), cx);
+                rows
             }
             Mode::Emoji => search::emoji(&query, 400, &mut self.matcher, &self.cfg.emoji),
+            Mode::Shots => {
+                let (rows, thumbs) = shots::rows(&self.shots, &query, self.shot_kind, &self.cfg.screenshots.primary);
+                self.shot_thumbs = thumbs;
+                rows
+            }
+            // A form draws its own body.
+            Mode::Form(_) => vec![],
+            Mode::Schedule => {
+                let rows = self.schedule_rows();
+                search::filter(&query, rows, &mut self.matcher)
+            }
             Mode::Files => {
                 // Results arrive later as Msg::Files; keep showing the previous ones meanwhile.
                 self.file_gen += 1;
@@ -713,22 +1641,29 @@ impl Launcher {
                     std::mem::take(&mut self.items)
                 }
             }
-            Mode::Args => match &self.pending {
-                Some(Pending::Script(i, got)) => {
-                    let s = &self.scripts[*i];
-                    let n = s.args.len();
-                    vec![Item::new(format!("Run {}", s.title), format!("argument {} of {n}", got.len() + 1), Icon::Vector(g::TERMINAL), Act::Script(*i))]
-                }
-                Some(Pending::Snippet { name, template, args, got, .. }) => {
-                    let sub = format!("{} · {} of {}", args[got.len()].name, got.len() + 1, args.len());
-                    vec![Item::new(format!("Paste {name}"), sub, Icon::Vector(g::EDIT), Act::Snippet(template.clone()))]
-                }
-                Some(Pending::RenameDesktop) => vec![Item::new("Rename Desktop", "Name for the current desktop", Icon::Vector(g::EDIT), Act::Cmd(Cmd::Desktop(Desk::Rename)))],
-                None => vec![],
-            },
+            Mode::Args => self.args_row.iter().cloned().collect(),
             // Typed text is the next question; with an empty bar, Enter copies the answer.
             Mode::Ai if !query.trim().is_empty() => vec![Item::new("Ask", "", Icon::Vector(g::SPARKLES), Act::Ask(query.trim().to_string()))],
             Mode::Ai => self.ai.iter().filter_map(|a| a.turns.last()).filter(|t| !t.text.is_empty()).map(|t| Item::new("Copy answer", "", Icon::Vector(g::COPY), Act::Copy(t.text.clone()))).collect(),
+            Mode::Translate => match &self.translation {
+                _ if query.trim().is_empty() => {
+                    let back = self.prev_set.filter(|&p| p < translate::sets(&self.cfg).len()).map(|p| ("Previous Language Set".to_string(), Act::UseLangSet(p)));
+                    vec![empty_row(g::LANGUAGES, "Type to translate".into(), "Or select text anywhere before opening Translate".into(), back.into_iter().collect())]
+                }
+                Some(tr) => translation_rows(tr, &self.cfg.translator),
+                None => vec![],
+            },
+            Mode::LanguageSets => search::filter(&query, lang_set_rows(&translate::sets(&self.cfg), translate::current(&self.cfg)), &mut self.matcher),
+            Mode::Notes(list) => {
+                // The store answers on its worker (`search_notes`); the last answer shows meanwhile.
+                self.search_notes(list, &query, cx);
+                self.note_items(list, &query, cx)
+            }
+            Mode::Define => match &self.define {
+                _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
+                Some(v) => define_rows(v, &self.cfg.search.fallback),
+                None => vec![],
+            },
             Mode::Output => match &self.output {
                 Some((_, _, true)) => vec![empty_row(g::CLOCK, "Running…".into(), String::new(), vec![])],
                 Some((_, text, false)) => {
@@ -820,22 +1755,673 @@ impl Launcher {
             let hint = if query.trim().is_empty() { "Text, images and files you copy show up here" } else { "Nothing copied matches" };
             self.items = vec![empty_row(g::PASTE, if query.trim().is_empty() { "Nothing copied yet" } else { "No matches" }.into(), hint.into(), vec![])];
         }
+        if self.items.is_empty() && self.mode == Mode::Shots {
+            let empty = shots_empty(self.shots_busy, !query.trim().is_empty() || self.shot_kind != shots::Kind::All);
+            let hint = match empty {
+                ShotsEmpty::Reading => "Text in new pictures is found in the background".to_string(),
+                ShotsEmpty::NoMatches => "Nothing in your screenshots matches".to_string(),
+                ShotsEmpty::NoScreenshots => shots::folders(&self.cfg.screenshots.folders).iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", "),
+            };
+            let add = (empty == ShotsEmpty::NoScreenshots).then(|| (Act::AddShotFolder.label().to_string(), Act::AddShotFolder));
+            self.items = vec![empty_row(g::SCAN_SEARCH, empty.title().into(), hint, add.into_iter().collect())];
+        }
         if self.items.is_empty() && self.mode == Mode::Emoji {
             self.items = vec![empty_row(g::EMOJI, "No emoji found".into(), "Try another word, e.g. heart or smile".into(), vec![])];
         }
-        if self.mode == Mode::Emoji {
-            self.grid_list.reset(grid_rows(&self.items, self.cfg.emoji.columns).len());
+        if matches!(self.mode, Mode::Emoji | Mode::Shots) {
+            let n = grid_rows(&self.items, self.grid_cols()).len();
+            // A batch of read text keeps the screenshot grid where it is scrolled.
+            if self.mode == Mode::Emoji || n != self.grid_list.item_count() {
+                self.grid_list.reset(n);
+            }
         }
         let _ = max;
-        self.selected = if keep_selection { self.selected.min(self.items.len().saturating_sub(1)) } else { 0 };
+        self.selected = if keep_selection {
+            self.selected.min(self.items.len().saturating_sub(1))
+        } else if self.mode == Mode::Root {
+            root_selection(&self.items, &query, &self.cfg, self.pick_next)
+        } else if self.mode == Mode::Translate {
+            self.translation.as_ref().map_or(0, |tr| tr.first)
+        } else {
+            0
+        };
+        self.sync_args(cx);
+        self.ask_sense(cx);
         self.scroll_to_selected();
         self.request_resize(cx);
         cx.notify();
     }
 
+    /// `refresh`, with the selection kept on the row it was on (`same_row`): pausing the second
+    /// timer, or a tick that adds a Running or Next row above, must not move Enter onto another row.
+    fn refresh_keeping(&mut self, cx: &mut Context<Self>) {
+        let was = self.items.get(self.selected).cloned();
+        self.refresh(cx);
+        if let Some(i) = was.and_then(|w| same_row(&self.items, &w)) {
+            self.selected = i;
+            self.sync_args(cx);
+            self.scroll_to_selected();
+        }
+    }
+
+    /// Running timers and stopwatches as the Running section (`Timers::matching` picks them).
+    fn timer_rows(&self, query: &str) -> Vec<Item> {
+        self.timers.matching(SystemTime::now(), query).into_iter().map(running_row).collect()
+    }
+
+    /// Starts the 1 s tick while a timer runs; the thread ends when its flag is set.
+    fn watch_timers(&mut self) {
+        if self.timer_tick.is_some() || (!self.timers.ticking() && !self.focus.ticking()) {
+            return;
+        }
+        let (stop, tx) = (Arc::new(AtomicBool::new(false)), self.tx.clone());
+        self.timer_tick = Some(stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) || tx.unbounded_send(Msg::TimerTick).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Announces timers that ran out (a sticky toast and the system sound), keeps the visible
+    /// Running rows current, ends the tick when nothing counts any more.
+    fn on_timer_tick(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        self.on_focus_tick(cx);
+        let due = self.timers.due(now);
+        for (_, label, length) in &due {
+            self.say(Msg::sticky(toast::Kind::Done, timers::done_text(label, *length)));
+            timers::beep();
+        }
+        if !self.timers.ticking()
+            && !self.focus.ticking()
+            && let Some(stop) = self.timer_tick.take()
+        {
+            stop.store(true, Ordering::Relaxed);
+        }
+        // Hidden: nothing to redraw; the toasts above still go out.
+        if !self.visible || self.mode != Mode::Root {
+            return;
+        }
+        let shown: Vec<u64> = self.items.iter().filter_map(timer_id).collect();
+        let rows = self.timers.matching(now, &self.query(cx));
+        // A timer that finished, appeared or went away rebuilds the list; otherwise only the times
+        // change. An open panel or an armed row (Join's second Enter) waits, as in `calendar_tick`:
+        // a rebuild would close the question; the times still tick in place.
+        let waits = self.panel.is_some() || self.armed.is_some();
+        let changed = !due.is_empty() || timers::rows_changed(&shown, &rows) || self.timers_stale;
+        self.timers_stale = waits && changed;
+        if !waits && changed {
+            return self.refresh_keeping(cx);
+        }
+        for it in &mut self.items {
+            if let Some(id) = timer_id(it)
+                && let Some(r) = rows.iter().find(|r| r.id == id)
+            {
+                it.accessory = r.accessory();
+            }
+        }
+        cx.notify();
+    }
+
+    // ---- My Schedule (the decisions are in calendar.rs) ------------------------------
+
+    /// The `[[calendar_feed]]` addresses, in order (an event's `feed` indexes them).
+    fn feed_urls(&self) -> Vec<String> {
+        self.cfg.calendar_feed.iter().map(|f| f.url.clone()).collect()
+    }
+
+    fn calendar_events(&self) -> Vec<calendar::Event> {
+        self.calendar.events(&self.feed_urls(), &self.cfg.calendar.ignore, &self.hidden_events)
+    }
+
+    /// An event's row, with its calendar's name and address.
+    fn event_row(&self, e: &calendar::Event, accessory: String) -> Item {
+        let feed = self.cfg.calendar_feed.get(e.feed);
+        calendar::row(e, (feed.map_or("", |f| f.name.as_str()), feed.map_or("", |f| f.url.as_str())), accessory)
+    }
+
+    /// The Next section of an empty root search: the meeting about to start (`Calendar::next`).
+    fn next_rows(&self) -> Vec<Item> {
+        let now = search::now() as i64;
+        let events = self.calendar_events();
+        self.calendar.next(&events, now, self.cfg.calendar.next_in_search).map(|e| self.event_row(e, calendar::in_minutes(e, now)).sec(NEXT)).into_iter().collect()
+    }
+
+    /// My Schedule: Now, Today and Tomorrow, or why there is nothing.
+    fn schedule_rows(&self) -> Vec<Item> {
+        if self.cfg.calendar_feed.iter().all(|f| f.url.trim().is_empty()) {
+            let add = vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)];
+            return vec![empty_row(g::CALENDAR_CLOCK, "No calendar connected".into(), "Paste your calendar's ICS address to see today's meetings here".into(), add)];
+        }
+        let now = search::now() as i64;
+        let sections = calendar::sections(&self.calendar_events(), now);
+        if sections.is_empty() {
+            let text = if self.calendar.pending() { "Fetching your calendar…" } else { "Nothing on today or tomorrow" };
+            // Enter is Add Calendar only with no feed; here it waits under Ctrl+K.
+            let mut it = empty_row(g::CALENDAR_CLOCK, text.into(), String::new(), vec![]);
+            it.extra = vec![(Act::AddCalendar.label().to_string(), Act::AddCalendar)];
+            return vec![it];
+        }
+        let mut rows = vec![];
+        for (name, events) in sections {
+            for e in events {
+                let on = name == "Now";
+                let mut it = self.event_row(&e, if on { calendar::until(&e) } else { calendar::span(&e) }).sec(name);
+                it.now = on;
+                it.extra.push((Act::AddCalendar.label().to_string(), Act::AddCalendar));
+                rows.push(it);
+            }
+        }
+        rows
+    }
+
+    /// The meeting Enter on `act` opens, (title, link): a Join row's, or Join Meeting's (`calendar::joinable`).
+    fn join_target(&self, act: &Act) -> Option<(String, String)> {
+        match act {
+            Act::Join(title, url) => Some((title.clone(), url.clone())),
+            Act::Cmd(Cmd::JoinMeeting) => calendar::joinable(&self.calendar_events(), search::now() as i64).and_then(|e| Some((e.title.clone(), e.join.clone()?))),
+            _ => None,
+        }
+    }
+
+    /// Join Meeting's hotkey with `confirm_join`: root search opens on the meeting's row, armed,
+    /// so the bar asks "Join <title> on <host>? Press ↵ again" as Enter on the row does.
+    fn ask_join(&mut self, cx: &mut Context<Self>) {
+        let now = search::now() as i64;
+        let events = self.calendar_events();
+        let Some(e) = calendar::joinable(&events, now) else { return };
+        let row = if e.start <= now { self.event_row(e, calendar::until(e)).sec("Now") } else { self.event_row(e, calendar::in_minutes(e, now)).sec(NEXT) };
+        self.items.retain(|it| it.section.as_deref() != Some(NEXT));
+        self.items.insert(0, row);
+        self.selected = 0;
+        self.armed = Some(0);
+        self.scroll_to_selected();
+        cx.notify();
+    }
+
+    /// Ctrl+Enter on Add Calendar: fetches the address once on the background executor; the
+    /// answer comes back as `Msg::CalendarAdded`.
+    fn add_calendar(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.form else { return };
+        if self.adding_calendar == Some(self.form_gen) {
+            self.status = Some((Tone::Info, READING.into()));
+            return cx.notify();
+        }
+        let v = form_values(&form.fields);
+        let url = v["ICS address"].trim().to_string();
+        if self.cfg.calendar_feed.iter().any(|f| calendar::same_feed(&f.url, &url)) {
+            self.status = Some((Tone::Error, calendar::ALREADY_ADDED.into()));
+            return cx.notify();
+        }
+        let name = match v["Name"].trim() {
+            "" => calendar::provider(&url),
+            n => n.to_string(),
+        };
+        let feed = config::CalendarFeed { name, colour: v["Colour"].to_string(), url };
+        let generation = self.form_gen;
+        self.adding_calendar = Some(generation);
+        self.status = Some((Tone::Info, READING.into()));
+        let tx = self.tx.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let r = std::panic::catch_unwind(|| calendar::fetch(&feed.url)).unwrap_or_else(|_| Err("the fetch failed".into()));
+                let _ = tx.unbounded_send(Msg::CalendarAdded(generation, feed, r));
+            })
+            .detach();
+        cx.notify();
+    }
+
+    /// Add Calendar's fetch for form `generation` came back: a calendar that reads is added
+    /// ("Added Work") and, from the form still on screen, My Schedule opens on it; one that does
+    /// not keeps that form, the ActionBar saying so. An older form's answer only toasts.
+    fn calendar_added(&mut self, generation: u64, feed: config::CalendarFeed, result: Result<Vec<calendar::Event>, String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (here, pending) = add_answer(self.adding_calendar, generation, self.form_gen, self.mode == Mode::Form(FormKind::AddCalendar));
+        self.adding_calendar = pending;
+        if pending.is_none() && self.status.as_ref().is_some_and(|(_, s)| s == READING) {
+            self.status = None;
+        }
+        let added = result
+            .map_err(|_| "Couldn't read this calendar".to_string())
+            .and_then(|events| calendar::save_feeds(&config::path(), |t| calendar::add_feed(t, &feed)).map(|(c, _)| (c, events)));
+        let (c, events) = match added {
+            Ok(v) => v,
+            Err(e) if here => {
+                self.status = Some((Tone::Error, e));
+                return cx.notify();
+            }
+            Err(e) => {
+                self.say(Msg::error(format!("{}: {e}", feed.name)));
+                return cx.notify();
+            }
+        };
+        self.cfg.calendar_feed = c.calendar_feed;
+        self.say(Msg::done(format!("Added {}", feed.name)));
+        self.calendar.added(feed.url, events);
+        if let Some(h) = self.settings_window {
+            drop(h.update(cx, |s, _, cx| s.reread(cx)));
+        }
+        if here {
+            self.status = None;
+            self.set_mode(Mode::Schedule, cx);
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
+    }
+
+    /// Left or Right on Add Calendar's Colour: the next swatch. False elsewhere.
+    fn step_swatch(&mut self, d: isize, cx: &mut Context<Self>) -> bool {
+        if !matches!(self.mode, Mode::Form(_)) || self.panel.is_some() || self.menu.is_some() {
+            return false;
+        }
+        let Some(f) = self.form.as_mut().and_then(|f| f.fields.get_mut(f.field)).filter(|f| matches!(f.ctl, Ctl::Swatches)) else { return false };
+        f.value = calendar::step_colour(&f.value, d).into();
+        cx.notify();
+        true
+    }
+
+    /// Every 10 s: fetches the feeds when due (off the UI thread), reminds of meetings about to
+    /// start, and keeps root's Next row current.
+    fn calendar_tick(&mut self, cx: &mut Context<Self>) {
+        let urls: Vec<String> = self.feed_urls().into_iter().filter(|u| !u.trim().is_empty()).collect();
+        let every = Duration::from_secs(u64::from(self.cfg.calendar.refresh_minutes.max(5)) * 60);
+        if self.calendar.wants_fetch(urls.len(), Instant::now(), every) {
+            self.calendar.fetching(Instant::now());
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                // The result is always sent, so a crash cannot leave "fetching" on.
+                let results = urls
+                    .into_iter()
+                    .map(|u| {
+                        let r = std::panic::catch_unwind(|| calendar::fetch(&u)).unwrap_or_else(|_| Err("the fetch failed".into()));
+                        (u, r)
+                    })
+                    .collect();
+                let _ = tx.unbounded_send(Msg::Calendar(results));
+            });
+        }
+        let events = self.calendar_events();
+        for text in self.calendar.due(&events, search::now() as i64, self.cfg.calendar.remind_minutes) {
+            self.say(Msg::sticky(toast::Kind::Info, text));
+            self.pick_next = true;
+        }
+        // An armed row waits for its second Enter: a refresh would move it.
+        if !self.visible || self.mode != Mode::Root || self.panel.is_some() || self.armed.is_some() || !self.query(cx).trim().is_empty() {
+            return;
+        }
+        let next = self.next_rows();
+        let shown: Vec<&Item> = self.items.iter().filter(|it| it.section.as_deref() == Some(NEXT)).collect();
+        if shown.len() != next.len() || shown.iter().zip(&next).any(|(a, b)| a.title != b.title) {
+            return self.refresh_keeping(cx);
+        }
+        for (it, n) in self.items.iter_mut().filter(|it| it.section.as_deref() == Some(NEXT)).zip(next) {
+            it.accessory = n.accessory;
+        }
+        cx.notify();
+    }
+
+    // ---- Focus sessions (the decisions are in focus.rs) -----------------------------
+
+    /// The number for a new HDR read (`Msg::Hdr`): only the last one asked for is taken.
+    fn hdr_read(&mut self) -> u64 {
+        self.hdr_seq += 1;
+        self.hdr_seq
+    }
+
+    /// Shows a toast (`Msg::done`, `Msg::error`, …).
+    fn say(&self, toast: Msg) {
+        let _ = self.tx.unbounded_send(toast);
+    }
+
+    /// Gives the browser companion the site filter (or switches it off).
+    fn focus_push(&mut self) {
+        self.focus.pushed(Instant::now());
+        self.browsers.ask_all(focus::sites_message(self.focus.session.as_ref(), focus::snooze_for(self.cfg.focus.snooze_minutes)));
+    }
+
+    /// The session as a root row with its actions, and the categories in a `focus …` search.
+    fn focus_rows(&self, query: &str) -> Vec<Item> {
+        let q = query.trim().to_lowercase();
+        let mut rows = vec![];
+        if let Some(s) = &self.focus.session
+            && (q.is_empty() || s.title.to_lowercase().contains(&q))
+        {
+            rows.push(focus_row(s, SystemTime::now()));
+        }
+        if let Some(rest) = q.strip_prefix("focus ") {
+            for c in focus::categories(&self.cfg.focus_category).into_iter().filter(|c| c.name.to_lowercase().contains(rest.trim())) {
+                let start = |m| Act::FocusStart(c.name.clone(), m);
+                let sub = focus::category_line(&c);
+                let mut row = Item::new(c.name.clone(), sub, Icon::Vector(focus::category_icon(&c.name)), start(focus::Mode::Block)).acc("Focus category").sec("Focus Categories");
+                row.extra = [focus::Mode::Block, focus::Mode::Allow].map(|m| (start(m).label().to_string(), start(m))).to_vec();
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    /// Starts (or, editing, replaces) the session; returns what to tell the user.
+    fn focus_begin(&mut self, start: focus::Start, edit: bool) -> String {
+        let focus::Start { title, minutes, filter, picks } = start;
+        let old = self.focus.session.take();
+        let (mode, apps, sites, picks) = match (filter, &old) {
+            (Some((m, a, s)), _) => (m, a, s, picks),
+            (None, Some(o)) if edit => (o.mode, o.apps.clone(), o.sites.clone(), o.picks.clone()),
+            (None, _) => (focus::Mode::Block, vec![], vec![], vec![]),
+        };
+        let mut session = focus::Session::new(&title, mode, &apps, &sites, minutes, self.cfg.focus.allow_all_on_empty_sites, SystemTime::now());
+        session.picks = picks;
+        // The apps already closed still come back at the end.
+        session.closed = old.map(|o| o.closed).unwrap_or_default();
+        let text = if minutes == 0 { format!("Focus started: {} (no limit)", session.title) } else { format!("Focus started: {} for {minutes} min", session.title) };
+        self.focus.set(Some(session));
+        self.watch_timers();
+        self.focus_push();
+        text
+    }
+
+    /// Adds categories to config.toml (the config reload applies them within a couple of seconds).
+    fn focus_save_categories(cats: &[config::FocusCategory]) -> Result<String, String> {
+        let mut n = 0;
+        config::edit_file(&config::path(), |text| {
+            let (text, added) = focus::add_categories(text, cats)?;
+            n = added;
+            if n == 0 { Err("Those categories are already in config.toml".into()) } else { Ok(text) }
+        })?;
+        Ok(format!("Added {n} focus categor{}", if n == 1 { "y" } else { "ies" }))
+    }
+
+    /// Enter with a Focus command's boxes: start (or edit) the session, or save the categories.
+    /// Start with Goal empty, and Edit as seeded, open the form instead (`focus_form_for`). A
+    /// refusal keeps the boxes and says why.
+    fn focus_args(&mut self, f: FocusCmd, got: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let cats = focus::categories(&self.cfg.focus_category);
+        if let Some(form) = focus_form_for(f, &got, self.focus.session.as_ref(), &cats, self.cfg.focus.default_minutes) {
+            return match form {
+                Ok(fields) => {
+                    self.load_running();
+                    self.open_form(FormKind::Focus, fields, window, cx);
+                }
+                Err(e) => self.focus_refused(e, cx),
+            };
+        }
+        let done = match f {
+            FocusCmd::Edit if self.focus.session.is_none() => Err("No Focus session is running".to_string()),
+            FocusCmd::Start | FocusCmd::Edit => focus::parse_start(&got, &cats, self.cfg.focus.default_minutes).map(|s| self.focus_begin(s, f == FocusCmd::Edit)),
+            FocusCmd::CreateCategory => focus::parse_category(&got).and_then(|c| Self::focus_save_categories(&[c])),
+            FocusCmd::ImportCategories => {
+                // A typed path may be a slow or missing drive: read off the UI thread.
+                let path = got[0].trim().trim_matches('"').to_string();
+                let read = cx.background_executor().spawn(async move { std::fs::read_to_string(path).map_err(|e| format!("Could not read the file: {e}")).and_then(|t| focus::import(&t)) });
+                cx.spawn(async move |this, cx| {
+                    let cats = read.await;
+                    _ = this.update(cx, |this, cx| this.focus_saved(cats.and_then(|c| Self::focus_save_categories(&c)), cx));
+                })
+                .detach();
+                return;
+            }
+            _ => return,
+        };
+        self.focus_saved(done, cx);
+    }
+
+    /// A Focus command's answer: done hides the launcher with a toast; a refusal says why.
+    fn focus_saved(&mut self, done: Result<String, String>, cx: &mut Context<Self>) {
+        match done {
+            Ok(text) => {
+                self.say(Msg::done(text));
+                // A late answer (Import reads off the UI thread) never takes focus back.
+                if self.visible {
+                    self.hide(true, cx);
+                }
+            }
+            Err(e) => self.focus_refused(e, cx),
+        }
+    }
+
+    /// Why a Focus command did nothing: in the ActionBar, or (run from a hotkey with the
+    /// window hidden) as a toast.
+    fn focus_refused(&mut self, e: String, cx: &mut Context<Self>) {
+        if !self.visible {
+            return self.say(Msg::error(e));
+        }
+        self.status = Some((Tone::Error, e));
+        cx.notify();
+    }
+
+    /// Ctrl+Enter in the Focus form: starts the session (replacing one that runs) and closes.
+    /// A Duration that does not parse stays, with why under it.
+    fn submit_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.form else { return };
+        let value = |label: &str| form.fields.iter().find(|f| f.label == label).map(|f| f.value.clone()).unwrap_or_default();
+        let (goal, duration, mode, picks) = (value("Goal"), value("Duration"), value("Mode"), focus::Picks::of(&value("Block")).0);
+        let cats = focus::categories(&self.cfg.focus_category);
+        let mut start = match focus::parse_start(&[goal, duration], &cats, self.cfg.focus.default_minutes) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(i) = form.fields.iter().position(|f| f.label == "Duration") {
+                    form.fields[i].error = Some(e);
+                    form.field = i;
+                }
+                return self.focus_field(window, cx);
+            }
+        };
+        let (apps, sites) = focus::resolve(&picks, &cats);
+        start.filter = Some((if mode == "allow" { focus::Mode::Allow } else { focus::Mode::Block }, apps, sites));
+        start.picks = picks;
+        let text = self.focus_begin(start, false);
+        self.say(Msg::done(text));
+        self.set_mode(Mode::Root, cx);
+        self.hide(true, cx);
+    }
+
+    /// Programs for the Block menu by file name, with their names: the running ones (as Quit
+    /// Applications lists them) and the installed ones that are programs, A to Z.
+    fn focus_apps(&self) -> Vec<(String, String)> {
+        let running = self.running.iter().flatten().map(|(r, _)| (focus::norm_app(&r.exe), r.name.clone()));
+        let installed = self.apps.iter().filter(|a| a.id.to_lowercase().ends_with(".exe")).map(|a| (focus::norm_app(&a.id), a.name.clone()));
+        let mut out: Vec<(String, String)> = vec![];
+        for (exe, name) in running.chain(installed) {
+            if !exe.is_empty() && !out.iter().any(|(e, _)| *e == exe) {
+                let name = if name.trim().is_empty() { focus::app_label(&exe) } else { name };
+                out.push((exe, name));
+            }
+        }
+        out.sort_by_key(|(_, n)| n.to_lowercase());
+        out
+    }
+
+    /// The Block menu's entries for form field `i`, and whether a typed website is blocked or allowed.
+    fn block_menu(&self, i: usize) -> (Vec<menu::Entry>, &'static str) {
+        let Some(form) = &self.form else { return (vec![], "Block") };
+        let picks = form.fields.get(i).map_or_else(focus::Picks::default, |f| focus::Picks::of(&f.value));
+        let verb = if form_values(&form.fields).get("Mode") == Some(&"allow") { "Allow" } else { "Block" };
+        (block_entries(&focus::categories(&self.cfg.focus_category), &self.focus_apps(), &picks), verb)
+    }
+
+    /// Opens the Block menu under token field `i`. A pick becomes a token and the menu opens
+    /// again, without it, for the next.
+    fn open_block_menu(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (entries, verb) = self.block_menu(i);
+        let m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::At(self.form_at.get()));
+        self.open_menu(
+            m,
+            move |this, id, window, cx| {
+                this.edit_picks(i, |p| p.add(&id));
+                this.open_block_menu(i, window, cx);
+            },
+            window,
+            cx,
+        );
+        if let Some(open) = &mut self.menu {
+            open.site = Some(verb);
+        }
+    }
+
+    /// Changes token field `i`'s picks.
+    fn edit_picks(&mut self, i: usize, f: impl FnOnce(&mut focus::Picks)) {
+        if let Some(field) = self.form.as_mut().and_then(|form| form.fields.get_mut(i)) {
+            let mut p = focus::Picks::of(&field.value);
+            f(&mut p);
+            field.value = p.value();
+        }
+    }
+
+    /// Backspace on the selected token field, or in its menu's empty search: the last token
+    /// goes back into the menu. False when the key is the text's (anywhere else).
+    fn pop_token(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(i) = self.form.as_ref().filter(|f| matches!(self.mode, Mode::Form(_)) && matches!(f.fields.get(f.field).map(|c| &c.ctl), Some(Ctl::Tokens))).map(|f| f.field) else { return false };
+        if self.menu.as_ref().is_some_and(|m| m.site.is_none() || !self.menu_input.read(cx).as_str().is_empty()) {
+            return false;
+        }
+        self.edit_picks(i, |p| _ = p.pop());
+        let (entries, _) = self.block_menu(i);
+        if let Some(open) = &mut self.menu {
+            open.menu.set_entries(entries);
+        }
+        cx.notify();
+        true
+    }
+
+    fn focus_cmd(&mut self, f: FocusCmd, window: &mut Window, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let needs_session = matches!(f, FocusCmd::Pause | FocusCmd::Resume | FocusCmd::Complete | FocusCmd::Cancel | FocusCmd::Restart | FocusCmd::Edit | FocusCmd::Snooze);
+        if needs_session && self.focus.session.is_none() {
+            return self.say(Msg::error("No Focus session running: start one first"));
+        }
+        match f {
+            // They take arguments: `run` asks for them (Mode::Args) before they get here.
+            FocusCmd::Start | FocusCmd::Edit | FocusCmd::CreateCategory | FocusCmd::ImportCategories => return,
+            FocusCmd::Toggle if self.focus.session.is_none() => {
+                let Some(last) = self.focus.preset.clone() else {
+                    self.ask_args_for(&Act::Cmd(Cmd::Focus(FocusCmd::Start)), window, cx);
+                    return;
+                };
+                let text = self.focus_begin(last.start(), false);
+                self.say(Msg::done(text));
+                if self.visible {
+                    self.hide(true, cx);
+                }
+                return;
+            }
+            FocusCmd::Toggle | FocusCmd::Complete => return self.focus_end(true, cx),
+            FocusCmd::Cancel => return self.focus_end(false, cx),
+            FocusCmd::SearchCategories => return self.input.update(cx, |s, cx| s.emplace("focus ", cx)),
+            FocusCmd::Pause => self.focus.update(|s| s.pause(now)),
+            FocusCmd::Resume => {
+                self.focus.update(|s| s.resume(now));
+                self.watch_timers();
+            }
+            FocusCmd::Restart => {
+                self.focus.update(|s| s.restart(now));
+                self.watch_timers();
+            }
+            FocusCmd::Snooze => {
+                let mins = focus::snooze_for(self.cfg.focus.snooze_minutes);
+                let Some((exe, path)) = self.focus.last_closed() else { return self.say(Msg::info("Focus has not closed an app yet")) };
+                self.focus.update(|s| {
+                    s.snooze(&exe, mins);
+                    s.closed.retain(|p| *p != path);
+                });
+                if !path.is_empty() {
+                    win::launch_app(&path);
+                }
+                return self.say(Msg::done(format!("Focus: {} allowed for {mins} min", focus::app_label(&exe))));
+            }
+        }
+        self.focus_push();
+        let said = match f {
+            FocusCmd::Pause => "Focus paused",
+            FocusCmd::Resume => "Focus resumed",
+            _ => "Focus restarted",
+        };
+        self.say(Msg::done(said));
+        if self.visible && self.mode == Mode::Root {
+            self.refresh(cx);
+        }
+    }
+
+    /// Five more minutes (the notice goes: the time is no longer up).
+    fn focus_extend(&mut self) {
+        self.focus.update(|s| s.extend(SystemTime::now()));
+        self.focus_push();
+        self.say(Msg::done("Focus extended by 5 min"));
+    }
+
+    /// Ends the session: done (completed) or cancelled.
+    fn focus_end(&mut self, done: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.focus.session.clone() else { return };
+        self.focus.set(None);
+        for path in &s.closed {
+            win::launch_app(path);
+        }
+        self.say(Msg::done(format!("Focus {}: {}", if done { "done" } else { "cancelled" }, s.title)));
+        self.focus_push();
+        if self.visible && self.mode == Mode::Root {
+            self.refresh(cx);
+        }
+    }
+
+    /// Once a second while a session counts down: sounds when the time is up (the notice shows
+    /// then, `hud`, and the session keeps blocking until Complete or Extend), repeats the site
+    /// filter now and then (the browser forgets it when its extension restarts), keeps the
+    /// row's time current.
+    fn on_focus_tick(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        // A paused session has nothing to count, repeat or redraw (a timer may keep the tick alive).
+        if !self.focus.session.as_ref().is_some_and(focus::Session::running) {
+            return;
+        }
+        if self.focus.time_up(now) && self.cfg.focus.sound {
+            focus::beep();
+        }
+        let left = self.focus.session.as_ref().map(|s| s.row(now).1).unwrap_or_default();
+        if self.focus.push_due(Instant::now()) {
+            self.focus_push();
+        }
+        if self.visible && self.mode == Mode::Root {
+            for it in &mut self.items {
+                if it.section.as_deref() == Some(FOCUS) {
+                    it.accessory = left.clone();
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// A window took focus: the window of a blocked app is asked to close.
+    fn focus_front(&mut self, hwnd: isize, exe: &str) {
+        let now = SystemTime::now();
+        let Some(s) = &self.focus.session else { return };
+        if !s.blocked_app(exe, now) || !self.focus.fresh(exe, Instant::now()) {
+            return;
+        }
+        let text = format!("{} is blocked · {}", focus::app_label(exe), s.title);
+        let path = focus::close_window(hwnd);
+        self.focus.closed_app(exe, path, self.cfg.focus.restore_apps, Instant::now());
+        self.say(Msg::done(text));
+    }
+
+    /// What the Focus HUD shows now: the pill while a session exists (unless `[focus] pill` is
+    /// off), the notice while its time is up.
+    fn hud(&self) -> hud::State {
+        let now = SystemTime::now();
+        let s = self.focus.session.as_ref();
+        let time = |s: &focus::Session| focus::pill_text(if s.unlimited() { s.elapsed(now) } else { s.left(now) });
+        hud::State { pill: s.filter(|_| self.cfg.focus.pill).map(|s| (time(s), s.title.clone())), notice: s.is_some_and(|s| s.expired(now)), theme: self.cfg.theme.clone() }
+    }
+
     /// Scrolls the selected row into view (section headers take list slots too).
     fn scroll_to_selected(&self) {
-        let at = display_rows(&self.items).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
+        if self.grid() {
+            if let Some(at) = grid_rows(&self.items, self.grid_cols()).iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
+                self.grid_list.scroll_to_reveal_item(at);
+            }
+            return;
+        }
+        let at = display_rows(&self.items, self.mode == Mode::Schedule).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
         self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
     }
 
@@ -901,24 +2487,45 @@ impl Launcher {
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode == Mode::Shots && mode != Mode::Shots {
+            self.drop_thumbs(cx);
+        }
+        // A typed snippet keyword's erase belongs to its own Args session only.
+        self.typed = Default::default();
         if mode != Mode::Ext {
             self.stop_ext_view();
+        }
+        if !matches!(mode, Mode::Form(_)) {
+            self.form = None;
+        }
+        // Add Calendar's wait is the form's: it does not follow the user elsewhere.
+        if self.status.as_ref().is_some_and(|(_, s)| s == READING) {
+            self.status = None;
         }
         if mode != Mode::Ai && self.ai.take().is_some() {
             self.send(json!({"t": "aiStop"}));
         }
         self.mode = mode;
         self.panel = None;
+        self.menu = None;
+        self.arg_memory.clear();
+        self.args_for = None;
         if mode == Mode::Files
             && let Some(f) = &self.files
         {
             f.refresh_if_stale(Duration::from_secs(3600));
+        }
+        if mode == Mode::Shots {
+            self.scan_shots();
         }
         if mode == Mode::Store {
             self.load_store();
         }
         if mode == Mode::Running {
             self.load_running();
+        }
+        if matches!(mode, Mode::Notes(_)) {
+            self.note_rows = None;
         }
         if mode == Mode::Tabs {
             self.tabs.clear();
@@ -941,7 +2548,8 @@ impl Launcher {
             self.scripts = scripts;
             self.catalog = search::catalog(&self.apps, &self.scripts, &self.exts, &self.cfg);
         }
-        self.status = None;
+        // A sticky toast closes; its text shows once in the ActionBar instead.
+        self.status = self.toast.and_then(|t| t.update(cx, |t, _, cx| t.dismiss(cx)).ok().flatten()).map(|(kind, text)| (Tone::of(kind), text));
         // Within the pop-to-root timeout the launcher reopens where it was.
         if mode == Mode::Root && self.keeps_state() {
             self.refresh(cx);
@@ -955,6 +2563,7 @@ impl Launcher {
                 "clipboard" => Mode::Clipboard,
                 "emoji" => Mode::Emoji,
                 "files" => Mode::Files,
+                "shots" => Mode::Shots,
                 "running" => Mode::Running,
                 "tabs" => Mode::Tabs,
                 _ => Mode::Root,
@@ -969,6 +2578,12 @@ impl Launcher {
         window.focus(&self.input.focus_handle(cx), cx);
         self.visible = true;
         self.scan_apps(false, false);
+        if self.cfg.dictionary.enabled {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || drop(tx.unbounded_send(Msg::DictReady(dict::installed().is_some()))));
+        }
+        let (seq, tx) = (self.hdr_read(), self.tx.clone());
+        std::thread::spawn(move || drop(tx.unbounded_send(Msg::Hdr(seq, hdr::displays()))));
         // The window was placed before this view existed (a notice, a kept search or a
         // query can each change its height), so size it to what it shows now. Without this,
         // `height` could claim a size the window doesn't have, and typing in compact mode
@@ -980,10 +2595,14 @@ impl Launcher {
     /// `restore` hands focus back to the window that was active before we opened;
     /// false only when focus already moved elsewhere (deactivation).
     fn hide(&mut self, restore: bool, cx: &mut Context<Self>) {
+        self.typed = Default::default();
         win::cloak(self.hwnd, true);
         self.visible = false;
+        self.pick_next = false;
         self.hidden_at = Some(Instant::now());
+        self.drop_thumbs(cx);
         self.panel = None;
+        self.menu = None;
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
         self.stop_ext_view();
         if self.mode == Mode::Ext {
@@ -1016,19 +2635,24 @@ impl Launcher {
     /// A clipboard image fitted for the detail pane, cached.
     fn clip_preview(&mut self, id: &str) -> Option<Arc<RenderImage>> {
         let history = &self.history;
-        self.clip_images.entry(format!("p:{id}")).or_insert_with(|| history.png(id).and_then(|p| clipboard::render_image(&p, 640))).clone()
+        used(&mut self.clip_images, &mut self.file_tick, format!("p:{id}"), || history.png(id).and_then(|p| clipboard::render_image(&p, 640)))
+    }
+
+    /// `file_images[key]`, marked as just used; None when it was never asked for.
+    fn cached_image(&mut self, key: &str) -> Option<Option<Arc<RenderImage>>> {
+        self.file_tick += 1;
+        let entry = self.file_images.get_mut(key)?;
+        entry.1 = self.file_tick;
+        Some(entry.0.clone())
     }
 
     /// A file's picture (`p:`, fitted) or shell icon (`i:`), made on a worker thread: None
     /// until it arrives as Msg::FilePreview.
     fn file_preview(&mut self, key: String) -> Option<Arc<RenderImage>> {
-        if self.file_images.len() > 300 {
-            self.file_images.clear();
+        if let Some(img) = self.cached_image(&key) {
+            return img;
         }
-        if let Some(img) = self.file_images.get(&key) {
-            return img.clone();
-        }
-        self.file_images.insert(key.clone(), None);
+        self.file_images.insert(key.clone(), (None, self.file_tick));
         let (tx, seq) = (self.tx.clone(), self.file_seq.clone());
         let at = seq.load(Ordering::Relaxed);
         std::thread::spawn(move || {
@@ -1045,16 +2669,84 @@ impl Launcher {
         None
     }
 
+    /// A screenshot grid cell's thumbnail (`shots::thumb_key`), `THUMB_PX` wide, for grid
+    /// row `row`: decoded on the background executor with no settle (a grid wants them all
+    /// at once), unless the grid has scrolled far from the row by its turn. Only a picture
+    /// no bigger than `shots::MAX_BYTES` is read. None until it arrives as Msg::FilePreview.
+    fn shot_thumb(&mut self, key: &str, row: usize, cx: &App) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.cached_image(key) {
+            return img;
+        }
+        self.file_images.insert(key.to_string(), (None, self.file_tick));
+        let (tx, top, key) = (self.tx.clone(), self.grid_top.clone(), key.to_string());
+        cx.background_executor()
+            .spawn(async move {
+                if !near(row, top.load(Ordering::Relaxed)) {
+                    // Asked again if it comes back into view.
+                    let _ = tx.unbounded_send(Msg::FilePreviewDropped(key));
+                    return;
+                }
+                let img = shot_file(&key).and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_width(&b, THUMB_PX));
+                let _ = tx.unbounded_send(Msg::FilePreview(key, img));
+            })
+            .detach();
+        None
+    }
+
+    /// Quick Look's picture (`q:` with the thumbnail key's time and path), fitted inside
+    /// `QUICK_LOOK_PX`: decoded on a worker once the selection rests, and the one shown before
+    /// it freed. None until it arrives as Msg::FilePreview.
+    fn quick_look_image(&mut self, key: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
+        if let Some(img) = self.cached_image(key) {
+            return img;
+        }
+        self.drop_images(&["q:"], cx);
+        self.file_images.insert(key.to_string(), (None, self.file_tick));
+        let at = self.file_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, seq, key) = (self.tx.clone(), self.file_seq.clone(), key.to_string());
+        std::thread::spawn(move || {
+            // Settle first: arrowing through the shots only decodes where the selection stops.
+            std::thread::sleep(Duration::from_millis(100));
+            // Asked again since: that request freed this key's entry (`drop_images`), and a
+            // drop sent now could remove the entry of a newer request for the same key.
+            if seq.load(Ordering::Relaxed) != at {
+                return;
+            }
+            let img = shot_file(&key).and_then(|p| std::fs::read(p).ok()).and_then(|b| clipboard::render_image(&b, QUICK_LOOK_PX));
+            let _ = tx.unbounded_send(Msg::FilePreview(key, img));
+        });
+        None
+    }
+
+    /// Forgets the screenshot thumbnails, frees their GPU textures and closes Quick Look (the
+    /// grid closed).
+    fn drop_thumbs(&mut self, cx: &mut App) {
+        self.close_quick_look(cx);
+        self.drop_images(&["t:"], cx);
+    }
+
+    /// Closes Quick Look and frees its picture.
+    fn close_quick_look(&mut self, cx: &mut App) {
+        self.quick_look = false;
+        self.quick_look_detail = Default::default();
+        self.drop_images(&["q:"], cx);
+    }
+
+    /// Forgets the decoded images whose keys start with one of `prefixes` and frees their GPU textures.
+    fn drop_images(&mut self, prefixes: &[&str], cx: &mut App) {
+        let gone = self.file_images.extract_if(|k, _| prefixes.iter().any(|p| k.starts_with(p))).filter_map(|(_, v)| v.0).collect();
+        release(gone, cx);
+    }
+
     /// A snippet chosen in the launcher (`erase` 0) or typed in an app: asks for its
     /// arguments first if it has any, then goes into the app.
     fn start_snippet(&mut self, name: String, template: String, erase: usize, then: String, window: &mut Window, cx: &mut Context<Self>) {
-        let args = snippets::arguments(&template);
-        if !args.is_empty() {
-            self.pending = Some(Pending::Snippet { name, template, args, got: vec![], erase, then });
-            if !self.visible {
-                self.show(Mode::Args, window, cx);
-            }
-            return self.set_mode(Mode::Args, cx);
+        let key = format!("sn:{name}");
+        if let Some(it) = self.catalog.iter().find(|it| it.key.as_ref() == Some(&key) && !it.args.is_empty()).cloned() {
+            self.ask_args(it, window, cx);
+            // After ask_args: opening the session clears what an abandoned one left.
+            self.typed = (erase, then);
+            return;
         }
         self.insert_snippet(template, vec![], erase, then, cx);
     }
@@ -1099,6 +2791,402 @@ impl Launcher {
                 self.start_snippet(s.name, s.text, erase, then, window, cx);
             }
         }
+    }
+
+    // ---- translator ------------------------------------------------------------------
+
+    /// Translates `job`. Typed text opens the translator at once, its text in the bar, the last
+    /// answers kept (dimmed) until the new ones land; the selection (or a paste-over-selection
+    /// job) hides the launcher first, so the app you came from has focus.
+    fn translate(&mut self, mut job: translate::Job, cx: &mut Context<Self>) {
+        self.translate_seq += 1;
+        let (seq, hidden) = (self.translate_seq, job.after != translate::After::Open || job.text.trim().is_empty());
+        if hidden {
+            if self.visible {
+                self.hide(true, cx);
+            }
+        } else {
+            self.status = None;
+            if self.mode != Mode::Translate || self.translation.is_none() {
+                self.translation = Some(TrView { job: job.clone(), rows: vec![], first: 0, busy: true });
+                self.set_mode(Mode::Translate, cx);
+            }
+            if let Some(tr) = &mut self.translation {
+                tr.job = job.clone();
+                tr.busy = true;
+            }
+            self.fill_query(&job.text, cx);
+        }
+        let (tx, owner, proxy) = (self.tx.clone(), self.hwnd.0 as isize, self.cfg.translator.proxy.clone());
+        std::thread::spawn(move || {
+            if job.text.trim().is_empty() {
+                match snippets::grab_selection(HWND(owner as _)).filter(|s| !s.trim().is_empty()) {
+                    Some(sel) => job.text = sel,
+                    // Nothing selected: the translator opens empty; Instant Translate says why.
+                    None if job.after == translate::After::Open => return drop(tx.unbounded_send(Msg::Translated { seq, job, hidden, result: Ok(vec![]) })),
+                    None => return drop(tx.unbounded_send(Msg::error("Select some text first"))),
+                }
+            }
+            let result = translate::run(&job, &proxy);
+            let _ = tx.unbounded_send(Msg::Translated { seq, job, hidden, result });
+        });
+    }
+
+    /// The bar's text, unless it already holds it (setting it fires `query_changed`).
+    fn fill_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.query(cx) != text {
+            self.input.update(cx, |s, cx| s.emplace(text, cx));
+        }
+        cx.notify();
+    }
+
+    /// Typing in the translator: asks again once typing pauses for `TYPING_QUIET`; the answers
+    /// shown stay, dimmed, until the new ones land. An empty bar shows the empty view.
+    fn translate_soon(&mut self, cx: &mut Context<Self>) {
+        let text = self.query(cx);
+        let Some(tr) = &mut self.translation else { return };
+        if text == tr.job.text {
+            return;
+        }
+        // Answers still on their way are for older text.
+        self.translate_seq += 1;
+        let seq = self.translate_seq;
+        tr.job.text = text.clone();
+        tr.busy = !text.trim().is_empty();
+        if !tr.busy {
+            tr.rows.clear();
+            self.status = None;
+            return;
+        }
+        let job = tr.job.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPING_QUIET).await;
+            _ = this.update(cx, |this, cx| {
+                if this.translate_seq == seq && this.mode == Mode::Translate {
+                    this.translate(job, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn on_translated(&mut self, seq: u64, job: translate::Job, hidden: bool, result: Result<Vec<translate::Translation>, String>, window: &mut Window, cx: &mut Context<Self>) {
+        if seq != self.translate_seq {
+            return;
+        }
+        let rows = match result {
+            Ok(rows) => rows,
+            // The last answers stay; the action bar says what went wrong.
+            Err(e) if self.visible && self.mode == Mode::Translate => {
+                if let Some(tr) = &mut self.translation {
+                    tr.busy = false;
+                }
+                self.status = Some((Tone::Error, e));
+                return cx.notify();
+            }
+            Err(e) => return drop(self.tx.unbounded_send(Msg::error(e))),
+        };
+        if job.after != translate::After::Open {
+            let Some(t) = rows.first() else { return };
+            cx.write_to_clipboard(ClipboardItem::new_string(t.text.clone()));
+            let verb = if job.after == translate::After::Copy {
+                "Copied"
+            } else {
+                // Over the selection the launcher gave focus back to.
+                clipboard::paste_soon();
+                "Pasted"
+            };
+            return drop(self.tx.unbounded_send(Msg::done(translate::instant_toast(verb, &t.detected, &t.to))));
+        }
+        let detected = rows.first().map(|t| t.detected.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| job.from.clone());
+        let (rows, first) = translate::order(rows, &detected, self.cfg.translator.cross_first);
+        let text = job.text.clone();
+        self.translation = Some(TrView { job, rows, first, busy: false });
+        self.status = None;
+        if hidden && !self.visible {
+            self.show(Mode::Translate, window, cx);
+        }
+        if self.mode == Mode::Translate {
+            self.fill_query(&text, cx);
+            self.refresh(cx);
+        }
+    }
+
+    /// Writes a config.toml edit and takes its translator settings and language sets now (the
+    /// reload follows); false, with the error in the ActionBar, when it fails.
+    fn save_translator(&mut self, edit: impl FnOnce(&str) -> Result<String, String>) -> bool {
+        match config::edit_file(&config::path(), edit) {
+            Ok((c, _)) => {
+                self.cfg.translator = c.translator;
+                self.cfg.language_set = c.language_set;
+                true
+            }
+            Err(e) => {
+                self.status = Some((Tone::Error, e));
+                false
+            }
+        }
+    }
+
+    /// The bar's Dropdown: the language set menu over the translator.
+    fn open_lang_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let m = lang_set_menu(&translate::sets(&self.cfg), translate::current(&self.cfg));
+        let pick = |this: &mut Launcher, id: String, window: &mut Window, cx: &mut Context<Launcher>| match id.parse() {
+            Ok(i) => this.use_lang_set(i, window, cx),
+            Err(_) => this.set_mode(Mode::LanguageSets, cx),
+        };
+        self.open_menu(m, pick, window, cx);
+    }
+
+    /// Makes set `i` current (the one before becomes the previous set) and re-translates.
+    fn use_lang_set(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let was = translate::current(&self.cfg);
+        if i != was {
+            if !self.save_translator(|t| translate::set_current(t, i)) {
+                return cx.notify();
+            }
+            self.prev_set = Some(was);
+        }
+        self.retranslate(window, cx);
+    }
+
+    /// Ctrl+Enter in the language set form: adds the set and makes it current, or saves an
+    /// edit and goes back to the list.
+    fn save_lang_set(&mut self, edit: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.form else { return };
+        let v = form_values(&form.fields);
+        let set = translate::LangSet::new(v["Source language"], &[v["Target language 1"].to_string(), v["Target language 2"].to_string()]);
+        let was = translate::current(&self.cfg);
+        match edit {
+            None if self.save_translator(|t| translate::add_set(t, &set)) => {
+                self.prev_set = Some(was);
+                self.retranslate(window, cx);
+            }
+            Some(i) if self.save_translator(|t| translate::replace_set(t, i, &set)) => {
+                self.status = Some((Tone::Ok, "Language set saved".into()));
+                self.set_mode(Mode::LanguageSets, cx);
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    /// Back to the translator in the current language set; typed text translates again at
+    /// once, the last answers dimmed meanwhile.
+    fn retranslate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Translate {
+            let keep = self.translation.take();
+            self.set_mode(Mode::Translate, cx);
+            self.translation = keep;
+        }
+        window.focus(&self.input.focus_handle(cx), cx);
+        let set = translate::current_set(&self.cfg);
+        let job = match &self.translation {
+            Some(tr) => translate::Job { from: set.from, to: set.to, ..tr.job.clone() },
+            None => translate::Job { text: String::new(), from: set.from, to: set.to, all: true, after: translate::After::Open },
+        };
+        if job.text.trim().is_empty() {
+            self.translation = Some(TrView { job, rows: vec![], first: 0, busy: false });
+            return self.refresh(cx);
+        }
+        self.translate(job, cx);
+    }
+
+    // ---- dictionary ------------------------------------------------------------------
+
+    /// Looks `word` up off the UI thread, opening the define view with the word in the bar;
+    /// `fetch` downloads the dictionary first when it is not there. Within the view, the
+    /// answer shown stays until the next one lands.
+    fn define(&mut self, word: String, fetch: bool, cx: &mut Context<Self>) {
+        self.define_seq += 1;
+        let (seq, tx) = (self.define_seq, self.tx.clone());
+        self.status = None;
+        let keep = self.mode == Mode::Define && !fetch;
+        let answer = self.define.take().and_then(|v| v.answer).filter(|_| keep);
+        if self.mode != Mode::Define {
+            self.set_mode(Mode::Define, cx);
+        }
+        // Not downloaded (as checked on show): say so without asking the worker.
+        let missing = !fetch && self.dict_ready == Some(false);
+        self.define = Some(DefView { word: word.clone(), fetch, answer: if missing { Some(Ok(None)) } else { answer } });
+        // Typed with a space after it ("ice "): the bar stays as typed.
+        if self.query(cx).trim() != word {
+            self.fill_query(&word, cx);
+        }
+        self.refresh(cx);
+        if missing {
+            return;
+        }
+        std::thread::spawn(move || {
+            let result = dict::define(&word, fetch);
+            let _ = tx.unbounded_send(Msg::Defined { seq, word, result });
+        });
+    }
+
+    /// Typing in the define view: looks the word up again once typing pauses for `TYPING_QUIET`.
+    fn define_soon(&mut self, cx: &mut Context<Self>) {
+        // Any change outdates a pause still being waited out ("dogs" back to "dog").
+        self.define_typed += 1;
+        let seq = self.define_typed;
+        let query = self.query(cx);
+        let Some(word) = self.define.as_ref().and_then(|v| typed_word(&v.word, &query)).map(str::to_string) else { return };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPING_QUIET).await;
+            _ = this.update(cx, |this, cx| {
+                if this.define_typed == seq && this.mode == Mode::Define && this.query(cx).trim() == word {
+                    this.define(word, false, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn on_defined(&mut self, seq: u64, word: String, result: Result<Option<dict::Answer>, String>, cx: &mut Context<Self>) {
+        if seq != self.define_seq {
+            return;
+        }
+        if let Ok(a) = &result {
+            self.dict_ready = Some(a.is_some());
+        }
+        self.define = Some(DefView { word, fetch: false, answer: Some(result) });
+        if self.mode == Mode::Define {
+            self.refresh(cx);
+        }
+    }
+
+    /// Define Similar Word: a menu of the synonyms; the pick is defined.
+    fn open_similar(&mut self, words: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = words.into_iter().map(|w| menu::Entry { id: w.clone(), label: w, icon: Some(g::BOOK_OPEN), ..Default::default() }).collect();
+        let m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+        self.open_menu(m, |this, word, _, cx| this.define(word, false, cx), window, cx);
+    }
+
+    /// Root search's Define row with a word in its box: asks a worker for that word's first
+    /// sense (its subtitle), unless it is known already or the dictionary is not downloaded.
+    fn ask_sense(&mut self, cx: &App) {
+        if self.mode != Mode::Root || self.dict_ready != Some(true) {
+            return;
+        }
+        let shown = self.arg_values(cx);
+        let boxed = self.arg_row().is_some();
+        let word = self.items.iter().enumerate().find_map(|(i, it)| define_word(it, if i == self.selected && boxed { &shown } else { &it.values })).map(str::to_lowercase);
+        let Some(word) = word.filter(|w| !self.senses.contains_key(w)) else { return };
+        self.sense_seq += 1;
+        let (seq, tx) = (self.sense_seq, self.tx.clone());
+        std::thread::spawn(move || {
+            let sense = dict::first_sense(&word);
+            let _ = tx.unbounded_send(Msg::Sense { seq, word, sense });
+        });
+    }
+
+    fn on_sense(&mut self, seq: u64, word: String, sense: Option<String>, cx: &mut Context<Self>) {
+        if seq != self.sense_seq {
+            return;
+        }
+        // ponytail: forgets everything past 256 words; an LRU if that ever shows.
+        if self.senses.len() > 256 {
+            self.senses.clear();
+        }
+        self.senses.insert(word, sense);
+        cx.notify();
+    }
+
+    // ---- screenshots -----------------------------------------------------------------
+
+    /// Brings the screenshot index up to date on a worker thread; the view fills in as
+    /// each batch of pictures has been read.
+    fn scan_shots(&mut self) {
+        // One scan at a time: a second would read the same pictures again and race on the saved file.
+        // ponytail: reopening during a scan shows its results; pictures added meanwhile wait for the next open.
+        if self.shots_busy {
+            return;
+        }
+        self.shots_seq += 1;
+        self.shots_busy = true;
+        self.shot_pins = shots::pins();
+        let (seq, tx, s, pins) = (self.shots_seq, self.tx.clone(), self.cfg.screenshots.clone(), self.shot_pins.clone());
+        std::thread::spawn(move || {
+            let run = || shots::rescan(&s, pins, |index, read| drop(tx.unbounded_send(Msg::Shots(seq, Some(index.clone()), read))));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            let _ = tx.unbounded_send(Msg::Shots(seq, None, None));
+        });
+    }
+
+    fn on_shots(&mut self, seq: u64, index: Option<shots::ShotIndex>, read: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        if seq != self.shots_seq {
+            return;
+        }
+        self.shots_progress = read;
+        match index {
+            // A pin made during the scan is the launcher's, not yet the scan's.
+            Some(mut index) => {
+                index.set_pins(self.shot_pins.clone());
+                self.shots = index
+            }
+            None => self.shots_busy = false,
+        }
+        if self.mode == Mode::Shots {
+            // New results arrive while you browse: keep the selection where it is.
+            self.refresh_in_place(cx);
+        }
+    }
+
+    /// A screenshot delete finished (`shots::delete`): it leaves the grid and its pin, and the
+    /// selection goes back to where the shot was.
+    fn on_shot_deleted(&mut self, path: PathBuf, at: usize, done: Result<(), String>, cx: &mut Context<Self>) {
+        let said = match done {
+            Ok(()) => {
+                self.shots.remove(&path);
+                if self.shot_pins.contains(&path)
+                    && let Ok(pins) = shots::pin(&path, false)
+                {
+                    self.shot_pins = pins;
+                }
+                (Tone::Ok, "Screenshot deleted".to_string())
+            }
+            Err(e) => (Tone::Error, e),
+        };
+        if !self.visible {
+            // Windows' question took focus and closed the launcher: say it in a toast.
+            return self.say(if said.0 == Tone::Ok { Msg::done(said.1) } else { Msg::error(said.1) });
+        }
+        self.status = Some(said);
+        if self.mode == Mode::Shots {
+            self.selected = at;
+            self.refresh_in_place(cx);
+        }
+        cx.notify();
+    }
+
+    /// Redraws the list with the selection kept at the same place.
+    fn refresh_in_place(&mut self, cx: &mut Context<Self>) {
+        let at = self.selected;
+        self.refresh(cx);
+        self.selected = at.min(self.items.len().saturating_sub(1));
+        self.scroll_to_selected();
+    }
+
+    /// Puts a screenshot (the newest when `path` is None) on the clipboard as an image, and
+    /// pastes it into the app you came from if `paste`. The work runs off the UI thread.
+    fn shot_to_clipboard(&mut self, path: Option<PathBuf>, paste: bool, cx: &mut Context<Self>) {
+        self.hide(true, cx);
+        let (owner, tx, folders, latest) = (self.hwnd.0 as isize, self.tx.clone(), shots::folders(&self.cfg.screenshots.folders), path.is_none());
+        std::thread::spawn(move || {
+            let put = || shots::put_image(HWND(owner as _), path, &folders);
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(put)).unwrap_or_else(|_| Err("Could not read that screenshot".into()));
+            match done {
+                Ok(shot) if paste => {
+                    clipboard::paste_soon();
+                    // Paste Latest Screenshot has no view: its toast says which one went in.
+                    if latest {
+                        let at = std::fs::metadata(&shot).and_then(|m| m.modified()).ok();
+                        drop(tx.unbounded_send(Msg::done(shots::paste_toast(at))));
+                    }
+                }
+                Ok(_) => drop(tx.unbounded_send(Msg::done("Screenshot copied"))),
+                Err(e) => drop(tx.unbounded_send(Msg::error(e))),
+            }
+        });
     }
 
     // ---- Quick AI -------------------------------------------------------------------
@@ -1222,6 +3310,7 @@ impl Launcher {
             self.extv = Some(ExtView { run, ext: e, view: ext::View::default(), depth: 1, values: HashMap::new(), inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] });
             self.mode = Mode::Ext;
             self.panel = None;
+            self.menu = None;
             self.input.update(cx, |s, cx| s.emplace("", cx));
             self.selected = 0;
             self.refresh(cx);
@@ -1396,6 +3485,7 @@ impl Launcher {
                             message: p["message"].as_str().unwrap_or_default().into(),
                             primary: p["primary"].as_str().unwrap_or("Confirm").into(),
                             danger: p["destructive"].as_bool().unwrap_or(false),
+                            then: None,
                         });
                         self.selected = 0;
                         self.refresh(cx);
@@ -1553,34 +3643,115 @@ impl Launcher {
         }
     }
 
+    /// The form on screen as rows, and the selected one: a native form or an extension's.
+    fn form_fields(&self) -> Option<(Vec<FormField>, usize)> {
+        if matches!(self.mode, Mode::Form(_)) {
+            return self.form.as_ref().map(|f| (f.fields.clone(), f.field));
+        }
+        let ev = self.extv.as_ref().filter(|_| self.is_form())?;
+        Some((ev.view.fields.iter().map(|f| ext_field(f, ev)).collect(), ev.field))
+    }
+
+    /// Opens a native form on `fields` (text controls get their boxes here), the first control focused.
+    fn open_form(&mut self, kind: FormKind, mut fields: Vec<FormField>, window: &mut Window, cx: &mut Context<Self>) {
+        let mut subs = vec![];
+        for (i, f) in fields.iter_mut().enumerate().filter(|(_, f)| matches!(f.ctl, Ctl::Text { .. })) {
+            let input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+            input.update(cx, |s, cx| s.emplace(&f.value, cx));
+            subs.push(cx.subscribe(&input, move |this, input, _: &TextChanged, cx| {
+                let value = input.read(cx).as_str().to_string();
+                if let Some(f) = this.form.as_mut().and_then(|f| f.fields.get_mut(i)) {
+                    f.value = value;
+                    f.error = None;
+                }
+            }));
+            f.input = Some(input);
+        }
+        let field = fields.iter().position(FormField::focusable).unwrap_or(0);
+        self.form = Some(NativeForm { fields, field, _subs: subs });
+        self.form_gen += 1;
+        if self.visible {
+            self.set_mode(Mode::Form(kind), cx);
+        } else {
+            self.show(Mode::Form(kind), window, cx);
+        }
+        self.focus_field(window, cx);
+    }
+
     fn focus_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ev) = &self.extv else { return };
-        let handle: FocusHandle = ev
-            .view
-            .fields
-            .get(ev.field)
-            .and_then(|f| ev.inputs.get(&f.id))
-            .map(|i| i.focus_handle(cx))
-            .unwrap_or_else(|| self.input.focus_handle(cx));
+        let Some((fields, i)) = self.form_fields() else { return };
+        let handle = fields.get(i).and_then(|f| f.input.as_ref()).map_or_else(|| self.form_focus.clone(), |input| input.focus_handle(cx));
         window.focus(&handle, cx);
         cx.notify();
     }
 
-    fn move_field(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ev) = &mut self.extv else { return };
-        let n = ev.view.fields.len() as isize;
-        let mut i = ev.field as isize;
-        for _ in 0..n {
-            i = (i + delta).clamp(0, n - 1);
-            if !matches!(ev.view.fields[i as usize].kind, FieldKind::Description | FieldKind::Separator) {
-                break;
-            }
+    fn move_field(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((fields, i)) = self.form_fields() else { return };
+        let i = next_field(&fields, i, d);
+        match (&mut self.form, &mut self.extv) {
+            (Some(f), _) if matches!(self.mode, Mode::Form(_)) => f.field = i,
+            (_, Some(ev)) => ev.field = i,
+            _ => {}
         }
-        ev.field = i.max(0) as usize;
         self.focus_field(window, cx);
     }
 
-    fn submit_form(&mut self, cx: &mut Context<Self>) {
+    /// Down or Enter on a Select control (or a token field), Down on a Text control with
+    /// presets: its menu under it. False for other controls.
+    fn open_field_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((fields, i)) = self.form_fields() else { return false };
+        if matches!(self.mode, Mode::Form(_)) && matches!(fields.get(i).map(|f| &f.ctl), Some(Ctl::Tokens)) {
+            self.open_block_menu(i, window, cx);
+            return true;
+        }
+        let Some(m) = fields.get(i).and_then(|f| field_menu(f, self.form_at.get())) else { return false };
+        // An extension may re-render while the menu is open: its field is known by id, not place.
+        let ext_id = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.fields.get(i)).map(|f| f.id.clone());
+        self.open_menu(
+            m,
+            move |this, id, window, cx| match (&mut this.form, &ext_id) {
+                (Some(f), _) if matches!(this.mode, Mode::Form(_)) => {
+                    if let Some(f) = f.fields.get_mut(i) {
+                        // A text box's preset is typed in.
+                        if let Some(input) = f.input.clone() {
+                            input.update(cx, |s, cx| s.emplace(&id, cx));
+                        }
+                        f.value = id;
+                    }
+                    cx.notify();
+                }
+                (_, Some(fid)) => this.run(Act::FormSet(fid.clone(), id), None, window, cx),
+                _ => {}
+            },
+            window,
+            cx,
+        );
+        true
+    }
+
+    /// Enter on an extension's checkbox.
+    fn toggle_check(&mut self, cx: &mut Context<Self>) {
+        let Some(ev) = &mut self.extv else { return };
+        let Some(f) = ev.view.fields.get(ev.field).cloned() else { return };
+        let on = !ev.values.get(&f.id).and_then(Value::as_bool).unwrap_or(false);
+        ev.values.insert(f.id.clone(), json!(on));
+        if let Some(h) = f.on_change {
+            let run = ev.run;
+            self.send(json!({"t": "event", "run": run, "fn": h, "args": [on]}));
+        }
+        cx.notify();
+    }
+
+    fn submit_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Mode::Form(kind) = self.mode {
+            // Each form acts on `form_values`.
+            match kind {
+                FormKind::Focus => self.submit_focus(window, cx),
+                FormKind::AddCalendar => self.add_calendar(cx),
+                FormKind::AddLanguageSet(edit) => self.save_lang_set(edit, window, cx),
+            }
+            return;
+        }
         let Some(ev) = &self.extv else { return };
         if let Some(f) = ev.view.actions.first().and_then(|a| a.on_action.clone()) {
             let (run, values) = (ev.run, json!(ev.values));
@@ -1589,53 +3760,81 @@ impl Launcher {
         cx.notify();
     }
 
+    /// A form is on screen or under Ctrl+K or a confirm; its keys live on the root (`form_focus`).
+    fn form_under(&self) -> bool {
+        matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"))
+    }
+
+    /// Ctrl+K or a confirm over a form stops drawing its text box, and a focused box that is
+    /// not drawn leaves gpui no key context: the root's `form_focus` takes the keys meanwhile,
+    /// and gives them back to the selected box once the form shows again.
+    fn guard_form_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.form_under() || self.menu.is_some() {
+            return;
+        }
+        // The ActionPanel's search field keeps the keys while the panel is open.
+        if self.panel_filtered() {
+            return;
+        }
+        let on_root = self.form_focus.is_focused(window);
+        if self.panel.is_some() || self.confirm.is_some() {
+            if !on_root && !self.input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.form_focus, cx);
+            }
+        } else if on_root && self.form_fields().is_some_and(|(f, i)| f.get(i).is_some_and(|f| f.input.is_some())) {
+            self.focus_field(window, cx);
+        }
+    }
+
+    /// A form is on screen: a native one, or an extension's Form.
     fn is_form(&self) -> bool {
-        self.mode == Mode::Ext && self.confirm.is_none() && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form")
+        matches!(self.mode, Mode::Form(_)) || (self.mode == Mode::Ext && self.confirm.is_none() && self.extv.as_ref().is_some_and(|e| e.view.kind == "Form"))
     }
 
     // ---- actions --------------------------------------------------------------------
 
     /// Enter on the selected row (or on the highlighted Ctrl+K action).
     fn launch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((item, i)) = self.panel.take() {
-            let act = item.actions().swap_remove(i).1;
-            return self.run(act, item.key.clone(), window, cx);
+        if let Some((item, i)) = &self.panel {
+            // Nothing matches the panel's search: Enter does nothing.
+            let Some((at, (_, act))) = self.panel_rows(cx).into_iter().nth(*i) else { return };
+            let (plain, key) = (item.args.is_empty(), item.key.clone());
+            self.panel = None;
+            // The primary action of a row with arguments goes through its boxes, like Enter.
+            if at > 0 || plain {
+                return self.run(act, key, window, cx);
+            }
         }
         if self.mode == Mode::Install {
             let what = self.query(cx).trim().to_string();
             return self.install(what, cx);
         }
-        if self.is_form() {
-            let ev = self.extv.as_mut().unwrap();
-            let field = ev.view.fields.get(ev.field).cloned();
-            match field.map(|f| (f.kind.clone(), f)) {
-                Some((FieldKind::Checkbox, f)) => {
-                    let on = !ev.values.get(&f.id).and_then(Value::as_bool).unwrap_or(false);
-                    ev.values.insert(f.id.clone(), json!(on));
-                    if let Some(h) = f.on_change {
-                        let run = ev.run;
-                        self.send(json!({"t": "event", "run": run, "fn": h, "args": [on]}));
-                    }
+        if let Some((fields, i)) = self.form_fields() {
+            match fields.get(i).map(|f| &f.ctl) {
+                Some(Ctl::Select(..) | Ctl::Tokens) => _ = self.open_field_menu(window, cx),
+                Some(Ctl::Check) => self.toggle_check(cx),
+                _ if Some(i) == fields.iter().rposition(FormField::focusable) => self.submit_form(window, cx),
+                _ => self.move_field(1, window, cx),
+            }
+            return;
+        }
+        self.sync_args(cx);
+        let Some(item) = self.items.get(self.selected).cloned() else { return };
+        let act = if item.args.is_empty() || !matches!(self.mode, Mode::Root | Mode::Args) {
+            item.act.clone()
+        } else {
+            match search::with_args(&item, &self.arg_values(cx)) {
+                Ok(act) => act,
+                Err((i, missing)) => {
+                    self.arg_missing = Some(i);
+                    self.status = Some((Tone::Error, missing));
+                    self.focus_arg(i, window, cx);
                     return cx.notify();
-                }
-                Some((FieldKind::Dropdown(opts), f)) => {
-                    let mut it = Item::new(&f.title, "", Icon::glyph("▾"), Act::None);
-                    it.extra = opts.into_iter().map(|(v, t)| (t, Act::FormSet(f.id.clone(), v))).collect();
-                    self.panel = Some((it, 0));
-                    return cx.notify();
-                }
-                _ => {
-                    let last = ev.view.fields.iter().rposition(|f| !matches!(f.kind, FieldKind::Description | FieldKind::Separator));
-                    if Some(ev.field) == last { self.submit_form(cx) } else { self.move_field(1, window, cx) }
-                    return;
                 }
             }
-        }
-        let Some(item) = self.items.get(self.selected).cloned() else { return };
-        if self.mode == Mode::Args {
-            return self.next_argument(cx);
-        }
+        };
         let needs_confirm = match item.act {
+            Act::Join(..) | Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(&item.act).is_some(),
             Act::Cmd(cmd) => cmd.destructive(),
             Act::Script(i) => self.scripts[i].confirm,
             _ => false,
@@ -1644,10 +3843,13 @@ impl Launcher {
             self.armed = Some(self.selected);
             return cx.notify();
         }
-        self.run(item.act, item.key, window, cx);
+        self.run(act, item.key, window, cx);
     }
 
     fn run(&mut self, act: Act, key: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ask_args_for(&act, window, cx) {
+            return;
+        }
         let housekeeping = matches!(act, Act::Favorite(..) | Act::Hide(_));
         if let Some(key) = key.as_ref().filter(|_| !housekeeping) {
             self.frec.record(key, search::now());
@@ -1683,6 +3885,23 @@ impl Launcher {
             Act::App(id) => win::launch_app(&id),
             Act::RunAsAdmin(id) => win::run_as_admin(&id),
             // A quicklink switches to a tab already showing it, when a browser is connected.
+            // The browser companion can't see a link procast opens itself, so check it here.
+            Act::Open(url) if self.focus.blocked_url(&url).is_some() => {
+                self.say(Msg::error(format!("{} is blocked until Focus ends", focus::host_of(&url).unwrap_or_default())));
+            }
+            Act::FocusStart(name, mode) => {
+                let Some(c) = focus::category(&focus::categories(&self.cfg.focus_category), &name).cloned() else { return };
+                let picks = vec![format!("cat:{}", c.name)];
+                let start = focus::Start { title: name, minutes: self.cfg.focus.default_minutes, filter: Some((mode, c.apps, c.sites)), picks };
+                let text = self.focus_begin(start, false);
+                self.say(Msg::done(text));
+            }
+            Act::Cmd(Cmd::Focus(f)) => return self.focus_cmd(f, window, cx),
+            Act::FocusExtend => {
+                self.focus_extend();
+                return self.refresh(cx);
+            }
+            Act::With(act, got) => return self.run_with(*act, got, window, cx),
             Act::Open(url) if self.cfg.search.existing_tab && key.as_deref().is_some_and(|k| k.starts_with("ql:")) && url.starts_with("http") && self.browsers.any() => {
                 win::allow_foreground();
                 if !self.browsers.ask(None, json!({"t": "open", "url": url})) {
@@ -1728,14 +3947,7 @@ impl Launcher {
                 let name = key.as_deref().and_then(|k| k.strip_prefix("sn:")).unwrap_or("snippet").to_string();
                 return self.start_snippet(name, template, 0, String::new(), window, cx);
             }
-            Act::Script(i) => {
-                if self.scripts[i].args.is_empty() {
-                    return self.start_script(i, vec![], cx);
-                }
-                self.pending = Some(Pending::Script(i, vec![]));
-                return self.set_mode(Mode::Args, cx);
-            }
-            Act::Fill(text) => return self.input.update(cx, |s, cx| s.emplace(&text, cx)),
+            Act::Script(i) => return self.start_script(i, vec![], cx),
             Act::ExtRun(e, c) => return self.start_ext(e, c, false, json!({}), cx),
             Act::ExtFn(f) => {
                 if let Some(ev) = &self.extv {
@@ -1764,7 +3976,11 @@ impl Launcher {
             }
             Act::Confirm(ok) => {
                 if let Some(c) = self.confirm.take() {
-                    self.reply(c.run, c.id, Ok(json!(ok)));
+                    match c.then {
+                        Some(then) if ok => then(self, cx),
+                        Some(_) => {}
+                        None => self.reply(c.run, c.id, Ok(json!(ok))),
+                    }
                 }
                 return self.refresh(cx);
             }
@@ -1779,6 +3995,123 @@ impl Launcher {
             }
             Act::None => return,
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
+            Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
+            Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
+            Act::Cmd(Cmd::SearchNotes) => return self.set_mode(Mode::Notes(NotesList::All), cx),
+            Act::Cmd(Cmd::RecentlyDeletedNotes) => return self.set_mode(Mode::Notes(NotesList::Deleted), cx),
+            Act::Cmd(Cmd::OpenNotes) => {
+                self.hide(false, cx);
+                // An open window already shows the note opened last.
+                if let Some(h) = self.notes_window
+                    && h.update(cx, |w, window, cx| w.has_note() && {
+                        w.reveal(window, cx);
+                        true
+                    })
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                return self.show_note(
+                    false,
+                    |s, now| {
+                        Ok(match s.last() {
+                            Some(id) => id,
+                            None => created(s.create(now)?),
+                        })
+                    },
+                    cx,
+                );
+            }
+            Act::OpenNote(id) => {
+                self.hide(false, cx);
+                return self.show_note(false, move |_, _| Ok(id), cx);
+            }
+            Act::RestoreNote(id) => {
+                self.hide(false, cx);
+                return self.show_note(false, move |s, _| s.restore(&id).map(|_| id), cx);
+            }
+            Act::PurgeNote(id) => {
+                let title = self.note_rows.iter().flatten().find(|(m, _)| m.id == id).map(|(m, _)| m.title.clone()).unwrap_or_default();
+                let then = move |this: &mut Launcher, cx: &mut Context<Launcher>| {
+                    this.notes.run(cx, move |s| s.purge(&id), |this, r, cx| {
+                        this.status = Some(match r {
+                            Ok(()) => (Tone::Ok, "Note deleted permanently".into()),
+                            Err(e) => (Tone::Error, format!("Couldn't delete the note: {e}")),
+                        });
+                        if matches!(this.mode, Mode::Notes(_)) {
+                            this.refresh_in_place(cx);
+                        }
+                    });
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Note Permanently?".into(), message: title, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
+            Act::Join(_, url) => win::open(&url),
+            Act::Cmd(Cmd::JoinMeeting) => match self.join_target(&Act::Cmd(Cmd::JoinMeeting)) {
+                Some((title, url)) => {
+                    win::open(&url);
+                    self.say(Msg::done(format!("Joining {title}")));
+                }
+                None => self.say(Msg::error("No meeting with a link right now")),
+            },
+            Act::HideEvent(key) => {
+                match calendar::hide(&config::dir().join(CALENDAR_HIDDEN), key) {
+                    Ok(set) => self.hidden_events = set,
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return self.refresh(cx);
+            }
+            Act::AddCalendar => return self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
+            Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
+            Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
+            Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
+            Act::OpenWith(path) => win::open_with(&path),
+            Act::QuickLook(_) => {
+                if self.quick_look {
+                    self.close_quick_look(cx);
+                } else {
+                    self.quick_look = true;
+                }
+                return cx.notify();
+            }
+            Act::PinShot(path, on) => {
+                match shots::pin(Path::new(&path), on) {
+                    Ok(pins) => {
+                        self.shot_pins = pins.clone();
+                        self.shots.set_pins(pins);
+                        self.status = Some((Tone::Ok, if on { "Pinned" } else { "Unpinned" }.into()));
+                    }
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return self.refresh_in_place(cx);
+            }
+            Act::CopyText(path) => {
+                let text = self.shots.text(Path::new(&path)).trim().to_string();
+                if text.is_empty() {
+                    self.status = Some((Tone::Error, "No text found in this screenshot".into()));
+                    return cx.notify();
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.say(Msg::done("Copied text"));
+            }
+            Act::DeleteShot(path) => {
+                let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let at = self.selected;
+                let then = move |this: &mut Launcher, _: &mut Context<Launcher>| {
+                    let tx = this.tx.clone();
+                    // Windows may ask before a delete it can't undo: let its question come forward.
+                    win::allow_foreground();
+                    std::thread::spawn(move || {
+                        let path = PathBuf::from(path);
+                        let done = shots::delete(&path);
+                        let _ = tx.unbounded_send(Msg::ShotDeleted(path, at, done));
+                    });
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Screenshot?".into(), message: name, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
             Act::Cmd(Cmd::ClipboardHistory) => return self.set_mode(Mode::Clipboard, cx),
             Act::Cmd(Cmd::Emoji) => return self.set_mode(Mode::Emoji, cx),
             Act::Cmd(Cmd::InstallExtension) => return self.set_mode(Mode::Install, cx),
@@ -1791,7 +4124,8 @@ impl Launcher {
                     return cx.notify();
                 }
                 win::open(&browser::extension_dir().to_string_lossy());
-                let _ = self.tx.unbounded_send(Msg::Toast(true, "In chrome://extensions or edge://extensions: Developer mode, Load unpacked, this folder".into()));
+                // An instruction to follow while the folder opens: it stays until dismissed.
+                let _ = self.tx.unbounded_send(Msg::sticky(toast::Kind::Info, "Load unpacked in chrome://extensions, Developer mode on"));
             }
             Act::Tab(conn, id) => {
                 let window = self.tabs.iter().find(|(c, _, t)| *c == conn && t.id == id).map_or(0, |t| t.2.window);
@@ -1805,9 +4139,104 @@ impl Launcher {
                 return;
             }
             Act::Cmd(Cmd::AskAi) => return self.open_ai(cx),
-            Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
-                self.pending = Some(Pending::RenameDesktop);
-                return self.set_mode(Mode::Args, cx);
+            Act::Translate(mut job) => {
+                // Translate's boxes leave the languages empty: the current language set's.
+                let set = translate::current_set(&self.cfg);
+                if job.from.is_empty() {
+                    job.from = set.from;
+                }
+                if job.to.is_empty() {
+                    job.to = set.to;
+                }
+                return self.translate(job, cx);
+            }
+            Act::Cmd(cmd @ (Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste)) => {
+                // Into the primary language, or the secondary when the text already is in it.
+                let after = if cmd == Cmd::InstantTranslateCopy { translate::After::Copy } else { translate::After::Replace };
+                let set = self.cfg.translator.set();
+                return self.translate(translate::Job { text: String::new(), from: set.from, to: set.to, all: false, after }, cx);
+            }
+            Act::Define(word) => return self.define(word, false, cx),
+            Act::DownloadDictionary(word) => return self.define(word, true, cx),
+            Act::SimilarWords(words) => return self.open_similar(words, window, cx),
+            Act::LangMenu => return self.open_lang_menu(window, cx),
+            Act::UseLangSet(i) => return self.use_lang_set(i, window, cx),
+            Act::SetAutoHdr(on) => {
+                match config::edit_file(&config::path(), |t| config::write_value(t, &["games".into(), "auto_hdr".into()], on.into())) {
+                    Ok((c, _)) => {
+                        self.cfg.games.auto_hdr = c.games.auto_hdr;
+                        // Redrawn in place: the selection stays on the row.
+                        for it in self.items.iter_mut().filter(|it| matches!(it.act, Act::SetAutoHdr(_))) {
+                            *it = auto_hdr_row(c.games.auto_hdr);
+                        }
+                    }
+                    Err(e) => self.status = Some((Tone::Error, e)),
+                }
+                return cx.notify();
+            }
+            Act::EditLangSet(i) => {
+                let set = i.and_then(|i| translate::sets(&self.cfg).get(i).cloned());
+                return self.open_form(FormKind::AddLanguageSet(i), lang_set_form(set.as_ref()), window, cx);
+            }
+            Act::DeleteLangSet(i) => {
+                let label = translate::sets(&self.cfg).get(i).map(translate::LangSet::label).unwrap_or_default();
+                let then = move |this: &mut Launcher, _: &mut Context<Launcher>| {
+                    if this.save_translator(|t| translate::delete_set(t, i)) {
+                        // The sets after it moved up one.
+                        this.prev_set = None;
+                        this.status = Some((Tone::Ok, "Language set deleted".into()));
+                    }
+                };
+                self.confirm = Some(Confirm { run: 0, id: 0, title: "Delete Language Set?".into(), message: label, primary: "Delete".into(), danger: true, then: Some(Box::new(then)) });
+                self.selected = 0;
+                return self.refresh(cx);
+            }
+            Act::StartTimer(secs, label) => {
+                let d = Duration::from_secs(secs);
+                self.timers.start(label.clone(), d);
+                self.watch_timers();
+                self.say(Msg::done(["Timer set", &timers::fmt_spoken(d), &label].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")));
+            }
+            Act::StopTimer(id) => {
+                // A stopwatch's time goes to the clipboard; a timer is cancelled, a done one dismissed.
+                let now = SystemTime::now();
+                let done = self.timers.rows(now).iter().any(|r| r.id == id && r.done);
+                self.status = match self.timers.elapsed(id, now).map(timers::fmt_duration) {
+                    Some(time) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(time.clone()));
+                        Some((Tone::Ok, format!("Stopped at {time}, copied")))
+                    }
+                    None if done => None,
+                    None => Some((Tone::Info, "Timer cancelled".into())),
+                };
+                self.timers.cancel(id);
+                return self.refresh(cx);
+            }
+            Act::PauseTimer(id) => {
+                self.timers.pause(id, SystemTime::now());
+                return self.refresh_keeping(cx);
+            }
+            Act::ResumeTimer(id) => {
+                self.timers.resume(id, SystemTime::now());
+                self.watch_timers();
+                return self.refresh_keeping(cx);
+            }
+            Act::RestartTimer(id) => {
+                self.timers.restart(id, SystemTime::now());
+                self.watch_timers();
+                return self.refresh_keeping(cx);
+            }
+            Act::AddTime(id, secs) => {
+                self.timers.add(id, Duration::from_secs(secs));
+                return self.refresh_keeping(cx);
+            }
+            Act::RenameTimer(id) => {
+                let Some(r) = self.timers.rows(SystemTime::now()).into_iter().find(|r| r.id == id) else { return };
+                let (kind, glyph) = timer_kind(r.stopwatch);
+                let name = search::Arg { optional: true, placeholder: "Type name".into(), ..search::Arg::new("Name") };
+                let mut it = Item::new(format!("Rename {kind}"), "", Icon::Vector(glyph), Act::RenameTimer(id)).tinted(design::Tint::System).boxes(vec![name], &[]);
+                it.values = vec![r.title];
+                return self.ask_args(it, window, cx);
             }
             Act::Ask(prompt) => return self.ask(prompt, cx),
             Act::QuitApp(pid) => {
@@ -1823,7 +4252,11 @@ impl Launcher {
             Act::Cmd(Cmd::ClearClipboardHistory) => self.history.clear(),
             Act::Cmd(Cmd::Settings) => {
                 self.hide(false, cx);
-                return self.open_settings(cx);
+                return self.open_settings(None, cx);
+            }
+            Act::AddShotFolder => {
+                self.hide(false, cx);
+                return self.open_settings(Some("Screenshots"), cx);
             }
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true, true),
@@ -1836,7 +4269,7 @@ impl Launcher {
                 let tx = self.tx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = commands::run_layout(&layout, &w, &ids) {
-                        let _ = tx.unbounded_send(Msg::Toast(false, e));
+                        let _ = tx.unbounded_send(Msg::error(e));
                     }
                 });
                 return;
@@ -1849,13 +4282,17 @@ impl Launcher {
                 let target = self.prev.0 as isize;
                 let w = self.cfg.window.clone();
                 let tx = self.tx.clone();
+                let hdr_seq = (cmd == Cmd::ToggleHdr).then(|| self.hdr_read());
                 std::thread::spawn(move || {
                     let said = match commands::run(cmd, HWND(target as _), &w) {
-                        Ok(done) => done.map(|d| (true, d)),
-                        Err(e) => Some((false, e)),
+                        Ok(done) => done.map(Msg::done),
+                        Err(e) => Some(Msg::error(e)),
                     };
-                    if let Some((ok, text)) = said {
-                        let _ = tx.unbounded_send(Msg::Toast(ok, text));
+                    if let Some(toast) = said {
+                        let _ = tx.unbounded_send(toast);
+                    }
+                    if let Some(seq) = hdr_seq {
+                        let _ = tx.unbounded_send(Msg::Hdr(seq, hdr::displays()));
                     }
                 });
                 return;
@@ -1864,6 +4301,65 @@ impl Launcher {
         // Hand focus back even when launching: a cloaked launcher that stays foreground
         // would swallow keys typed before the new app's window appears.
         self.hide(true, cx);
+    }
+
+    /// Enter on a row whose act takes its boxes' values as they are (`Act::With`).
+    fn run_with(&mut self, act: Act, got: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        match act {
+            Act::Script(i) => self.start_script(i, got, cx),
+            Act::Snippet(template) => {
+                let (erase, then) = std::mem::take(&mut self.typed);
+                self.mode = Mode::Root;
+                self.insert_snippet(template, got, erase, then, cx);
+            }
+            Act::Cmd(Cmd::Focus(f)) => self.focus_args(f, got, window, cx),
+            Act::Cmd(Cmd::CreateNote) => {
+                self.hide(false, cx);
+                let title = got[0].trim().to_string();
+                self.show_note(
+                    !title.is_empty(),
+                    move |s, now| {
+                        let id = created(s.create(now)?);
+                        if !title.is_empty() {
+                            s.save(&id, &format!("# {title}\n"), now)?;
+                        }
+                        Ok(id)
+                    },
+                    cx,
+                );
+            }
+            Act::Cmd(Cmd::StartStopwatch) => {
+                self.timers.stopwatch(got[0].clone());
+                self.watch_timers();
+                self.say(Msg::done("Stopwatch started"));
+                // A hotkey starts it without opening the launcher.
+                if self.visible {
+                    self.hide(true, cx);
+                }
+            }
+            Act::RenameTimer(id) => {
+                self.timers.rename(id, got[0].trim().to_string());
+                self.args_row = None;
+                self.set_mode(Mode::Root, cx);
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+            Act::Cmd(Cmd::Desktop(Desk::Rename)) => {
+                self.hide(true, cx);
+                let (tx, name) = (self.tx.clone(), got[0].clone());
+                std::thread::spawn(move || {
+                    if let Err(e) = desktops::rename(&name) {
+                        let _ = tx.unbounded_send(Msg::error(e));
+                    }
+                });
+            }
+            Act::ExtRun(e, c) => {
+                // The extension gets its arguments by name; empty ones are left out.
+                let names = self.exts.get(e).and_then(|(x, _)| x.commands.get(c)).map(|c| c.args.iter().map(|a| a.name.to_string()).collect::<Vec<_>>()).unwrap_or_default();
+                let args: serde_json::Map<String, Value> = names.into_iter().zip(got).filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n, json!(v))).collect();
+                self.start_ext(e, c, false, Value::Object(args), cx);
+            }
+            act => self.run(act, None, window, cx),
+        }
     }
 
     /// Lists running apps in the background; icons come from the cache or are read once.
@@ -1894,9 +4390,16 @@ impl Launcher {
 
     /// Whether running this needs the launcher on screen (it opens a view or asks for input).
     fn needs_window(&self, act: &Act) -> bool {
+        if self.asks_args(act) {
+            return true;
+        }
         match act {
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::Desktop(Desk::Rename)) | Act::Fill(_) => true,
-            Act::Script(i) => self.scripts.get(*i).is_some_and(|s| !s.args.is_empty() || matches!(s.output, Output::Full)),
+            Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
+            // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
+            Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
+            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
+            Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
         }
@@ -1927,6 +4430,9 @@ impl Launcher {
         }
         if self.needs_window(&it.act) {
             self.show(Mode::Root, window, cx);
+            if it.act == Act::Cmd(Cmd::JoinMeeting) {
+                return self.ask_join(cx);
+            }
         } else if !self.visible {
             let fg = win::foreground();
             if fg != self.hwnd {
@@ -1936,12 +4442,124 @@ impl Launcher {
         self.run(it.act, it.key, window, cx);
     }
 
-    /// Brings up the settings window, reusing it if it's already open.
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    /// Once at startup, on the store's worker: notes deleted longer ago than `[notes]
+    /// keep_deleted_days` go for good.
+    fn purge_old_notes(&mut self, cx: &mut Context<Self>) {
+        if let Some(e) = self.cfg.notes.folder_error() {
+            self.say(Msg::error(e));
+        }
+        let (now, days) = (search::now() as i64, self.cfg.notes.keep_days());
+        self.notes.run(cx, move |s| s.purge_expired(now, days), |this, r, _| {
+            if let Err(e) = r {
+                this.say(Msg::error(format!("Notes: {e}")));
+            }
+        });
+    }
+
+    /// Shows a note in the Notes window, opening the window the first time. `pick` chooses the
+    /// note on the store's worker (and may change the store); the note is then marked opened
+    /// and read there too.
+    /// `wrote`: `pick` writes the note's text (Create Note's title), which the window then shows
+    /// even over its own copy of that note.
+    fn show_note(&mut self, wrote: bool, pick: impl FnOnce(&mut Store, i64) -> std::io::Result<String> + Send + 'static, cx: &mut Context<Self>) {
+        let now = search::now() as i64;
+        let place = self.notes_window.is_none().then(notes::window::place_path);
+        // The note on screen is written before `pick` reads anything.
+        if let Some(h) = self.notes_window {
+            drop(h.update(cx, |w, _, cx| w.save(cx)));
+        }
+        self.notes.run(
+            cx,
+            move |s| {
+                let id = pick(s, now)?;
+                s.open_note(&id, now)?;
+                let text = s.text(&id)?;
+                Ok((id, text, place.and_then(|p| notes::window::load_place(&p))))
+            },
+            move |this, r, cx| match r {
+                Ok((id, text, place)) => this.note_window(id, text, wrote, place, cx),
+                Err(e) => this.note_failed(format!("Couldn't open the note: {e}")),
+            },
+        );
+    }
+
+    /// Opening a note failed: the launcher hid without handing focus back (the window was to take
+    /// it), so the app you came from gets it again, and a toast says why.
+    fn note_failed(&mut self, why: String) {
+        if !self.visible && !self.prev.is_invalid() {
+            win::focus(self.prev);
+        }
+        self.say(Msg::error(why));
+    }
+
+    /// The Notes window on note `id`: reused while it exists, else opened where it was last
+    /// (`place`, when that is still on a screen) or centred.
+    fn note_window(&mut self, id: String, text: String, wrote: bool, place: Option<Place>, cx: &mut Context<Self>) {
+        if let Some(h) = self.notes_window
+            && h.update(cx, |w, window, cx| w.show(id.clone(), text.clone(), wrote, window, cx)).is_ok()
+        {
+            return;
+        }
+        let bounds = place
+            .map(Place::bounds)
+            .filter(|b| cx.displays().iter().any(|d| d.bounds().intersects(b)))
+            .unwrap_or_else(|| Bounds::centered(None, size(gpui::px(design::NOTES_W), gpui::px(design::NOTES_H)), cx));
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Hidden: the header is the caption (drag area and close).
+            titlebar: Some(gpui::TitlebarOptions { title: Some("Notes".into()), appears_transparent: true, ..Default::default() }),
+            windows_window_background: backdrop(design::refresh_glass()),
+            ..Default::default()
+        };
+        let (notes, tx, theme) = (self.notes.clone(), self.tx.clone(), self.cfg.theme.clone());
+        self.notes_window = cx.open_window(options, |window, cx| cx.new(|cx| NotesWindow::new(notes, tx, theme, window, cx))).ok();
+        match self.notes_window {
+            Some(h) => drop(h.update(cx, |w, window, cx| w.show(id, text, wrote, window, cx))),
+            None => self.note_failed("Couldn't open the Notes window".into()),
+        }
+    }
+
+    /// Asks the store for `Mode::Notes`' rows; the answer replaces the list if nothing newer was asked.
+    fn search_notes(&mut self, list: NotesList, query: &str, cx: &mut Context<Self>) {
+        self.note_gen += 1;
+        let (generation, q) = (self.note_gen, query.to_string());
+        self.notes.run(cx, move |s| Ok(s.browse(list == NotesList::Deleted, &q)), move |this, r, cx| {
+            if this.note_gen != generation || this.mode != Mode::Notes(list) {
+                return;
+            }
+            this.note_rows = Some(r.unwrap_or_else(|e| {
+                this.status = Some((Tone::Error, format!("Couldn't read the notes: {e}")));
+                vec![]
+            }));
+            if this.confirm.is_none() {
+                let q = this.query(cx);
+                this.items = this.note_items(list, &q, cx);
+                this.selected = this.selected.min(this.items.len().saturating_sub(1));
+                this.scroll_to_selected();
+            }
+            cx.notify();
+        });
+    }
+
+    fn note_items(&self, list: NotesList, query: &str, cx: &App) -> Vec<Item> {
+        match &self.note_rows {
+            None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
+            Some(rows) => {
+                let current = self.notes_window.and_then(|h| h.read(cx).ok()).and_then(NotesWindow::current);
+                note_rows(list, rows, current, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_days())
+            }
+        }
+    }
+
+    /// Brings up the settings window, reusing it if it's already open; on `page` when given.
+    fn open_settings(&mut self, page: Option<&str>, cx: &mut Context<Self>) {
         let items = search::all_items(&self.apps, &self.scripts, &self.exts, &self.cfg);
         if let Some(h) = self.settings_window
-            && h.update(cx, |s, window, _| {
+            && h.update(cx, |s, window, cx| {
                 s.set_items(items.clone());
+                if let Some(page) = page {
+                    s.show_section(page, window, cx);
+                }
                 window.activate()
             })
             .is_ok()
@@ -1958,8 +4576,11 @@ impl Launcher {
         };
         design::refresh_glass();
         self.refresh_index_status(cx);
-        let (tx, status) = (self.tx.clone(), self.index_status.clone());
-        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, window, cx))).ok();
+        let (tx, status, feeds) = (self.tx.clone(), self.index_status.clone(), self.calendar.status.clone());
+        self.settings_window = cx.open_window(options, |window, cx| cx.new(|cx| settings::Settings::new(items, tx, status, feeds, window, cx))).ok();
+        if let (Some(h), Some(page)) = (self.settings_window, page) {
+            drop(h.update(cx, |s, window, cx| s.show_section(page, window, cx)));
+        }
     }
 
     /// Rewrites the Settings index line from the live index and repaints Settings.
@@ -2035,53 +4656,6 @@ impl Launcher {
         });
     }
 
-    fn next_argument(&mut self, cx: &mut Context<Self>) {
-        let value = self.query(cx).trim().to_string();
-        match self.pending.take() {
-            None => {}
-            Some(Pending::Script(i, mut got)) => {
-                let spec = &self.scripts[i].args[got.len()];
-                if value.is_empty() && !spec.optional {
-                    self.status = Some((Tone::Error, format!("{} is required", spec.placeholder)));
-                    self.pending = Some(Pending::Script(i, got));
-                    return cx.notify();
-                }
-                got.push(value);
-                if got.len() < self.scripts[i].args.len() {
-                    self.pending = Some(Pending::Script(i, got));
-                    self.status = None;
-                    self.input.update(cx, |s, cx| s.emplace("", cx));
-                    return self.refresh(cx);
-                }
-                self.start_script(i, got, cx);
-            }
-            Some(Pending::Snippet { name, template, args, mut got, erase, then }) => {
-                got.push(value);
-                if got.len() < args.len() {
-                    self.pending = Some(Pending::Snippet { name, template, args, got, erase, then });
-                    self.input.update(cx, |s, cx| s.emplace("", cx));
-                    return self.refresh(cx);
-                }
-                self.mode = Mode::Root;
-                self.insert_snippet(template, got, erase, then, cx);
-            }
-            Some(Pending::RenameDesktop) => {
-                if value.is_empty() {
-                    self.status = Some((Tone::Error, "Name is required".into()));
-                    self.pending = Some(Pending::RenameDesktop);
-                    return cx.notify();
-                }
-                self.hide(true, cx);
-                let tx = self.tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = desktops::rename(&value) {
-                        let _ = tx.unbounded_send(Msg::Toast(false, e));
-                    }
-                });
-            }
-        }
-    }
-
     fn start_script(&mut self, i: usize, args: Vec<String>, cx: &mut Context<Self>) {
         let script = self.scripts[i].clone();
         match script.output {
@@ -2117,6 +4691,9 @@ impl Launcher {
                     clipboard::configure(&cfg.clipboard.ignore_apps, cfg.clipboard.ocr);
                     self.history.set_limits(cfg.clipboard.history, &cfg.clipboard.keep);
                 }
+                if cfg.games.list != self.cfg.games.list {
+                    foreground::set_games(&cfg.games.list);
+                }
                 if cfg.apps.folders != self.cfg.apps.folders || cfg.apps.deep != self.cfg.apps.deep {
                     self.scanned = None;
                 }
@@ -2136,6 +4713,28 @@ impl Launcher {
                     self.files = start_files(&cfg, &self.tx);
                     self.refresh_index_status(cx);
                 }
+                if cfg.calendar_feed.iter().map(|f| &f.url).ne(self.cfg.calendar_feed.iter().map(|f| &f.url)) {
+                    self.calendar.reset(&cfg.calendar_feed.iter().map(|f| f.url.clone()).collect::<Vec<_>>());
+                }
+                if cfg.notes.folder != self.cfg.notes.folder
+                    && let Some(e) = cfg.notes.folder_error()
+                {
+                    self.say(Msg::error(e));
+                }
+                if cfg.notes.dir() != self.cfg.notes.dir() {
+                    self.notes = Notes::start(cfg.notes.dir(), cx);
+                    let notes = self.notes.clone();
+                    if let Some(h) = self.notes_window {
+                        drop(h.update(cx, |w, window, cx| w.use_store(notes, window, cx)));
+                    }
+                }
+                if let Some(h) = self.notes_window {
+                    let theme = cfg.theme.clone();
+                    drop(h.update(cx, |w, _, cx| {
+                        w.theme = theme;
+                        cx.notify();
+                    }));
+                }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
                 self.notice = None;
@@ -2147,12 +4746,26 @@ impl Launcher {
 
     fn on_msg(&mut self, msg: Msg, window: &mut Window, cx: &mut Context<Self>) {
         match msg {
-            Msg::Hotkey(_) if self.cfg.launcher.game_mode && !self.visible && win::full_screen_app() => {}
+            Msg::Hotkey(_) if self.cfg.launcher.game_mode && !self.visible && foreground::full_screen_app() => {}
             Msg::Hotkey(i) if i >= BINDS.len() => self.run_hotkey(i, window, cx),
             Msg::Hotkey(i) if self.visible && self.mode == Mode::of(BINDS[i]) => self.hide(true, cx),
             Msg::Hotkey(i) => self.show(Mode::of(BINDS[i]), window, cx),
             Msg::Tray(TrayCmd::Open) => self.show(Mode::Root, window, cx),
-            Msg::Tray(TrayCmd::Settings) => self.open_settings(cx),
+            // A fresh root search, list showing: its top row is the session's.
+            Msg::Hud(hud::Click::Open) => {
+                self.hidden_at = None;
+                self.show(Mode::Root, window, cx);
+                self.peek = true;
+                self.refresh(cx);
+            }
+            Msg::Hud(hud::Click::Extend) => {
+                self.focus_extend();
+                if self.visible && self.mode == Mode::Root {
+                    self.refresh(cx);
+                }
+            }
+            Msg::Hud(hud::Click::Complete) => self.focus_end(true, cx),
+            Msg::Tray(TrayCmd::Settings) => self.open_settings(None, cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Msg::Tray(TrayCmd::Quit) => cx.quit(),
             Msg::Apps(apps) => {
@@ -2187,6 +4800,12 @@ impl Launcher {
             }
             // The old index is dropped; a new one re-crawls the folders (never the saved copy)
             // and reconnects the helper, which scans every drive's MFT afresh.
+            Msg::AddCalendar => self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
+            Msg::RecentlyDeletedNotes => {
+                let mode = Mode::Notes(NotesList::Deleted);
+                if self.visible { self.set_mode(mode, cx) } else { self.show(mode, window, cx) }
+            }
+            Msg::CalendarAdded(generation, feed, result) => self.calendar_added(generation, feed, result, window, cx),
             Msg::RebuildIndex => {
                 self.files = start_files(&self.cfg, &self.tx);
                 self.refresh_index_status(cx);
@@ -2223,6 +4842,31 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
+            Msg::ToastClose => {
+                if let Some(t) = self.toast {
+                    _ = t.update(cx, |t, _, cx| t.dismiss(cx));
+                }
+            }
+            Msg::TimerTick => self.on_timer_tick(cx),
+            Msg::Translated { seq, job, hidden, result } => self.on_translated(seq, job, hidden, result, window, cx),
+            Msg::Defined { seq, word, result } => self.on_defined(seq, word, result, cx),
+            Msg::DictReady(ready) => {
+                self.dict_ready = Some(ready);
+                self.ask_sense(cx);
+            }
+            Msg::Sense { seq, word, sense } => self.on_sense(seq, word, sense, cx),
+            Msg::Shots(seq, index, read) => self.on_shots(seq, index, read, cx),
+            Msg::ShotDeleted(path, at, done) => self.on_shot_deleted(path, at, done, cx),
+            Msg::Hdr(seq, status) => {
+                if take_hdr_read(&mut self.hdr_status, self.hdr_seq, seq, status) {
+                    hdr_state(&mut self.items, self.hdr_status.as_deref());
+                    cx.notify();
+                }
+            }
+            Msg::Foreground { hwnd, game, exe } => {
+                self.hdr.foreground(self.cfg.games.auto_hdr, game, hwnd, exe.clone());
+                self.focus_front(hwnd, &exe);
+            }
             Msg::Notice(e) => {
                 self.notice = Some(e.lines().next().unwrap_or(&e).chars().take(200).collect());
                 self.show(Mode::Root, window, cx);
@@ -2249,7 +4893,21 @@ impl Launcher {
                 self.history.prune(search::now());
                 let idle = Duration::from_secs(self.cfg.apps.auto_quit_minutes.max(1) * 60);
                 self.autoquit.tick(&self.cfg.apps.auto_quit, idle, win::foreground());
+                self.calendar_tick(cx);
                 self.tick(cx);
+            }
+            Msg::Calendar(results) => {
+                for text in self.calendar.done(results, search::now()) {
+                    self.say(Msg::error(text));
+                }
+                // Settings → Calendar says when each feed came.
+                if let Some(h) = self.settings_window {
+                    drop(h.update(cx, |_, _, cx| cx.notify()));
+                }
+                // An armed row (Join's confirm) waits for its second Enter: a refresh would move it.
+                if self.visible && self.armed.is_none() && self.panel.is_none() && (self.mode == Mode::Schedule || self.mode == Mode::Root && self.query(cx).trim().is_empty()) {
+                    self.refresh_keeping(cx);
+                }
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
@@ -2261,18 +4919,25 @@ impl Launcher {
                 }
             }
             Msg::FilePreview(key, img) => {
-                self.file_images.insert(key, img);
-                if self.visible && self.mode == Mode::Files {
+                match self.file_images.get_mut(&key) {
+                    // A second decode of the same key (reopened meanwhile): free the first.
+                    Some(entry) => release(std::mem::replace(&mut entry.0, img).into_iter().collect(), cx),
+                    // Forgotten meanwhile (evicted, or the grid closed): not kept.
+                    None => release(img.into_iter().collect(), cx),
+                }
+                release(evict(&mut self.file_images, FILE_IMAGES_MAX, FILE_IMAGES_KEEP), cx);
+                if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
                 }
             }
             Msg::FilePreviewDropped(key) => {
-                self.file_images.remove(&key);
+                release(self.file_images.remove(&key).and_then(|e| e.0).into_iter().collect(), cx);
                 // Re-selected meanwhile? The next render asks again.
-                if self.visible && self.mode == Mode::Files {
+                if self.visible && matches!(self.mode, Mode::Files | Mode::Shots) {
                     cx.notify();
                 }
             }
+            Msg::BrowserUp => self.focus_push(),
             Msg::Browser(conn, reply) => match reply {
                 browser::Reply::Tabs(name, tabs) => {
                     self.tabs.retain(|(c, ..)| *c != conn);
@@ -2282,7 +4947,7 @@ impl Launcher {
                     }
                 }
                 browser::Reply::Done(Err(e)) => {
-                    let _ = self.tx.unbounded_send(Msg::Toast(false, e));
+                    let _ = self.tx.unbounded_send(Msg::error(e));
                 }
                 browser::Reply::Done(Ok(())) => {}
             },
@@ -2335,12 +5000,15 @@ impl Launcher {
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
             Mode::Tabs => Some("Browser Tabs".into()),
-            Mode::Args => self.pending.as_ref().map(|p| match p {
-                Pending::Script(i, _) => self.scripts[*i].title.clone(),
-                Pending::Snippet { name, .. } => name.clone(),
-                Pending::RenameDesktop => "Rename Desktop".into(),
-            }),
+            Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
+            Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
+            Mode::Define => self.define.as_ref().map(|v| format!("Define {}", v.word)),
+            Mode::Shots => Some("Search Screenshots".into()),
+            Mode::Schedule => Some("My Schedule".into()),
+            Mode::Notes(NotesList::All) => Some("Search Notes".into()),
+            Mode::Notes(NotesList::Deleted) => Some("Recently Deleted Notes".into()),
+            Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
                 let (x, _) = &self.exts[e.ext];
@@ -2360,23 +5028,16 @@ impl Launcher {
             Mode::Running => "Search running apps…".into(),
             Mode::Tabs => "Search open tabs…".into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
-            Mode::Args => self
-                .pending
-                .as_ref()
-                .map(|p| match p {
-                    Pending::Script(i, got) => {
-                        let a = &self.scripts[*i].args[got.len()];
-                        if a.optional { format!("{} (optional)", a.placeholder) } else { a.placeholder.clone() }
-                    }
-                    Pending::Snippet { args, got, .. } => {
-                        let a = &args[got.len()];
-                        if a.default.is_empty() { format!("{}…", a.name) } else { format!("{} (empty: {})", a.name, a.default) }
-                    }
-                    Pending::RenameDesktop => "Desktop name…".into(),
-                })
-                .unwrap_or_default()
-                .into(),
+            Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()).unwrap_or_default().into(),
             Mode::Output => "Enter copies the output".into(),
+            Mode::Define => "Word to define…".into(),
+            Mode::Shots => "Filter screenshots by name:, text: or date:…".into(),
+            Mode::Schedule => "Search events…".into(),
+            Mode::Notes(NotesList::All) => "Search notes…".into(),
+            Mode::Notes(NotesList::Deleted) => "Search deleted notes…".into(),
+            Mode::Form(_) => "".into(),
+            Mode::Translate => "Text to translate…".into(),
+            Mode::LanguageSets => "Search language sets…".into(),
             Mode::Ai if self.ai.as_ref().is_some_and(|a| !a.turns.is_empty()) => "Ask a follow-up, or Enter copies the answer".into(),
             Mode::Ai => "Ask a question…".into(),
         }
@@ -2397,8 +5058,13 @@ impl Launcher {
         if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.view.loading) {
             return "Loading…".into();
         }
-        // The grid shows no names: the selected emoji's is here.
-        if self.grid() && self.panel.is_none()
+        if self.mode == Mode::Schedule
+            && let Some(line) = self.calendar.updated_line(search::now())
+        {
+            return line;
+        }
+        // The emoji grid shows no names: the selected emoji's is here.
+        if self.mode == Mode::Emoji && self.grid() && self.panel.is_none()
             && let Some(it) = self.items.get(self.selected)
         {
             return it.title.clone();
@@ -2406,10 +5072,7 @@ impl Launcher {
         if let Some(label) = self.label() {
             return label;
         }
-        match self.items.get(self.selected).filter(|it| it.section.as_deref() != Some(EMPTY)) {
-            Some(it) if !it.accessory.is_empty() && !it.accessory.contains(" ago") => it.accessory.clone(),
-            _ => "procast".into(),
-        }
+        row_footer(self.items.get(self.selected))
     }
 
     /// The icon on the left of the action bar.
@@ -2424,8 +5087,16 @@ impl Launcher {
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
             Mode::Tabs => Icon::Vector(g::GLOBE),
-            Mode::Args | Mode::Output => Icon::Vector(g::TERMINAL),
+            Mode::Args => self.args_row.as_ref().map_or(Icon::Vector(g::TERMINAL), |it| it.icon.clone()),
+            Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
+            Mode::Translate | Mode::LanguageSets => Icon::Vector(g::LANGUAGES),
+            Mode::Define => Icon::Vector(g::BOOK_OPEN),
+            Mode::Shots => Icon::Vector(g::SCAN_SEARCH),
+            Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
+            Mode::Notes(NotesList::All) => Icon::Vector(g::NOTEBOOK_TABS),
+            Mode::Notes(NotesList::Deleted) => Icon::Vector(g::ARCHIVE_RESTORE),
+            Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
 
@@ -2437,6 +5108,49 @@ impl Launcher {
         }
     }
 
+    /// Opens `menu` over the window. With a search field, typing goes to `menu_input`.
+    fn open_menu(&mut self, menu: menu::Menu, on_pick: impl Fn(&mut Launcher, String, &mut Window, &mut Context<Launcher>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
+        let back = window.focused(cx);
+        if menu.search.is_some() {
+            self.menu_input.update(cx, |s, cx| s.emplace("", cx));
+            window.focus(&self.menu_input.focus_handle(cx), cx);
+        }
+        self.menu = Some(OpenMenu { menu, on_pick: Box::new(on_pick), back, scroll: ScrollHandle::new(), site: None });
+        cx.notify();
+    }
+
+    /// Hands a key to the open menu; false when none is open.
+    fn menu_key(&mut self, key: menu::Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(open) = &mut self.menu else { return false };
+        match open.menu.key(key) {
+            menu::Event::Picked(i) => self.menu_pick(i, window, cx),
+            menu::Event::Closed => _ = self.close_menu(window, cx),
+            menu::Event::None => {
+                if let Some(k) = open.menu.selected_row() {
+                    open.scroll.scroll_to_item(k);
+                }
+                cx.notify()
+            }
+        }
+        true
+    }
+
+    /// Closes the menu and gives the opener the id of entry `i`.
+    fn menu_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = self.close_menu(window, cx) {
+            (open.on_pick)(self, open.menu.entries[i].id.clone(), window, cx);
+        }
+    }
+
+    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<OpenMenu> {
+        let open = self.menu.take()?;
+        if let Some(back) = &open.back {
+            window.focus(back, cx);
+        }
+        cx.notify();
+        Some(open)
+    }
+
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.panel.take().is_some() {
             cx.notify();
@@ -2444,92 +5158,148 @@ impl Launcher {
                 self.focus_field(window, cx);
             }
         } else if let Some(c) = self.confirm.take() {
-            self.reply(c.run, c.id, Ok(json!(false)));
+            if c.then.is_none() {
+                self.reply(c.run, c.id, Ok(json!(false)));
+            }
             self.refresh(cx);
+        } else if self.quick_look {
+            self.close_quick_look(cx);
+            cx.notify();
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
             self.send(json!({"t": "pop", "run": run}));
         } else if self.mode == Mode::Root {
             self.hide(true, cx)
         } else if self.cfg.launcher.escape == "close" {
-            self.pending = None;
+            self.args_row = None;
             self.set_mode(Mode::Root, cx);
             self.hide(true, cx);
             // Popped to root: the next open starts fresh whatever pop_to_root says.
             self.hidden_at = None;
+        } else if self.mode == Mode::LanguageSets {
+            self.retranslate(window, cx);
+        } else if let Mode::Form(FormKind::AddLanguageSet(_)) = self.mode {
+            self.set_mode(Mode::LanguageSets, cx);
+            window.focus(&self.input.focus_handle(cx), cx);
         } else {
-            self.pending = None;
+            self.args_row = None;
             self.set_mode(Mode::Root, cx);
             window.focus(&self.input.focus_handle(cx), cx);
         }
     }
 
-    fn render_form(&self, t: &Tokens) -> gpui::AnyElement {
-        let Some(ev) = &self.extv else { return div().into_any_element() };
-        let field_box = |on: bool| design::field(on, t).w_full();
+    /// Esc while boxes show: from a box back to the query, then clears the boxes. False when
+    /// neither applies, for the usual Esc.
+    fn dismiss_args(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.panel.is_some() || self.arg_row().is_none() {
+            return false;
+        }
+        if self.arg_focused(window, cx).is_some() {
+            window.focus(&self.input.focus_handle(cx), cx);
+        } else if self.arg_values(cx).iter().any(|v| !v.is_empty()) {
+            self.arg_missing = None;
+            self.status = None;
+            for a in &self.args {
+                a.update(cx, |s, cx| s.emplace("", cx));
+            }
+        } else {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    /// `.pc-form--center`: the rows centred under the bar, the selected control focused.
+    fn render_form(&self, t: &Tokens, me: gpui::WeakEntity<Self>) -> gpui::AnyElement {
+        let Some((fields, selected)) = self.form_fields() else { return div().into_any_element() };
+        let rows = fields.into_iter().enumerate().map(|(i, f)| {
+            let on = i == selected;
+            let control = match &f.ctl {
+                Ctl::Text { placeholder, icon, tall, .. } => match &f.input {
+                    Some(input) => {
+                        let text = text_input(SharedString::from(format!("field-{i}")))
+                            .state(input.downgrade())
+                            .placeholder(placeholder.clone())
+                            .placeholder_color(t.text_faint)
+                            .caret_color(t.accent)
+                            .w_full()
+                            .whitespace_nowrap();
+                        design::field_with_icon(on, text, *icon, t).when(*tall, |d| d.h(px(2. * design::CONTROL)).items_start().py(px(design::sp::S8))).into_any_element()
+                    }
+                    None => div().into_any_element(),
+                },
+                Ctl::Select(entries, _) => {
+                    let title = entries.iter().find(|e| e.id == f.value).map(|e| e.label.clone()).unwrap_or_default();
+                    design::field_with_icon(on, title, Some(g::CHEVRON_DOWN), t).into_any_element()
+                }
+                Ctl::Check => {
+                    let checked = f.value == "true";
+                    div()
+                        .h(px(design::CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(design::sp::S8))
+                        .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
+                        .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.label.clone()))
+                        .into_any_element()
+                }
+                // Each token's × removes it.
+                Ctl::Tokens => {
+                    let tokens = focus::Picks::of(&f.value).0.into_iter().map(|id| {
+                        let (glyph, name) = focus::pick_look(&id);
+                        let me = me.clone();
+                        let x = div().id(SharedString::from(format!("token-{id}"))).flex().child(design::token_x(t)).on_click(move |_, _, cx| {
+                            me.update(cx, |this, cx| {
+                                this.edit_picks(i, |p| p.remove(&id));
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                        design::token(glyph, &name, x, t).into_any_element()
+                    });
+                    design::token_field(on, tokens, t).into_any_element()
+                }
+                // A click picks a swatch.
+                Ctl::Swatches => div()
+                    .h(px(design::CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(design::sp::S8))
+                    .children(calendar::COLOURS.iter().map(|&(name, tint)| {
+                        let me = me.clone();
+                        design::swatch(tint, f.value == name, t).id(SharedString::from(format!("swatch-{name}"))).on_click(move |_, _, cx| {
+                            me.update(cx, |this, cx| {
+                                if let Some(f) = this.form.as_mut().and_then(|f| f.fields.get_mut(i)) {
+                                    f.value = name.into();
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                    }))
+                    .into_any_element(),
+                Ctl::Note if f.label.is_empty() => return design::form_note(f.value.clone(), t).into_any_element(),
+                Ctl::Note => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(f.value.clone()).into_any_element(),
+                Ctl::Rule => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
+            };
+            // A menu opens under the selected control.
+            let at = self.form_at.clone();
+            let control = div().id(("form-ctl", i)).flex().flex_col().when(on, |d| d.on_prepaint(move |p, _, _| at.set(p.bounds.bottom_left() + gpui::point(px(0.), px(design::sp::S4))))).child(control);
+            let label = if matches!(f.ctl, Ctl::Check | Ctl::Rule) { SharedString::default() } else { f.label.clone() };
+            let error = f.error.clone().map(|e| div().text_size(px(design::ts::SMALL)).text_color(t.danger).child(e).into_any_element());
+            design::form_row(label, std::iter::once(control.into_any_element()).chain(error), t).into_any_element()
+        });
         div()
             .id("form")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
-            .justify_center()
-            .pt(px(24.))
-            .child(div().w(px(520.)).flex().flex_col().gap(px(12.)).children(ev.view.fields.iter().enumerate().map(|(i, f)| {
-                let on = i == ev.field;
-                let value = ev.values.get(&f.id).cloned().unwrap_or(Value::Null);
-                let control = match &f.kind {
-                    FieldKind::Text | FieldKind::Password | FieldKind::TextArea => match ev.inputs.get(&f.id) {
-                        Some(input) => field_box(on)
-                            .when(f.kind == FieldKind::TextArea, |d| d.h(px(2. * design::CONTROL)).items_start().py(px(8.)))
-                            .child(
-                                text_input(SharedString::from(format!("field-{}", f.id)))
-                                    .state(input.downgrade())
-                                    .placeholder(f.placeholder.clone())
-                                    .placeholder_color(t.text_faint)
-                                    .caret_color(t.accent)
-                                    .w_full()
-                                    .whitespace_nowrap(),
-                            )
-                            .into_any_element(),
-                        None => div().into_any_element(),
-                    },
-                    FieldKind::Checkbox => {
-                        let checked = value.as_bool().unwrap_or(false);
-                        div()
-                            .h(px(design::CONTROL))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(design::icon(if checked { g::CHECKBOX_ON } else { g::CHECKBOX }, design::ic::LG, if checked { t.accent } else { t.text_muted }))
-                            .child(div().text_color(if on { t.text } else { t.text_muted }).child(f.title.clone()))
-                            .into_any_element()
-                    }
-                    FieldKind::Dropdown(opts) => {
-                        let cur = value.as_str().unwrap_or_default();
-                        let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
-                        field_box(on).justify_between().child(div().truncate().child(title)).child(design::icon(g::CHEVRON_DOWN, design::ic::SM, t.text_muted)).into_any_element()
-                    }
-                    FieldKind::Description => div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(value.as_str().unwrap_or_default().to_string()).into_any_element(),
-                    FieldKind::Separator => div().h(px(1.)).w_full().bg(t.hairline).into_any_element(),
-                };
-                let label = if matches!(f.kind, FieldKind::Checkbox | FieldKind::Separator) { String::new() } else { f.title.clone() };
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(12.))
-                    .child(div().w(px(120.)).flex_none().h(px(design::CONTROL)).flex().items_center().justify_end().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(label))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .child(control)
-                            .children(f.error.clone().map(|e| div().text_size(px(design::ts::SMALL)).text_color(t.danger).child(e))),
-                    )
-            })))
+            .flex_col()
+            .items_center()
+            .gap(px(design::sp::S12))
+            .pt(px(design::sp::S24))
+            .children(rows)
             .into_any_element()
     }
 
@@ -2592,7 +5362,7 @@ impl Launcher {
             }
         };
         meta.insert(0, ("Application".into(), if e.app.is_empty() { "Unknown".into() } else { e.app.clone() }));
-        meta.push(("Copied".into(), format!("{} · {}", win::local_time_of(e.at), search::ago(e.at))));
+        meta.push(("Copied".into(), format!("{} · {}", win::local_time_of(e.at), timers::ago(search::now().saturating_sub(e.at)))));
         if e.pinned {
             meta.push(("Pinned".into(), "Yes".into()));
         }
@@ -2608,6 +5378,80 @@ impl Launcher {
             .child(top)
             .children(info_rows(&meta, t))
             .into_any_element()
+    }
+
+    /// The translator's right-hand pane: the selected translation, then under a hairline its
+    /// source and target languages as tags.
+    fn translate_detail(&self, t: &Tokens) -> gpui::AnyElement {
+        use design::sp;
+        let Some(tr) = &self.translation else { return div().flex_1().into_any_element() };
+        // The pronunciation row (last, past the translations) shows with the first one's languages.
+        let (text, row) = match tr.rows.get(self.selected) {
+            Some(r) => (r.text.clone(), r),
+            None => (self.items.get(self.selected).map(|it| it.title.clone()).unwrap_or_default(), &tr.rows[0]),
+        };
+        let meta = |key: &str, tags: Vec<gpui::Div>| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(sp::S8))
+                .child(div().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(key.to_string()))
+                .child(div().flex().gap(px(sp::S4)).children(tags))
+        };
+        let mut source = vec![];
+        if tr.job.from == "auto" {
+            source.push(design::tag("Auto-Detect", design::Tint::System, t));
+        }
+        source.push(design::tag(&translate::language_name(&tr.detected()), design::Tint::Web, t));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().id("translation").flex_1().min_h_0().overflow_y_scroll().p(px(sp::S16)).text_color(t.text).child(text))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(sp::S16))
+                    .py(px(sp::S12))
+                    .flex()
+                    .flex_col()
+                    .gap(px(sp::S8))
+                    .border_t_1()
+                    .border_color(t.hairline)
+                    .child(meta("Source Language", source))
+                    .child(meta("Target Language", vec![design::tag(&translate::language_name(&row.to), design::Tint::Paste, t)])),
+            )
+            .into_any_element()
+    }
+
+    /// The define view's right-hand pane: the word, "noun · 1 sense · WordNet", the selected
+    /// sense's gloss, its examples and its synonyms; for a Did you mean row, that word and its
+    /// part of speech.
+    fn define_detail(&self, t: &Tokens) -> gpui::AnyElement {
+        use design::{sp, ts};
+        let pane = div().id("define").flex_1().min_h_0().overflow_y_scroll().p(px(sp::S16)).flex().flex_col().gap(px(sp::S8));
+        let Some((v, Some(Ok(Some(a))))) = self.define.as_ref().map(|v| (v, v.answer.as_ref())) else { return pane.into_any_element() };
+        let big = |w: &str| div().font_family(design::FONT_DISPLAY).text_size(px(ts::DISPLAY)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.text).child(w.to_string());
+        let meta = |m: String| div().font_family(design::FONT_SMALL).text_size(px(ts::SMALL)).text_color(t.text_faint).child(m);
+        let muted = |m: String| div().text_size(px(ts::BODY)).text_color(t.text_muted).child(m);
+        let groups = dict::group(&a.senses);
+        match groups.iter().flat_map(|(_, s)| s).nth(self.selected) {
+            Some(s) => {
+                let n = groups.iter().find(|(p, _)| *p == s.pos).map_or(1, |(_, g)| g.len());
+                pane.child(big(&v.word))
+                    .child(meta(dict::meta_line(s.pos, n)))
+                    .child(muted(s.gloss.clone()))
+                    .children(s.examples.iter().map(|e| muted(format!("\"{e}\""))))
+                    .children(dict::similar_line(&s.synonyms).map(muted))
+            }
+            None => match a.maybe.get(self.selected.saturating_sub(a.senses.len())) {
+                Some((w, pos)) => pane.child(big(w)).child(meta(pos.name().to_lowercase())),
+                None => pane,
+            },
+        }
+        .into_any_element()
     }
 
     /// File Search's right-hand pane: a preview, then the file's information.
@@ -2651,9 +5495,9 @@ impl Launcher {
         pane.child(top).children(info_rows(&meta, t)).into_any_element()
     }
 
-    /// Emoji picker: moves the selection by `dx` cells or `dy` grid rows.
+    /// The grids: moves the selection by `dx` cells or `dy` grid rows.
     fn grid_move(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
-        let rows = grid_rows(&self.items, self.cfg.emoji.columns);
+        let rows = grid_rows(&self.items, self.grid_cols());
         let cells: Vec<&Vec<usize>> = rows.iter().filter_map(|r| if let GridRow::Cells(c) = r { Some(c) } else { None }).collect();
         let Some((r, c)) = cells.iter().enumerate().find_map(|(r, row)| row.iter().position(|&i| i == self.selected).map(|c| (r, c))) else { return };
         self.selected = if dy != 0 {
@@ -2662,19 +5506,88 @@ impl Launcher {
         } else {
             (self.selected as isize + dx).clamp(0, self.items.len() as isize - 1) as usize
         };
-        if let Some(at) = rows.iter().position(|row| matches!(row, GridRow::Cells(c) if c.contains(&self.selected))) {
-            self.grid_list.scroll_to_reveal_item(at);
-        }
+        self.scroll_to_selected();
         cx.notify();
     }
 
-    /// The emoji picker shows a grid (it falls back to the list for its empty state).
+    /// The emoji picker and Search Screenshots show a grid (each falls back to the list for
+    /// its empty state, and for a confirm's two rows).
     fn grid(&self) -> bool {
-        self.mode == Mode::Emoji && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+        matches!(self.mode, Mode::Emoji | Mode::Shots) && self.confirm.is_none() && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    /// The open ActionPanel's actions, each with its place among all of them; with a search
+    /// field (`panel_filtered`), only those whose label holds what is typed in it.
+    fn panel_rows(&self, cx: &App) -> Vec<(usize, (String, Act))> {
+        let Some((item, _)) = &self.panel else { return vec![] };
+        let typed = if self.panel_filtered() { self.menu_input.read(cx).as_str().to_string() } else { String::new() };
+        search::panel_filter(item.actions(), &typed)
+    }
+
+    /// The open ActionPanel has a search field: more than `PANEL_FILTER_AT` actions. Typing
+    /// goes to it (`menu_input`) while it is open.
+    fn panel_filtered(&self) -> bool {
+        self.panel.as_ref().is_some_and(|(item, _)| item.actions().len() > search::PANEL_FILTER_AT)
+    }
+
+    /// An action's own shortcut (`search::act_keys`, "Ctrl+O"): runs that action of the open
+    /// panel's row, or else of the selected row, without the panel. Otherwise the keys go on.
+    fn shortcut(&mut self, keys: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let item = match &self.panel {
+            Some((item, _)) => Some(item.clone()),
+            None => self.items.get(self.selected).cloned(),
+        };
+        let act = item.as_ref().and_then(|it| it.actions().into_iter().map(|a| a.1).find(|a| search::act_keys(a) == Some(keys)));
+        match (item, act) {
+            (Some(item), Some(act)) if self.menu.is_none() => {
+                self.panel = None;
+                self.run(act, item.key, window, cx)
+            }
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Quick Look (Ctrl+Y): the selected screenshot large, contain-fit, in place of the grid,
+    /// with its name (weight 600) and "2.4 MB · Today, 14:59 · Screenshots" under it.
+    fn quick_look_view(&mut self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let path = self.items.get(self.selected).and_then(|it| it.extra.iter().find_map(|(_, a)| if let Act::QuickLook(p) = a { Some(p.clone()) } else { None })).unwrap_or_default();
+        let image = self.shot_thumbs.get(self.selected).cloned().flatten().and_then(|key| self.quick_look_image(&key.replacen("t:", "q:", 1), cx));
+        // A stat once per shot shown, not per redraw.
+        if self.quick_look_detail.0 != path {
+            let line = shots::detail(Path::new(&path), SystemTime::now()).unwrap_or_default();
+            self.quick_look_detail = (path.clone(), line);
+        }
+        let meta = self.quick_look_detail.1.clone();
+        let path = Path::new(&path);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let picture = match image {
+            Some(image) => gpui::img(image).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element(),
+            None => design::icon(if shots::picture(path) { g::PICTURE } else { g::VIDEO }, design::ic::XL, t.text_faint).into_any_element(),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .px(px(design::sp::S16))
+            .py(px(design::sp::S12))
+            .gap(px(design::sp::S4))
+            .child(div().flex_1().min_h_0().pb(px(design::sp::S8)).flex().items_center().justify_center().child(picture))
+            .child(div().truncate().font_weight(gpui::FontWeight::SEMIBOLD).child(name))
+            .child(div().truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(meta))
+            .into_any_element()
+    }
+
+    /// Cells per grid row: `[screenshots] columns` (3 to 6) or `[emoji] columns` (4 to 16).
+    fn grid_cols(&self) -> usize {
+        if self.mode == Mode::Shots { self.cfg.screenshots.columns.clamp(3, 6) } else { self.cfg.emoji.columns.clamp(4, 16) }
     }
 
     fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let cols = self.cfg.emoji.columns.clamp(4, 16);
+        if self.mode == Mode::Shots {
+            return self.shot_grid(t, cx);
+        }
+        let cols = self.grid_cols();
         let me = cx.weak_entity();
         let (selected, t) = (self.selected, *t);
         let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
@@ -2721,6 +5634,135 @@ impl Launcher {
             });
         div().flex_1().min_h_0().flex().flex_col().px(px(8.)).py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
     }
+
+    /// Search Screenshots' grid (`.pc-grid`): the section with its count, then the thumbnails
+    /// `grid_cols` across, each decoded off the UI thread as its row comes on screen.
+    fn shot_grid(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cols = self.grid_cols();
+        let me = cx.weak_entity();
+        let (selected, t, count) = (self.selected, *t, self.items.len());
+        let cells: Rc<Vec<(Option<String>, String)>> = Rc::new(self.items.iter().enumerate().map(|(i, it)| (self.shot_thumbs.get(i).cloned().flatten(), it.accessory.clone())).collect());
+        let rows = Rc::new(grid_rows(&self.items, cols));
+        self.grid_top.store(self.grid_list.logical_scroll_top().item_ix, Ordering::Relaxed);
+        let last = rows.len().saturating_sub(1);
+        let list = gpui::list(self.grid_list.clone(), move |k, _, cx| match &rows[k] {
+            GridRow::Header(s) => design::section_header(s, Some(count), &t).into_any_element(),
+            GridRow::Cells(row) => div()
+                .flex()
+                .w_full()
+                .px(px(design::sp::S16))
+                .pb(px(if k == last { design::sp::S8 } else { design::sp::S12 }))
+                .gap(px(design::sp::S12))
+                .children(row.iter().map(|&i| {
+                    let (key, caption) = &cells[i];
+                    let image = key.as_ref().and_then(|key| me.update(cx, |this, cx| this.shot_thumb(key, k, cx)).ok().flatten());
+                    let me = me.clone();
+                    design::thumb(image, caption, i == selected, &t)
+                        .id(("shot", i))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                            me.update(cx, |this, cx| {
+                                this.selected = i;
+                                this.launch(window, cx);
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                }))
+                .children((row.len()..cols).map(|_| div().flex_1().into_any_element()))
+                .into_any_element(),
+        });
+        div().flex_1().min_h_0().flex().flex_col().child(list.flex_1().min_h_0()).into_any_element()
+    }
+
+    /// Search Screenshots' dropdown: All, Screenshots, Recordings, Pinned.
+    fn open_shot_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = shots::Kind::ALL.iter().map(|k| menu::Entry { id: k.label().into(), label: k.label().into(), ..Default::default() }).collect();
+        let mut m = menu::Menu::new(entries, None, menu::Place::Right);
+        m.selected = shots::Kind::ALL.iter().position(|k| *k == self.shot_kind).unwrap_or(0);
+        let pick = |this: &mut Launcher, id: String, _: &mut Window, cx: &mut Context<Launcher>| {
+            this.shot_kind = shots::Kind::ALL.into_iter().find(|k| k.label() == id).unwrap_or_default();
+            this.refresh(cx);
+        };
+        self.open_menu(m, pick, window, cx);
+    }
+}
+
+/// The width a screenshot thumbnail is decoded at.
+const THUMB_PX: u32 = 320;
+/// Quick Look's picture is decoded to fit inside this many pixels each way.
+const QUICK_LOOK_PX: u32 = 1280;
+
+/// The picture a thumbnail or Quick Look key (`t:`/`q:{mtime}|{path}`) names, if it may be
+/// read: no bigger than `shots::MAX_BYTES`.
+fn shot_file(key: &str) -> Option<&Path> {
+    key.split_once('|').map(|(_, p)| Path::new(p)).filter(|p| shots::picture(p) && std::fs::metadata(p).is_ok_and(|m| m.len() <= shots::MAX_BYTES))
+}
+
+/// A thumbnail decode is dropped when its row is further than this from the grid's top row.
+const NEAR_ROWS: usize = 12;
+/// `file_images` past `FILE_IMAGES_MAX` entries is cut to the `FILE_IMAGES_KEEP` used last.
+const FILE_IMAGES_MAX: usize = 300;
+const FILE_IMAGES_KEEP: usize = 200;
+
+/// Whether grid row `row` is near enough to `top` (the row at the top of the view) to decode.
+fn near(row: usize, top: usize) -> bool {
+    row + NEAR_ROWS >= top && row <= top + NEAR_ROWS
+}
+
+/// Past `max` entries, forgets the least recently used (by tick) down to `keep`; returns the
+/// images among them, for `release`.
+fn evict<V>(cache: &mut HashMap<String, (Option<V>, u64)>, max: usize, keep: usize) -> Vec<V> {
+    if cache.len() <= max {
+        return vec![];
+    }
+    let mut old: Vec<(u64, String)> = cache.iter().map(|(k, v)| (v.1, k.clone())).collect();
+    old.sort_unstable();
+    old.truncate(cache.len() - keep);
+    old.into_iter().filter_map(|(_, k)| cache.remove(&k)?.0).collect()
+}
+
+/// `cache[key]`, made by `make` the first time, marked as just used for `evict`.
+fn used<V: Clone>(cache: &mut HashMap<String, (Option<V>, u64)>, tick: &mut u64, key: String, make: impl FnOnce() -> Option<V>) -> Option<V> {
+    *tick += 1;
+    let entry = cache.entry(key).or_insert_with(|| (make(), 0));
+    entry.1 = *tick;
+    entry.0.clone()
+}
+
+/// Frees images' GPU textures (gpui keeps an image's atlas entry until `drop_image`). Deferred
+/// until no window is being drawn, so every window lets go of them.
+fn release(images: Vec<Arc<RenderImage>>, cx: &mut App) {
+    if !images.is_empty() {
+        cx.defer(move |cx| images.into_iter().for_each(|i| cx.drop_image(i, None)));
+    }
+}
+
+/// What Search Screenshots says with nothing to show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ShotsEmpty {
+    Reading,
+    NoMatches,
+    /// The only one whose Enter is Add Folder.
+    NoScreenshots,
+}
+
+impl ShotsEmpty {
+    fn title(self) -> &'static str {
+        match self {
+            ShotsEmpty::Reading => "Reading screenshots…",
+            ShotsEmpty::NoMatches => "No matches",
+            ShotsEmpty::NoScreenshots => "No screenshots found",
+        }
+    }
+}
+
+/// `filtered`: a query, or a dropdown choice other than All, may be what hides them.
+fn shots_empty(busy: bool, filtered: bool) -> ShotsEmpty {
+    match (busy, filtered) {
+        (true, _) => ShotsEmpty::Reading,
+        (_, true) => ShotsEmpty::NoMatches,
+        _ => ShotsEmpty::NoScreenshots,
+    }
 }
 
 /// An emoji cell's height.
@@ -2732,9 +5774,9 @@ enum GridRow {
     Cells(Vec<usize>),
 }
 
-/// The emoji picker's layout: each section's header, then its emoji in rows of `cols`.
+/// A grid's layout: each section's header, then its cells in rows of `cols`.
 fn grid_rows(items: &[Item], cols: usize) -> Vec<GridRow> {
-    let cols = cols.clamp(4, 16);
+    let cols = cols.max(1);
     let mut out = vec![];
     let mut last: Option<&str> = None;
     for (i, it) in items.iter().enumerate() {
@@ -2793,19 +5835,28 @@ fn act_glyph(act: &Act) -> &'static str {
     match act {
         Act::Favorite(..) => g::STAR,
         Act::Hide(_) => g::CANCEL,
-        Act::Copy(_) | Act::CopyClip(_) => g::COPY,
-        Act::PinClip(..) => g::PIN,
-        Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => g::PASTE,
+        Act::Copy(_) | Act::CopyClip(_) | Act::CopyShot(_) | Act::CopyText(_) => g::COPY,
+        Act::PinClip(..) | Act::PinShot(..) => g::PIN,
+        Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) | Act::PasteShot(_) => g::PASTE,
         Act::Open(_) => g::GLOBE,
-        Act::File(_) => g::DOCUMENT,
-        Act::Reveal(_) => g::FOLDER,
+        // g::PDF is the `file` icon.
+        Act::File(_) => g::PDF,
+        Act::OpenWith(_) => g::APP,
+        Act::QuickLook(_) => g::EYE,
+        Act::Reveal(_) => g::FOLDER_SEARCH,
         Act::RunAsAdmin(_) => g::SHIELD,
-        Act::DeleteClip(_) | Act::UninstallExt(_) => g::DELETE,
-        Act::Install(_) => g::DOWNLOAD,
+        Act::DeleteClip(_) | Act::UninstallExt(_) | Act::DeleteShot(_) => g::DELETE,
+        Act::Install(_) | Act::DownloadDictionary(_) => g::DOWNLOAD,
+        Act::Define(_) | Act::SimilarWords(_) => g::BOOK_OPEN,
         Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::Layout(_) | Act::ExtRun(..) => g::PLAY,
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
         Act::Confirm(false) => g::CANCEL,
+        Act::Translate(_) | Act::LangMenu => g::LANGUAGES,
+        Act::UseLangSet(_) => g::CHECK,
+        Act::EditLangSet(_) => g::EDIT,
+        Act::AddCalendar | Act::AddShotFolder => g::PLUS,
+        Act::DeleteLangSet(_) => g::DELETE,
         _ => g::PLAY,
     }
 }
@@ -2831,7 +5882,7 @@ fn ext_log(who: &str, text: &str) {
 #[derive(Clone)]
 enum Slot {
     Header(String, Option<usize>),
-    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint> },
+    Row { idx: usize, title: String, subtitle: String, accessory: String, hotkey: String, icon: Icon, tint: Option<design::Tint>, live: bool, now: bool, toggle: Option<bool> },
 }
 
 impl Render for Launcher {
@@ -2840,32 +5891,67 @@ impl Render for Launcher {
         // Rem-based spacing follows the scale too.
         window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
+        // A menu closed without `close_menu` (a mode change, an extension exiting) would
+        // strand focus on its no longer drawn field, where no key binding matches.
+        // The ActionPanel's search field is the menu's while the panel is open.
+        if self.menu.is_none() && !self.panel_filtered() && self.menu_input.focus_handle(cx).is_focused(window) {
+            if self.is_form() {
+                self.focus_field(window, cx);
+            } else {
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+        }
+        self.guard_form_focus(window, cx);
+        // The same for a box whose row is no longer selected.
+        let shown = self.arg_row().map_or(0, |it| it.args.len());
+        if self.args[shown..].iter().any(|a| a.focus_handle(cx).is_focused(window)) {
+            window.focus(&self.input.focus_handle(cx), cx);
+        }
         let notices: Vec<String> = self.notice.iter().chain(self.hotkey_errors.iter().flatten()).cloned().collect();
         let empty = (self.items.len() == 1 && self.items[0].section.as_deref() == Some(EMPTY)).then(|| self.items[0].clone());
         // Views with their own body: the emoji grid, and the detail panes of clipboard history and file search.
-        let grid = self.grid().then(|| self.grid_view(&t, cx));
+        let grid = self.grid().then(|| if self.quick_look { self.quick_look_view(&t, cx) } else { self.grid_view(&t, cx) });
+        // The translator's previous answers, dimmed while the next ones are on their way.
+        let lt = if self.mode == Mode::Translate && self.translation.as_ref().is_some_and(|tr| tr.busy) { Tokens { text: t.text_faint, text_muted: t.text_faint, ..t } } else { t };
         let side = match self.mode {
             Mode::Clipboard if empty.is_none() => Some(self.clip_detail(&t)),
             Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
+            Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
+            Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
         let primary = actions.first().map(|a| a.0.clone()).filter(|l| !l.is_empty());
+        let bar_second = selected_item.and_then(|it| it.bar_second.clone()).filter(|_| actions.len() > 1);
+        let arg_row = self.arg_row().cloned();
+        let arg_values = self.arg_values(cx);
+        let arg_focus = self.arg_focused(window, cx);
+        // While boxes show: "Next Box" from the query, then the command's verb ("Start").
+        let arg_keys = arg_row.as_ref().filter(|_| self.panel.is_none() && self.armed != Some(self.selected)).map(|it| (arg_focus.is_none(), it.act.label().split(' ').next().unwrap_or_default().to_string()));
 
         // Footer right side, also dumped for tests.
-        let footer_action = match (&self.panel, selected_item) {
+        let footer_action = if let Some((next, verb)) = &arg_keys {
+            format!("{}{verb}  ↵", if *next { "Next Box  Tab    " } else { "" })
+        } else {
+            match (&self.panel, selected_item) {
             (Some(_), _) => "Run  ↵    Close  Esc".to_string(),
+            _ if let Mode::Form(kind) = self.mode => format!("{}  Ctrl+↵", kind.bar().2),
             _ if self.is_form() => "Submit  Ctrl+↵    Actions  Ctrl+K".to_string(),
-            (None, Some(it)) if self.armed == Some(self.selected) => format!("Press ↵ again to {}", it.title),
+            (None, Some(it)) if self.armed == Some(self.selected) => match self.join_target(&it.act) {
+                Some((title, url)) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(&url).unwrap_or_default()),
+                None => format!("Press ↵ again to {}", it.title),
+            },
             (None, Some(_)) => match &primary {
-                Some(p) if actions.len() > 1 => format!("{p}  ↵    Actions  Ctrl+K"),
+                Some(p) if actions.len() > 1 => format!("{p}  ↵    {}Actions  Ctrl+K", bar_second.as_ref().map(|s| format!("{s}  Ctrl+↵    ")).unwrap_or_default()),
                 Some(p) => format!("{p}  ↵"),
                 None => String::new(),
             },
             (None, None) => String::new(),
+            }
         };
         let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| e.view.clone());
+        let panel_rows = self.panel_rows(cx);
         dump_ui(
             "procast-ui.json",
             json!({
@@ -2874,18 +5960,22 @@ impl Render for Launcher {
                 "query": self.query(cx),
                 "label": self.label(),
                 "rows": match &self.panel {
-                    Some((item, _)) => item.actions().into_iter().map(|a| a.0).collect::<Vec<_>>(),
+                    Some(_) => panel_rows.iter().map(|(_, a)| a.0.clone()).collect::<Vec<_>>(),
                     None => self.items.iter().filter(|it| it.section.as_deref() != Some(EMPTY)).map(|it| it.title.clone()).collect(),
                 },
                 "selected": self.panel.as_ref().map_or(self.selected, |p| p.1),
                 "panel": self.panel.is_some(),
+                "menu": self.menu.as_ref().map(|o| o.menu.visible().into_iter().map(|i| o.menu.entries[i].label.clone()).collect::<Vec<_>>()),
                 "footer": [self.footer_left(), footer_action.clone()],
                 "ai": self.ai.as_ref().map(|a| json!({"text": a.turns.last().map_or("", |t| t.text.as_str()), "busy": a.busy, "turns": a.turns.len()})),
                 "notice": self.notice,
                 "view": view.as_ref().map(|v| &v.kind),
-                "fields": self.extv.as_ref().map(|e| e.view.fields.iter().map(|f| &f.title).collect::<Vec<_>>()),
-                "field": self.extv.as_ref().map(|e| e.field),
+                "fields": self.form_fields().map(|(f, _)| f.iter().map(|f| f.label.to_string()).collect::<Vec<_>>()),
+                "field": self.form_fields().map(|(_, i)| i),
                 "trays": self.trays.keys().collect::<Vec<_>>(),
+                "args": arg_values,
+                "arg_missing": self.arg_missing,
+                "quick_look": self.quick_look,
             }),
         );
 
@@ -2894,11 +5984,12 @@ impl Render for Launcher {
         // ---- results list ----
         let slots: Vec<Slot> = {
             let mut out = vec![];
-            let rows = display_rows(&self.items);
+            let rows = display_rows(&self.items, self.mode == Mode::Schedule);
             let count = |sec: &Option<String>| self.items.iter().filter(|it| &it.section == sec).count();
             // The right-hand column shows what tells rows apart. In root search that is a
             // row's own hotkey or alias (its kind is in the action bar); elsewhere it is the
-            // row's accessory, said once per run of rows that share it.
+            // row's accessory, said once per run of rows that share it (the translator names
+            // every row's language).
             let root = self.mode == Mode::Root;
             let mut above = String::new();
             for (k, r) in rows.iter().enumerate() {
@@ -2907,20 +5998,33 @@ impl Render for Launcher {
                         let it = &self.items[rows[k + 1].unwrap_or(0)];
                         let sec = it.section.clone();
                         above.clear();
-                        out.push(Slot::Header(sec.clone().unwrap_or_default(), (self.mode != Mode::Root).then(|| count(&sec))));
+                        let counted = (self.mode != Mode::Root || sec.as_deref() == Some(RUNNING)) && sec.as_deref() != Some(DID_YOU_MEAN);
+                        out.push(Slot::Header(sec.clone().unwrap_or_default(), counted.then(|| count(&sec))));
                     }
                     Some(i) => {
                         let it = &self.items[*i];
                         let hotkey = it.key.as_ref().filter(|_| root).and_then(|k| self.cfg.launcher.hotkeys.get(k)).cloned().unwrap_or_default();
-                        let accessory = if root {
-                            it.alias.clone()
-                        } else if it.accessory == above {
+                        // A row with arguments says how many until it is selected.
+                        let accessory = if it.live {
+                            it.accessory.clone()
+                        } else if root {
+                            if it.alias.is_empty() && *i != self.selected { it.arg_count().unwrap_or_default() } else { it.alias.clone() }
+                        } else if it.accessory == above && self.mode != Mode::Translate {
                             String::new()
                         } else {
                             above = it.accessory.clone();
                             above.clone()
                         };
-                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle: it.subtitle.clone(), accessory, hotkey, icon: it.icon.clone(), tint: it.tint });
+                        // Its subtitle repeats what its boxes hold.
+                        let values = if *i == self.selected && arg_row.is_some() { &arg_values } else { &it.values };
+                        let mirrored = search::mirror(it, values);
+                        // Define's subtitle is the word's first sense, once known.
+                        let subtitle = match define_word(it, values) {
+                            Some(w) => self.senses.get(&w.to_lowercase()).cloned().flatten().unwrap_or_default(),
+                            None if mirrored.is_empty() => it.subtitle.clone(),
+                            None => mirrored,
+                        };
+                        out.push(Slot::Row { idx: *i, title: it.title.clone(), subtitle, accessory, hotkey, icon: it.icon.clone(), tint: it.tint, live: it.live, now: it.now, toggle: it.toggle });
                     }
                 }
             }
@@ -2930,24 +6034,31 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || self.mode == Mode::Clipboard { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
+        let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
-                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint } => {
+                        Slot::Row { idx, title, subtitle, accessory, hotkey, icon, tint, live, now, toggle } => {
                             let (i, on) = (*idx, *idx == selected);
                             let me = me.clone();
-                            let accessory = if !hotkey.is_empty() {
+                            let accessory = if let Some(state) = toggle {
+                                Some(design::toggle(*state, &lt).into_any_element())
+                            } else if !hotkey.is_empty() {
                                 Some(design::key_caps(hotkey, &t).into_any_element())
+                            } else if *live {
+                                // The event on now: "until 11:00" in the accent, weight 600 (`.pc-now`).
+                                let color = if *now { t.accent } else if accessory == timers::DONE { t.success } else { t.text_muted };
+                                Some(design::live(accessory, live_w, color).when(*now, |d| d.font_weight(gpui::FontWeight::SEMIBOLD)).into_any_element())
                             } else if !accessory.is_empty() {
                                 Some(accessory.clone().into_any_element())
                             } else {
                                 None
                             };
-                            design::list_row(design::icon_tile(icon, &t, on, *tint), title, subtitle, accessory, acc_max, on, &t)
+                            design::list_row(design::icon_tile(icon, &lt, on, *tint), title, subtitle, accessory, acc_max, on, &lt)
                                 .id(k)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
@@ -2991,7 +6102,7 @@ impl Render for Launcher {
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .child(div().w(px(base_width(cfg) * 0.4)).flex_none().flex().flex_col().min_h_0().child(list))
+                .child(div().w(px(base_width(cfg) * design::SPLIT_LIST)).flex_none().flex().flex_col().min_h_0().child(list))
                 .child(div().flex_1().min_w_0().flex().flex_col().border_l_1().border_color(t.hairline).child(detail))
                 .into_any_element()
         };
@@ -3017,7 +6128,7 @@ impl Render for Launcher {
                 let glyph = if let Icon::Vector(c) = e.icon { c } else { g::SEARCH };
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
-            (_, Some(v)) if v.kind == "Form" => self.render_form(&t),
+            _ if self.panel.is_none() && self.is_form() => self.render_form(&t, cx.weak_entity()),
             (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail", None),
             (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
@@ -3057,27 +6168,83 @@ impl Render for Launcher {
         // ---- search bar ----
         let at_root = self.mode == Mode::Root;
         let leading = if at_root { design::search_mark(&t).into_any_element() } else { design::back_tile(&t).id("back").on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element() };
-        let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.as_ref()).map(|(opts, cur, _)| {
-            let title = opts.iter().find(|o| &o.0 == cur).map(|o| o.1.as_str()).unwrap_or_default();
-            design::dropdown(title, &t).into_any_element()
+        let dropdown = self.extv.as_ref().filter(|_| self.mode == Mode::Ext).and_then(|e| e.view.dropdown.clone()).map(|(opts, cur, on_change)| {
+            let title = opts.iter().find(|o| o.0 == cur).map(|o| o.1.clone()).unwrap_or_default();
+            design::dropdown(g::FILTER, &title, &t)
+                .id("dropdown")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let Some(f) = on_change.clone() else { return };
+                    let entries = opts.iter().map(|(v, title)| menu::Entry { id: v.clone(), label: title.clone(), ..Default::default() }).collect();
+                    let mut m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+                    m.selected = opts.iter().position(|o| o.0 == cur).unwrap_or(m.selected);
+                    this.open_menu(m, move |this, v, window, cx| this.run(Act::ExtSet(f.clone(), v), None, window, cx), window, cx);
+                }))
+                .into_any_element()
         });
+        // The translator's languages; a click (or Ctrl+P) opens the language set menu.
+        let dropdown = dropdown.or_else(|| {
+            let tr = self.translation.as_ref().filter(|_| self.mode == Mode::Translate)?;
+            let label = translate::LangSet { from: tr.job.from.clone(), to: tr.job.to.clone() }.label();
+            Some(design::dropdown(g::FILTER, &label, &t).id("lang-set").on_click(cx.listener(|this, _, window, cx| this.open_lang_menu(window, cx))).into_any_element())
+        });
+        let dropdown = dropdown.or_else(|| {
+            (self.mode == Mode::Shots).then(|| design::dropdown(g::BULLETS, self.shot_kind.label(), &t).id("shot-kind").on_click(cx.listener(|this, _, window, cx| this.open_shot_menu(window, cx))).into_any_element())
+        });
+        // While the scan reads text: "Reading text in screenshots  94 of 996", static.
+        let banner = self.shots_progress.filter(|(done, of)| self.mode == Mode::Shots && done < of).map(|(done, of)| design::banner(g::SCAN_TEXT, "Reading text in screenshots", &format!("{} of {}", design::thousands(done), design::thousands(of)), &t));
         // Compact root with nothing typed: say what Down does, so the bare bar is not a dead end.
         let hint = (collapsed && !self.fav_strip()).then(|| design::search_hint("Recent", "↓", &t).into_any_element());
-        let search_bar = design::search_bar(
-            leading,
-            text_input("query")
-                .state(self.input.downgrade())
-                .placeholder(self.placeholder())
-                .placeholder_color(t.text_faint)
-                .caret_color(t.accent)
-                .caret_blink_interval_500ms()
-                .flex_1()
-                .font_family(design::FONT_DISPLAY)
-                .text_size(px(design::ts::QUERY))
-                .whitespace_nowrap(),
-            hint.into_iter().chain(dropdown),
-            &t,
-        );
+        let query_input = text_input("query")
+            .state(self.input.downgrade())
+            .placeholder(self.placeholder())
+            .placeholder_color(t.text_faint)
+            .caret_color(t.accent)
+            .caret_blink_interval_500ms()
+            .font_family(design::FONT_DISPLAY)
+            .text_size(px(design::ts::QUERY))
+            .whitespace_nowrap();
+        // With boxes the query takes its own width (it gives way first), then the command's
+        // icon and the boxes, together at most 60% of the bar.
+        let (query, arg_group) = match &arg_row {
+            // A native form's bar holds only Back.
+            None if matches!(self.mode, Mode::Form(_)) => (div().flex_1().into_any_element(), None),
+            None => (query_input.flex_1().into_any_element(), None),
+            Some(it) => {
+                let q = Some(self.query(cx)).filter(|q| !q.is_empty()).unwrap_or_else(|| self.placeholder().to_string());
+                let w = design::text_width(&q, design::ts::QUERY, window) + px(design::sp::S4);
+                let query = div().flex_shrink(1.).min_w_0().w(w).overflow_hidden().child(query_input.w_full()).into_any_element();
+                let hue = it.tint.map_or(t.text_muted, |k| k.hue(&t));
+                let mark = match &it.icon {
+                    Icon::Vector(ch) => design::icon(ch, design::ic::LG, hue).into_any_element(),
+                    Icon::Image(image) => gpui::img(image.clone()).size(px(design::ic::LG)).flex_none().into_any_element(),
+                    Icon::Glyph(s) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::LG)).child(s.clone()).into_any_element(),
+                };
+                let boxes = it.args.iter().enumerate().map(|(i, a)| {
+                    let v = arg_values[i].as_str();
+                    let secret = a.kind == search::ArgKind::Secret;
+                    let dots = secret.then(|| "•".repeat(v.chars().count()));
+                    let tag = a.optional && v.is_empty();
+                    let help = (!a.help.is_empty()).then(|| SharedString::from(a.help.clone()));
+                    let measured = if v.is_empty() { a.placeholder.as_ref() } else { dots.as_deref().unwrap_or(v) };
+                    let width = design::arg_width(measured, tag, help.is_some(), window);
+                    let input = text_input(SharedString::from(format!("arg-{i}")))
+                        .state(self.args[i].downgrade())
+                        .placeholder(a.placeholder.clone())
+                        .placeholder_color(t.text_faint)
+                        .caret_color(t.accent)
+                        .w_full()
+                        .whitespace_nowrap()
+                        .when(secret, |e| e.text_color(gpui::transparent_black()));
+                    let left = self.arg_left.clone();
+                    let look = design::ArgBox { width, tag, help, dots, focused: arg_focus == Some(i), missing: self.arg_missing == Some(i) };
+                    let b = design::arg_box(i, input, look, &t).on_prepaint(move |p, _, _| left[i].set(p.bounds.origin.x));
+                    if matches!(a.kind, search::ArgKind::Choice(_)) { b.on_click(cx.listener(move |this, _, window, cx| this.open_choice(i, window, cx))).into_any_element() } else { b.into_any_element() }
+                });
+                let group = div().flex_none().max_w(gpui::relative(0.6)).ml(px(design::sp::S4)).flex().items_center().gap(px(design::sp::S8)).overflow_hidden().child(mark).children(boxes);
+                (query, Some(group.into_any_element()))
+            }
+        };
+        let search_bar = design::search_bar(leading, query, arg_group.into_iter().chain(hint).chain(dropdown), &t);
 
         // ---- action bar ----
         let tone = self.status.as_ref().map(|(tone, _)| match tone {
@@ -3088,7 +6255,7 @@ impl Render for Launcher {
         // A status shows its tone dot; in root search the selected row's own icon in its hue; else the view's icon.
         let mark = match tone {
             Some(c) => design::status_dot(c).into_any_element(),
-            None => match selected_item.filter(|it| at_root && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.text_muted, |k| k.hue(&t)))) {
+            None => match selected_item.filter(|it| (at_root || self.mode == Mode::Args) && it.section.as_deref() != Some(EMPTY)).map_or_else(|| (self.context_icon(), t.text_muted), |it| (it.icon.clone(), it.tint.map_or(t.text_muted, |k| k.hue(&t)))) {
                 (Icon::Vector(ch), hue) => design::icon(ch, design::ic::MD, hue).into_any_element(),
                 (Icon::Image(image), _) => gpui::img(image).size(px(design::ic::LG)).flex_none().into_any_element(),
                 (Icon::Glyph(s), _) => div().font_family(design::FONT_EMOJI).text_size(px(design::ic::MD)).child(s).into_any_element(),
@@ -3097,12 +6264,24 @@ impl Render for Launcher {
         let keys = |label: &str, keys: &[&str]| design::shortcut(label, keys, &t).into_any_element();
         let right = if self.panel.is_some() {
             vec![keys("Run", &["↵"]), design::vdivider(&t).into_any_element(), keys("Close", &["Esc"])]
+        } else if let Mode::Form(kind) = self.mode {
+            vec![keys(kind.bar().2, &["Ctrl", "↵"])]
         } else if self.is_form() {
             vec![keys("Submit", &["Ctrl", "↵"]), design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]
         } else if self.armed == Some(self.selected) {
             vec![div().text_color(t.warning).child("Press ↵ again to confirm").into_any_element()]
+        } else if let Some((next, verb)) = &arg_keys {
+            let mut v = vec![];
+            if *next {
+                v.extend([keys("Next Box", &["Tab"]), design::vdivider(&t).into_any_element()]);
+            }
+            v.push(keys(verb, &["↵"]));
+            v
         } else if let Some(p) = &primary {
             let mut v = vec![keys(p, &["↵"])];
+            if let Some(second) = &bar_second {
+                v.extend([design::vdivider(&t).into_any_element(), keys(second, &["Ctrl", "↵"])]);
+            }
             if actions.len() > 1 {
                 v.extend([design::vdivider(&t).into_any_element(), keys("Actions", &["Ctrl", "K"])]);
             }
@@ -3113,16 +6292,21 @@ impl Render for Launcher {
         let footer = design::action_bar(mark, &self.footer_left(), tone.is_some(), right, &t);
 
         // ---- overlays ----
+        let search = self.panel_filtered().then(|| {
+            let input = text_input("panel-search").state(self.menu_input.downgrade()).placeholder("Search for actions…").placeholder_color(t.text_faint).caret_color(t.accent).w_full().whitespace_nowrap();
+            design::panel_search(input, &t)
+        });
         let popover = self.panel.as_ref().map(|(item, sel)| {
             let me = cx.weak_entity();
-            let rows = item.actions().into_iter().enumerate().map(|(i, (label, act))| {
+            let rows = panel_rows.into_iter().enumerate().map(|(i, (at, (label, act)))| {
                 let me = me.clone();
-                let keys: &[&str] = match i {
-                    0 => &["↵"],
-                    1 => &["Ctrl", "↵"],
-                    _ => &[],
+                // The first two take Enter and Ctrl+Enter by place; the rest their own keys.
+                let keys: Vec<&str> = match at {
+                    0 => vec!["↵"],
+                    1 => vec!["Ctrl", "↵"],
+                    _ => search::act_keys(&act).map_or(vec![], |k| k.split('+').collect()),
                 };
-                design::panel_row(act_glyph(&act), &label, keys, i == *sel, act.destructive(), &t).id(("act", i)).on_click(move |_, window, cx| {
+                design::panel_row(act_glyph(&act), &label, &keys, i == *sel, act.destructive(), &t).id(("act", i)).on_click(move |_, window, cx| {
                     me.update(cx, |this, cx| {
                         if let Some((_, p)) = &mut this.panel {
                             *p = i;
@@ -3136,7 +6320,7 @@ impl Render for Launcher {
             // A click on it closes the panel; the panel occludes it, so clicks inside stay with the panel.
             [
                 design::scrim(t.scrim_soft).id("panel-scrim").occlude().on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))).into_any_element(),
-                design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t).occlude().into_any_element(),
+                design::action_panel(design::panel_head(design::icon_tile(&item.icon, &t, false, item.tint), &item.title, &t), rows, &t).children(search).occlude().into_any_element(),
             ]
         });
         let dialog = self.confirm.as_ref().map(|c| {
@@ -3155,16 +6339,45 @@ impl Render for Launcher {
             design::dialog(c.danger, &c.title, &c.message, [button(0, &c.primary, primary), button(1, "Cancel", design::Button::Quiet)], &t)
         });
 
+        let pop = self.menu.as_ref().map(|open| {
+            let me = cx.weak_entity();
+            let pick = move |i: usize, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| this.menu_pick(i, window, cx));
+            let me = cx.weak_entity();
+            let outside = move |_: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| _ = me.update(cx, |this, cx| _ = this.close_menu(window, cx));
+            let field = open.menu.search.as_ref().map(|placeholder| {
+                let input = text_input("menu-search").state(self.menu_input.downgrade()).placeholder(placeholder.clone()).placeholder_color(t.text_faint).caret_color(t.accent).w_full().whitespace_nowrap();
+                // In the Block menu, Backspace in the empty search takes the last token.
+                div().flex_1().min_w_0().when(open.site.is_some(), |d| d.key_context("TokenMenu")).child(input).into_any_element()
+            });
+            design::pop_menu(&open.menu, field, &open.scroll, pick, outside, |_, _| None, &t)
+        });
+
+        // A form's keys live on the root, which stays drawn while Ctrl+K or a confirm covers
+        // the form: a focused control that is not drawn then leaves the keys here.
         design::glass_window(&t)
+            .when(self.form_under(), |d| d.track_focus(&self.form_focus).key_context("Form"))
             .size_full()
             .font_family(design::FONT_UI)
             .text_size(px(design::ts::BODY))
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                if this.menu_key(menu::Key::Down, window, cx) {
+                    return;
+                }
+                // In a box Down opens a list's menu, and otherwise does nothing.
+                if this.panel.is_none()
+                    && let Some(i) = this.arg_focused(window, cx)
+                {
+                    return this.open_choice(i, window, cx);
+                }
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(ROW * 3., cx);
                 }
+                // On a select Down opens its menu; elsewhere in a form it moves on.
                 if this.panel.is_none() && this.is_form() {
-                    return this.move_field(1, window, cx);
+                    if !this.open_field_menu(window, cx) {
+                        this.move_field(1, window, cx);
+                    }
+                    return;
                 }
                 if this.collapsed(cx) {
                     this.peek = true;
@@ -3173,15 +6386,20 @@ impl Render for Launcher {
                 if this.panel.is_none() && this.grid() {
                     return this.grid_move(0, 1, cx);
                 }
+                let shown = this.panel_rows(cx).len();
                 match &mut this.panel {
-                    Some((item, i)) => *i = (*i + 1).min(item.actions().len().saturating_sub(1)),
+                    Some((_, i)) => *i = (*i + 1).min(shown.saturating_sub(1)),
                     None => this.selected = (this.selected + 1).min(this.items.len().saturating_sub(1)),
                 }
                 this.armed = None;
+                this.sync_args(cx);
                 this.scroll_to_selected();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SelectPrev, window, cx| {
+                if this.menu_key(menu::Key::Up, window, cx) || (this.panel.is_none() && this.arg_focused(window, cx).is_some()) {
+                    return;
+                }
                 if this.panel.is_none() && this.mode == Mode::Ai {
                     return this.scroll_ai(-ROW * 3., cx);
                 }
@@ -3199,38 +6417,101 @@ impl Render for Launcher {
                     None => this.selected = this.selected.saturating_sub(1),
                 }
                 this.armed = None;
+                this.sync_args(cx);
                 this.scroll_to_selected();
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleActions, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleActions, window, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
                 this.panel = match this.panel.take() {
                     Some(_) => None,
                     None => this.items.get(this.selected).cloned().filter(|it| it.section.as_deref() != Some(EMPTY) || !it.extra.is_empty()).filter(|it| it.act != Act::None || !it.extra.is_empty()).map(|it| (it, 0)),
                 };
+                // A long panel has a search field, and typing goes there.
+                if this.panel_filtered() {
+                    this.menu_input.update(cx, |s, cx| s.emplace("", cx));
+                    window.focus(&this.menu_input.focus_handle(cx), cx);
+                }
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| this.grid_move(-1, 0, cx)))
-            .on_action(cx.listener(|this, _: &SelectRight, _, cx| this.grid_move(1, 0, cx)))
+            .on_action(cx.listener(|this, _: &KeyOpen, window, cx| this.shortcut("Ctrl+O", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyOpenWith, window, cx| this.shortcut("Ctrl+Shift+O", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyQuickLook, window, cx| this.shortcut("Ctrl+Y", window, cx)))
+            .on_action(cx.listener(|this, _: &KeyReveal, window, cx| this.shortcut("Ctrl+Alt+O", window, cx)))
+            .on_action(cx.listener(|this, _: &OpenDropdown, window, cx| {
+                if this.menu.is_none() && this.panel.is_none() {
+                    match this.mode {
+                        Mode::Translate => this.open_lang_menu(window, cx),
+                        Mode::Shots => this.open_shot_menu(window, cx),
+                        _ => {}
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                if !this.step_swatch(-1, cx) {
+                    this.grid_move(-1, 0, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                if !this.step_swatch(1, cx) {
+                    this.grid_move(1, 0, cx)
+                }
+            }))
             // Left and Right move through the emoji grid instead of the search text.
-            .when(self.grid() && self.panel.is_none(), |d| d.key_context("EmojiGrid"))
-            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
+            // Tab and Shift+Tab move between the query and the boxes.
+            .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
+            // Anywhere but a token field (or its menu's empty search), Backspace edits the text.
+            .on_action(cx.listener(|this, _: &PopToken, _, cx| {
+                if !this.pop_token(cx) {
+                    cx.propagate();
+                }
+            }))
+            // Over a form, an open menu takes Tab and Shift+Tab as Down and Up.
+            .on_action(cx.listener(|this, _: &NextBox, window, cx| match this.is_form() {
+                true if this.menu_key(menu::Key::Down, window, cx) => {}
+                true => this.move_field(1, window, cx),
+                false => this.step_arg(1, window, cx),
+            }))
+            .on_action(cx.listener(|this, _: &PrevBox, window, cx| match this.is_form() {
+                true if this.menu_key(menu::Key::Up, window, cx) => {}
+                true => this.move_field(-1, window, cx),
+                false => this.step_arg(-1, window, cx),
+            }))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                if !this.menu_key(menu::Key::Esc, window, cx) && !this.dismiss_args(window, cx) {
+                    this.dismiss(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &EmacsNext, window, cx| this.nav("emacs", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsPrev, window, cx| this.nav("emacs", Box::new(SelectPrev), window, cx)))
             .on_action(cx.listener(|this, _: &EmacsBack, window, cx| this.nav("emacs", Box::new(Dismiss), window, cx)))
             .on_action(cx.listener(|this, _: &VimNext, window, cx| this.nav("vim", Box::new(SelectNext), window, cx)))
             .on_action(cx.listener(|this, _: &VimPrev, window, cx| this.nav("vim", Box::new(SelectPrev), window, cx)))
             .on_action(cx.listener(|this, _: &VimBack, window, cx| this.nav("vim", Box::new(Dismiss), window, cx)))
-            .on_action(cx.listener(|this, _: &Launch, window, cx| this.launch(window, cx)))
+            .on_action(cx.listener(|this, _: &Launch, window, cx| {
+                if !this.menu_key(menu::Key::Enter, window, cx) {
+                    this.launch(window, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Submit, window, cx| {
+                // The Block menu stays open between picks; Ctrl+Enter there still starts the session.
+                if this.menu.as_ref().is_some_and(|m| m.site.is_some()) {
+                    this.close_menu(window, cx);
+                } else if this.menu.is_some() {
+                    return;
+                }
                 if this.is_form() && this.panel.is_none() {
-                    this.submit_form(cx)
+                    this.submit_form(window, cx)
                 } else if this.panel.is_none()
                     && let Some(item) = this.items.get(this.selected).cloned()
                     && item.actions().len() > 1
                 {
                     // Ctrl+Enter: the secondary action, as shown in the action panel.
-                    this.panel = Some((item, 1));
-                    this.launch(window, cx);
+                    let act = item.actions().swap_remove(1).1;
+                    this.run(act, item.key, window, cx);
                 } else {
                     this.launch(window, cx)
                 }
@@ -3252,10 +6533,70 @@ impl Render for Launcher {
                     .child(div().min_w_0().child(n))
             }))
             .when(collapsed && self.fav_strip(), |d| d.child(fav_strip))
-            .when(!collapsed, |d| d.child(body).child(footer))
+            .when(!collapsed, |d| d.children(banner).child(body).child(footer))
             .children(popover.into_iter().flatten())
             .children(dialog)
+            .children(pop)
     }
+}
+
+/// Every key binding: the text box defaults first, then ours, added later at the same depth so
+/// they win for these keys.
+fn key_bindings() -> Vec<KeyBinding> {
+    let ours = [
+        KeyBinding::new("up", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("down", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("tab", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("shift-tab", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-p", OpenDropdown, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-o", KeyOpen, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-o", KeyOpenWith, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-y", KeyQuickLook, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-alt-o", KeyReveal, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-p", EmacsPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-b", EmacsBack, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
+        KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
+        // In a form's text box Tab moves to the next control, never into a menu (Down does that).
+        KeyBinding::new("tab", NextBox, Some(&format!("Form > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("shift-tab", PrevBox, Some(&format!("Form > {DEFAULT_INPUT_CONTEXT}"))),
+        // A form control without a text box (a select, a checkbox) holds the keys itself.
+        KeyBinding::new("tab", NextBox, Some("Form")),
+        KeyBinding::new("shift-tab", PrevBox, Some("Form")),
+        KeyBinding::new("up", SelectPrev, Some("Form")),
+        KeyBinding::new("down", SelectNext, Some("Form")),
+        KeyBinding::new("enter", Launch, Some("Form")),
+        KeyBinding::new("ctrl-enter", Submit, Some("Form")),
+        KeyBinding::new("escape", Dismiss, Some("Form")),
+        KeyBinding::new("ctrl-k", ToggleActions, Some("Form")),
+        KeyBinding::new("backspace", PopToken, Some("Form")),
+        // Add Calendar's swatches; a text box keeps its own Left and Right.
+        KeyBinding::new("left", SelectLeft, Some("Form")),
+        KeyBinding::new("right", SelectRight, Some("Form")),
+        KeyBinding::new("backspace", PopToken, Some(&format!("TokenMenu > {DEFAULT_INPUT_CONTEXT}"))),
+        // The settings window when no text field has focus.
+        KeyBinding::new("up", SelectPrev, Some("Settings")),
+        KeyBinding::new("down", SelectNext, Some("Settings")),
+        KeyBinding::new("tab", SelectNext, Some("Settings")),
+        KeyBinding::new("shift-tab", SelectPrev, Some("Settings")),
+        KeyBinding::new("enter", Launch, Some("Settings")),
+        KeyBinding::new("escape", Dismiss, Some("Settings")),
+        KeyBinding::new("ctrl-down", NextSection, Some("Settings")),
+        KeyBinding::new("ctrl-up", PrevSection, Some("Settings")),
+    ];
+    default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)).chain(ours).collect()
 }
 
 /// A plain accent-coloured disc; no third-party artwork.
@@ -3333,37 +6674,7 @@ fn main() {
     }
     gpui_ce_platform::application().with_assets(design::Icons).with_quit_mode(QuitMode::Explicit).run(|cx: &mut App| {
         design::register_fonts(cx);
-        // Defaults first; ours are added later at the same depth, so they win for these keys.
-        cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
-        cx.bind_keys([
-            KeyBinding::new("up", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("down", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("tab", SelectNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("shift-tab", SelectPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("escape", Dismiss, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("enter", Launch, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-enter", Submit, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-k", ToggleActions, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-down", NextSection, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("ctrl-up", PrevSection, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-n", EmacsNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-p", EmacsPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-b", EmacsBack, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-j", VimNext, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-k", VimPrev, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
-            KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
-            KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
-            // The settings window when no text field has focus.
-            KeyBinding::new("up", SelectPrev, Some("Settings")),
-            KeyBinding::new("down", SelectNext, Some("Settings")),
-            KeyBinding::new("tab", SelectNext, Some("Settings")),
-            KeyBinding::new("shift-tab", SelectPrev, Some("Settings")),
-            KeyBinding::new("enter", Launch, Some("Settings")),
-            KeyBinding::new("escape", Dismiss, Some("Settings")),
-            KeyBinding::new("ctrl-down", NextSection, Some("Settings")),
-            KeyBinding::new("ctrl-up", PrevSection, Some("Settings")),
-        ]);
+        cx.bind_keys(key_bindings());
 
         let (cfg, notice) = match config::load() {
             Ok(cfg) if cfg.files.ntfs && ntfs::old_helper_installed() => {
@@ -3376,7 +6687,7 @@ fn main() {
         net::load_rates();
         design::set_size(&cfg.size);
         // Before the first render, so the body is not drawn as glass on a machine with transparency off.
-        let glass = design::refresh_glass();
+        design::refresh_glass();
         let (tx, mut rx) = mpsc::unbounded::<Msg>();
         let tray = if cfg.tray { tray(tx.clone()) } else { None };
         let tick_tx = tx.clone();
@@ -3386,20 +6697,27 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
             kind: WindowKind::PopUp,
-            show: false,
+            // Shown at once and cloaked before its view is built: gpui shows it with
+            // SW_SHOWNOACTIVATE only here. `show: false` then `set_visible` replays a placement
+            // that activates it, taking the foreground (and the user's typing) at startup.
+            show: true,
             focus: false,
-            windows_window_background: backdrop(glass),
+            // No backdrop to draw before the cloak; `show` sets the real one before un-cloaking.
+            windows_window_background: gpui::WindowsWindowBackground::Transparent,
             ..Default::default()
         };
-        let handle = cx.open_window(options, |window, cx| cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))).unwrap();
+        let handle = cx
+            .open_window(options, |window, cx| {
+                win::cloak(win::hwnd(window), true);
+                cx.new(|cx| Launcher::new(cfg, notice, tx, window, cx))
+            })
+            .unwrap();
 
         // Shown once, cloaked: from now on hotkey -> un-cloak -> next frame.
         let _ = handle.update(cx, |this, window, _| {
             this.hwnd = win::hwnd(window);
             win::make_tool_window(this.hwnd);
             win::round_corners(this.hwnd);
-            win::cloak(this.hwnd, true);
-            window.set_visible(true);
             this.tray_icon = tray;
             this.scan_apps(true, false);
             // For screenshots and checks of the settings window without clicking through.
@@ -3424,30 +6742,53 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let toast = toast::open(cx);
+            _ = handle.update(cx, |this, _, _| this.toast = toast);
+            let mut hud = handle.update(cx, |this, _, _| this.tx.clone()).map(|tx| hud::Hud::open(cx, tx)).unwrap_or_default();
             while let Some(msg) = rx.next().await {
+                // Between updates (it moves windows): what the action that sent this message
+                // did to the session (and, after `on_msg` below, what the message did).
+                if let Ok(state) = handle.update(cx, |this, _, _| this.hud()) {
+                    hud.sync(cx, state);
+                }
                 if let Msg::Resize = msg {
                     if let Ok((hwnd, h)) = handle.update(cx, |this, _, _| (this.hwnd, this.height)) {
                         win::resize(hwnd, h * design::launcher_scale());
                     }
                     continue;
                 }
-                if let Msg::Toast(ok, text) = msg {
-                    let text: String = text.lines().next().unwrap_or_default().chars().take(200).collect();
-                    let theme = handle.update(cx, |this, _, _| this.cfg.theme.clone()).unwrap_or_default();
-                    toast::show(cx, toast, ok, text, theme);
+                if let Msg::Toast(kind, stay, text) = msg {
+                    // A sticky toast would take the open launcher's Esc: it goes in the ActionBar instead.
+                    let theme = handle.update(cx, |this, _, cx| {
+                        if this.visible && stay == toast::Stay::Sticky {
+                            this.status = Some((Tone::of(kind), text.clone()));
+                            cx.notify();
+                            return None;
+                        }
+                        Some(this.cfg.theme.clone())
+                    });
+                    if let Ok(Some(theme)) = theme {
+                        toast::show(cx, toast, kind, stay, &text, theme);
+                    }
                     continue;
                 }
                 // SetWindowPos sends WM_SIZE/WM_DPICHANGED synchronously and GPUI's window
                 // proc re-borrows the app, so the window is moved here, between updates.
                 let opens = match msg {
-                    Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && win::full_screen_app())).unwrap_or(false),
+                    Msg::Hotkey(i) => handle.update(cx, |this, _, _| this.hotkey_opens(i) && !(this.cfg.launcher.game_mode && !this.visible && foreground::full_screen_app())).unwrap_or(false),
                     Msg::Expand(ref hit) => handle.update(cx, |this, _, _| this.expand_opens(hit)).unwrap_or(false),
-                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
+                    _ => matches!(msg, Msg::Tray(TrayCmd::Open) | Msg::Hud(hud::Click::Open) | Msg::HotkeyStatus(0, Err(_)) | Msg::ScriptDone(..) | Msg::Notice(_)),
                 };
-                let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open));
+                let opens = opens || match &msg {
+                    // The launcher was hidden to read the selection: the answer brings it back.
+                    Msg::Translated { hidden: true, job, result: Ok(_), .. } => job.after == translate::After::Open,
+                    _ => false,
+                };
+                let opens_root = matches!(msg, Msg::Hotkey(0) | Msg::Tray(TrayCmd::Open) | Msg::Hud(hud::Click::Open));
+                // The pill opens on the session's row, so with the list even in compact mode.
+                let pill = matches!(msg, Msg::Hud(hud::Click::Open));
                 let geometry = handle.update(cx, |this, _, cx| {
                     // Opening compact root search: just the bar, unless the last search is kept.
-                    let compact = opens_root && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
+                    let compact = opens_root && !pill && this.cfg.window_mode == "compact" && (!this.keeps_state() || this.collapsed(cx));
                     let height = if compact { BAR + if this.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&this.cfg) };
                     (!this.visible).then(|| (this.hwnd, this.cfg.monitor.clone(), this.cfg.width, base_width(&this.cfg), height))
                 });
@@ -3458,6 +6799,9 @@ fn main() {
                     win::place(hwnd, &screen, base * s, height * s);
                 }
                 let _ = handle.update(cx, |this, window, cx| this.on_msg(msg, window, cx));
+                if let Ok(state) = handle.update(cx, |this, _, _| this.hud()) {
+                    hud.sync(cx, state);
+                }
             }
         })
         .detach();
@@ -3492,6 +6836,232 @@ mod tests {
     use super::*;
 
     #[test]
+    fn note_rows_say_when_each_note_was_opened_and_how_long_it_is() {
+        let meta = |id: &str, title: &str, opened: i64, deleted_at: Option<i64>| NoteMeta { id: id.into(), pinned: false, created: 0, modified: 100, deleted_at, opened, title: title.into() };
+        let now = 3 * 86_400 + 100;
+        let notes = [(meta("a", "Groceries", now - 120, None), 186), (meta("b", "Plans", 0, None), 1), (meta("c", "Trip", now - 2 * 86_400, None), 397)];
+        let rows = note_rows(NotesList::All, &notes, Some(("c".into(), 400)), now, false, 30);
+        let line = |it: &Item| (it.title.clone(), it.subtitle.clone(), it.act.clone(), it.section.clone());
+        assert_eq!(line(&rows[0]), ("Groceries".into(), "Opened 2 min ago · 186 characters".into(), Act::OpenNote("a".into()), Some("Notes".into())));
+        assert_eq!(line(&rows[1]).1, "Edited 3 days ago · 1 character", "never opened: its last edit");
+        assert_eq!(line(&rows[2]).1, "● Current · 400 characters", "the window's note, counted with its edits");
+        assert_eq!(note_rows(NotesList::All, &notes, None, now, false, 30)[2].subtitle, "Opened 2 days ago · 397 characters");
+        assert!(rows.iter().all(|it| it.tint == Some(design::Tint::Paste)));
+
+        let gone = note_rows(NotesList::Deleted, &[(meta("c", "Old", 0, Some(now - 86_400)), 0)], Some(("c".into(), 0)), now, false, 30);
+        assert_eq!(line(&gone[0]), ("Old".into(), "Deleted yesterday · 0 characters".into(), Act::RestoreNote("c".into()), Some("Recently Deleted".into())));
+        let acts: Vec<(String, bool)> = gone[0].actions().into_iter().map(|(l, a)| (l, a.destructive())).collect();
+        assert_eq!(acts, [("Restore".to_string(), false), ("Delete Permanently".to_string(), true)]);
+
+        assert_eq!(note_rows(NotesList::All, &[], None, now, false, 30)[0].act, Act::Cmd(Cmd::CreateNote));
+        assert_eq!(note_rows(NotesList::All, &[], None, now, true, 30)[0].title, "No matching notes");
+        assert_eq!(note_rows(NotesList::Deleted, &[], None, now, false, 7)[0].subtitle, "Deleted notes stay 7 days");
+    }
+
+    #[test]
+    fn create_note_takes_an_optional_title_and_runs_from_a_hotkey_at_once() {
+        let cfg = Config::default();
+        let it = search::catalog(&[], &[], &[], &cfg).into_iter().find(|it| it.act == Act::Cmd(Cmd::CreateNote)).unwrap();
+        assert_eq!((it.args.len(), it.args[0].name.as_ref(), it.args[0].optional), (1, "Title", true));
+        assert_eq!(search::prefill(&it, "Create Note Groceries"), ["Groceries"]);
+        assert_eq!(search::with_args(&it, &["Groceries".into()]).ok(), Some(Act::With(Box::new(Act::Cmd(Cmd::CreateNote)), vec!["Groceries".into()])));
+    }
+
+    #[test]
+    fn an_older_hdr_read_never_replaces_a_newer_one() {
+        // Read 1 (the launcher showed), then read 2 (after Toggle HDR); 1 lands last.
+        let mut cache = None;
+        assert!(take_hdr_read(&mut cache, 2, 2, vec![]));
+        assert!(cache.is_some());
+        cache = None;
+        assert!(!take_hdr_read(&mut cache, 2, 1, vec![]));
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn hdr_rows_in_root_search() {
+        // Toggle HDR stays with no HDR display, and says so; other rows are left alone.
+        let mut rows = vec![Item::new("Toggle HDR", "System", Icon::Vector(g::SUN_MEDIUM), Act::Cmd(Cmd::ToggleHdr)), Item::new("Lock Screen", "System", Icon::Vector(g::LOCK), Act::Cmd(Cmd::Lock))];
+        // Before the first read: the plain subtitle and label, no claim either way.
+        hdr_state(&mut rows, None);
+        assert_eq!((rows[0].subtitle.as_str(), rows[0].actions()[0].0.as_str()), ("System", "Run Command"));
+        hdr_state(&mut rows, Some(&[]));
+        assert_eq!((rows[0].subtitle.as_str(), rows[0].actions()[0].0.as_str()), ("No HDR display", "Turn HDR On"));
+        assert_eq!((rows[1].subtitle.as_str(), rows[1].extra.len()), ("System", 0));
+        // The Auto HDR row shows for "hdr", and Enter flips what its switch shows.
+        for q in ["hdr", "HD", "toggle hdr", "auto hdr"] {
+            assert!(wants_auto_hdr(q), "{q}");
+        }
+        for q in ["", "h", "hello", "dark"] {
+            assert!(!wants_auto_hdr(q), "{q}");
+        }
+        let on = auto_hdr_row(true);
+        assert_eq!((on.toggle, on.act.clone(), on.section.as_deref()), (Some(true), Act::SetAutoHdr(false), Some("Auto HDR")));
+        assert_eq!(auto_hdr_row(false).act.label(), "Turn Auto HDR On");
+    }
+
+    fn field(label: &'static str, ctl: Ctl, value: &str) -> FormField {
+        FormField { label: label.into(), ctl, value: value.into(), input: None, error: None }
+    }
+
+    fn text(label: &'static str, value: &str) -> FormField {
+        field(label, Ctl::Text { placeholder: "".into(), icon: None, tall: false, presets: &[] }, value)
+    }
+
+    fn entry(id: &str, label: &str) -> menu::Entry {
+        menu::Entry { id: id.into(), label: label.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn form_values_collects_text_and_picked_ids_by_label() {
+        let mode = Ctl::Select(vec![entry("block", "Block Apps & Websites"), entry("allow", "Allow Apps & Websites")], true);
+        let fields = [text("Goal", "Deep work"), field("", Ctl::Note, "a note"), field("Mode", mode, "allow"), field("", Ctl::Rule, ""), text("Duration", "")];
+        let v = form_values(&fields);
+        assert_eq!(v["Goal"], "Deep work");
+        assert_eq!(v["Mode"], "allow", "the picked id, not its label");
+        assert_eq!(v["Duration"], "");
+        assert_eq!(v.len(), 3, "notes and rules carry no value: {v:?}");
+    }
+
+    #[test]
+    fn moving_past_the_last_field_wraps_and_skips_notes() {
+        let fields = [field("", Ctl::Note, "intro"), text("Goal", ""), field("", Ctl::Rule, ""), text("Duration", ""), field("", Ctl::Note, "note")];
+        assert_eq!(next_field(&fields, 1, 1), 3, "past the rule");
+        assert_eq!(next_field(&fields, 3, 1), 1, "Tab on the last field wraps to the first");
+        assert_eq!(next_field(&fields, 1, -1), 3, "Shift+Tab on the first wraps to the last");
+        assert_eq!(next_field(&[], 0, 1), 0);
+    }
+
+    #[test]
+    fn a_select_opens_its_menu_on_the_current_value_and_a_text_field_has_none() {
+        let at = gpui::point(px(10.), px(20.));
+        let mode = field("Mode", Ctl::Select(vec![entry("block", "Block Apps & Websites"), entry("allow", "Allow Apps & Websites")], true), "allow");
+        let m = field_menu(&mode, at).expect("a select opens a menu");
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("allow"));
+        assert_eq!(m.search.as_deref(), Some("Search…"));
+        assert!(matches!(m.place, menu::Place::At(p) if p == at));
+        let plain = field("Mode", Ctl::Select(vec![entry("a", "A")], false), "");
+        assert!(field_menu(&plain, at).is_some_and(|m| m.search.is_none()), "no search field when asked for none");
+        assert!(field_menu(&text("Goal", ""), at).is_none());
+    }
+
+    #[test]
+    fn an_extension_dropdown_becomes_a_select_on_its_value() {
+        let dd = ext::Field { id: "lang".into(), kind: FieldKind::Dropdown(vec![("en".into(), "English".into()), ("de".into(), "German".into())]), title: "Language".into(), placeholder: String::new(), value: json!("en"), controlled: false, on_change: None, error: None };
+        let check = ext::Field { id: "ok".into(), kind: FieldKind::Checkbox, title: "Remember".into(), value: json!(false), ..dd.clone() };
+        let view = ext::View { kind: "Form".into(), fields: vec![dd.clone(), check.clone()], ..Default::default() };
+        let values = HashMap::from([("lang".to_string(), json!("de")), ("ok".to_string(), json!(true))]);
+        let ev = ExtView { run: 1, ext: 0, view, depth: 1, values, inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] };
+        let f = ext_field(&dd, &ev);
+        assert_eq!((f.label.as_ref(), f.value.as_str()), ("Language", "de"), "the value as last set, not the default");
+        let m = field_menu(&f, gpui::point(px(0.), px(0.))).expect("the dropdown opens the shared menu");
+        assert_eq!(m.picked().map(|e| e.label.as_str()), Some("German"));
+        let c = ext_field(&check, &ev);
+        assert!(matches!(c.ctl, Ctl::Check) && c.value == "true");
+    }
+
+    #[test]
+    fn translator_rows_copy_or_paste_per_action_and_end_with_the_pronunciation() {
+        let row = |text: &str, to: &str, say: Option<&str>| translate::Translation { text: text.into(), detected: "de".into(), to: to.into(), pronunciation: say.map(String::from) };
+        let job = translate::Job { text: "guten Morgen".into(), from: "auto".into(), to: vec!["en".into(), "es".into()], all: true, after: translate::After::Open };
+        let tr = TrView { job, rows: vec![row("good morning", "en", Some("ˈɡuːtn̩")), row("buenos días", "es", None)], first: 0, busy: false };
+        let rows = translation_rows(&tr, &config::Translator::default());
+        let shown: Vec<(&str, &str, &str)> = rows.iter().map(|it| (it.title.as_str(), it.subtitle.as_str(), it.accessory.as_str())).collect();
+        assert_eq!(shown, [("good morning", "", "English"), ("buenos días", "", "Spanish"), ("ˈɡuːtn̩", "Pronunciation", "German")]);
+        let labels: Vec<String> = rows[0].actions().into_iter().map(|a| a.0).collect();
+        assert_eq!(labels, ["Copy Translation", "Paste to Active App", "Copy Source", "Swap Languages", "Open in Google Translate", "Change Target"]);
+        assert_eq!(rows[0].act, Act::Copy("good morning".into()), "Enter");
+        let swap = &rows[0].actions()[3].1;
+        assert!(matches!(swap, Act::Translate(j) if j.text == "good morning" && j.from == "en" && j.to == ["de"]), "{swap:?}");
+        let paste = config::Translator { action: "paste".into(), ..Default::default() };
+        let rows = translation_rows(&tr, &paste);
+        assert_eq!((rows[0].act.clone(), rows[0].actions()[1].0.as_str()), (Act::Paste("good morning".into()), "Copy Translation"));
+        assert_eq!(rows[0].actions()[5].1, Act::LangMenu, "Change Target opens the language set menu");
+    }
+
+    fn two_sets() -> Vec<translate::LangSet> {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        vec![translate::LangSet::new("auto", &v(&["en", "es"])), translate::LangSet::new("de", &v(&["en"]))]
+    }
+
+    #[test]
+    fn the_language_set_menu_offers_manage_then_the_sets_with_the_current_one_selected() {
+        let m = lang_set_menu(&two_sets(), 1);
+        let shown: Vec<(&str, &str, Option<&str>)> = m.entries.iter().map(|e| (e.id.as_str(), e.label.as_str(), e.icon)).collect();
+        assert_eq!(shown, [("manage", "Manage Language Sets…", Some(g::EDIT)), ("0", "Auto-Detect → English, Spanish", Some(g::LANGUAGES)), ("1", "German → English", Some(g::LANGUAGES))]);
+        assert_eq!(m.rows()[1], menu::Row::Rule, "a rule under Manage");
+        assert_eq!(m.search.as_deref(), Some("Search…"));
+        assert!(matches!(m.place, menu::Place::Right));
+        assert_eq!(m.picked().map(|e| e.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn manage_language_sets_lists_add_then_the_sets_the_current_one_ticked() {
+        let rows = lang_set_rows(&two_sets(), 0);
+        let shown: Vec<(&str, &str)> = rows.iter().map(|it| (it.title.as_str(), it.accessory.as_str())).collect();
+        assert_eq!(shown, [("Add Language Set…", ""), ("Auto-Detect → English, Spanish", "Current"), ("German → English", "")]);
+        assert!(matches!((&rows[0].icon, &rows[1].icon, &rows[2].icon), (Icon::Vector(g::PLUS), Icon::Vector(g::CHECK), Icon::Vector(g::LANGUAGES))));
+        assert_eq!((rows[0].act.clone(), rows[0].act.label()), (Act::EditLangSet(None), "Add Language Set"));
+        let acts = |i: usize| rows[i].actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        assert_eq!(acts(2), ["Make Current", "Edit", "Delete"]);
+        assert_eq!(acts(1), ["Make Current", "Edit"], "the first set is Settings': no Delete");
+        assert_eq!((rows[2].act.clone(), rows[2].actions()[2].1.destructive()), (Act::UseLangSet(1), true));
+    }
+
+    #[test]
+    fn the_language_set_form_reads_back_as_a_set() {
+        let fields = lang_set_form(None);
+        let v = form_values(&fields);
+        assert_eq!((v["Source language"], v["Target language 1"], v["Target language 2"]), ("auto", "en", ""));
+        let title = |f: &FormField| if let Ctl::Select(e, search) = &f.ctl { (e.iter().find(|e| e.id == f.value).map(|e| e.label.clone()), *search) } else { (None, false) };
+        assert_eq!(fields.iter().map(title).collect::<Vec<_>>(), [(Some("Auto-Detect".into()), true), (Some("English".into()), true), (Some("None".into()), true)]);
+        let set = &two_sets()[1];
+        let fields = lang_set_form(Some(set));
+        let v = form_values(&fields);
+        assert_eq!(translate::LangSet::new(v["Source language"], &[v["Target language 1"].into(), v["Target language 2"].into()]), *set, "Edit is prefilled");
+    }
+
+    #[test]
+    fn screenshots_say_no_matches_when_a_filter_hides_them() {
+        assert_eq!(shots_empty(false, false), ShotsEmpty::NoScreenshots, "only then Add Folder");
+        assert_eq!(shots_empty(false, true), ShotsEmpty::NoMatches, "a query or Pinned / Recordings");
+        assert_eq!(shots_empty(true, true), ShotsEmpty::Reading);
+    }
+
+    #[test]
+    fn thumbnail_cache_forgets_the_least_recently_used() {
+        let mut cache: HashMap<String, (Option<u32>, u64)> = (0..10u32).map(|i| (format!("t:{i}"), ((i % 2 == 0).then_some(i), u64::from(i)))).collect();
+        assert!(evict(&mut cache, 10, 4).is_empty(), "at the limit nothing goes");
+        cache.insert("t:new".into(), (Some(99), 20));
+        let mut gone = evict(&mut cache, 10, 4);
+        gone.sort_unstable();
+        assert_eq!(gone, [0, 2, 4, 6], "the oldest seven go; their images come back to be freed");
+        let mut kept: Vec<&String> = cache.keys().collect();
+        kept.sort();
+        assert_eq!(kept, ["t:7", "t:8", "t:9", "t:new"]);
+    }
+
+    #[test]
+    fn clipboard_images_are_made_once_and_the_unused_ones_freed() {
+        let (mut cache, mut tick, mut made) = (HashMap::new(), 0, 0);
+        for i in 0..12u32 {
+            used(&mut cache, &mut tick, format!("t:{i}"), || Some(i));
+        }
+        assert_eq!(used(&mut cache, &mut tick, "t:0".into(), || { made += 1; Some(0) }), Some(0), "cached");
+        assert_eq!(made, 0, "not made again");
+        let mut gone = evict(&mut cache, 10, 4);
+        gone.sort_unstable();
+        assert_eq!(gone, (1..=8).collect::<Vec<_>>(), "the ones not used lately come back to be freed");
+        assert!(cache.contains_key("t:0"), "used last, kept");
+    }
+
+    #[test]
+    fn far_rows_are_not_decoded() {
+        assert!(near(0, 0) && near(12, 0) && !near(13, 0));
+        assert!(near(28, 40) && !near(27, 40) && near(52, 40));
+    }
+
+    #[test]
     fn emoji_grid_rows_break_at_sections_and_columns() {
         let it = |sec: &str| Item::new("x", "", Icon::glyph("x"), Act::None).sec(sec);
         let items: Vec<Item> = (0..6).map(|_| it("Smileys")).chain((0..2).map(|_| it("People"))).collect();
@@ -3499,6 +7069,298 @@ mod tests {
         assert_eq!(shape, ["Smileys", "[0, 1, 2, 3]", "[4, 5]", "People", "[6, 7]"]);
         let searched: Vec<Item> = (0..5).map(|_| Item::new("x", "", Icon::glyph("x"), Act::None)).collect();
         assert_eq!(grid_rows(&searched, 4).len(), 2, "no sections: just rows");
+    }
+
+    #[test]
+    fn running_is_always_headed_and_results_are_headed_below_another_section() {
+        let it = |sec: &str| Item::new("x", "", Icon::glyph("x"), Act::None).sec(sec);
+        assert_eq!(display_rows(&[it("Running")], false), [None, Some(0)], "alone, still headed");
+        assert_eq!(display_rows(&[it("Results"), it("Running"), it("Results")], false), [Some(0), None, Some(1), None, Some(2)]);
+        assert_eq!(display_rows(&[it("Results"), it("Results")], false), [Some(0), Some(1)]);
+        // My Schedule heads even a lone section; root heads a lone Next.
+        assert_eq!(display_rows(&[it("Today"), it("Today")], true), [None, Some(0), Some(1)]);
+        assert_eq!(display_rows(&[it("Today")], false), [Some(0)]);
+        assert_eq!(display_rows(&[it(NEXT)], false), [None, Some(0)]);
+    }
+
+    #[test]
+    fn define_view_groups_senses_offers_spellings_and_says_when_nothing_is_found() {
+        let sense = |pos, gloss: &str, synonyms: &[&str]| dict::Sense { pos, gloss: gloss.into(), examples: vec![], synonyms: synonyms.iter().map(|s| s.to_string()).collect() };
+        let view = |word: &str, answer| DefView { word: word.into(), fetch: false, answer: Some(Ok(answer)) };
+        let web = "https://www.google.com/search?q={query}";
+
+        let found = dict::Answer { senses: vec![sense(dict::Pos::Adj, "lucky", &[]), sense(dict::Pos::Noun, "good luck", &["fluke", "luck"])], maybe: vec![("serendipitous".into(), dict::Pos::Adj)] };
+        let rows = define_rows(&view("serendipity", Some(found)), web);
+        let shape: Vec<(&str, Option<&str>)> = rows.iter().map(|it| (it.title.as_str(), it.section.as_deref())).collect();
+        assert_eq!(shape, [("good luck", Some("Noun")), ("lucky", Some("Adjective")), ("serendipitous", Some(DID_YOU_MEAN))]);
+        assert_eq!(rows[0].tint, Some(design::Tint::Web));
+        let labels: Vec<String> = rows[0].actions().into_iter().map(|a| a.0).collect();
+        assert_eq!(labels, ["Copy Definition", "Copy Word", "Define Similar Word", "Open in Browser"]);
+        assert_eq!(rows[0].act, Act::Copy("good luck".into()), "Enter copies the gloss");
+        assert_eq!(rows[0].actions()[2].1, Act::SimilarWords(vec!["fluke".into(), "luck".into()]));
+        assert_eq!(rows[0].actions()[3].1, Act::Open("https://en.wiktionary.org/wiki/serendipity".into()));
+        assert!(!rows[1].actions().iter().any(|a| a.0 == "Define Similar Word"), "no synonyms, no menu");
+        assert_eq!(rows[2].act, Act::Define("serendipitous".into()));
+
+        // Misspelled: Did you mean alone, still headed; its first row (the closest match) is where the selection starts.
+        let rows = define_rows(&view("serendipty", Some(dict::Answer { senses: vec![], maybe: vec![("serendipity".into(), dict::Pos::Noun)] })), web);
+        assert_eq!(display_rows(&rows, false), [None, Some(0)]);
+        assert_eq!((rows[0].title.as_str(), rows[0].subtitle.as_str()), ("serendipity", "Noun"));
+
+        // Unknown: the empty view, Enter searches the web.
+        let rows = define_rows(&view("xyzq", Some(dict::Answer { senses: vec![], maybe: vec![] })), web);
+        assert_eq!((rows[0].title.as_str(), rows[0].subtitle.as_str(), rows[0].section.as_deref()), ("No definition for 'xyzq'", "Check the spelling, or search the web", Some(EMPTY)));
+        assert_eq!(rows[0].actions()[0], ("Search the Web".to_string(), Act::Open("https://www.google.com/search?q=xyzq".into())));
+
+        // Not downloaded: the empty view's Enter downloads it.
+        let rows = define_rows(&view("dog", None), web);
+        assert_eq!((rows[0].title.as_str(), rows[0].act.clone()), ("Download Dictionary", Act::DownloadDictionary("dog".into())));
+    }
+
+    #[test]
+    fn typing_in_the_define_view_asks_only_for_a_new_word() {
+        // "dog" shown; "s" queues "dogs"; Backspace before the pause is back to "dog": nothing new
+        // is queued (and the bump in `define_soon` outdates the "dogs" timer).
+        assert_eq!(typed_word("dog", "dogs"), Some("dogs"));
+        assert_eq!(typed_word("dog", "dog"), None);
+        assert_eq!(typed_word("dog", " dog "), None);
+        assert_eq!(typed_word("dog", "  "), None);
+        // A trailing space asks for the word without it.
+        assert_eq!(typed_word("ic", "ice "), Some("ice"));
+    }
+
+    #[test]
+    fn the_root_define_row_names_its_word_only_with_one_typed() {
+        let define = Item::new("Define", "", Icon::glyph("x"), Act::Cmd(Cmd::Define));
+        assert_eq!(define_word(&define, &[" Dog ".into()]), Some("Dog"));
+        assert_eq!(define_word(&define, &["  ".into()]), None);
+        assert_eq!(define_word(&define, &[]), None);
+        assert_eq!(define_word(&Item::new("Start Timer", "", Icon::glyph("x"), Act::Cmd(Cmd::StartTimer)), &["dog".into()]), None);
+    }
+
+    #[test]
+    fn running_rows_pause_on_enter_stop_on_ctrl_enter_and_dismiss_when_done() {
+        let row = |paused, done, stopwatch| running_row(timers::Row { id: 4, title: "tea".into(), stopwatch, paused, done, time: "4:12".into() });
+        let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        let it = row(false, false, false);
+        assert_eq!((it.subtitle.as_str(), it.accessory.as_str(), it.section.as_deref(), it.live), ("Timer", "4:12 left", Some(RUNNING), true));
+        assert!(matches!(it.icon, Icon::Vector(g::ALARM_CLOCK)) && matches!(row(false, false, true).icon, Icon::Vector(g::TIMER)));
+        assert_eq!((it.act.clone(), it.actions()[1].1.clone()), (Act::PauseTimer(4), Act::StopTimer(4)));
+        assert_eq!(labels(&it), ["Pause", "Stop", "Restart", "Rename", "Add 5 min"]);
+        assert_eq!(it.extra[4].1, Act::AddTime(4, 300));
+        let paused = row(true, false, false);
+        assert_eq!((paused.act, paused.accessory.as_str()), (Act::ResumeTimer(4), "Paused · 4:12"));
+        let done = row(false, true, false);
+        assert_eq!((done.act.clone(), done.accessory.as_str(), labels(&done)), (Act::StopTimer(4), timers::DONE, vec!["Dismiss".to_string(), "Stop".into(), "Restart".into()]));
+        assert_eq!(done.actions()[1].1, Act::StopTimer(4), "Ctrl+Enter stops a done timer, never restarts it");
+        assert_eq!(timer_id(&done), Some(4));
+    }
+
+    #[test]
+    fn an_alias_heads_root_over_a_keyword_and_a_lone_letter_keyword_leads_nothing() {
+        let mut cfg = Config::default();
+        cfg.launcher.aliases.insert(Cmd::Settings.key(), "t".into());
+        let cat = search::catalog(&[], &[], &[], &cfg);
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let shown = |q: &str| {
+            let found = search::root(q, &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+            let rows = head_rows(vec![running.clone()], found, q, &cfg);
+            let at = root_selection(&rows, q, &cfg, false);
+            (rows, at)
+        };
+        let (rows, at) = shown("t");
+        assert_eq!((rows[0].act.clone(), at), (Act::Cmd(Cmd::Settings), 0), "the alias, not Start Timer");
+        let (rows, at) = shown("t 90");
+        assert_eq!((rows[0].title.as_str(), at), ("Start Timer", 0), "a keyword with a value leads");
+        let (rows, at) = shown("timer");
+        assert_eq!((rows[0].title.as_str(), at), ("Start Timer", 0));
+        cfg.launcher.aliases.clear();
+        let cat = search::catalog(&[], &[], &[], &cfg);
+        let found = search::root("t", &cat, &cfg, &Frecency::default(), &mut Matcher::new(nucleo_matcher::Config::DEFAULT));
+        assert!(found.iter().all(|it| !search::leads(it, "t", &cfg)), "a bare one-letter keyword is just a letter");
+        assert!(found.iter().any(|it| it.section.as_deref().is_some_and(|s| s.starts_with("Use "))), "so the fallbacks stay");
+    }
+
+    #[test]
+    fn a_typed_query_starts_past_the_running_rows() {
+        let cfg = Config::default();
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let rows = vec![running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(root_selection(&rows, "te", &cfg, false), 1, "Enter on \"te\" opens Terminal, it does not pause tea");
+        assert_eq!(root_selection(&rows, "", &cfg, false), 0, "an empty search starts on the top row");
+        assert_eq!(root_selection(&rows[..1], "tea", &cfg, false), 0, "only Running rows: the first of them");
+    }
+
+    #[test]
+    fn after_a_reminder_the_empty_search_starts_on_the_next_meeting() {
+        let cfg = Config::default();
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let next = Item::new("Standup", "Work · Teams", Icon::glyph("x"), Act::Join("Standup".into(), "https://teams.live.com/meet/1".into())).sec(NEXT);
+        let rows = vec![running, next, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(root_selection(&rows, "", &cfg, true), 1, "Enter joins");
+        assert_eq!(root_selection(&rows, "", &cfg, false), 0, "no reminder: the top row");
+        assert_eq!(root_selection(&rows, "te", &cfg, true), 2, "typing still starts on the results");
+    }
+
+    #[test]
+    fn the_action_bar_names_a_row_by_its_kind_never_its_age() {
+        let app = Item::new("Terminal", "", Icon::glyph("x"), Act::None).acc("Application".to_string());
+        assert_eq!(row_footer(Some(&app)), "Application");
+        for when in ["yesterday", "just now", "3 min ago"] {
+            let clip = Item::new("text", "", Icon::glyph("x"), Act::Clip("k".into())).acc(when.to_string());
+            assert_eq!(row_footer(Some(&clip)), "procast", "{when}");
+        }
+        assert_eq!(row_footer(None), "procast");
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_selection_on_the_same_row() {
+        let timer = |id, title: &str| running_row(timers::Row { id, title: title.into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let app = |title: &str, key: Option<&str>| {
+            let mut it = Item::new(title, "", Icon::glyph("x"), Act::None).sec("Results");
+            it.key = key.map(Into::into);
+            it
+        };
+        let next = Item::new("Standup", "", Icon::glyph("x"), Act::Join("Standup".into(), "https://teams.live.com/meet/1".into())).sec(NEXT);
+        let before = vec![timer(1, "Timer"), app("Terminal", Some("app:term")), app("Notes", None)];
+        // A timer and a meeting came in above: the rows moved down, the selection follows them.
+        let after = vec![next.clone(), timer(2, "Timer"), timer(1, "Timer"), app("Terminal", Some("app:term")), app("Notes", None)];
+        assert_eq!(same_row(&after, &before[0]), Some(2), "the same timer, not the first one with its title");
+        assert_eq!(same_row(&after, &before[1]), Some(3), "the same key");
+        assert_eq!(same_row(&after, &before[2]), Some(4), "no key: the same title in the same section");
+        assert_eq!(same_row(&after, &next), Some(0));
+        assert_eq!(same_row(&before, &next), None, "gone: refresh's own choice stands");
+        let mut elsewhere = app("Notes", None);
+        elsewhere.section = Some("Commands".into());
+        assert_eq!(same_row(&after, &elsewhere), None, "a title in another section is another row");
+    }
+
+    fn deep_work(minutes: u32) -> focus::Session {
+        let mut s = focus::Session::new("Deep work", focus::Mode::Block, &[], &[], minutes, false, SystemTime::now());
+        s.picks = vec!["cat:Messaging".into(), "cat:Social".into()];
+        s
+    }
+
+    #[test]
+    fn the_focus_row_heads_root_with_its_time_and_keys() {
+        let now = SystemTime::now();
+        let mut s = deep_work(25);
+        let it = focus_row(&s, now);
+        assert_eq!((it.title.as_str(), it.subtitle.as_str(), it.accessory.as_str(), it.section.as_deref()), ("Deep work", "Blocking 2 categories", "25:00 left", Some(FOCUS)));
+        assert!(matches!(it.icon, Icon::Vector(g::SHIELD_CHECK)) && it.tint == Some(design::Tint::System) && it.live);
+        let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        assert_eq!(labels(&it), ["Pause", "Complete", "Edit", "Extend", "Restart", "Cancel"]);
+        assert_eq!((it.act.clone(), it.actions()[1].1.clone(), it.bar_second.as_deref()), (Act::Cmd(Cmd::Focus(FocusCmd::Pause)), Act::Cmd(Cmd::Focus(FocusCmd::Complete)), Some("Complete")), "Enter pauses, Ctrl+Enter completes");
+        s.pause(now);
+        let paused = focus_row(&s, now);
+        assert_eq!((paused.act, paused.accessory.as_str()), (Act::Cmd(Cmd::Focus(FocusCmd::Resume)), "Paused · 25:00"));
+        assert!(!labels(&focus_row(&deep_work(0), now)).contains(&"Extend".to_string()), "no limit: nothing to extend");
+        // Focus heads root above Running, headed even alone; a typed query starts past both.
+        let running = running_row(timers::Row { id: 1, title: "tea".into(), stopwatch: false, paused: false, done: false, time: "4:12".into() });
+        let rows = vec![it, running, Item::new("Terminal", "", Icon::glyph("x"), Act::None).sec("Results")];
+        assert_eq!(display_rows(&rows[..1], false), [None, Some(0)]);
+        assert_eq!(root_selection(&rows, "de", &Config::default(), false), 2);
+    }
+
+    #[test]
+    fn the_focus_form_starts_from_its_seed_and_reads_back() {
+        let picks = vec!["cat:Messaging".to_string(), "site:x.com".into()];
+        let fields = focus_form("Deep work", "1 hour 30 minutes", focus::Mode::Allow, &picks);
+        assert_eq!(fields.iter().map(|f| f.label.to_string()).collect::<Vec<_>>(), ["Goal", "Duration", "Mode", "Block"]);
+        let v = form_values(&fields);
+        assert_eq!((v["Goal"], v["Duration"], v["Mode"]), ("Deep work", "1 hour 30 minutes", "allow"));
+        assert_eq!(focus::Picks::of(v["Block"]).0, picks);
+        assert!(matches!(&fields[1].ctl, Ctl::Text { icon: Some(g::CLOCK), presets, .. } if presets.len() == 5));
+        let menu = field_menu(&fields[1], gpui::Point::default()).unwrap();
+        assert_eq!((menu.entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), menu.selected, menu.search.is_some()), (focus::DURATIONS.to_vec(), 3, false), "Down: the presets, on the current one");
+        let Ctl::Select(modes, search) = &fields[2].ctl else { panic!("Mode is a select") };
+        assert_eq!((modes.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), *search), (vec!["Block Apps & Websites", "Allow Apps & Websites"], true));
+        assert!(field_menu(&fields[3], gpui::Point::default()).is_none(), "the token field opens the Block menu instead");
+    }
+
+    #[test]
+    fn edit_opens_the_form_from_the_session_and_keeps_its_mode() {
+        let cats = focus::categories(&[]);
+        let strings = |a: [&str; 4]| a.map(String::from).to_vec();
+        let values = |r: Option<Result<Vec<FormField>, String>>| r.map(|f| f.unwrap().into_iter().map(|f| f.value).collect::<Vec<_>>());
+        let open = |f: FocusCmd, got: &[&str], s: Option<&focus::Session>| values(focus_form_for(f, &got.iter().map(|g| g.to_string()).collect::<Vec<_>>(), s, &cats, 25));
+        let s = deep_work(50);
+        let from_session = Some(strings(["Deep work", "50 min", "block", "cat:Messaging\ncat:Social"]));
+        let seeded = focus::edit_seed(&s);
+        let seeded: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        assert_eq!(open(FocusCmd::Edit, &seeded, Some(&s)), from_session, "Enter on the boxes as seeded opens the form; the clock does not restart");
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], Some(&s)), from_session, "run on its own (Ctrl+K Edit, a hotkey)");
+        assert_eq!(open(FocusCmd::Edit, &["Essay", "50", "Messaging, Social"], Some(&s)), None, "changed boxes apply at once");
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], None), None, "no session: refused later");
+        assert_eq!(open(FocusCmd::Start, &["", "50", ""], None), Some(strings(["", "50 min", "block", ""])));
+        assert_eq!(open(FocusCmd::Start, &["Read", "", ""], None), None, "a goal starts at once");
+        // An allow session with nothing picked stays an allow session.
+        let open_allow = focus::Session::new("Open", focus::Mode::Allow, &[], &[], 25, false, SystemTime::now());
+        assert_eq!(open(FocusCmd::Edit, &["", "", ""], Some(&open_allow)).map(|v| v[2].clone()).as_deref(), Some("allow"));
+    }
+
+    #[test]
+    fn tab_in_a_form_text_box_moves_on_and_backspace_reaches_the_token_menu_first() {
+        let keymap = gpui::Keymap::new(key_bindings());
+        let actions = |key: &str, stack: &[&str]| {
+            let stack: Vec<gpui::KeyContext> = stack.iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+            keymap.bindings_for_input(&[gpui::Keystroke::parse(key).unwrap()], &stack).0.iter().map(|b| b.action().name().rsplit("::").next().unwrap_or_default().to_string()).collect::<Vec<_>>()
+        };
+        let first = |key: &str, stack: &[&str]| actions(key, stack).first().cloned().unwrap_or_default();
+        let input = DEFAULT_INPUT_CONTEXT;
+        assert_eq!(first("tab", &["Form", input]), "NextBox", "Tab on Duration moves on; it never opens the presets");
+        assert_eq!(first("shift-tab", &["Form", input]), "PrevBox");
+        assert_eq!(first("down", &["Form", input]), "SelectNext", "Down still opens them");
+        assert_eq!(first("tab", &[input]), "SelectNext", "the query keeps its Tab");
+        assert_eq!(first("tab", &["Form", "TokenMenu", input]), "NextBox", "in a menu over a form too: its handler steps the open menu");
+        assert_eq!(actions("backspace", &["Form", "TokenMenu", input])[..2], ["PopToken", "DeleteLeft"], "the token first, then (propagated) the text");
+        assert_eq!(first("backspace", &["Form", input]), "DeleteLeft", "Goal's Backspace edits Goal");
+        assert_eq!(first("backspace", &["Form"]), "PopToken", "on the token field itself");
+        assert_eq!((first("left", &["Form"]), first("right", &["Form"])), ("SelectLeft".into(), "SelectRight".into()), "Left and Right move between swatches");
+        assert_ne!(first("left", &["Form", input]), "SelectLeft", "a text box keeps its caret keys");
+    }
+
+    #[test]
+    fn an_add_calendar_answer_drives_only_the_form_that_asked() {
+        assert_eq!(add_answer(Some(1), 1, 1, true), (true, None), "the form on screen follows its answer");
+        assert_eq!(add_answer(Some(1), 1, 1, false), (false, None), "left for root: no form to drive");
+        // A was sent from form 1, Esc, form 2 sent B: A's answer only toasts and B still waits.
+        assert_eq!(add_answer(Some(2), 1, 2, true), (false, Some(2)));
+        assert_eq!(add_answer(Some(2), 2, 2, true), (true, None));
+    }
+
+    #[test]
+    fn add_calendar_asks_for_the_address_first_then_a_name_and_a_colour() {
+        let f = calendar_form();
+        assert_eq!(f.iter().position(FormField::focusable), Some(0), "the address is focused first");
+        assert!(matches!(&f[0].ctl, Ctl::Text { placeholder, icon: Some(g::LINK), .. } if placeholder.as_ref() == "https://calendar.google.com/…/basic.ics"));
+        assert!(matches!(&f[1].ctl, Ctl::Text { placeholder, icon: None, .. } if placeholder.as_ref() == "Work"));
+        assert!(matches!(f[2].ctl, Ctl::Swatches) && f[2].value == "system" && f[2].label.as_ref() == "Colour");
+        assert!(matches!(f[3].ctl, Ctl::Note) && f[3].label.is_empty());
+        assert_eq!(f[3].value, "Google: Settings → your calendar → Secret address in iCal format. Outlook: Settings → Shared calendars → Publish → ICS.");
+        assert_eq!(form_values(&f).get("Colour"), Some(&"system"));
+        assert_eq!(FormKind::AddCalendar.bar(), (g::CALENDAR_CLOCK, "Add Calendar", "Add Calendar"));
+        assert_eq!(Act::AddCalendar.label(), "Add Calendar");
+    }
+
+    #[test]
+    fn the_block_menu_lists_what_is_not_picked_and_a_typed_website() {
+        let cats = focus::categories(&[]);
+        let apps = vec![("discord.exe".to_string(), "Discord".to_string())];
+        let picks = focus::Picks(vec!["cat:Messaging".into(), "cat:Social".into()]);
+        let mut entries = block_entries(&cats, &apps, &picks);
+        let m = menu::Menu::new(entries.clone(), Some("Search…".into()), menu::Place::Right);
+        assert_eq!(m.rows()[0], menu::Row::Header("Focus Categories"));
+        assert_eq!(entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Streaming", "Travel", "News", "Shopping", "Gaming", "Discord"], "picked ones leave the menu");
+        assert_eq!((entries[0].id.as_str(), entries[0].icon, entries[5].id.as_str(), entries[5].section.as_deref()), ("cat:Streaming", Some(g::CIRCLE_PLAY), "app:discord.exe", Some("Applications")));
+        site_lead(&mut entries, "Block", "Reddit.com");
+        assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].always), ("Block reddit.com", "site:reddit.com", true));
+        site_lead(&mut entries, "Allow", "x.com");
+        assert_eq!((entries[0].label.as_str(), entries.len()), ("Allow x.com", 7), "the typed row is replaced, never stacked");
+        site_lead(&mut entries, "Block", "Steam.exe");
+        assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].icon), ("Block steam.exe", "app:steam.exe", Some(g::APP)), "a program, never a website");
+        site_lead(&mut entries, "Block", "news");
+        assert_eq!(entries.len(), 6, "not a website: no row");
     }
 
     #[test]

@@ -1,0 +1,395 @@
+//! HDR on and off per display (the Windows "advanced color" switch), for Toggle HDR and for
+//! Auto HDR: HDR comes on while a game has focus and goes off after, but only if procast
+//! was the one that turned it on.
+
+use std::{
+    sync::mpsc::{Sender, channel},
+    thread,
+};
+
+use windows::Win32::{
+    Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    },
+    Foundation::{HWND, LUID},
+    Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow},
+    UI::WindowsAndMessaging::GetWindowThreadProcessId,
+};
+
+use futures::channel::mpsc::UnboundedSender;
+
+use crate::win::Msg;
+
+/// One active display.
+#[derive(Clone, Debug)]
+pub struct HdrDisplay {
+    adapter: LUID,
+    id: u32,
+    /// Windows' name for the display ("\\.\DISPLAY1"): matches a window's monitor to it.
+    gdi: String,
+    /// The monitor's own name ("DELL U2723QE"); empty if Windows won't say.
+    name: String,
+    pub supported: bool,
+    pub enabled: bool,
+}
+
+/// (HDR can be used, HDR is on) from the advanced-color bits: 0 supported, 1 enabled, 3 force-disabled.
+fn decode(bits: u32) -> (bool, bool) {
+    (bits & 1 != 0 && bits & 8 == 0, bits & 2 != 0)
+}
+
+fn name_of(buf: &[u16]) -> String {
+    String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())])
+}
+
+fn header(kind: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_TYPE, size: usize, adapter: LUID, id: u32) -> DISPLAYCONFIG_DEVICE_INFO_HEADER {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER { r#type: kind, size: size as u32, adapterId: adapter, id }
+}
+
+/// Every active display, with whether it can do HDR and whether it is on. Empty on any error.
+pub fn displays() -> Vec<HdrDisplay> {
+    unsafe {
+        let (mut np, mut nm) = (0, 0);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm).0 != 0 {
+            return vec![];
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None).0 != 0 {
+            return vec![];
+        }
+        paths.truncate(np as usize);
+        paths
+            .iter()
+            .filter_map(|p| {
+                let (adapter, id) = (p.targetInfo.adapterId, p.targetInfo.id);
+                let mut color = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+                color.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, size_of_val(&color), adapter, id);
+                if DisplayConfigGetDeviceInfo(&mut color.header) != 0 {
+                    return None;
+                }
+                let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+                source.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, size_of_val(&source), p.sourceInfo.adapterId, p.sourceInfo.id);
+                if DisplayConfigGetDeviceInfo(&mut source.header) != 0 {
+                    return None;
+                }
+                let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+                target.header = header(DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, size_of_val(&target), adapter, id);
+                let name = if DisplayConfigGetDeviceInfo(&mut target.header) == 0 { name_of(&target.monitorFriendlyDeviceName) } else { String::new() };
+                let (supported, enabled) = decode(color.Anonymous.value);
+                Some(HdrDisplay { adapter, id, gdi: name_of(&source.viewGdiDeviceName), name, supported, enabled })
+            })
+            .collect()
+    }
+}
+
+/// The display a window is on.
+fn display_of(all: &[HdrDisplay], hwnd: HWND) -> Option<&HdrDisplay> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    let ok = unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) };
+    let name = name_of(&info.szDevice);
+    all.iter().find(|d| ok.as_bool() && d.gdi == name)
+}
+
+/// Turns HDR on or off on one display.
+pub fn set(target: &HdrDisplay, on: bool) -> Result<(), String> {
+    let mut state = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
+    state.header = header(DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, size_of_val(&state), target.adapter, target.id);
+    state.Anonymous.value = on as u32;
+    match unsafe { DisplayConfigSetDeviceInfo(&state.header) } {
+        0 => Ok(()),
+        e => Err(format!("Windows refused to change HDR (error {e})")),
+    }
+}
+
+/// Toggle HDR: flips every HDR-capable display. Says the state of the first one afterwards.
+pub fn toggle() -> Result<String, String> {
+    let all: Vec<HdrDisplay> = displays().into_iter().filter(|d| d.supported).collect();
+    let Some(first) = all.first() else { return Err(format!("{NONE} · connect an HDR monitor")) };
+    let mut failed = None;
+    for d in &all {
+        if let Err(e) = set(d, !d.enabled) {
+            failed.get_or_insert(e);
+        }
+    }
+    failed.map_or_else(|| Ok(format!("HDR {}", if first.enabled { "off" } else { "on" })), Err)
+}
+
+const NONE: &str = "No HDR display";
+
+/// Whether HDR is on, as Toggle HDR flips it and reports it: the first HDR-capable display's.
+fn first_on(displays: &[HdrDisplay]) -> Option<bool> {
+    displays.iter().find(|d| d.supported).map(|d| d.enabled)
+}
+
+/// Toggle HDR's subtitle: "On · DELL U2723QE", "Off · 2 displays" or "No HDR display".
+pub fn subtitle(displays: &[HdrDisplay]) -> String {
+    let hdr: Vec<&HdrDisplay> = displays.iter().filter(|d| d.supported).collect();
+    let Some(on) = first_on(displays) else { return NONE.into() };
+    let which = match hdr.as_slice() {
+        [one] if !one.name.is_empty() => one.name.clone(),
+        _ => format!("{} display{}", hdr.len(), if hdr.len() == 1 { "" } else { "s" }),
+    };
+    format!("{} · {which}", if on { "On" } else { "Off" })
+}
+
+/// What Enter on Toggle HDR will do, for the ActionBar.
+pub fn bar_label(displays: &[HdrDisplay]) -> &'static str {
+    if first_on(displays) == Some(true) { "Turn HDR Off" } else { "Turn HDR On" }
+}
+
+/// Auto HDR's toast: "HDR on for Elden Ring" (just "HDR on" when the app has no name).
+pub fn switch_text(on: bool, app: &str) -> String {
+    let state = if on { "on" } else { "off" };
+    if app.is_empty() { format!("HDR {state}") } else { format!("HDR {state} for {app}") }
+}
+
+/// Auto HDR says it switched once per game launch: `last` is the process it last told about.
+fn should_toast(last: Option<u32>, pid: u32) -> bool {
+    last != Some(pid)
+}
+
+/// What Auto HDR does on a focus change: `ours` is whether procast turned HDR on (and not
+/// off since), `hdr_on` the state of the game's display.
+pub fn next(auto: bool, game: bool, ours: bool, hdr_on: bool) -> Option<bool> {
+    match (auto, game) {
+        (false, _) => None,
+        (true, true) => (!hdr_on).then_some(true),
+        (true, false) => (ours && hdr_on).then_some(false),
+    }
+}
+
+/// Whether procast still owns the on-state after acting: a switch it made, or one the user
+/// has not undone.
+fn owned(done: Option<bool>, ours: bool, hdr_on: bool) -> bool {
+    done.unwrap_or(ours && hdr_on)
+}
+
+/// Holds the name of the display procast turned HDR on for, while it owns the on-state, so a
+/// crash or restart can still switch off that display (and only that one).
+fn flag() -> std::path::PathBuf {
+    crate::config::dir().join("hdr-on")
+}
+
+fn set_flag(owned: Option<&str>) {
+    let _ = match owned {
+        Some(gdi) => std::fs::write(flag(), gdi),
+        None => std::fs::remove_file(flag()),
+    };
+}
+
+/// What to do at start-up about a flag left by the last run.
+#[derive(Debug, PartialEq)]
+enum Recovery {
+    /// Nothing to undo: forget the flag.
+    Clear,
+    /// A game still has focus on that display: procast keeps owning HDR.
+    Keep,
+    /// Turn that display off, then forget the flag.
+    Release,
+}
+
+/// `flag` is the display named in the flag file, `game_on` the display of the game in front, if any.
+fn recovery(flag: &str, all: &[HdrDisplay], game_on: Option<&str>) -> Recovery {
+    match all.iter().find(|d| d.gdi == flag) {
+        None => Recovery::Clear,
+        Some(_) if game_on == Some(flag) => Recovery::Keep,
+        Some(d) if d.enabled => Recovery::Release,
+        Some(_) => Recovery::Clear,
+    }
+}
+
+/// The switch one focus change asks for, on the display procast may own (`mine`). With Auto
+/// HDR off, an owned display is let go as if the game had left.
+fn decide(auto: bool, game: bool, mine: bool, hdr_on: bool) -> Option<bool> {
+    next(auto || mine, game && auto, mine, hdr_on)
+}
+
+/// Auto HDR runs on its own thread, one focus change at a time (display calls take a moment).
+pub struct Auto(Sender<(bool, bool, isize, String)>);
+
+impl Auto {
+    /// Starts the thread, first undoing what a previous run left on (see `recovery`). Turning
+    /// HDR on for a game sends a toast on `toasts`.
+    pub fn start(toasts: UnboundedSender<Msg>) -> Self {
+        let (tx, rx) = channel::<(bool, bool, isize, String)>();
+        let _ = thread::Builder::new().spawn(move || {
+            // The display procast turned HDR on for.
+            let mut ours: Option<String> = None;
+            // The game process the last toast was for.
+            let mut told: Option<u32> = None;
+            if let Ok(saved) = std::fs::read_to_string(flag()) {
+                let all = displays();
+                let game_on = crate::foreground::game_in_front().then(|| display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone())).flatten();
+                match recovery(saved.trim(), &all, game_on.as_deref()) {
+                    Recovery::Keep => ours = Some(saved.trim().to_string()),
+                    Recovery::Release => {
+                        all.iter().filter(|d| d.gdi == saved.trim()).for_each(|d| _ = set(d, false));
+                        set_flag(None);
+                    }
+                    Recovery::Clear => set_flag(None),
+                }
+            } else if flag().exists() {
+                set_flag(None); // unreadable: nothing safe to undo
+            }
+            // ponytail: one owned display; a game moved to another HDR display leaves the first on.
+            for (auto, game, hwnd, exe) in rx {
+                if !auto && ours.is_none() {
+                    continue;
+                }
+                let game = game && auto;
+                let before = ours.clone();
+                let all = displays();
+                let target = if game { display_of(&all, HWND(hwnd as *mut _)) } else { ours.as_ref().and_then(|g| all.iter().find(|d| &d.gdi == g)) };
+                match target.filter(|t| t.supported) {
+                    // The owned display is gone, or there is no HDR display to act on.
+                    None if !game => ours = None,
+                    None => {}
+                    Some(t) => {
+                        let mine = ours.as_ref() == Some(&t.gdi);
+                        let want = decide(auto, game, mine, t.enabled);
+                        let done = want.filter(|&on| set(t, on).is_ok());
+                        if game && done == Some(true) {
+                            let mut pid = 0;
+                            unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
+                            if should_toast(told, pid) {
+                                told = Some(pid);
+                                let _ = toasts.unbounded_send(Msg::done(switch_text(true, &crate::focus::app_label(&exe))));
+                            }
+                        }
+                        // Windows refused: ownership stays as it was, try again at the next change.
+                        if want.is_none() || done.is_some() {
+                            if owned(done, mine, t.enabled) {
+                                ours = Some(t.gdi.clone());
+                            } else if mine {
+                                ours = None;
+                            }
+                        }
+                    }
+                }
+                if ours != before {
+                    set_flag(ours.as_deref());
+                }
+            }
+        });
+        Self(tx)
+    }
+
+    /// The foreground window changed; `exe` is its program's file name (`Msg::Foreground`).
+    pub fn foreground(&self, auto: bool, game: bool, hwnd: isize, exe: String) {
+        let _ = self.0.send((auto, game, hwnd, exe));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_hdr_decisions() {
+        // A game in front with HDR off: on. Already on: leave it.
+        assert_eq!(next(true, true, false, false), Some(true));
+        assert_eq!(next(true, true, false, true), None);
+        // The game is gone and procast turned it on: off.
+        assert_eq!(next(true, false, true, true), Some(false));
+        // HDR the user turned on is never turned off.
+        assert_eq!(next(true, false, false, true), None);
+        assert_eq!(next(true, false, false, false), None);
+        // The user already turned it off again.
+        assert_eq!(next(true, false, true, false), None);
+        // Off means off, whatever the state.
+        for (game, ours, on) in [(true, false, false), (false, true, true), (true, true, true), (false, false, true)] {
+            assert_eq!(next(false, game, ours, on), None);
+        }
+    }
+
+    #[test]
+    fn ownership_ends_when_the_user_switches_off() {
+        assert!(owned(Some(true), false, false)); // we just turned it on
+        assert!(!owned(Some(false), true, true)); // we just turned it off
+        assert!(owned(None, true, true)); // untouched
+        assert!(!owned(None, true, false)); // the user turned it off
+        assert!(!owned(None, false, true)); // theirs, not ours
+    }
+
+    #[test]
+    fn advanced_color_bits() {
+        assert_eq!(decode(0b0011), (true, true));
+        assert_eq!(decode(0b0001), (true, false));
+        assert_eq!(decode(0), (false, false));
+        assert_eq!(decode(0b1001), (false, false)); // force-disabled
+    }
+
+    #[test]
+    #[ignore = "reads this machine's displays (changes nothing); run with --ignored --nocapture"]
+    fn displays_are_found() {
+        let all = displays();
+        println!("{all:?}");
+        let fg = display_of(&all, crate::win::foreground()).map(|d| d.gdi.clone());
+        println!("foreground window is on {fg:?}");
+        assert!(!all.is_empty());
+    }
+
+    fn display(gdi: &str, enabled: bool) -> HdrDisplay {
+        HdrDisplay { adapter: LUID::default(), id: 0, gdi: gdi.into(), name: "DELL U2723QE".into(), supported: true, enabled }
+    }
+
+    #[test]
+    fn the_row_says_the_state_and_the_display() {
+        let sdr = HdrDisplay { supported: false, name: "Laptop".into(), ..display("c", false) };
+        assert_eq!(subtitle(&[display("a", true)]), "On · DELL U2723QE");
+        assert_eq!(subtitle(&[display("a", false), sdr.clone()]), "Off · DELL U2723QE");
+        // Only HDR-capable displays count.
+        assert_eq!(subtitle(&[display("a", false), sdr.clone(), display("b", false)]), "Off · 2 displays");
+        assert_eq!(subtitle(std::slice::from_ref(&sdr)), "No HDR display");
+        assert_eq!(subtitle(&[]), "No HDR display");
+        // A display Windows gives no name.
+        assert_eq!(subtitle(&[HdrDisplay { name: String::new(), ..display("a", true) }]), "On · 1 display");
+    }
+
+    #[test]
+    fn the_bar_says_what_enter_does() {
+        assert_eq!(bar_label(&[display("a", true)]), "Turn HDR Off");
+        assert_eq!(bar_label(&[display("a", false)]), "Turn HDR On");
+        assert_eq!(bar_label(&[]), "Turn HDR On");
+    }
+
+    #[test]
+    fn switch_toast_names_the_game_once_per_launch() {
+        assert_eq!(switch_text(true, "Elden Ring"), "HDR on for Elden Ring");
+        assert_eq!(switch_text(false, "Eldenring"), "HDR off for Eldenring");
+        assert_eq!(switch_text(true, ""), "HDR on");
+        assert!(should_toast(None, 42));
+        assert!(!should_toast(Some(42), 42)); // the same game again (alt-tab back): no second toast
+        assert!(should_toast(Some(42), 43)); // a new launch
+    }
+
+    #[test]
+    fn recovery_only_undoes_what_the_flag_names() {
+        let (a, b) = (r"\\.\DISPLAY1", r"\\.\DISPLAY2");
+        // Flag names A (on), the user has B on: only A is released.
+        let all = [display(a, true), display(b, true)];
+        assert_eq!(recovery(a, &all, None), Recovery::Release);
+        // The flagged display is gone, or already off: nothing to switch off, flag cleared.
+        assert_eq!(recovery(r"\\.\DISPLAY9", &all, None), Recovery::Clear);
+        assert_eq!(recovery("", &all, None), Recovery::Clear);
+        assert_eq!(recovery(a, &[display(a, false), display(b, true)], None), Recovery::Clear);
+        // A game still in front on that display: keep owning. On another display: release.
+        assert_eq!(recovery(a, &all, Some(a)), Recovery::Keep);
+        assert_eq!(recovery(a, &all, Some(b)), Recovery::Release);
+    }
+
+    #[test]
+    fn turning_auto_off_releases_what_procast_owns() {
+        assert_eq!(decide(false, true, true, true), Some(false)); // owned, auto off, game in front: release
+        assert_eq!(decide(false, false, true, true), Some(false));
+        assert_eq!(decide(false, true, false, true), None); // the user's HDR stays
+        assert_eq!(decide(false, false, true, false), None); // already off
+        assert_eq!(decide(true, true, false, false), Some(true)); // auto on behaves as `next`
+        assert_eq!(decide(true, false, true, true), Some(false));
+    }
+}

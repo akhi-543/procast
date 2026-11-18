@@ -19,6 +19,13 @@ pub struct Arg {
     pub optional: bool,
 }
 
+impl Arg {
+    /// Its box in the search bar.
+    pub fn to_arg(&self) -> crate::search::Arg {
+        crate::search::Arg { optional: self.optional, ..crate::search::Arg::new(self.placeholder.clone()) }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Script {
     pub title: String,

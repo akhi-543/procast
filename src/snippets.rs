@@ -22,6 +22,14 @@ pub struct Arg {
     pub default: String,
 }
 
+impl Arg {
+    /// Its box in the search bar; one with a default may stay empty.
+    pub fn to_arg(&self) -> crate::search::Arg {
+        let help = if self.default.is_empty() { String::new() } else { format!("Empty: {}", self.default) };
+        crate::search::Arg { optional: !self.default.is_empty(), help, ..crate::search::Arg::new(self.name.clone()) }
+    }
+}
+
 /// `{word key="value" …}` -> (word, attributes); None for text that isn't a placeholder.
 fn placeholder(inner: &str) -> Option<(&str, Vec<(&str, String)>)> {
     let inner = inner.trim();
@@ -327,6 +335,18 @@ fn selection() -> Option<String> {
     None
 }
 
+/// Off the UI thread: the text selected in the app you came from, once focus is back there.
+/// The clipboard gets its old text back (ponytail: only text, as with snippets).
+pub fn grab_selection(owner: HWND) -> Option<String> {
+    std::thread::sleep(Duration::from_millis(80));
+    let old = clipboard::text();
+    let sel = selection();
+    if let Some(old) = &old {
+        clipboard::set(owner, clipboard::Put::Text(old), true);
+    }
+    sel
+}
+
 /// Whether a link needs filling in from the app you came from.
 pub fn link_needs_fill(url: &str) -> bool {
     url.contains("{selection}") || url.contains("{clipboard}")
@@ -344,7 +364,7 @@ pub fn open_link(owner: HWND, url: String, tx: futures::channel::mpsc::Unbounded
         let old = clipboard::text();
         let sel = if url.contains("{selection}") {
             let Some(sel) = selection().filter(|s| !s.trim().is_empty()) else {
-                let _ = tx.unbounded_send(crate::win::Msg::Toast(false, "No text selected".into()));
+                let _ = tx.unbounded_send(crate::win::Msg::error("Select some text first"));
                 return;
             };
             // ponytail: only text comes back, as with snippets.

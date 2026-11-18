@@ -1,0 +1,770 @@
+//! Notes on disk: `<root>/<id>.md` per note, `notes.json` with the metadata, and
+//! `history/<id>/<unix>.md` snapshots. Times are unix seconds and passed in by the caller.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::focus::write_atomic;
+
+pub type Id = String;
+
+/// One snapshot per this many seconds of editing, and this many kept per note.
+const SNAPSHOT_EVERY: i64 = 5 * 60;
+const SNAPSHOT_KEEP: usize = 50;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NoteMeta {
+    pub id: Id,
+    #[serde(default)]
+    pub pinned: bool,
+    pub created: i64,
+    pub modified: i64,
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+    /// When the Notes window last showed it; 0 = never.
+    #[serde(default)]
+    pub opened: i64,
+    /// First line without markdown; kept in memory only, rebuilt from the file.
+    #[serde(skip)]
+    pub title: String,
+}
+
+/// `create` found an empty note already: that is the one to open.
+#[derive(Debug, PartialEq)]
+pub struct Exists(pub Id);
+
+pub struct Store {
+    root: PathBuf,
+    metas: Vec<NoteMeta>,
+    /// Largest id handed out or found, as a number; ids only ever go up.
+    last: u64,
+}
+
+/// Why a damaged `notes.json` stops the store, and what to do: short enough to follow the longest
+/// "Couldn't duplicate the note: " in a toast.
+const DAMAGED: &str = "move notes.json away to rebuild";
+
+impl Store {
+    /// Opens (creating if needed) the notes folder. A missing `notes.json` is rebuilt from the
+    /// `.md` files, and files and entries that disagree are reconciled, so no note is lost. One
+    /// that can't be read or parsed is an error, never rebuilt over: it holds what the files
+    /// don't (deleted, pinned, created, opened).
+    pub fn open(root: PathBuf) -> io::Result<Store> {
+        fs::create_dir_all(&root)?;
+        let read: Option<Vec<NoteMeta>> = match fs::read_to_string(root.join("notes.json")) {
+            // The toast says what to do; the parser's detail would push that past its 60 characters.
+            Ok(t) => Some(serde_json::from_str(&t).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, DAMAGED))?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let had = read.is_some();
+        let mut metas = read.unwrap_or_default();
+        let before = metas.len();
+        metas.retain(|m| root.join(format!("{}.md", m.id)).is_file());
+        let mut changed = !had || metas.len() != before;
+        for e in fs::read_dir(&root)?.flatten() {
+            let path = e.path();
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
+            let md = path.extension().is_some_and(|x| x == "md");
+            if !md || !valid(&id) || metas.iter().any(|m| m.id == id) {
+                continue;
+            }
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            metas.push(NoteMeta { id, pinned: false, created: t, modified: t, deleted_at: None, opened: 0, title: String::new() });
+            changed = true;
+        }
+        for m in &mut metas {
+            m.title = title_of(&read_note(&root.join(format!("{}.md", m.id))).unwrap_or_default());
+        }
+        let last = metas.iter().filter_map(|m| u64::from_str_radix(&m.id, 36).ok()).max().unwrap_or(0);
+        let store = Store { root, metas, last };
+        if changed {
+            store.persist()?;
+        }
+        Ok(store)
+    }
+
+    /// Live notes: pinned first, then newest edit first.
+    pub fn list(&self) -> Vec<NoteMeta> {
+        let mut v: Vec<NoteMeta> = self.metas.iter().filter(|m| m.deleted_at.is_none()).cloned().collect();
+        v.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.modified.cmp(&a.modified)).then(b.id.cmp(&a.id)));
+        v
+    }
+
+    /// Recently deleted, newest deletion first.
+    pub fn deleted(&self) -> Vec<NoteMeta> {
+        let mut v: Vec<NoteMeta> = self.metas.iter().filter(|m| m.deleted_at.is_some()).cloned().collect();
+        v.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at).then(b.id.cmp(&a.id)));
+        v
+    }
+
+    /// The live note the Notes window showed last; never opened, the newest edit.
+    pub fn last(&self) -> Option<Id> {
+        self.list().into_iter().max_by_key(|m| (m.opened, m.modified)).map(|m| m.id)
+    }
+
+    /// The note's text. A missing file is an empty note; any other read error is passed on, so a
+    /// transient lock can never look like an empty note (and get saved over the real one).
+    pub fn text(&self, id: &str) -> io::Result<String> {
+        checked(id)?;
+        match read_note(&self.path(id)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            r => r,
+        }
+    }
+
+    /// A new empty note, unless one exists already (then its id comes back as `Exists`).
+    pub fn create(&mut self, now: i64) -> io::Result<Result<Id, Exists>> {
+        for m in self.list() {
+            if self.text(&m.id)?.trim().is_empty() {
+                return Ok(Err(Exists(m.id)));
+            }
+        }
+        self.add("", now).map(Ok)
+    }
+
+    pub fn duplicate(&mut self, id: &str, now: i64) -> io::Result<Id> {
+        self.index(id)?;
+        let text = self.text(id)?;
+        self.add(&text, now)
+    }
+
+    pub fn save(&mut self, id: &str, text: &str, now: i64) -> io::Result<()> {
+        let i = self.index(id)?;
+        let old = self.text(id)?;
+        self.snapshot(id, &old, self.metas[i].modified, text, now)?;
+        write_atomic(&self.path(id), text)?;
+        self.metas[i].modified = now;
+        self.metas[i].title = title_of(text);
+        self.persist()
+    }
+
+    pub fn pin(&mut self, id: &str, pinned: bool) -> io::Result<()> {
+        let i = self.index(id)?;
+        self.metas[i].pinned = pinned;
+        self.persist()
+    }
+
+    /// Soft delete: the note moves to `deleted()` until restored or purged.
+    pub fn delete(&mut self, id: &str, now: i64) -> io::Result<()> {
+        let i = self.index(id)?;
+        self.metas[i].deleted_at = Some(now);
+        self.persist()
+    }
+
+    pub fn restore(&mut self, id: &str) -> io::Result<()> {
+        let i = self.index(id)?;
+        self.metas[i].deleted_at = None;
+        self.persist()
+    }
+
+    /// The Notes window shows the note now.
+    pub fn open_note(&mut self, id: &str, now: i64) -> io::Result<()> {
+        let i = self.index(id)?;
+        self.metas[i].opened = now;
+        self.persist()
+    }
+
+    /// Removes a deleted note for good: file, history and metadata. A live note is refused.
+    pub fn purge(&mut self, id: &str) -> io::Result<()> {
+        let i = self.index(id)?;
+        if self.metas[i].deleted_at.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "only a deleted note can be removed for good"));
+        }
+        let md = self.path(id);
+        if md.exists() {
+            fs::remove_file(md)?;
+        }
+        let _ = fs::remove_dir_all(self.history_dir(id));
+        self.metas.remove(i);
+        self.persist()
+    }
+
+    /// Purges the notes deleted `days` days ago or longer; how many went.
+    pub fn purge_expired(&mut self, now: i64, days: u32) -> io::Result<usize> {
+        let old: Vec<Id> = self.deleted().into_iter().filter(|m| m.deleted_at.is_some_and(|d| now - d >= i64::from(days) * 86_400)).map(|m| m.id).collect();
+        for id in &old {
+            self.purge(id)?;
+        }
+        Ok(old.len())
+    }
+
+    /// Live notes whose title or text contains `q`, ignoring case; ordered like `list()`.
+    pub fn search(&self, q: &str) -> Vec<NoteMeta> {
+        let q = q.trim().to_lowercase();
+        self.list()
+            .into_iter()
+            .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q) || self.text(&m.id).unwrap_or_default().to_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Search Notes (`search`; pinned first, then last opened, a note never opened by its last
+    /// edit), or Recently Deleted Notes (whose title holds `q`, any case), each with its length in
+    /// characters. A note that can't be read counts 0.
+    pub fn browse(&self, deleted: bool, q: &str) -> Vec<(NoteMeta, usize)> {
+        let q = q.trim().to_lowercase();
+        // ponytail: reads every listed note per search; keep lengths in NoteMeta if folders grow large.
+        let notes: Vec<NoteMeta> = if deleted {
+            self.deleted().into_iter().filter(|m| m.title.to_lowercase().contains(&q)).collect()
+        } else {
+            let mut v = self.search(&q);
+            v.sort_by_key(|m| (std::cmp::Reverse(m.pinned), std::cmp::Reverse(if m.opened > 0 { m.opened } else { m.modified })));
+            v
+        };
+        notes
+            .into_iter()
+            .map(|m| {
+                let n = self.text(&m.id).map_or(0, |t| t.chars().count());
+                (m, n)
+            })
+            .collect()
+    }
+
+    fn add(&mut self, text: &str, now: i64) -> io::Result<Id> {
+        let n = ((now.max(0) as u64) * 1000).max(self.last + 1);
+        let id = base36(n);
+        write_atomic(&self.root.join(format!("{id}.md")), text)?;
+        self.last = n;
+        self.metas.push(NoteMeta { id: id.clone(), pinned: false, created: now, modified: now, deleted_at: None, opened: 0, title: title_of(text) });
+        self.persist()?;
+        Ok(id)
+    }
+
+    fn index(&self, id: &str) -> io::Result<usize> {
+        checked(id)?;
+        self.metas
+            .iter()
+            .position(|m| m.id == id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such note"))
+    }
+
+    fn path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.md"))
+    }
+
+    fn history_dir(&self, id: &str) -> PathBuf {
+        self.root.join("history").join(id)
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(&self.metas).map_err(io::Error::other)?;
+        write_atomic(&self.root.join("notes.json"), &json)
+    }
+
+    /// Snapshot times of a note, oldest first.
+    fn snapshots(&self, id: &str) -> Vec<i64> {
+        if !valid(id) {
+            return vec![];
+        }
+        let mut v: Vec<i64> = fs::read_dir(self.history_dir(id))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.path().file_stem()?.to_str()?.parse().ok())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Before a save replaces `old` (last modified at `stamp`) with `new` at `now`: keeps `old` as a
+    /// snapshot, so the version being overwritten can always be recovered. At most one per five
+    /// minutes, never a blank or unchanged one; keeps the newest 50.
+    fn snapshot(&self, id: &str, old: &str, stamp: i64, new: &str, now: i64) -> io::Result<()> {
+        let times = self.snapshots(id);
+        if times.last().is_some_and(|t| now - t < SNAPSHOT_EVERY) || old.trim().is_empty() || old == new {
+            return Ok(());
+        }
+        let dir = self.history_dir(id);
+        fs::create_dir_all(&dir)?;
+        write_atomic(&dir.join(format!("{stamp}.md")), old)?;
+        let total = times.len() + 1;
+        for t in times.iter().take(total.saturating_sub(SNAPSHOT_KEEP)) {
+            let _ = fs::remove_file(dir.join(format!("{t}.md")));
+        }
+        Ok(())
+    }
+}
+
+/// An id is letters and digits only (base 36, or a stray file's plain name), so it can never
+/// name a path outside the notes folder.
+fn valid(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn checked(id: &str) -> io::Result<()> {
+    if valid(id) { Ok(()) } else { Err(io::Error::new(io::ErrorKind::InvalidInput, "not a note id")) }
+}
+
+fn base36(mut n: u64) -> String {
+    let mut out = Vec::new();
+    loop {
+        out.push(char::from_digit((n % 36) as u32, 36).unwrap_or('0'));
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.iter().rev().collect()
+}
+
+/// Text as the editor keeps it: `\n` line ends and no byte-order mark (a note saved by another
+/// editor; pasted text).
+pub fn normalized(text: &str) -> String {
+    text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// A note file's text, `normalized`. The file keeps its own line ends until the note is edited.
+fn read_note(path: &Path) -> io::Result<String> {
+    fs::read_to_string(path).map(|t| normalized(&t))
+}
+
+/// First line with something in it, without the markdown around it; "Untitled" for an empty note.
+pub fn title_of(text: &str) -> String {
+    text.lines().map(strip_line).find(|l| !l.is_empty()).unwrap_or_else(|| "Untitled".into())
+}
+
+fn strip_line(line: &str) -> String {
+    let mut s = line.trim();
+    loop {
+        let before = s;
+        s = s.trim_start_matches('#').trim_start();
+        s = s.strip_prefix('>').unwrap_or(s).trim_start();
+        for m in ["- [ ] ", "- [x] ", "- [X] ", "- ", "* ", "+ "] {
+            s = s.strip_prefix(m).unwrap_or(s).trim_start();
+        }
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            s = s[digits..].strip_prefix(". ").unwrap_or(s).trim_start();
+        }
+        if s == before {
+            break;
+        }
+    }
+    let mut out = s.to_owned();
+    for t in ["**", "~~", "==", "`", "<u>", "</u>", "*"] {
+        out = out.replace(t, "");
+    }
+    out.trim().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A note's snapshots, newest first, as (unix seconds, text): what `snapshot` kept.
+    fn history(s: &Store, id: &str) -> Vec<(i64, String)> {
+        let mut v: Vec<(i64, String)> = s.snapshots(id).into_iter().filter_map(|t| Some((t, fs::read_to_string(s.history_dir(id).join(format!("{t}.md"))).ok()?))).collect();
+        v.reverse();
+        v
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("procast-notes-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        d
+    }
+
+    fn open(name: &str) -> Store {
+        Store::open(tmp(name)).unwrap()
+    }
+
+    fn made(r: io::Result<Result<Id, Exists>>) -> Id {
+        r.unwrap().unwrap()
+    }
+
+    #[test]
+    fn create_twice_returns_the_empty_note() {
+        let mut s = open("create");
+        let a = made(s.create(100));
+        assert_eq!(s.create(101).unwrap(), Err(Exists(a.clone())));
+        s.save(&a, "hello", 102).unwrap();
+        let b = made(s.create(103));
+        assert_ne!(a, b);
+        assert_eq!(s.list().len(), 2);
+    }
+
+    #[test]
+    fn ids_are_monotonic_even_within_one_second() {
+        let mut s = open("ids");
+        let a = made(s.create(100));
+        s.save(&a, "x", 100).unwrap();
+        let b = s.duplicate(&a, 100).unwrap();
+        let c = s.duplicate(&a, 50).unwrap();
+        let n = |i: &str| u64::from_str_radix(i, 36).unwrap();
+        assert!(n(&a) < n(&b) && n(&b) < n(&c));
+        assert!(a.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn delete_restore_purge() {
+        let mut s = open("delete");
+        let a = made(s.create(1));
+        s.save(&a, "one", 2).unwrap();
+        s.delete(&a, 3).unwrap();
+        assert!(s.list().is_empty());
+        assert_eq!(s.deleted().len(), 1);
+        assert_eq!(s.deleted()[0].deleted_at, Some(3));
+        s.restore(&a).unwrap();
+        assert_eq!(s.list().len(), 1);
+        assert!(s.deleted().is_empty());
+        s.delete(&a, 4).unwrap();
+        s.purge(&a).unwrap();
+        assert!(!s.path(&a).exists());
+        assert!(!s.history_dir(&a).exists());
+        assert!(s.list().is_empty() && s.deleted().is_empty());
+        assert!(s.purge(&a).is_err());
+        // purged ids are not handed out again
+        let b = made(s.create(0));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn list_order_pin_then_modified() {
+        let mut s = open("order");
+        let a = made(s.create(1));
+        s.save(&a, "a", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "b", 2).unwrap();
+        let c = made(s.create(3));
+        s.save(&c, "c", 3).unwrap();
+        let ids = |s: &Store| s.list().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s), [c.clone(), b.clone(), a.clone()]);
+        s.pin(&a, true).unwrap();
+        assert_eq!(ids(&s), [a.clone(), c.clone(), b.clone()]);
+        s.save(&b, "b2", 9).unwrap();
+        assert_eq!(ids(&s), [a.clone(), b.clone(), c.clone()]);
+        s.pin(&a, false).unwrap();
+        assert_eq!(ids(&s), [b, c, a]);
+    }
+
+    #[test]
+    fn duplicate_copies_text_unpinned() {
+        let mut s = open("dup");
+        let a = made(s.create(1));
+        s.save(&a, "# Hi", 2).unwrap();
+        s.pin(&a, true).unwrap();
+        let b = s.duplicate(&a, 3).unwrap();
+        assert_eq!(s.text(&b).unwrap(), "# Hi");
+        let m = s.list().into_iter().find(|m| m.id == b).unwrap();
+        assert!(!m.pinned);
+        assert_eq!(m.title, "Hi");
+        assert!(s.duplicate("nope", 4).is_err());
+    }
+
+    #[test]
+    fn titles_are_stripped_of_markdown() {
+        assert_eq!(title_of("# Hello **world**"), "Hello world");
+        assert_eq!(title_of("\n\n  ## ~~Old~~ ==new== `code` <u>under</u> *it*\nbody"), "Old new code under it");
+        assert_eq!(title_of("- [x] done"), "done");
+        assert_eq!(title_of("- [ ] todo"), "todo");
+        assert_eq!(title_of("> quote"), "quote");
+        assert_eq!(title_of("* item"), "item");
+        assert_eq!(title_of("12. numbered"), "numbered");
+        assert_eq!(title_of("# \n---\nreal"), "---");
+        assert_eq!(title_of("##\n  \nsecond"), "second");
+        assert_eq!(title_of("# Ünï **çödé** 日本語"), "Ünï çödé 日本語");
+        assert_eq!(title_of(""), "Untitled");
+        assert_eq!(title_of("  \n\n"), "Untitled");
+        assert_eq!(title_of("# "), "Untitled");
+    }
+
+    #[test]
+    fn history_recovers_the_version_a_save_overwrites() {
+        let mut s = open("history");
+        let a = made(s.create(1000));
+        s.save(&a, "a", 1000).unwrap();
+        assert!(history(&s, &a).is_empty());
+        s.save(&a, "ab", 1100).unwrap();
+        s.save(&a, "abcdef", 1200).unwrap();
+        // throttled: only the first overwritten version, stamped when it was written
+        assert_eq!(history(&s, &a), [(1000, "a".to_string())]);
+        s.save(&a, "x", 5000).unwrap();
+        assert_eq!(history(&s, &a), [(1200, "abcdef".to_string()), (1000, "a".to_string())]);
+        assert_eq!(s.text(&a).unwrap(), "x");
+    }
+
+    #[test]
+    fn history_throttle_edge_is_exactly_five_minutes() {
+        let mut s = open("edge");
+        let a = made(s.create(1000));
+        s.save(&a, "v1", 1000).unwrap();
+        s.save(&a, "v2", 1100).unwrap(); // snapshot v1 @1000
+        s.save(&a, "v3", 1299).unwrap(); // 299 s since 1000: none
+        assert_eq!(history(&s, &a).len(), 1);
+        s.save(&a, "v4", 1300).unwrap(); // 300 s: snapshot v3 @1299
+        assert_eq!(history(&s, &a), [(1299, "v3".to_string()), (1000, "v1".to_string())]);
+    }
+
+    #[test]
+    fn wiping_a_note_keeps_its_last_text_and_blank_or_same_text_is_never_snapshotted() {
+        let mut s = open("wipe");
+        let a = made(s.create(1000));
+        s.save(&a, "keep me", 1000).unwrap();
+        s.save(&a, "keep me", 2000).unwrap(); // unchanged: nothing
+        assert!(history(&s, &a).is_empty());
+        s.save(&a, "", 3000).unwrap(); // wipe: the old text is recoverable
+        assert_eq!(history(&s, &a), [(2000, "keep me".to_string())]);
+        s.save(&a, "new", 9000).unwrap(); // old text is blank: nothing
+        assert_eq!(history(&s, &a).len(), 1);
+    }
+
+    #[test]
+    fn read_errors_are_not_an_empty_note() {
+        let mut s = open("readerr");
+        let a = made(s.create(1));
+        s.save(&a, "real", 2).unwrap();
+        // a directory where the file should be: reading fails with something other than NotFound
+        fs::remove_file(s.path(&a)).unwrap();
+        fs::create_dir(s.path(&a)).unwrap();
+        assert!(s.text(&a).is_err());
+        assert!(s.save(&a, "overwrite", 3).is_err());
+        assert!(s.duplicate(&a, 4).is_err());
+        assert!(s.create(5).is_err());
+        assert_eq!(s.list().len(), 1);
+        // a plainly missing file is an empty note
+        fs::remove_dir(s.path(&a)).unwrap();
+        assert_eq!(s.text(&a).unwrap(), "");
+    }
+
+    #[test]
+    fn history_keeps_the_newest_fifty() {
+        let mut s = open("keep");
+        let a = made(s.create(0));
+        for i in 0..60 {
+            s.save(&a, &format!("v{i}"), 1000 + i * 300).unwrap();
+        }
+        let h = history(&s, &a);
+        assert_eq!(h.len(), 50);
+        assert_eq!(h[0].1, "v58");
+        assert_eq!(h[49].1, "v9");
+    }
+
+    #[test]
+    fn purge_removes_history() {
+        let mut s = open("purgehist");
+        let a = made(s.create(0));
+        s.save(&a, "x", 10).unwrap();
+        s.save(&a, "y", 20).unwrap();
+        assert_eq!(history(&s, &a).len(), 1);
+        s.delete(&a, 30).unwrap();
+        s.purge(&a).unwrap();
+        assert!(history(&s, &a).is_empty());
+    }
+
+    #[test]
+    fn search_is_case_insensitive_and_non_ascii_safe() {
+        let mut s = open("search");
+        let a = made(s.create(1));
+        s.save(&a, "# Groceries\nbuy ÄPFEL and milk", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "# Plans\nmeeting notes", 2).unwrap();
+        let c = made(s.create(3));
+        s.save(&c, "Äpfel in the title", 3).unwrap();
+        let ids = |s: &Store, q: &str| s.search(q).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s, "äpfel"), [c.clone(), a.clone()]);
+        assert_eq!(ids(&s, "PLANS"), std::slice::from_ref(&b));
+        assert_eq!(ids(&s, "MEETING"), std::slice::from_ref(&b));
+        assert!(ids(&s, "nothing").is_empty());
+        assert_eq!(ids(&s, "").len(), 3);
+        s.delete(&b, 4).unwrap();
+        assert!(ids(&s, "plans").is_empty());
+    }
+
+    #[test]
+    fn reopening_keeps_everything() {
+        let dir = tmp("reopen");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(5));
+        s.save(&a, "# Kept", 6).unwrap();
+        s.pin(&a, true).unwrap();
+        let b = s.duplicate(&a, 7).unwrap();
+        s.delete(&b, 8).unwrap();
+        let s2 = Store::open(dir).unwrap();
+        assert_eq!(s2.list().len(), 1);
+        assert!(s2.list()[0].pinned);
+        assert_eq!(s2.list()[0].title, "Kept");
+        assert_eq!(s2.deleted()[0].id, b);
+        assert!(s2.last >= u64::from_str_radix(&b, 36).unwrap());
+    }
+
+    #[test]
+    fn corrupt_or_missing_metadata_is_rebuilt_from_the_files() {
+        let dir = tmp("rebuild");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(5));
+        s.save(&a, "# Alpha", 6).unwrap();
+        let b = made(s.create(7));
+        s.save(&b, "Beta", 8).unwrap();
+        drop(s);
+        fs::remove_file(dir.join("notes.json")).unwrap();
+        let s = Store::open(dir.clone()).unwrap();
+        let mut ids: Vec<_> = s.list().into_iter().map(|m| m.id).collect();
+        ids.sort();
+        let mut want = vec![a.clone(), b.clone()];
+        want.sort();
+        assert_eq!(ids, want);
+        assert!(s.list().iter().any(|m| m.title == "Alpha"));
+        drop(s);
+        // the rebuilt file is valid json again
+        assert!(serde_json::from_str::<Vec<NoteMeta>>(&fs::read_to_string(dir.join("notes.json")).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_notes_json_is_an_error_and_is_never_rebuilt_over() {
+        let dir = tmp("damaged");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(5));
+        s.save(&a, "# Alpha", 6).unwrap();
+        s.delete(&a, 7).unwrap();
+        drop(s);
+        fs::write(dir.join("notes.json"), "{ not json").unwrap();
+        let e = Store::open(dir.clone()).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let toast = crate::toast::clip(&format!("Couldn't duplicate the note: {e}"));
+        assert!(toast.ends_with("move notes.json away to rebuild"), "the toast keeps what to do: {toast}");
+        assert_eq!(fs::read_to_string(dir.join("notes.json")).unwrap(), "{ not json", "the damaged file is left as it was");
+        // a notes.json that can't be read at all (here a folder) is an error too
+        fs::remove_file(dir.join("notes.json")).unwrap();
+        fs::create_dir(dir.join("notes.json")).unwrap();
+        assert!(Store::open(dir.clone()).is_err());
+        assert!(dir.join("notes.json").is_dir());
+    }
+
+    #[test]
+    fn metadata_and_files_are_reconciled() {
+        let dir = tmp("reconcile");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(5));
+        s.save(&a, "gone soon", 6).unwrap();
+        let b = made(s.create(7));
+        s.save(&b, "stays", 8).unwrap();
+        drop(s);
+        fs::remove_file(dir.join(format!("{a}.md"))).unwrap();
+        fs::write(dir.join("stray.md"), "# Stray").unwrap();
+        fs::write(dir.join("notes.md.bak"), "ignored").unwrap();
+        let s = Store::open(dir).unwrap();
+        let mut ids: Vec<_> = s.list().into_iter().map(|m| m.id).collect();
+        ids.sort();
+        let mut want = vec![b, "stray".to_string()];
+        want.sort();
+        assert_eq!(ids, want);
+    }
+
+    #[test]
+    fn unknown_ids_are_errors_not_panics() {
+        let mut s = open("unknown");
+        assert!(s.save("../x", "t", 1).is_err());
+        assert!(s.pin("zz", true).is_err());
+        assert!(s.delete("zz", 1).is_err());
+        assert!(s.restore("zz").is_err());
+        assert_eq!(s.text("zz").unwrap(), "");
+    }
+
+    #[test]
+    fn purge_refuses_a_live_note_and_keeps_its_file() {
+        let mut s = open("purgelive");
+        let a = made(s.create(1));
+        s.save(&a, "keep", 2).unwrap();
+        assert!(s.purge(&a).is_err());
+        assert!(s.path(&a).exists());
+        assert_eq!(s.text(&a).unwrap(), "keep");
+        assert_eq!(s.list().len(), 1);
+    }
+
+    #[test]
+    fn purge_expired_removes_only_deleted_notes_older_than_the_limit() {
+        const DAY: i64 = 86_400;
+        let mut s = open("expired");
+        let now = 100 * DAY;
+        let old = made(s.create(1));
+        s.save(&old, "old", 1).unwrap();
+        s.delete(&old, now - 31 * DAY).unwrap();
+        let recent = made(s.create(2));
+        s.save(&recent, "recent", 2).unwrap();
+        s.delete(&recent, now - 29 * DAY).unwrap();
+        let live = made(s.create(3));
+        s.save(&live, "live and old", 3).unwrap();
+        assert_eq!(s.purge_expired(now, 30).unwrap(), 1);
+        assert!(!s.path(&old).exists());
+        assert_eq!(s.deleted().into_iter().map(|m| m.id).collect::<Vec<_>>(), [recent]);
+        assert_eq!(s.list().into_iter().map(|m| m.id).collect::<Vec<_>>(), [live]);
+    }
+
+    #[test]
+    fn opened_round_trips_and_old_metadata_without_it_loads() {
+        let dir = tmp("opened");
+        let mut s = Store::open(dir.clone()).unwrap();
+        let a = made(s.create(1));
+        s.save(&a, "a", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "b", 2).unwrap();
+        assert_eq!(s.last(), Some(b.clone()), "never opened: the newest edit");
+        s.open_note(&a, 77).unwrap();
+        assert_eq!(s.last(), Some(a.clone()));
+        assert!(s.open_note("zz", 78).is_err());
+        let s2 = Store::open(dir.clone()).unwrap();
+        assert_eq!(s2.list().iter().find(|m| m.id == a).map(|m| m.opened), Some(77));
+        assert_eq!(s2.last(), Some(a.clone()));
+        drop((s, s2));
+        let old = format!(r#"[{{"id":"{a}","pinned":false,"created":1,"modified":1,"deleted_at":null}}]"#);
+        fs::write(dir.join("notes.json"), old).unwrap();
+        fs::remove_file(dir.join(format!("{b}.md"))).unwrap();
+        let s3 = Store::open(dir).unwrap();
+        assert_eq!(s3.list().len(), 1);
+        assert_eq!((s3.list()[0].opened, s3.list()[0].title.as_str()), (0, "a"));
+    }
+
+    #[test]
+    fn ids_that_are_not_plain_letters_and_digits_never_touch_a_path() {
+        let mut s = open("badid");
+        for id in ["../x", r"..\x", "a.b", "", "C:x", "a/b"] {
+            assert!(s.text(id).is_err(), "{id:?}");
+            assert!(s.save(id, "t", 1).is_err(), "{id:?}");
+            assert!(s.purge(id).is_err(), "{id:?}");
+            assert!(history(&s, id).is_empty(), "{id:?}");
+        }
+        assert_eq!(s.text("zz9").unwrap(), "", "a valid id with no file is an empty note");
+    }
+
+    #[test]
+    fn browse_counts_characters_and_lists_live_or_deleted_notes() {
+        let mut s = open("browse");
+        let a = made(s.create(1));
+        s.save(&a, "# Café\nau lait", 1).unwrap();
+        let b = made(s.create(2));
+        s.save(&b, "# Plans", 2).unwrap();
+        s.delete(&b, 3).unwrap();
+        let rows = |s: &Store, deleted, q| s.browse(deleted, q).into_iter().map(|(m, n)| (m.id, n)).collect::<Vec<_>>();
+        assert_eq!(rows(&s, false, ""), [(a.clone(), 14)]);
+        assert_eq!(rows(&s, false, "LAIT"), [(a.clone(), 14)], "live notes match their text too");
+        assert_eq!(rows(&s, true, ""), [(b.clone(), 7)]);
+        assert_eq!(rows(&s, true, "pla"), [(b, 7)]);
+        assert!(rows(&s, true, "café").is_empty());
+        // pinned first, then last opened; a note never opened by its last edit
+        let c = made(s.create(10));
+        s.save(&c, "c", 10).unwrap();
+        let d = made(s.create(11));
+        s.save(&d, "d", 11).unwrap();
+        s.open_note(&a, 20).unwrap();
+        let ids = |s: &Store| s.browse(false, "").into_iter().map(|(m, _)| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s), [a.clone(), d.clone(), c.clone()]);
+        s.pin(&c, true).unwrap();
+        assert_eq!(ids(&s), [c, a, d]);
+    }
+
+    #[test]
+    fn base36_roundtrip() {
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+        assert_eq!(u64::from_str_radix(&base36(1_700_000_000_123), 36).unwrap(), 1_700_000_000_123);
+    }
+}
