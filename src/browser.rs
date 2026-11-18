@@ -40,6 +40,7 @@ const SCRIPT: &str = include_str!("../browser/background.js");
 /// Where Focus sends a blocked site's tab.
 const BLOCKED_PAGE: &str = include_str!("../browser/blocked.html");
 const BLOCKED_SCRIPT: &str = include_str!("../browser/blocked.js");
+const YTMUSIC: &str = include_str!("../browser/ytmusic.js");
 /// Chrome's own cap on a message to the browser; anything bigger is a broken stream.
 const MAX_FRAME: u32 = 64 << 20;
 
@@ -120,6 +121,8 @@ pub enum Reply {
     Tabs(String, Vec<Tab>),
     /// Done (activate, open) or failed.
     Done(Result<(), String>),
+    /// YouTube Music's answer, errors included.
+    Music(crate::ytmusic::Reply),
 }
 
 /// A connected browser: its id and the queue of requests for its worker.
@@ -183,6 +186,15 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
                         {
                             crate::win::open(url);
                         }
+                        if req["t"] == "ytm" {
+                            let reply = crate::ytmusic::Reply {
+                                req: req["req"].as_u64().unwrap_or_default(),
+                                op: req["op"].as_str().unwrap_or_default().to_string(),
+                                error: Some("The browser closed: open YouTube Music and try again".into()),
+                                ..Default::default()
+                            };
+                            let _ = tx.unbounded_send(Msg::Browser(id, Reply::Music(reply)));
+                        }
                         break;
                     };
                     let reply = parse_reply(&answer);
@@ -197,6 +209,15 @@ pub fn serve(tx: UnboundedSender<Msg>) -> Browsers {
 
 fn parse_reply(body: &[u8]) -> Reply {
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
+    if v["t"] == "ytm" {
+        let music = serde_json::from_value(v.clone()).unwrap_or_else(|_| crate::ytmusic::Reply {
+            req: v["req"].as_u64().unwrap_or_default(),
+            op: v["op"].as_str().unwrap_or_default().to_string(),
+            error: Some("Unexpected answer from the browser extension".into()),
+            ..Default::default()
+        });
+        return Reply::Music(music);
+    }
     if let Some(e) = v["error"].as_str() {
         return Reply::Done(Err(e.to_string()));
     }
@@ -224,6 +245,7 @@ pub fn register() -> std::io::Result<()> {
     std::fs::write(dir.join("background.js"), SCRIPT)?;
     std::fs::write(dir.join("blocked.html"), BLOCKED_PAGE)?;
     std::fs::write(dir.join("blocked.js"), BLOCKED_SCRIPT)?;
+    std::fs::write(dir.join("ytmusic.js"), YTMUSIC)?;
     let exe = std::env::current_exe()?;
     let manifest = json!({
         "name": HOST,
@@ -278,9 +300,36 @@ mod tests {
     }
 
     #[test]
+    fn music_replies_parse() {
+        let found = br#"{"t":"ytm","req":7,"op":"search","title":"","current":null,"items":[
+            {"kind":"song","id":"abc","playlistId":"","title":"One","subtitle":"Song","thumb":"https://i/x.jpg","duration":"3:21"},
+            {"kind":"album","id":"MPREb_1","playlistId":"OLAK5","title":"Two","subtitle":"Album","thumb":"","duration":""}]}"#;
+        match parse_reply(found) {
+            Reply::Music(r) => {
+                assert_eq!((r.req, r.op.as_str(), r.items.len(), r.error), (7, "search", 2, None));
+                assert_eq!((r.items[0].kind, r.items[0].id.as_str()), (crate::ytmusic::Kind::Song, "abc"));
+                assert_eq!((r.items[1].kind, r.items[1].playlist_id.as_str()), (crate::ytmusic::Kind::Album, "OLAK5"));
+            }
+            r => panic!("{r:?}"),
+        }
+        match parse_reply(br#"{"t":"ytm","req":8,"op":"like","title":"","items":[],"current":null,"error":"Open YouTube Music first."}"#) {
+            Reply::Music(r) => assert_eq!((r.req, r.op.as_str(), r.error.as_deref()), (8, "like", Some("Open YouTube Music first."))),
+            r => panic!("{r:?}"),
+        }
+        match parse_reply(br#"{"t":"ytm","req":9,"op":"browse","items":[{"kind":"podcast","id":"x"}]}"#) {
+            Reply::Music(r) => assert_eq!((r.req, r.op.as_str(), r.error.as_deref()), (9, "browse", Some("Unexpected answer from the browser extension"))),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
     fn manifest_has_a_key_and_native_messaging() {
         let m: Value = serde_json::from_str(MANIFEST).unwrap();
-        assert!(m["permissions"].as_array().unwrap().iter().any(|p| p == "nativeMessaging"));
+        let permissions = m["permissions"].as_array().unwrap();
+        for p in ["nativeMessaging", "cookies", "scripting", "declarativeNetRequestWithHostAccess"] {
+            assert!(permissions.iter().any(|x| x == p), "{p}");
+        }
+        assert!(m["host_permissions"].as_array().unwrap().iter().any(|h| h == "https://music.youtube.com/*"));
         assert!(m["key"].as_str().is_some_and(|k| k.len() > 300));
         assert_eq!(EXTENSION_ID.len(), 32);
     }

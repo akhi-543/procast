@@ -17,6 +17,9 @@ mod hdr;
 mod hud;
 mod keys;
 mod menu;
+mod media;
+mod music_tray;
+mod music_view;
 mod net;
 mod notes;
 mod ntfs;
@@ -30,6 +33,9 @@ mod timers;
 mod toast;
 mod translate;
 mod win;
+mod ytmdesktop;
+mod ytmusic;
+mod ytmusic_api;
 
 use std::{
     cell::Cell,
@@ -87,6 +93,8 @@ actions!(procast, [OpenDropdown]);
 actions!(procast, [NextBox, PrevBox]);
 // Backspace on a token field (or in its menu's empty search) takes the last token.
 actions!(procast, [PopToken]);
+// Tab in YouTube Music's Search and Library: the next filter.
+actions!(procast, [NextFilter]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 // An action's own shortcut (`search::act_keys`) on the selected row: Ctrl+O, Ctrl+Shift+O, Ctrl+Y, Ctrl+Alt+O.
@@ -158,6 +166,8 @@ enum Mode {
     Running,
     /// Tabs open in connected browsers.
     Tabs,
+    /// A YouTube Music screen (see `Launcher::music`).
+    Music,
     /// A Quick AI answer (see `Launcher::ai`).
     Ai,
     /// A translation (see `Launcher::translation`).
@@ -876,6 +886,9 @@ struct Launcher {
     browsers: browser::Browsers,
     /// Search Browser Tabs: (connection, browser name, tab) as they answer.
     tabs: Vec<(u32, String, browser::Tab)>,
+    music: music_view::MusicState,
+    /// Started the first time YouTube Music is used.
+    media: Option<media::Media>,
     /// Quit Applications: the running apps, once listed (None while loading).
     running: Option<Vec<(apps::Running, Option<Arc<RenderImage>>)>>,
     /// Program icons by path, so the running list fills in at once next time.
@@ -1090,6 +1103,8 @@ impl Launcher {
             running: None,
             browsers,
             tabs: vec![],
+            music: Default::default(),
+            media: None,
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
             timers: timers::Timers::load(config::dir().join("timers.json")),
@@ -1287,6 +1302,7 @@ impl Launcher {
         if space_typed && self.arg_row().is_some_and(|it| search::named_in(it, q.trim_start(), &self.cfg) == Some("")) {
             self.focus_arg(0, window, cx);
         }
+        self.music_typed(cx);
     }
 
     // ---- argument boxes (the decisions are in search.rs) ----------------------------
@@ -1476,15 +1492,7 @@ impl Launcher {
     /// An extension icon value: "icon:Name", an emoji, an asset file or a URL.
     /// A web image (http only): drawn from the cache once downloaded, `glyph` until then.
     fn web_icon(&mut self, url: &str, glyph: &'static str) -> Icon {
-        if !url.starts_with("http") {
-            return Icon::Vector(glyph);
-        }
-        let cached = net::image_path(url);
-        if cached.exists() {
-            return self.image(cached).map(Icon::Image).unwrap_or(Icon::Vector(glyph));
-        }
-        net::fetch_image(url, &self.tx);
-        Icon::Vector(glyph)
+        net::cached_image(url, &self.tx).and_then(|path| self.image(path)).map_or(Icon::Vector(glyph), Icon::Image)
     }
 
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
@@ -1581,7 +1589,7 @@ impl Launcher {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let query = self.query(cx);
         let max = self.cfg.max_results.max(1);
-        let keep_selection = self.mode == Mode::Ext;
+        let keep_selection = matches!(self.mode, Mode::Ext | Mode::Music);
         self.armed = None;
         self.items = match self.mode {
             _ if let Some(c) = &self.confirm => confirm_rows(c),
@@ -1745,6 +1753,7 @@ impl Launcher {
                     search::filter(&query, rows, &mut self.matcher)
                 }
             }
+            Mode::Music => self.music_rows(&query),
             Mode::Install => {
                 let what = query.trim();
                 let title = if what.is_empty() { "Install an extension".to_string() } else { format!("Install {what}") };
@@ -1785,6 +1794,16 @@ impl Launcher {
         } else {
             0
         };
+        if self.mode == Mode::Music && self.grid() {
+            // The visible rows redraw every frame: only a changed layout needs the list told.
+            let rows = grid_rows(&self.items, self.grid_cols()).len();
+            if !(keep_selection && self.selected > 0 && rows == self.grid_list.item_count()) {
+                self.grid_list.reset(rows);
+                if self.selected > 0 {
+                    self.scroll_to_selected();
+                }
+            }
+        }
         self.sync_args(cx);
         self.ask_sense(cx);
         self.scroll_to_selected();
@@ -2603,6 +2622,9 @@ impl Launcher {
         self.drop_thumbs(cx);
         self.panel = None;
         self.menu = None;
+        if self.mode == Mode::Music {
+            self.music.retire_covers();
+        }
         // ponytail: an extension view ends when the window closes (Raycast keeps it ~90 s).
         self.stop_ext_view();
         if self.mode == Mode::Ext {
@@ -4118,6 +4140,10 @@ impl Launcher {
             Act::Cmd(Cmd::BrowseStore) => return self.set_mode(Mode::Store, cx),
             Act::Cmd(Cmd::QuitApps) => return self.set_mode(Mode::Running, cx),
             Act::Cmd(Cmd::SearchTabs) => return self.set_mode(Mode::Tabs, cx),
+            Act::Cmd(Cmd::YtMusic(screen)) => return self.music_open(screen, cx),
+            Act::Cmd(Cmd::YtImportSession) => return self.music_import_session(cx),
+            Act::Cmd(Cmd::YtControl(control)) => return self.music_act(music_view::MusicAct::Control(control), cx),
+            Act::Music(act) => return self.music_act(act, cx),
             Act::Cmd(Cmd::BrowserSetup) => {
                 if let Err(e) = browser::register() {
                     self.status = Some((Tone::Error, format!("Could not set up the extension: {e}")));
@@ -4398,7 +4424,7 @@ impl Launcher {
             // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
             Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
             Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
-            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi) | Act::Define(_) => true,
+            Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::YtMusic(_)) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
             _ => false,
@@ -4702,6 +4728,10 @@ impl Launcher {
                 }
                 if cfg.tray != self.cfg.tray {
                     self.tray_icon = if cfg.tray { tray(self.tx.clone()) } else { None };
+                    // The music tray's own handler takes over when the main one is gone.
+                    if self.tray_icon.is_none() {
+                        self.music_tray_listen();
+                    }
                 }
                 design::set_size(&cfg.size);
                 if cfg.window.auto_close_empty_desktops != self.cfg.window.auto_close_empty_desktops {
@@ -4737,6 +4767,7 @@ impl Launcher {
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
                 self.cfg = cfg;
+                self.music_tray_sync();
                 self.notice = None;
             }
             Err(e) => self.notice = Some(e),
@@ -4842,6 +4873,7 @@ impl Launcher {
             }
             // Handled by the message loop, between updates.
             Msg::Toast(..) => {}
+            Msg::NowPlaying(now) => self.music_now(now, cx),
             Msg::ToastClose => {
                 if let Some(t) = self.toast {
                     _ = t.update(cx, |t, _, cx| t.dismiss(cx));
@@ -4911,11 +4943,18 @@ impl Launcher {
             }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
+                self.music.drop_cover(&path);
+                if self.music.cover_is(&path) {
+                    self.music_tray_refresh();
+                }
                 if self.cfg.quicklink.iter().any(|q| net::favicon_url(&q.url).is_some_and(|u| net::image_path(&u) == path)) {
                     self.rebuild_catalog(cx);
                 }
                 if self.visible && matches!(self.mode, Mode::Ext | Mode::Tabs) {
                     self.refresh(cx);
+                }
+                if self.visible && self.mode == Mode::Music {
+                    self.music_covers_arrived(cx);
                 }
             }
             Msg::FilePreview(key, img) => {
@@ -4950,7 +4989,9 @@ impl Launcher {
                     let _ = self.tx.unbounded_send(Msg::error(e));
                 }
                 browser::Reply::Done(Ok(())) => {}
+                browser::Reply::Music(reply) => self.music_reply(reply, cx),
             },
+            Msg::Music(reply) => self.music_reply(reply, cx),
             Msg::Running(list) => {
                 for (r, icon) in &list {
                     self.exe_icons.insert(r.exe.clone(), icon.clone());
@@ -4968,6 +5009,7 @@ impl Launcher {
                     self.refresh(cx);
                 }
             }
+            Msg::TrayMusic(id) => self.music_tray_act(&id, cx),
             Msg::TrayExt(run, f) => {
                 if !f.is_empty() {
                     self.send(json!({"t": "event", "run": run, "fn": f, "args": [{"type": "left-click"}]}));
@@ -5000,6 +5042,7 @@ impl Launcher {
             Mode::Store => Some("Extension Store".into()),
             Mode::Running => Some("Quit Applications".into()),
             Mode::Tabs => Some("Browser Tabs".into()),
+            Mode::Music => Some(self.music_label()),
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()),
             Mode::Output => self.output.as_ref().map(|(i, _, _)| self.scripts[*i].title.clone()),
             Mode::Translate | Mode::LanguageSets => Some("Translate".into()),
@@ -5027,6 +5070,7 @@ impl Launcher {
             Mode::Store => "Search the extension store…".into(),
             Mode::Running => "Search running apps…".into(),
             Mode::Tabs => "Search open tabs…".into(),
+            Mode::Music => self.music_placeholder().into(),
             Mode::Ext => self.extv.as_ref().and_then(|e| e.view.placeholder.clone()).unwrap_or_else(|| "Search…".into()).into(),
             Mode::Args => self.args_row.as_ref().map(|it| it.title.clone()).unwrap_or_default().into(),
             Mode::Output => "Enter copies the output".into(),
@@ -5063,8 +5107,11 @@ impl Launcher {
         {
             return line;
         }
-        // The emoji grid shows no names: the selected emoji's is here.
-        if self.mode == Mode::Emoji && self.grid() && self.panel.is_none()
+        if self.mode == Mode::Music && self.music_loading() {
+            return "Loading…".into();
+        }
+        // The emoji and cover grids show no names: the selected cell's is here.
+        if matches!(self.mode, Mode::Emoji | Mode::Music) && self.grid() && self.panel.is_none()
             && let Some(it) = self.items.get(self.selected)
         {
             return it.title.clone();
@@ -5087,6 +5134,7 @@ impl Launcher {
             Mode::Install => Icon::Vector(g::DOWNLOAD),
             Mode::Running => Icon::Vector(g::CANCEL),
             Mode::Tabs => Icon::Vector(g::GLOBE),
+            Mode::Music => Icon::Vector(g::PLAY),
             Mode::Args => self.args_row.as_ref().map_or(Icon::Vector(g::TERMINAL), |it| it.icon.clone()),
             Mode::Output => Icon::Vector(g::TERMINAL),
             Mode::Ai => Icon::Vector(g::SPARKLES),
@@ -5168,6 +5216,7 @@ impl Launcher {
         } else if self.mode == Mode::Ext && self.extv.as_ref().is_some_and(|e| e.depth > 1) {
             let run = self.extv.as_ref().unwrap().run;
             self.send(json!({"t": "pop", "run": run}));
+        } else if self.mode == Mode::Music && self.music_back(cx) {
         } else if self.mode == Mode::Root {
             self.hide(true, cx)
         } else if self.cfg.launcher.escape == "close" {
@@ -5510,10 +5559,23 @@ impl Launcher {
         cx.notify();
     }
 
-    /// The emoji picker and Search Screenshots show a grid (each falls back to the list for
+    /// The emoji picker, Search Screenshots and YouTube Music's albums show a grid (each falls back to the list for
     /// its empty state, and for a confirm's two rows).
     fn grid(&self) -> bool {
-        matches!(self.mode, Mode::Emoji | Mode::Shots) && self.confirm.is_none() && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+        (matches!(self.mode, Mode::Emoji | Mode::Shots) || self.music_grid()) && self.confirm.is_none() && self.items.first().is_some_and(|it| it.section.as_deref() != Some(EMPTY))
+    }
+
+    /// Where Left and Right move through a grid, and where Tab cycles YouTube Music's filters.
+    fn grid_keys(&self) -> Option<&'static str> {
+        if self.panel.is_some() || self.menu.is_some() {
+            return None;
+        }
+        match (self.grid(), self.music_tabs()) {
+            (true, true) => Some("EmojiGrid Music"),
+            (true, false) => Some("EmojiGrid"),
+            (false, true) => Some("Music"),
+            (false, false) => None,
+        }
     }
 
     /// The open ActionPanel's actions, each with its place among all of them; with a search
@@ -5578,9 +5640,13 @@ impl Launcher {
             .into_any_element()
     }
 
-    /// Cells per grid row: `[screenshots] columns` (3 to 6) or `[emoji] columns` (4 to 16).
+    /// Cells per grid row: `[screenshots] columns` (3 to 6), `[ytmusic] columns` (3 to 8) or `[emoji] columns` (4 to 16).
     fn grid_cols(&self) -> usize {
-        if self.mode == Mode::Shots { self.cfg.screenshots.columns.clamp(3, 6) } else { self.cfg.emoji.columns.clamp(4, 16) }
+        match self.mode {
+            Mode::Shots => self.cfg.screenshots.columns.clamp(3, 6),
+            Mode::Music => self.cfg.ytmusic.columns.clamp(3, 8),
+            _ => self.cfg.emoji.columns.clamp(4, 16),
+        }
     }
 
     fn grid_view(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -5588,37 +5654,41 @@ impl Launcher {
             return self.shot_grid(t, cx);
         }
         let cols = self.grid_cols();
+        let cover_width = music_view::cell_width(base_width(&self.cfg), cols);
         let me = cx.weak_entity();
         let (selected, t) = (self.selected, *t);
-        let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
+        let cells: Rc<Vec<GridCell>> = Rc::new(
+            self.items
+                .iter()
+                .map(|it| match &it.icon {
+                    _ if self.mode == Mode::Music => GridCell::Cover(it.icon.clone(), it.title.clone(), it.subtitle.clone()),
+                    Icon::Glyph(s) => GridCell::Emoji(s.clone()),
+                    _ => GridCell::Emoji(SharedString::default()),
+                })
+                .collect(),
+        );
         let rows = Rc::new(grid_rows(&self.items, cols));
         // ponytail: rows are laid out only while on screen; 400 emoji cells per keystroke made typing lag.
         let list = gpui::list(self.grid_list.clone(), move |k, _, _| match &rows[k] {
                 GridRow::Header(s) => design::section_header(s, None, &t).into_any_element(),
-                GridRow::Cells(cells) => {
-                    let pad = cols - cells.len();
+                GridRow::Cells(row) => {
+                    let pad = cols - row.len();
                     div()
                         .flex()
                         .w_full()
                         .gap(px(4.))
-                        .children(cells.iter().map(|&i| {
+                        .children(row.iter().map(|&i| {
                             let on = i == selected;
                             let me = me.clone();
-                            let glyph = glyphs[i].clone();
                             let t = &t;
                             let hover = t.hover;
-                            div()
-                                .id(("emoji", i))
-                                .flex_1()
-                                .h(px(EMOJI_CELL))
-                                .flex()
-                                .items_center()
-                                .justify_center()
+                            let cell = match &cells[i] {
+                                GridCell::Emoji(glyph) => div().flex_1().h(px(EMOJI_CELL)).flex().items_center().justify_center().font_family(design::FONT_EMOJI).text_size(px(30.)).child(glyph.clone()),
+                                GridCell::Cover(icon, title, subtitle) => music_view::cover_cell(icon, title, subtitle, cover_width, t),
+                            };
+                            cell.id(("emoji", i))
                                 .rounded(px(design::r::MD))
                                 .map(|d| if on { design::lozenge(d, t) } else { d.hover(move |s| s.bg(hover)) })
-                                .font_family(design::FONT_EMOJI)
-                                .text_size(px(30.))
-                                .child(glyph)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
                                         this.selected = i;
@@ -5768,6 +5838,13 @@ fn shots_empty(busy: bool, filtered: bool) -> ShotsEmpty {
 /// An emoji cell's height.
 const EMOJI_CELL: f32 = 56.;
 
+/// What a grid cell draws.
+enum GridCell {
+    Emoji(SharedString),
+    /// An album or playlist: cover, title, subtitle.
+    Cover(Icon, String, String),
+}
+
 enum GridRow {
     Header(String),
     /// Item indices, at most `columns`.
@@ -5888,6 +5965,7 @@ enum Slot {
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         design::scale_launcher();
+        self.music_release(window);
         // Rem-based spacing follows the scale too.
         window.set_rem_size(px(16.));
         let t = Tokens::from_theme(&self.cfg.theme, window);
@@ -6459,8 +6537,9 @@ impl Render for Launcher {
                     this.grid_move(1, 0, cx)
                 }
             }))
-            // Left and Right move through the emoji grid instead of the search text.
-            .when(self.grid() && self.panel.is_none() && self.menu.is_none(), |d| d.key_context("EmojiGrid"))
+            .on_action(cx.listener(|this, _: &NextFilter, _, cx| this.music_cycle(cx)))
+            // Left and Right move through a grid instead of the search text; Tab cycles YouTube Music's filters.
+            .when_some(self.grid_keys(), |d, context| d.key_context(context))
             // Tab and Shift+Tab move between the query and the boxes.
             .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
             // Anywhere but a token field (or its menu's empty search), Backspace edits the text.
@@ -6567,6 +6646,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-h", VimBack, Some(DEFAULT_INPUT_CONTEXT)),
         KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("tab", NextFilter, Some(&format!("Music > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
         // In a form's text box Tab moves to the next control, never into a menu (Down does that).
@@ -6629,6 +6709,10 @@ fn tray(tx: UnboundedSender<Msg>) -> Option<TrayIcon> {
             if let Ok(run) = run.parse() {
                 let _ = menu_tx.unbounded_send(Msg::TrayExt(run, f.to_string()));
             }
+            return;
+        }
+        if let Some(msg) = music_tray::message(&e.id.0) {
+            let _ = menu_tx.unbounded_send(msg);
             return;
         }
         let cmd = match &e.id {
@@ -6719,6 +6803,7 @@ fn main() {
             win::make_tool_window(this.hwnd);
             win::round_corners(this.hwnd);
             this.tray_icon = tray;
+            this.music_tray_sync();
             this.scan_apps(true, false);
             // For screenshots and checks of the settings window without clicking through.
             if std::env::var_os("PROCAST_OPEN_SETTINGS").is_some() {
@@ -7361,6 +7446,14 @@ mod tests {
         assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].icon), ("Block steam.exe", "app:steam.exe", Some(g::APP)), "a program, never a website");
         site_lead(&mut entries, "Block", "news");
         assert_eq!(entries.len(), 6, "not a website: no row");
+    }
+
+    #[test]
+    fn album_grid_rows_follow_the_column_count() {
+        let albums: Vec<Item> = (0..7).map(|_| Item::new("x", "", Icon::Vector(g::AUDIO), Act::None).sec("Albums")).collect();
+        let shape = |cols| grid_rows(&albums, cols).iter().map(|r| match r { GridRow::Header(h) => h.clone(), GridRow::Cells(c) => c.len().to_string() }).collect::<Vec<_>>();
+        assert_eq!(shape(3), ["Albums", "3", "3", "1"]);
+        assert_eq!(shape(8), ["Albums", "7"]);
     }
 
     #[test]

@@ -194,7 +194,7 @@ impl Row {
     }
 }
 
-const SECTIONS: [&str; 19] = [
+const SECTIONS: [&str; 20] = [
     "General",
     "Launcher",
     "Shortcuts",
@@ -213,11 +213,12 @@ const SECTIONS: [&str; 19] = [
     "Calendar",
     "Notes",
     "Games",
+    "YouTube Music",
     "Advanced",
 ];
 /// The sidebar icon of each section, in `SECTIONS` order. A feature's section takes its
 /// command's icon.
-const SECTION_ICONS: [&str; 19] = [
+const SECTION_ICONS: [&str; 20] = [
     design::g::SLIDERS_HORIZONTAL,
     design::g::SEARCH,
     design::g::KEYBOARD,
@@ -236,6 +237,7 @@ const SECTION_ICONS: [&str; 19] = [
     design::g::CALENDAR_CLOCK,
     design::g::NOTEBOOK_PEN,
     design::g::GAMEPAD_2,
+    design::g::AUDIO,
     design::g::WRENCH,
 ];
 
@@ -481,6 +483,15 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 row("Enter", "emoji.action", Kind::Choice(&[("Paste", S("paste")), ("Copy", S("copy"))]), "Paste into the app you came from, or only copy."),
                 row("Skin tone", "emoji.skin_tone", Kind::Choice(SKIN_TONES), "Used for every emoji that comes in skin tones."),
                 row("Shortcodes anywhere", "emoji.shortcodes", Kind::Bool, "Typing :name: in any app (e.g. :thumbsup:) turns into the emoji."),
+            ],
+        )]),
+        "YouTube Music" => groups(vec![(
+            "YouTube Music",
+            vec![
+                row("Enabled", "ytmusic.enabled", Kind::Bool, "Play and control the YouTube Music Desktop App, with in-process search and library."),
+                row("Tray player", "ytmusic.tray", Kind::Bool, "A tray icon with the current track and playback controls."),
+                row("Album columns", "ytmusic.columns", Kind::Number, "Albums per row in the grid, 3 to 8."),
+                row("Volume step", "ytmusic.volume_step", Kind::Number, "How much Volume Up and Volume Down change the volume, in percent."),
             ],
         )]),
         "Window" => groups(vec![

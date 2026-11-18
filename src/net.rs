@@ -2,7 +2,7 @@
 //! Central Bank reference rates, per 1 EUR) and web images extensions show.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Mutex, OnceLock, RwLock},
@@ -93,27 +93,82 @@ pub fn favicon_url(link: &str) -> Option<String> {
     (!host.is_empty() && !host.contains(['{', '}'])).then(|| format!("{}://{host}/favicon.ico", scheme.to_ascii_lowercase()))
 }
 
-/// Downloads a web image once into the cache, then reports `Msg::ImageReady`.
+/// Web images downloading at once, at most.
+const IMAGE_WORKERS: usize = 4;
+
+/// The images waiting for a download and the ones being downloaded, and how many workers
+/// are at it.
+#[derive(Default)]
+struct Fetches {
+    queued: VecDeque<(String, UnboundedSender<Msg>)>,
+    known: HashSet<String>,
+    workers: usize,
+}
+
+impl Fetches {
+    /// Queues `url` unless it is already waiting or downloading; true when a worker should start.
+    fn add(&mut self, url: &str, tx: &UnboundedSender<Msg>) -> bool {
+        if !self.known.insert(url.to_string()) {
+            return false;
+        }
+        self.queued.push_back((url.to_string(), tx.clone()));
+        let start = self.workers < IMAGE_WORKERS;
+        self.workers += usize::from(start);
+        start
+    }
+
+    /// The next download in the order they were added; None ends the calling worker.
+    fn next(&mut self) -> Option<(String, UnboundedSender<Msg>)> {
+        let next = self.queued.pop_front();
+        self.workers -= usize::from(next.is_none());
+        next
+    }
+
+    fn done(&mut self, url: &str) {
+        self.known.remove(url);
+    }
+}
+
+/// The cached file of a web image; until it has arrived None, and a download is queued.
+pub fn cached_image(url: &str, tx: &UnboundedSender<Msg>) -> Option<PathBuf> {
+    let path = image_path(url);
+    if path.exists() {
+        return Some(path);
+    }
+    fetch_image(url, tx);
+    None
+}
+
+/// Downloads a web image once into the cache, then reports `Msg::ImageReady`. Downloads run
+/// a few at a time, oldest request first.
 pub fn fetch_image(url: &str, tx: &UnboundedSender<Msg>) {
-    static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let busy = IN_FLIGHT.get_or_init(Default::default);
-    if !url.starts_with("https://") && !url.starts_with("http://") || !busy.lock().unwrap().insert(url.to_string()) {
+    static FETCHES: OnceLock<Mutex<Fetches>> = OnceLock::new();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
         return;
     }
-    let (url, tx) = (url.to_string(), tx.clone());
+    let fetches = FETCHES.get_or_init(Default::default);
+    if !fetches.lock().unwrap().add(url, tx) {
+        return;
+    }
     std::thread::spawn(move || {
-        let bytes = agent().get(&url).call().ok().and_then(|mut r| r.body_mut().with_config().limit(MAX_IMAGE).read_to_vec().ok());
-        if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
-            let path = image_path(&url);
-            let _ = std::fs::create_dir_all(path.parent().unwrap());
-            if std::fs::write(&path, bytes).is_ok() {
-                let _ = tx.unbounded_send(Msg::ImageReady(path));
-            }
+        loop {
+            let Some((url, tx)) = fetches.lock().unwrap().next() else { break };
+            download_image(&url, &tx);
+            fetches.lock().unwrap().done(&url);
         }
-        busy.lock().unwrap().remove(&url);
     });
 }
 
+fn download_image(url: &str, tx: &UnboundedSender<Msg>) {
+    let bytes = agent().get(url).call().ok().and_then(|mut r| r.body_mut().with_config().limit(MAX_IMAGE).read_to_vec().ok());
+    if let Some(bytes) = bytes.filter(|b| !b.is_empty()) {
+        let path = image_path(url);
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        if std::fs::write(&path, bytes).is_ok() {
+            let _ = tx.unbounded_send(Msg::ImageReady(path));
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +185,22 @@ mod tests {
         assert_ne!(image_path("https://a/1.png"), image_path("https://a/2.png"));
     }
 
+    #[test]
+    fn downloads_queue_in_order_with_a_few_workers() {
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let mut fetches = Fetches::default();
+        let started: Vec<bool> = (0..6).map(|i| fetches.add(&format!("https://a/{i}"), &tx)).collect();
+        assert_eq!(started, [true, true, true, true, false, false]);
+        assert!(!fetches.add("https://a/3", &tx), "a queued image is not queued twice");
+        assert_eq!(fetches.queued.len(), 6);
+        let order: Vec<String> = std::iter::from_fn(|| fetches.next().map(|(url, _)| url)).take(6).collect();
+        assert_eq!(order, ["https://a/0", "https://a/1", "https://a/2", "https://a/3", "https://a/4", "https://a/5"]);
+        assert!(fetches.next().is_none());
+        assert_eq!(fetches.workers, 3, "a worker leaves when the queue is empty");
+        assert!(!fetches.add("https://a/5", &tx), "still known until it is done");
+        fetches.done("https://a/5");
+        assert!(fetches.add("https://a/5", &tx));
+    }
     #[test]
     fn favicons_come_from_the_links_host() {
         assert_eq!(favicon_url("https://github.com/search?q={query}").as_deref(), Some("https://github.com/favicon.ico"));

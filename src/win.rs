@@ -121,8 +121,12 @@ pub enum Msg {
     BrowserUp,
     /// A connected browser's answer (see browser.rs), by connection id.
     Browser(u32, crate::browser::Reply),
+    /// An in-process YouTube Music catalog reply (search / browse).
+    Music(crate::ytmusic::Reply),
     /// A tray menu item of a menu-bar command was clicked: (run, handler).
     TrayExt(u64, String),
+    /// A menu item of the YouTube Music tray icon was clicked (see music_tray.rs): its id.
+    TrayMusic(String),
     /// Something needs fixing (an outdated helper); shown as the launcher's notice until fixed.
     Notice(String),
     /// The foreground window changed: its handle, whether it is a game, and its program's file
@@ -135,6 +139,8 @@ pub enum Msg {
     ToastClose,
     /// The Focus pill or notice was clicked (hud.rs).
     Hud(crate::hud::Click),
+    /// What the browser is playing now, or None when nothing is (see media.rs).
+    NowPlaying(Option<crate::media::NowPlaying>),
 }
 
 impl Msg {
