@@ -1159,7 +1159,10 @@ impl NotesWindow {
             if hidden {
                 lines.push(row);
             } else {
-                lines.push(row.children(check).child(div().relative().flex_1().min_w_0().child(overlay(layout.clone(), sel, (raw && caret).then_some(cursor - start), t)).child(st)));
+                // A flex column, not a block: a block lays its text out inline as its own content,
+                // so `st` would never measure and `overlay` / `offset_at` would read no layout.
+                let cell = div().relative().flex_1().min_w_0().flex().flex_col();
+                lines.push(row.children(check).child(cell.child(overlay(layout.clone(), sel, (raw && caret).then_some(cursor - start), t)).child(st)));
                 self.rows.push(Row { start, len: if empty { 0 } else { len }, map, layout });
             }
             start = end + 1;
@@ -1326,7 +1329,7 @@ fn highlight(s: Style, t: &Tokens) -> HighlightStyle {
 }
 
 /// The selection and the caret (display bytes) under the line's text. It paints from the
-/// text's layout, which every element has by the time anything paints.
+/// text's layout, which the text measures itself only outside a block parent (see `body`).
 fn overlay(layout: TextLayout, sel: Option<(usize, usize)>, caret: Option<usize>, t: &Tokens) -> impl IntoElement {
     let (sel_color, caret_color) = (t.sel_ring, t.accent);
     canvas(
