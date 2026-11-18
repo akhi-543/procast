@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "procast",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Lets procast search your open tabs, switch to a tab that already shows a page, and control YouTube Music.",
   "permissions": ["tabs", "nativeMessaging", "alarms", "cookies", "scripting", "declarativeNetRequestWithHostAccess"],
-  "host_permissions": ["https://music.youtube.com/*"],
+  "host_permissions": ["https://*.youtube.com/*"],
   "background": { "service_worker": "background.js" },
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlOAKdHsDUqeBSTh26XxFCL/K6cyaJPXae3+Fgn2KHRKFhvDV8lxXm7w3N9ECqdG7MpvNWC+UYPiXjnYLOUmVfwCfIaRf8fHEQaPIYomfN2coEK06fnEeLQ6kPlNcX3hDTlhwN4H3ro0kk+DbHWikyATR+hvdT6tlgQJP2gRU6H4sDGjxcJgw3oTTgHpPCP2822k6arWyPy7MevJUQyNNxw67tXb0udK8sMu8dNdc861hLEUUiyKv6nKy6W/Np23IN7We/okENG4vLhh1YQY2QMdofF/6f4ywyXnJAlp2FzRuvnNXb266dQbuPAB/MsPaSDBiKnvqvMLTJP8iJgMdfwIDAQAB"
 }

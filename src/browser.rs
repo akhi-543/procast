@@ -329,7 +329,8 @@ mod tests {
         for p in ["nativeMessaging", "cookies", "scripting", "declarativeNetRequestWithHostAccess"] {
             assert!(permissions.iter().any(|x| x == p), "{p}");
         }
-        assert!(m["host_permissions"].as_array().unwrap().iter().any(|h| h == "https://music.youtube.com/*"));
+        // SAPISID lives on .youtube.com; chrome.cookies only returns cookies whose own domain is permitted.
+        assert!(m["host_permissions"].as_array().unwrap().iter().any(|h| h == "https://*.youtube.com/*"));
         assert!(m["key"].as_str().is_some_and(|k| k.len() > 300));
         assert_eq!(EXTENSION_ID.len(), 32);
     }

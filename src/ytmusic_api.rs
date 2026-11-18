@@ -219,12 +219,13 @@ fn require_session(session: Option<Session>) -> Result<Session, String> {
 
 fn browse_reply(id: &str, json: &Value, signed_in: bool) -> Reply {
     let (title, items) = parse_page(json);
-    let error = if items.is_empty() && !signed_in && (id.starts_with("FEmusic_") || id == "VLLM") {
-        Some(SIGN_IN.to_string())
-    } else {
-        None
-    };
+    let error = library_error(id, items.len(), signed_in).map(str::to_string);
     Reply { op: "browse".into(), title, items, error, ..Default::default() }
+}
+
+/// A signed-out, empty library shelf asks to sign in; a signed-in empty one is just empty.
+pub fn library_error(id: &str, item_count: usize, signed_in: bool) -> Option<&'static str> {
+    (item_count == 0 && !signed_in && (id.starts_with("FEmusic_") || id == "VLLM")).then_some(SIGN_IN)
 }
 
 pub fn search(query: &str, filter: Filter) -> Result<Reply, String> {
@@ -327,6 +328,19 @@ mod tests {
         assert!(load_session_from(&path).unwrap().sapisid().is_none());
         assert!(load_session_from(&dir.join("missing.json")).is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vllm_with_items_is_not_a_sign_in_error() {
+        let page = json!({"musicResponsiveListItemRenderer": {"playlistItemData": {"videoId": "abcdefghijk"}, "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "One More Time"}]}}}]}});
+        let reply = browse_reply("VLLM", &page, true);
+        assert!(reply.error.is_none());
+        assert_eq!(reply.items[0].title, "One More Time");
+        assert_eq!(reply.items[0].id, "abcdefghijk");
+        assert_eq!(library_error("VLLM", 0, true), None);
+        assert_eq!(library_error("VLLM", 0, false), Some(SIGN_IN));
+        assert_eq!(library_error("FEmusic_liked_albums", 0, false), Some(SIGN_IN));
+        assert_eq!(library_error("MPREb_1", 0, false), None);
     }
 
     #[test]

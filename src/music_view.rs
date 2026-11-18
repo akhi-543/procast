@@ -200,6 +200,11 @@ fn desktop_notice(control: Control, state: &ytmdesktop::State) -> Option<String>
     }
 }
 
+/// The library shelf to fetch again once a session is imported: the one showing, unless a page covers it.
+fn shelf_after_import(screen: Screen, shelf: Option<Shelf>, page_open: bool) -> Option<Shelf> {
+    shelf.filter(|_| screen == Screen::Library && !page_open)
+}
+
 fn apply_desktop_playlists(shelf: Shelf, mut reply: Reply, desktop: Option<Vec<(String, String)>>) -> Reply {
     if shelf != Shelf::Playlists || !playlists_need_desktop(&reply) {
         return reply;
@@ -868,7 +873,12 @@ impl Launcher {
                     Err(error) => (false, error),
                 }
             };
+            let view = &self.music.view;
+            let reload = if toast.0 { shelf_after_import(self.music.screen, Some(view.shelf), view.page.is_some()) } else { None };
             let _ = self.tx.unbounded_send(toast_msg(toast.0, toast.1));
+            if let Some(shelf) = reload {
+                self.music_fetch(Ask::Shelf(shelf));
+            }
             return;
         }
         if matches!(reply.op.as_str(), "search" | "browse") {
@@ -1439,6 +1449,13 @@ mod tests {
         assert_eq!(reply.op, "search");
         let signed_out = Reply { op: "browse".into(), error: Some("Sign in to music.youtube.com in this browser to see your library".into()), ..Default::default() };
         assert_eq!(catalog_reply(&Ask::Shelf(Shelf::Albums), Ok(signed_out.clone())).error, signed_out.error);
+    }
+
+    #[test]
+    fn import_success_reloads_the_open_library_shelf() {
+        assert_eq!(shelf_after_import(Screen::Library, Some(Shelf::Liked), false), Some(Shelf::Liked));
+        assert_eq!(shelf_after_import(Screen::Library, Some(Shelf::Albums), true), None);
+        assert_eq!(shelf_after_import(Screen::Search, Some(Shelf::Liked), false), None);
     }
 
     #[test]
