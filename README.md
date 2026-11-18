@@ -15,7 +15,8 @@
 -->
 
 Press <kbd>Alt</kbd>+<kbd>Space</kbd>, type, hit <kbd>Enter</kbd>. Apps, files, clipboard history, snippets,
-calculator, window management, system commands and Raycast store extensions, all from one search bar. <kbd>Ctrl</kbd>+<kbd>K</kbd> shows every action for the selected item.
+calculator, window management, system commands, built-in tools (timers, translator, dictionary, focus sessions, calendar, notes,
+screenshot search, YouTube Music) and Raycast store extensions, all from one search bar. <kbd>Ctrl</kbd>+<kbd>K</kbd> shows every action for the selected item.
 
 ## Speed: procast vs Raycast for Windows
 
@@ -107,11 +108,21 @@ extensions run, so these figures are for a fresh start.<br>
 - Now Playing and Quick Actions (like, dislike, play/pause, next, previous, volume, shuffle, repeat), each bindable to a hotkey; the YouTube Music Desktop App plays
 - Optional tray player; **Import YouTube Music Session** is optional for the full library
 
+**Built-in tools**
+- **Timers and stopwatch**: `timer 5m tea`; running ones head root search to pause, extend or stop
+- **Translator**: Google Translate from the search bar or on the selection (Instant Translate Copy / Paste), with language sets
+- **Dictionary**: `define dog`, offline (WordNet, downloaded once), with spelling suggestions and similar words
+- **Focus sessions**: block (or allow only) apps and websites for a while, with categories, snooze and a Focus pill; Raycast Focus categories import
+- **Calendar**: My Schedule and Join Meeting from ICS feeds (Google, Outlook), with a reminder before each meeting
+- **Screenshots**: search your screenshot folders by the text in each picture (Windows OCR), Quick Look, pin, paste the latest
+- **Notes**: a floating Markdown notes window with a live editor, search, and recently deleted notes
+- **Auto HDR for games**: turns HDR on while a full-screen game is in front
+
 **AI**: Quick AI from the search bar with follow-ups, running the Claude Agent SDK on your own Claude Code login
 
 **Settings and themes**
 - Settings window for everything, which writes a plain `config.toml` (comments kept) that hot-reloads
-- Seven built-in themes, a theme studio with live preview, follow system light / dark, three interface sizes
+- Dark and Light glass themes (follow Windows, or pick one), three interface sizes
 
 ## procast vs Raycast for Windows
 
@@ -127,7 +138,7 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Favourites, hide / disable items, fallback commands | ✅ | ✅ |
 | Compact mode, search history, Vim / Emacs keys, game mode | ✅ | ✅ |
 | Calculator with units and currencies | ✅ | ✅ |
-| Themes and theme studio | ✅ | ✅ |
+| Light and dark themes | ✅ | ✅ |
 | **Clipboard history** | | |
 | Text, images and files | ✅ | ✅ |
 | OCR search in copied images | ✅ | ✅ |
@@ -173,13 +184,16 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Dictation | ✅ | ⬜ |
 | **Built-in tools** | | |
 | YouTube Music controls and library | ⬜ (macOS-only store extension) | ✅ |
-| Translator, dictionary, calendar, contacts | ✅ | ⬜ |
-| Floating notes, focus sessions, timer, screenshot search | ✅ | ⬜ |
-| Taskbar widget, auto HDR | ✅ | ⬜ |
+| Translator, dictionary, calendar | ✅ | ✅ |
+| Contacts | ✅ | ⬜ |
+| Floating notes, focus sessions, timer, screenshot search | ✅ | ✅ |
+| Auto HDR | ✅ | ✅ |
+| Taskbar widget | ✅ | ⬜ |
 | **App** | | |
 | Settings window | ✅ | ✅ |
 | Search in Settings, export / import / backup | ✅ | ⬜ |
-| Auto-update and installer | ✅ | ⬜ |
+| Installer | ✅ | ✅ |
+| Auto-update | ✅ | ⬜ |
 | Hotkeys over admin windows | ✅ | ⬜ |
 | Account, cloud sync, organizations | ✅ | not planned |
 | **Openness** | | |
@@ -189,9 +203,9 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 
 ## Getting started
 
-There are no prebuilt releases yet, so build from source.
+**Install**: download `procast-setup-<version>.exe` from [Releases](https://github.com/akhi-543/procast/releases) and run it. It installs for your user only (no admin), adds a Start menu entry, and can start procast at sign-in. Uninstall from Settings → Apps. A portable `procast.exe` is attached too.
 
-**You need**
+**Or build from source**. You need
 - Windows 11
 - [Rust](https://rustup.rs) 1.95 or newer with the MSVC toolchain, Visual Studio 2022 Build Tools ("Desktop development with C++") and the Windows SDK
 - [Node.js](https://nodejs.org), npm and git, only for extensions and Quick AI
