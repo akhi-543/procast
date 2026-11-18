@@ -33,6 +33,7 @@ pub struct Config {
     pub language_set: Vec<LanguageSet>,
     pub clipboard: Clipboard,
     pub emoji: Emoji,
+    pub ytmusic: YtMusic,
     pub files: Files,
     pub window: Window,
     pub scripts: Scripts,
@@ -311,6 +312,32 @@ impl Default for Emoji {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct YtMusic {
+    pub enabled: bool,
+    /// A tray icon with the current track and playback controls.
+    pub tray: bool,
+    /// Albums per row in the grid.
+    pub columns: usize,
+    /// Percent that Volume Up and Volume Down change the volume by.
+    pub volume_step: u32,
+    /// YouTube Music Desktop App companion (ytmdesktop, port 9863).
+    pub desktop_url: String,
+}
+
+impl Default for YtMusic {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tray: false,
+            columns: 5,
+            volume_step: 10,
+            desktop_url: "http://127.0.0.1:9863".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Files {
     pub enabled: bool,
     /// Folders to index. Empty = your user folder.
@@ -561,6 +588,7 @@ impl Default for Config {
             language_set: vec![],
             clipboard: Clipboard::default(),
             emoji: Emoji::default(),
+            ytmusic: YtMusic::default(),
             files: Files::default(),
             window: Window::default(),
             scripts: Scripts::default(),
@@ -935,6 +963,13 @@ columns = 8                   # emoji per row in the picker
 action = "paste"              # Enter: paste (into the app you came from) | copy
 skin_tone = "none"            # none | light | medium_light | medium | medium_dark | dark
 shortcodes = true             # typing :name: in any app (e.g. :thumbsup:) turns into the emoji
+
+[ytmusic]
+enabled = true                # search, library and playback through the YouTube Music Desktop App
+tray = false                  # a tray icon with the current track and playback controls
+columns = 5                   # covers per row in the albums and playlists grid, 3 to 6
+volume_step = 10              # percent that Volume Up and Volume Down change the volume by
+desktop_url = "http://127.0.0.1:9863"  # YouTube Music Desktop App companion server
 
 [files]
 enabled = true

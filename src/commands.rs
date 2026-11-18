@@ -7,6 +7,7 @@ use crate::{
     design::Tint,
     desktops,
     system::{self, RadioOf, Volume},
+    ytmusic::{Control, Screen},
 };
 use windows::{
     Win32::{
@@ -79,6 +80,12 @@ pub enum Cmd {
     SearchTabs,
     /// Show the browser extension's folder, to load it in the browser.
     BrowserSetup,
+    /// Open a YouTube Music screen.
+    YtMusic(Screen),
+    /// Copy signed-in cookies from the companion into `session.json`.
+    YtImportSession,
+    /// Control YouTube Music playback, from anywhere.
+    YtControl(Control),
     Desktop(Desk),
     Focus(FocusCmd),
     /// Ask for a duration and label in the search bar (`timer 5m tea`).
@@ -219,6 +226,24 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::SearchNotes, "Search Notes", "note notes find list browse markdown", g::NOTEBOOK_TABS),
     (Cmd::CreateNote, "Create Note", "new note notes write markdown", g::SQUARE_PEN),
     (Cmd::RecentlyDeletedNotes, "Recently Deleted Notes", "note notes trash restore undelete removed", g::ARCHIVE_RESTORE),
+    (Cmd::YtMusic(Screen::Search), "Search YouTube Music", "youtube music song album artist playlist find", g::SEARCH),
+    (Cmd::YtMusic(Screen::Library), "YouTube Music Library", "youtube music liked songs albums playlists artists", g::BULLETS),
+    (Cmd::YtMusic(Screen::NowPlaying), "YouTube Music Now Playing", "youtube music current track song playing", g::PLAY),
+    (Cmd::YtMusic(Screen::QuickActions), "YouTube Music Quick Actions", "youtube music controls volume like shuffle repeat", g::SLIDERS_HORIZONTAL),
+    (Cmd::YtImportSession, "Import YouTube Music Session", "youtube music cookies library sign in session", g::DOWNLOAD),
+    (Cmd::YtControl(Control::PlayPause), "Play/Pause Music", "youtube music song resume stop toggle", g::PLAY),
+    (Cmd::YtControl(Control::Next), "Next Track", "youtube music song skip forward", g::SKIP_FORWARD),
+    (Cmd::YtControl(Control::Previous), "Previous Track", "youtube music song skip back", g::SKIP_BACK),
+    (Cmd::YtControl(Control::Like), "Like Current Song", "youtube music song favorite thumbs up", g::THUMBS_UP),
+    (Cmd::YtControl(Control::Dislike), "Dislike Current Song", "youtube music song thumbs down", g::THUMBS_DOWN),
+    (Cmd::YtControl(Control::Mute), "Mute Music", "youtube music song volume silence", g::VOLUME_X),
+    (Cmd::YtControl(Control::VolumeLow), "Music Volume Low", "youtube music song quiet sound", g::VOLUME),
+    (Cmd::YtControl(Control::VolumeMedium), "Music Volume Medium", "youtube music song sound", g::VOLUME_1),
+    (Cmd::YtControl(Control::VolumeHigh), "Music Volume High", "youtube music song loud sound", g::VOLUME_2),
+    (Cmd::YtControl(Control::VolumeUp), "Music Volume Up", "youtube music song louder sound", g::VOLUME_2),
+    (Cmd::YtControl(Control::VolumeDown), "Music Volume Down", "youtube music song quieter sound", g::VOLUME_1),
+    (Cmd::YtControl(Control::Shuffle), "Shuffle Music", "youtube music song queue random", g::SHUFFLE),
+    (Cmd::YtControl(Control::Repeat), "Repeat Mode", "youtube music song loop one all", g::REPEAT),
     (Cmd::Lock, "Lock Screen", "lock", g::LOCK),
     (Cmd::Sleep, "Sleep", "suspend", g::SLEEP),
     (Cmd::Restart, "Restart", "reboot", g::ROTATE_CW),
@@ -311,7 +336,12 @@ impl Cmd {
     }
 
     pub fn key(self) -> String {
-        format!("cmd:{self:?}")
+        match self {
+            Cmd::YtMusic(screen) => format!("ytm:{}", screen.slug()),
+            Cmd::YtImportSession => "ytm:import".into(),
+            Cmd::YtControl(control) => format!("ytm:{}", control.slug()),
+            _ => format!("cmd:{self:?}"),
+        }
     }
 
     /// The group a command belongs to, shown after its title.
@@ -332,6 +362,7 @@ impl Cmd {
             Cmd::HdrSettings => "Windows Settings",
             Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot => "Screenshots",
             Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => "Notes",
+            Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => "YouTube Music",
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::FastFileSearch(_) | Cmd::Quit => "procast",
             _ => "System",
         }
@@ -343,7 +374,7 @@ impl Cmd {
             Cmd::Snap(_) | Cmd::Minimize | Cmd::MinimizeOthers | Cmd::CloseOthers | Cmd::ToggleMaximize | Cmd::Desktop(_) => Tint::Window,
             Cmd::SearchFiles | Cmd::SearchScreenshots => Tint::File,
             Cmd::ClipboardHistory | Cmd::Emoji | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => Tint::Paste,
-            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define => Tint::Web,
+            Cmd::SearchTabs | Cmd::AskAi | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => Tint::Web,
             Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::EmptyBin | Cmd::EmptyTemp | Cmd::QuitApps | Cmd::Quit => Tint::Danger,
             Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::BrowserSetup | Cmd::FastFileSearch(_) => Tint::Accent,
             _ => Tint::System,
@@ -384,7 +415,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
         }
     }
     Ok(None)
@@ -910,6 +941,22 @@ mod tests {
     #[test]
     fn hdr_settings_says_where_it_goes() {
         assert_eq!(Cmd::HdrSettings.subtitle(), "Windows Settings");
+    }
+
+    #[test]
+    fn music_commands_are_listed_with_their_own_keys() {
+        let music: Vec<_> = ALL.iter().filter(|(c, ..)| matches!(c, Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_))).collect();
+        assert_eq!(music.len(), 5 + Control::ALL.len());
+        assert!(Control::ALL.iter().all(|&c| music.iter().any(|&&(cmd, ..)| cmd == Cmd::YtControl(c))));
+        assert!(music.iter().all(|&&(c, ..)| c.subtitle() == "YouTube Music" && c.key().starts_with("ytm:")));
+        assert_eq!(Cmd::YtMusic(Screen::QuickActions).key(), "ytm:actions");
+        assert_eq!(Cmd::YtImportSession.key(), "ytm:import");
+        assert_eq!(Cmd::YtControl(Control::PlayPause).key(), "ytm:play-pause");
+        assert_eq!(Cmd::Lock.key(), "cmd:Lock");
+        let mut keys: Vec<String> = ALL.iter().map(|&(c, ..)| c.key()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), ALL.len(), "every command has its own key");
     }
 
     #[test]

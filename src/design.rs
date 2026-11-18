@@ -368,6 +368,13 @@ names! {
     USB = "usb",
     VOLUME_1 = "volume-1",
     VOLUME_2 = "volume-2",
+    REPEAT = "repeat",
+    SHUFFLE = "shuffle",
+    SKIP_BACK = "skip-back",
+    SKIP_FORWARD = "skip-forward",
+    THUMBS_DOWN = "thumbs-down",
+    THUMBS_UP = "thumbs-up",
+    VOLUME = "volume",
     VOLUME_X = "volume-x",
     WIFI = "wifi",
     WIN_ALMOST_MAXIMIZE = "win-almost-maximize",
@@ -771,6 +778,7 @@ icon_files![
     "power-off",
     "quote",
     "refresh-ccw",
+    "repeat",
     "restart",
     "return",
     "rotate-ccw",
@@ -783,7 +791,10 @@ icon_files![
     "shield-check",
     "shield-off",
     "shopping-cart",
+    "shuffle",
     "sign-out",
+    "skip-back",
+    "skip-forward",
     "sleep",
     "sliders-horizontal",
     "sparkles",
@@ -796,6 +807,8 @@ icon_files![
     "sun-moon",
     "terminal",
     "text-cursor-input",
+    "thumbs-down",
+    "thumbs-up",
     "tiles",
     "timer",
     "type",
@@ -803,6 +816,7 @@ icon_files![
     "usb",
     "users",
     "video",
+    "volume",
     "volume-1",
     "volume-2",
     "volume-x",
@@ -1100,14 +1114,27 @@ pub fn thousands(n: usize) -> String {
 /// alone until it has loaded) over its one-line caption. Selected: a 2 px `accent` ring and
 /// the caption in `text`, no fill.
 pub fn thumb(image: Option<std::sync::Arc<gpui::RenderImage>>, caption: &str, on: bool, t: &Tokens) -> Div {
+    thumb_of(image, None, THUMB_ASPECT, caption, None, on, t)
+}
+
+/// `.pc-thumb` for an album or playlist: the picture square, and a second line under the
+/// caption (`ts-small`, `text_faint`, `text_muted` when selected). Without a picture (the
+/// Desktop App lists playlists with none) `glyph` shows at `ic-xl` in `text_faint`.
+pub fn cover(image: Option<std::sync::Arc<gpui::RenderImage>>, glyph: &'static str, title: &str, subtitle: &str, on: bool, t: &Tokens) -> Div {
+    thumb_of(image, Some(glyph), 1., title, Some(subtitle), on, t)
+}
+
+fn thumb_of(image: Option<std::sync::Arc<gpui::RenderImage>>, glyph: Option<&'static str>, aspect: f32, caption: &str, second: Option<&str>, on: bool, t: &Tokens) -> Div {
     let picture = div()
         .w_full()
-        .aspect_ratio(THUMB_ASPECT)
+        .aspect_ratio(aspect)
         .rounded(px(r::MD))
         .bg(t.surface)
         .border_1()
         .border_color(t.hairline)
         .when(on, |d| d.ring(px(RING)).ring_color(t.accent))
+        .when(image.is_none() && glyph.is_some(), |d| d.flex().items_center().justify_center())
+        .children(glyph.filter(|_| image.is_none()).map(|g| icon(g, ic::XL, t.text_faint)))
         .children(image.map(|i| img(i).size_full().rounded(px(r::MD)).object_fit(gpui::ObjectFit::Cover)));
     div()
         .flex_1()
@@ -1117,6 +1144,7 @@ pub fn thumb(image: Option<std::sync::Arc<gpui::RenderImage>>, caption: &str, on
         .gap(px(sp::S4))
         .child(picture)
         .child(div().truncate().text_size(px(ts::BODY_SM)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(if on { t.text } else { t.text_muted }).child(caption.to_string()))
+        .children(second.map(|s| div().truncate().text_size(px(ts::SMALL)).text_color(if on { t.text_muted } else { t.text_faint }).child(s.to_string())))
 }
 
 /// `.pc-banner`: a one-row notice under the bar (the icon muted, then `text`, then `meta`

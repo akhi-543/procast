@@ -6,6 +6,10 @@
 //   {t: "focusSites", mode, sites, snooze} -> {t: "focusSites", ok}: Focus. mode "block" sends tabs on those domains
 //                                       (and their subdomains) to blocked.html, "allow" sends every other tab there, "off"
 //                                       stops. The page's Snooze lets its site through for `snooze` minutes.
+//   {t: "ytm", req, op, ...}         -> {t: "ytm", req, op, title, items, current, error?}: YouTube Music, see ytmusic.js
+
+importScripts("ytmusic.js");
+ytm.setup();
 
 const HOST = "com.procast.browser";
 let port = null;
@@ -107,6 +111,8 @@ async function handle(req) {
       for (const t of await chrome.tabs.query({})) redirect(t.id, t.url);
       return { t: "focusSites", ok: true };
     }
+    case "ytm":
+      return ytm.handle(req);
     default:
       return { t: req.t, error: "unknown request" };
   }
