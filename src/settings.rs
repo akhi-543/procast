@@ -333,6 +333,7 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
                 vec![
                     row("Open procast", "hotkey", Kind::Hotkey, "Press anywhere to show or hide the launcher. Click, then press the new keys."),
                     row("Double-tap to open", "keyboard.double_tap", Kind::Choice(TAP_KEYS), "Press this key twice quickly to open procast, besides the hotkey above."),
+                    row("Windows key opens procast", "keyboard.win_key", Kind::Bool, "Press the Windows key alone to open procast instead of Start. Win+E and other Windows shortcuts still work."),
                     row("Hyper key", "keyboard.hyper", Kind::Choice(HYPER_KEYS), "Hold this key for Ctrl+Alt+Shift+Win, so Hyper+K style hotkeys never clash with apps. Tapped alone it does nothing."),
                 ],
             ),

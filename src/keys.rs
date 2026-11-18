@@ -1,5 +1,5 @@
 //! A low-level keyboard hook for what RegisterHotKey can't do: the Hyper key (one key
-//! held = Ctrl+Alt+Shift+Win), double-tapping a modifier to open procast, and snippet
+//! held = Ctrl+Alt+Shift+Win), double-tapping a modifier or a lone Windows key to open procast, and snippet
 //! keywords typed in any app (snippets.rs), and Esc closing a sticky toast (toast.rs).
 //! The hook runs only while one of them is on; its callback must stay quick,
 //! since every keystroke on the machine passes through it.
@@ -34,6 +34,7 @@ const RSHIFT: u16 = 0xA1;
 const ALT: u16 = 0xA4;
 const RALT: u16 = 0xA5;
 const LWIN: u16 = 0x5B;
+const RWIN: u16 = 0x5C;
 const ESC: u16 = 0x1B;
 /// `dwExtraInfo` on every key procast sends, so the hook can tell them from typing.
 pub const OURS: usize = 0x7072_6f63;
@@ -78,6 +79,11 @@ struct State {
     sticky: bool,
     /// Ctrl, Alt, Shift or Win is held (the hook reads it just before an Esc).
     mods: bool,
+    /// A lone Windows key opens procast instead of Start.
+    win_key: bool,
+    /// The Windows key is held, and (`win_used`) another key went down since.
+    win_down: bool,
+    win_used: bool,
 }
 
 /// What the hook should do with one key event.
@@ -92,6 +98,8 @@ enum Out {
     Open,
     /// Swallow it and close the sticky toast.
     CloseToast,
+    /// Swallow this lone Windows key release (Start stays shut) and open procast.
+    WinOpen(u16),
 }
 
 impl State {
@@ -113,6 +121,21 @@ impl State {
                     Out::Hyper { down: false, nothing: !self.used }
                 }
             };
+        }
+        if self.win_key && (vk == LWIN || vk == RWIN) {
+            if down {
+                if !self.win_down {
+                    self.win_down = true;
+                    self.win_used = false;
+                }
+            } else if std::mem::take(&mut self.win_down) && !self.win_used {
+                return Out::WinOpen(vk);
+            }
+            return Out::Pass;
+        }
+        if down {
+            // Any other key, modifiers too: Win+Shift is not a lone Win.
+            self.win_used = true;
         }
         if self.tap.contains(&vk) {
             if down {
@@ -148,18 +171,18 @@ struct Shared {
 }
 
 static SHARED: Mutex<Shared> =
-    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None, sticky: false, mods: false }, expander: None, window: 0, tx: None });
+    Mutex::new(Shared { state: State { hyper: None, tap: &[], holding: false, used: false, tap_down: None, last_tap: None, sticky: false, mods: false, win_key: false, win_down: false, win_used: false }, expander: None, window: 0, tx: None });
 static THREAD: Mutex<u32> = Mutex::new(0);
 
 /// Applies the settings: starts the hook when any feature is on, stops it otherwise.
-pub fn configure(hyper: &str, double_tap: &str, expander: Option<Expander>, tx: UnboundedSender<Msg>) {
+pub fn configure(kb: &crate::config::Keyboard, expander: Option<Expander>, tx: UnboundedSender<Msg>) {
     // A dev instance installs no global keyboard hook (see `win::dev`).
     if crate::win::dev() {
         return;
     }
     let wanted = {
         let mut s = SHARED.lock().unwrap();
-        s.state = State { hyper: hyper_vk(hyper), tap: tap_vks(double_tap), sticky: s.state.sticky, ..Default::default() };
+        s.state = State { hyper: hyper_vk(&kb.hyper), tap: tap_vks(&kb.double_tap), win_key: kb.win_key, sticky: s.state.sticky, ..Default::default() };
         s.expander = expander.filter(|x| !x.is_idle());
         s.tx = Some(tx);
         wanted(&s)
@@ -182,7 +205,7 @@ pub fn sticky(on: bool) {
 }
 
 fn wanted(s: &Shared) -> bool {
-    s.state.hyper.is_some() || !s.state.tap.is_empty() || s.expander.is_some() || s.state.sticky
+    s.state.hyper.is_some() || !s.state.tap.is_empty() || s.state.win_key || s.expander.is_some() || s.state.sticky
 }
 
 /// Starts or stops the hook's thread.
@@ -246,6 +269,14 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
                     send_hyper(down, nothing);
                     return LRESULT(1);
                 }
+                Out::WinOpen(vk) => {
+                    // Tap the spare key, then release Win ourselves: Start only opens on a bare Win.
+                    send(&[(NOTHING, false), (NOTHING, true), (vk, true)]);
+                    if let Some(tx) = tx {
+                        let _ = tx.unbounded_send(Msg::Hotkey(0));
+                    }
+                    return LRESULT(1);
+                }
             }
         }
     }
@@ -299,20 +330,26 @@ fn typed(s: &mut Shared, k: &KBDLLHOOKSTRUCT) -> Option<crate::snippets::Hit> {
 }
 
 fn send_hyper(down: bool, nothing: bool) {
-    let key = |vk: u16, up: bool| INPUT {
+    let mods = [CTRL, SHIFT, ALT, LWIN];
+    let mut keys: Vec<(u16, bool)> = vec![];
+    if down {
+        keys.extend(mods.iter().map(|&m| (m, false)));
+    } else {
+        if nothing {
+            keys.extend([(NOTHING, false), (NOTHING, true)]);
+        }
+        keys.extend(mods.iter().rev().map(|&m| (m, true)));
+    }
+    send(&keys);
+}
+
+/// Sends (virtual key, released) events, marked as procast's own.
+fn send(keys: &[(u16, bool)]) {
+    let key = |&(vk, up): &(u16, bool)| INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, dwExtraInfo: OURS, ..Default::default() } },
     };
-    let mods = [CTRL, SHIFT, ALT, LWIN];
-    let mut inputs: Vec<INPUT> = vec![];
-    if down {
-        inputs.extend(mods.iter().map(|&m| key(m, false)));
-    } else {
-        if nothing {
-            inputs.extend([key(NOTHING, false), key(NOTHING, true)]);
-        }
-        inputs.extend(mods.iter().rev().map(|&m| key(m, true)));
-    }
+    let inputs: Vec<INPUT> = keys.iter().map(key).collect();
     unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
 }
 
@@ -349,6 +386,26 @@ mod tests {
         s.key(CTRL, false, ms(3600)); // held, not tapped
         s.key(CTRL, true, ms(3700));
         assert_eq!(s.key(CTRL, false, ms(3750)), Out::Pass);
+    }
+
+    #[test]
+    fn a_lone_windows_key_opens() {
+        let now = Instant::now();
+        let mut s = State { win_key: true, ..Default::default() };
+        assert_eq!(s.key(LWIN, true, now), Out::Pass, "Win down goes through, so Win+E works");
+        assert_eq!(s.key(LWIN, true, now), Out::Pass, "auto-repeat");
+        assert_eq!(s.key(LWIN, false, now), Out::WinOpen(LWIN));
+        s.key(RWIN, true, now);
+        s.key(b'E' as u16, true, now);
+        assert_eq!(s.key(RWIN, false, now), Out::Pass, "Win+E is a shortcut, not a lone press");
+        assert_eq!(s.key(LWIN, false, now), Out::Pass, "a stray release opens nothing");
+        s.key(LWIN, true, now);
+        s.key(SHIFT, true, now);
+        s.key(SHIFT, false, now);
+        assert_eq!(s.key(LWIN, false, now), Out::Pass, "Win+Shift is not a lone Win");
+        let mut off = State::default();
+        off.key(LWIN, true, now);
+        assert_eq!(off.key(LWIN, false, now), Out::Pass, "off: Start as usual");
     }
 
     #[test]

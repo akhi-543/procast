@@ -5040,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "procast"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "emojis",
  "fend-core",

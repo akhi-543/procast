@@ -613,7 +613,7 @@ fn empty_row(glyph: &'static str, title: String, hint: String, actions: Vec<(Str
 fn configure_keys(cfg: &Config, tx: &UnboundedSender<Msg>) {
     let keywords = cfg.snippet.iter().enumerate().filter(|(_, s)| cfg.snippets.expand && !cfg.launcher.is_disabled(&format!("sn:{}", s.name))).map(|(i, s)| (i, s.keyword.clone())).collect();
     let x = snippets::Expander::new(keywords, snippets::Trigger::of(&cfg.snippets.trigger), cfg.snippets.within_words, cfg.emoji.shortcodes);
-    keys::configure(&cfg.keyboard.hyper, &cfg.keyboard.double_tap, Some(x), tx.clone());
+    keys::configure(&cfg.keyboard, Some(x), tx.clone());
 }
 
 /// What `configure_keys` reads, to tell when a reload must redo it.

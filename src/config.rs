@@ -261,11 +261,13 @@ pub struct Keyboard {
     pub hyper: String,
     /// Double-tap this modifier to open procast: off | ctrl | shift | alt.
     pub double_tap: String,
+    /// Pressing the Windows key alone opens procast instead of Start.
+    pub win_key: bool,
 }
 
 impl Default for Keyboard {
     fn default() -> Self {
-        Self { hyper: "off".into(), double_tap: "off".into() }
+        Self { hyper: "off".into(), double_tap: "off".into(), win_key: false }
     }
 }
 
@@ -856,6 +858,7 @@ game_mode = false             # hotkeys do nothing while a full-screen app or ga
 [keyboard]
 hyper = "off"                 # a key that acts as Ctrl+Alt+Shift+Win while held: off | capslock | rightalt | rightctrl | scrolllock
 double_tap = "off"            # double-tap a modifier to open procast: off | ctrl | shift | alt
+win_key = false               # the Windows key pressed alone opens procast instead of Start (Win+E and the like still work)
 
 [apps]
 hotkey_action = "focus"       # an app's hotkey: launch (new window) | focus (open window first) | toggle (hide if focused)
