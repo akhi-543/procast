@@ -504,7 +504,7 @@ pub fn search(req: u64, query: &str, filter: Filter) -> Value {
     json!({"t": "ytm", "req": req, "op": "search", "query": query, "filter": filter.name()})
 }
 
-#[cfg(test)]
+/// Asks the browser companion to browse a library id with the signed-in Chrome session.
 pub fn browse(req: u64, id: &str) -> Value {
     json!({"t": "ytm", "req": req, "op": "browse", "id": id})
 }

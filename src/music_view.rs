@@ -171,6 +171,41 @@ fn playlists_need_desktop(reply: &Reply) -> bool {
     reply.error.as_deref() == Some(ytmusic_api::SIGN_IN) || reply.items.is_empty()
 }
 
+/// Saved library (liked albums, artists, songs) is empty from unsigned InnerTube.
+fn library_needs_browser(reply: &Reply) -> bool {
+    reply.items.is_empty()
+}
+
+/// The empty row's title is the real reason. A generic "Couldn't load" contradicts a correct detail.
+fn load_failure(error: &str) -> (String, String) {
+    if error == ytmusic_api::SIGN_IN {
+        ("Sign in to see your library".into(), "Import YouTube Music Session, or open YouTube Music in your browser".into())
+    } else if error == ytmusic_api::UNREACHABLE {
+        ("Couldn't reach YouTube Music".into(), String::new())
+    } else {
+        (error.to_string(), String::new())
+    }
+}
+
+/// Words for a desktop command that succeeded, taken from the state it just read.
+fn desktop_notice(control: Control, state: &ytmdesktop::State) -> Option<String> {
+    let volume = || {
+        if state.muted {
+            "Muted".into()
+        } else {
+            format!("Volume {}%", state.volume)
+        }
+    };
+    match control {
+        Control::Like if state.like_status == 2 => Some("Liked".into()),
+        Control::Like if state.like_status == 1 || state.like_status == 0 => Some("Removed like".into()),
+        Control::Dislike if state.like_status == 0 => Some("Disliked".into()),
+        Control::Dislike if state.like_status == 1 || state.like_status == 2 => Some("Removed dislike".into()),
+        Control::Mute | Control::VolumeLow | Control::VolumeMedium | Control::VolumeHigh | Control::VolumeUp | Control::VolumeDown => Some(volume()),
+        _ => None,
+    }
+}
+
 fn apply_desktop_playlists(shelf: Shelf, mut reply: Reply, desktop: Option<Vec<(String, String)>>) -> Reply {
     if shelf != Shelf::Playlists || !playlists_need_desktop(&reply) {
         return reply;
@@ -240,6 +275,8 @@ pub struct MusicState {
     playlist_id: String,
     /// Last desktop player volume from `/state`, for Volume Up/Down `setVolume`.
     volume: Option<u32>,
+    /// Companion browse already sent for this library reply, so an empty answer is not asked again.
+    browser_library: Option<u64>,
     tray: Option<TrayIcon>,
 }
 
@@ -283,29 +320,18 @@ impl Launcher {
         let base = self.cfg.ytmusic.desktop_url.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let run = || {
-                let desktop = ytmdesktop::Desktop::new(&base);
+            let desktop = ytmdesktop::Desktop::new(&base);
+            let commanded = (|| {
                 let token = ytmdesktop::ensure_token(&desktop)?;
                 match &job {
                     DesktopJob::Play { video, playlist } => ytmdesktop::play(&token, &desktop.base, video.as_deref(), playlist.as_deref())?,
                     DesktopJob::Command(control) => ytmdesktop::command(&token, &desktop.base, ytmdesktop::transport(*control, step, volume))?,
                     DesktopJob::State => {}
                 }
-                ytmdesktop::state(&token, &desktop.base)
-            };
-            match run() {
-                Ok(state) => {
-                    media::set_desktop_active(true);
-                    let (mut now, video_id, playlist_id) = ytmdesktop::to_now_playing(&state);
-                    now.video_id = video_id;
-                    now.playlist_id = playlist_id;
-                    now.cover = if state.thumb_url.is_empty() {
-                        None
-                    } else {
-                        net::cached_image(&state.thumb_url, &tx).or_else(|| Some(net::image_path(&state.thumb_url)))
-                    };
-                    let _ = tx.unbounded_send(Msg::NowPlaying(Some(now).filter(|n| !n.title.is_empty() || !n.video_id.is_empty())));
-                }
+                Ok(token)
+            })();
+            let token = match commanded {
+                Ok(token) => token,
                 Err(e) => {
                     if e == ytmdesktop::OPEN_APP {
                         media::set_desktop_active(false);
@@ -318,8 +344,23 @@ impl Launcher {
                         }
                     }
                     let _ = tx.unbounded_send(Msg::Toast(false, e));
+                    return;
                 }
+            };
+            // The command already happened. A failed /state refresh must not toast a
+            // different failure over a play, like, or volume change that succeeded.
+            let Ok(state) = ytmdesktop::state(&token, &desktop.base) else { return };
+            media::set_desktop_active(true);
+            if let DesktopJob::Command(control) = job
+                && let Some(text) = desktop_notice(control, &state)
+            {
+                let _ = tx.unbounded_send(Msg::Toast(true, text));
             }
+            let (mut now, video_id, playlist_id) = ytmdesktop::to_now_playing(&state);
+            now.video_id = video_id;
+            now.playlist_id = playlist_id;
+            now.cover = if state.thumb_url.is_empty() { None } else { net::cached_image(&state.thumb_url, &tx).or_else(|| Some(net::image_path(&state.thumb_url))) };
+            let _ = tx.unbounded_send(Msg::NowPlaying(Some(now).filter(|n| !n.title.is_empty() || !n.video_id.is_empty())));
         });
     }
 
@@ -481,17 +522,18 @@ impl Launcher {
         }
         let waiting = view.loading || searching && query.trim() != view.searched;
         let (glyph, title, hint) = if let Some(error) = &view.error {
-            (g::WARNING, "Couldn't load YouTube Music", error.as_str())
+            let (title, hint) = load_failure(error);
+            (g::WARNING, title, hint)
         } else if waiting {
-            (g::CLOCK, if searching { "Searching…" } else { "Loading…" }, "")
+            (g::CLOCK, (if searching { "Searching…" } else { "Loading…" }).to_string(), String::new())
         } else if searching {
-            (g::SEARCH, "No results", "Try another search")
+            (g::SEARCH, "No results".into(), "Try another search".into())
         } else if typed {
-            (g::SEARCH, "No matches", "")
+            (g::SEARCH, "No matches".into(), String::new())
         } else {
-            (g::AUDIO, "Nothing here yet", "")
+            (g::AUDIO, "Nothing here yet".into(), String::new())
         };
-        vec![empty_row(glyph, title.into(), hint.into(), vec![])]
+        vec![empty_row(glyph, title, hint, vec![])]
     }
 
     /// Esc on a page: back to the screen under it. False when there is none.
@@ -838,7 +880,23 @@ impl Launcher {
         }
         if matches!(reply.op.as_str(), "search" | "browse") {
             let flight = self.music.relay.landed(reply.req);
-            if let Some(shelf) = flight.and_then(|flight| flight.shelf).filter(|_| reply.error.is_none()) {
+            let shelf = flight.as_ref().and_then(|flight| flight.shelf);
+            if let Some(shelf) = shelf.filter(|_| library_needs_browser(&reply) && self.music.browser_library != Some(reply.req) && self.browsers.any()) {
+                self.music.req += 1;
+                let req = self.music.req;
+                if self.browsers.ask(None, ytmusic::browse(req, shelf.browse_id())) {
+                    self.music.browser_library = Some(req);
+                    self.music.relay.sent(req, &Ask::Shelf(shelf));
+                    self.music.view.pending = Some(req);
+                    self.music.view.loading = true;
+                    if self.visible && self.mode == Mode::Music {
+                        self.refresh(cx);
+                    }
+                    return;
+                }
+            }
+            self.music.browser_library = None;
+            if let Some(shelf) = shelf.filter(|_| reply.error.is_none()) {
                 ytmusic::save_cached(shelf.browse_id(), &reply.items);
                 if shelf == Shelf::Playlists {
                     self.music.playlists.clone_from(&reply.items);
@@ -1423,6 +1481,44 @@ mod tests {
         assert_eq!(reply.op, "search");
         let signed_out = Reply { op: "browse".into(), error: Some("Sign in to music.youtube.com in this browser to see your library".into()), ..Default::default() };
         assert_eq!(catalog_reply(&Ask::Shelf(Shelf::Albums), Ok(signed_out.clone())).error, signed_out.error);
+    }
+
+    #[test]
+    fn empty_library_asks_the_browser_and_says_why() {
+        let signed_out = Reply { op: "browse".into(), error: Some(ytmusic_api::SIGN_IN.into()), ..Default::default() };
+        assert!(library_needs_browser(&signed_out));
+        assert!(!library_needs_browser(&Reply { op: "browse".into(), items: vec![MusicItem { title: "Discovery".into(), ..Default::default() }], ..Default::default() }));
+        let ask = ytmusic::browse(4, Shelf::Albums.browse_id());
+        assert_eq!((ask["op"].as_str(), ask["id"].as_str()), (Some("browse"), Some("FEmusic_liked_albums")));
+        assert_eq!(
+            load_failure(ytmusic_api::SIGN_IN),
+            ("Sign in to see your library".into(), "Import YouTube Music Session, or open YouTube Music in your browser".into())
+        );
+        assert_eq!(load_failure(ytmusic_api::UNREACHABLE).0, "Couldn't reach YouTube Music");
+        assert_ne!(load_failure(ytmusic_api::SIGN_IN).0, "Couldn't load YouTube Music");
+    }
+
+    #[test]
+    fn desktop_notice_matches_the_player() {
+        let state = |like_status, volume, muted| ytmdesktop::State {
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            video_id: String::new(),
+            playlist_id: String::new(),
+            playing: false,
+            volume,
+            muted,
+            like_status,
+            thumb_url: String::new(),
+        };
+        assert_eq!(desktop_notice(Control::Like, &state(2, 40, false)).as_deref(), Some("Liked"));
+        assert_eq!(desktop_notice(Control::Like, &state(1, 40, false)).as_deref(), Some("Removed like"));
+        assert_eq!(desktop_notice(Control::Dislike, &state(0, 40, false)).as_deref(), Some("Disliked"));
+        assert_eq!(desktop_notice(Control::VolumeUp, &state(-1, 55, false)).as_deref(), Some("Volume 55%"));
+        assert_eq!(desktop_notice(Control::Mute, &state(-1, 55, true)).as_deref(), Some("Muted"));
+        assert_eq!(desktop_notice(Control::Like, &state(-1, 40, false)), None);
+        assert_eq!(desktop_notice(Control::Next, &state(2, 40, false)), None);
     }
 
     #[test]
