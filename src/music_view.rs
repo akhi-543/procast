@@ -9,13 +9,13 @@ use std::{
     time::Duration,
 };
 
-use gpui::{ClipboardItem, Context, Div, IntoElement, ObjectFit, ParentElement, RenderImage, Styled, StyledImage, Window, div, img};
+use gpui::{ClipboardItem, Context, RenderImage, Window};
 use tray_icon::TrayIcon;
 
 use crate::{
     Launcher, Mode, Tone,
     commands::{self, Cmd},
-    design::{self, Tokens, g, px},
+    design::g,
     empty_row, ext,
     media::{self, Media, NowPlaying, Transport},
     music_tray::{self, Action},
@@ -39,12 +39,6 @@ const COVER_REFRESH: Duration = Duration::from_millis(100);
 const NO_BROWSER: &str = "No browser connected: run Set Up Browser Extension";
 const IMPORT_SESSION: &str = "Import YouTube Music Session";
 
-const CELL_PAD: f32 = 6.;
-const CELL_GAP: f32 = 4.;
-const TITLE_HEIGHT: f32 = 20.;
-const SUBTITLE_HEIGHT: f32 = 18.;
-/// The grid's horizontal padding (both sides) and the window's border.
-const GRID_INSET: f32 = 18.;
 
 /// What to do with the link of the track now playing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -518,7 +512,7 @@ impl Launcher {
         let searching = self.music.screen == Screen::Search && view.page.is_none();
         let typed = !query.trim().is_empty();
         if searching && !typed {
-            return vec![empty_row(g::SEARCH, "Search YouTube Music".into(), "Songs, albums, artists or playlists · Tab changes what to search".into(), vec![])];
+            return vec![empty_row(g::SEARCH, "Search YouTube Music".into(), "Type a song, album, artist or playlist".into(), vec![])];
         }
         let waiting = view.loading || searching && query.trim() != view.searched;
         let (glyph, title, hint) = if let Some(error) = &view.error {
@@ -1072,7 +1066,7 @@ fn glyph_of(kind: Kind) -> &'static str {
     match kind {
         Kind::Song | Kind::Album => g::AUDIO,
         Kind::Playlist => g::BULLETS,
-        Kind::Artist => g::STAR,
+        Kind::Artist => g::USERS,
     }
 }
 
@@ -1154,37 +1148,6 @@ fn remember_track(video_id: &mut String, playlist_id: &mut String, now: Option<&
             playlist_id.clear();
         }
     }
-}
-
-/// An album cell's width: `columns` of them side by side across a window `window` wide.
-pub fn cell_width(window: f32, columns: usize) -> f32 {
-    let gaps = CELL_GAP * columns.saturating_sub(1) as f32;
-    ((window - GRID_INSET - gaps) / columns.max(1) as f32).floor()
-}
-
-fn cell_height(width: f32) -> f32 {
-    width + 2. * CELL_GAP + TITLE_HEIGHT + SUBTITLE_HEIGHT
-}
-
-/// An album or playlist in the grid: its cover, then its title and subtitle on one line each.
-pub fn cover_cell(icon: &Icon, title: &str, subtitle: &str, width: f32, t: &Tokens) -> Div {
-    let side = width - 2. * CELL_PAD;
-    let cover = match icon {
-        Icon::Image(image) => img(image.clone()).size(px(side)).object_fit(ObjectFit::Cover).rounded(px(design::r::SM)).into_any_element(),
-        Icon::Vector(name) => div().size(px(side)).flex().items_center().justify_center().rounded(px(design::r::SM)).bg(t.surface).child(design::icon(name, design::ic::XL, t.text_muted)).into_any_element(),
-        Icon::Glyph(_) => div().size(px(side)).into_any_element(),
-    };
-    div()
-        .w(px(width))
-        .h(px(cell_height(width)))
-        .flex_none()
-        .flex()
-        .flex_col()
-        .gap(px(CELL_GAP))
-        .p(px(CELL_PAD))
-        .child(cover)
-        .child(div().h(px(TITLE_HEIGHT)).truncate().text_color(t.text).child(title.to_string()))
-        .child(div().h(px(SUBTITLE_HEIGHT)).truncate().text_size(px(design::ts::BODY_SM)).text_color(t.text_muted).child(subtitle.to_string()))
 }
 
 fn transport(control: Control) -> Option<Transport> {
@@ -1423,15 +1386,6 @@ mod tests {
         assert_eq!(actions[1].1, Act::Copy("https://music.youtube.com/browse/UC1".into()));
         assert_eq!(playlist_of(&item(Kind::Artist, "UC1", "RDAO1")), None);
         assert_eq!(playlist_of(&item(Kind::Song, "abc", "PL1")), None);
-    }
-
-    #[test]
-    fn cells_fill_the_window_width() {
-        let width = cell_width(750., 5);
-        assert!((width * 5. + 4. * 4. + GRID_INSET) <= 750. && width > 130.);
-        assert!(cell_width(750., 3) > cell_width(750., 8));
-        assert_eq!(cell_width(750., 0), cell_width(750., 1));
-        assert_eq!(cell_height(100.), 100. + 2. * CELL_GAP + TITLE_HEIGHT + SUBTITLE_HEIGHT);
     }
 
     #[test]

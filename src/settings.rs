@@ -488,10 +488,10 @@ fn rows(section: usize, exts: &[ext::Extension], text: &str) -> Vec<Row> {
         "YouTube Music" => groups(vec![(
             "YouTube Music",
             vec![
-                row("Enabled", "ytmusic.enabled", Kind::Bool, "Play and control the YouTube Music Desktop App, with in-process search and library."),
-                row("Tray player", "ytmusic.tray", Kind::Bool, "A tray icon with the current track and playback controls."),
-                row("Album columns", "ytmusic.columns", Kind::Number, "Albums per row in the grid, 3 to 8."),
-                row("Volume step", "ytmusic.volume_step", Kind::Number, "How much Volume Up and Volume Down change the volume, in percent."),
+                row("Enabled", "ytmusic.enabled", Kind::Bool, "Play and control the YouTube Music Desktop App, with in-process search and library.").with_icon(g::AUDIO),
+                row("Tray player", "ytmusic.tray", Kind::Bool, "A tray icon with the current track and playback controls.").with_icon(g::PIN),
+                row("Column count", "ytmusic.columns", Kind::Columns, "Covers per row in YouTube Music's albums and playlists").with_icon(g::TILES),
+                row("Volume step", "ytmusic.volume_step", Kind::Number, "How much Volume Up and Volume Down change the volume, in percent.").with_icon(g::VOLUME_2),
             ],
         )]),
         "Window" => groups(vec![

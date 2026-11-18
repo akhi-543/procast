@@ -5640,11 +5640,11 @@ impl Launcher {
             .into_any_element()
     }
 
-    /// Cells per grid row: `[screenshots] columns` (3 to 6), `[ytmusic] columns` (3 to 8) or `[emoji] columns` (4 to 16).
+    /// Cells per grid row: `[screenshots] columns` (3 to 6), `[ytmusic] columns` (3 to 6) or `[emoji] columns` (4 to 16).
     fn grid_cols(&self) -> usize {
         match self.mode {
             Mode::Shots => self.cfg.screenshots.columns.clamp(3, 6),
-            Mode::Music => self.cfg.ytmusic.columns.clamp(3, 8),
+            Mode::Music => self.cfg.ytmusic.columns.clamp(3, 6),
             _ => self.cfg.emoji.columns.clamp(4, 16),
         }
     }
@@ -5653,42 +5653,41 @@ impl Launcher {
         if self.mode == Mode::Shots {
             return self.shot_grid(t, cx);
         }
+        if self.mode == Mode::Music {
+            return self.cover_grid(t, cx);
+        }
         let cols = self.grid_cols();
-        let cover_width = music_view::cell_width(base_width(&self.cfg), cols);
         let me = cx.weak_entity();
         let (selected, t) = (self.selected, *t);
-        let cells: Rc<Vec<GridCell>> = Rc::new(
-            self.items
-                .iter()
-                .map(|it| match &it.icon {
-                    _ if self.mode == Mode::Music => GridCell::Cover(it.icon.clone(), it.title.clone(), it.subtitle.clone()),
-                    Icon::Glyph(s) => GridCell::Emoji(s.clone()),
-                    _ => GridCell::Emoji(SharedString::default()),
-                })
-                .collect(),
-        );
+        let glyphs: Rc<Vec<SharedString>> = Rc::new(self.items.iter().map(|it| if let Icon::Glyph(s) = &it.icon { s.clone() } else { SharedString::default() }).collect());
         let rows = Rc::new(grid_rows(&self.items, cols));
         // ponytail: rows are laid out only while on screen; 400 emoji cells per keystroke made typing lag.
         let list = gpui::list(self.grid_list.clone(), move |k, _, _| match &rows[k] {
                 GridRow::Header(s) => design::section_header(s, None, &t).into_any_element(),
-                GridRow::Cells(row) => {
-                    let pad = cols - row.len();
+                GridRow::Cells(cells) => {
+                    let pad = cols - cells.len();
                     div()
                         .flex()
                         .w_full()
                         .gap(px(4.))
-                        .children(row.iter().map(|&i| {
+                        .children(cells.iter().map(|&i| {
                             let on = i == selected;
                             let me = me.clone();
+                            let glyph = glyphs[i].clone();
                             let t = &t;
                             let hover = t.hover;
-                            let cell = match &cells[i] {
-                                GridCell::Emoji(glyph) => div().flex_1().h(px(EMOJI_CELL)).flex().items_center().justify_center().font_family(design::FONT_EMOJI).text_size(px(30.)).child(glyph.clone()),
-                                GridCell::Cover(icon, title, subtitle) => music_view::cover_cell(icon, title, subtitle, cover_width, t),
-                            };
-                            cell.id(("emoji", i))
+                            div()
+                                .id(("emoji", i))
+                                .flex_1()
+                                .h(px(EMOJI_CELL))
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded(px(design::r::MD))
                                 .map(|d| if on { design::lozenge(d, t) } else { d.hover(move |s| s.bg(hover)) })
+                                .font_family(design::FONT_EMOJI)
+                                .text_size(px(30.))
+                                .child(glyph)
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                                     me.update(cx, |this, cx| {
                                         this.selected = i;
@@ -5703,6 +5702,44 @@ impl Launcher {
                 }
             });
         div().flex_1().min_h_0().flex().flex_col().px(px(8.)).py(px(LIST_PAD)).child(list.flex_1().min_h_0()).into_any_element()
+    }
+
+    /// YouTube Music's albums and playlists: `.pc-thumb` covers, square, `[ytmusic] columns`
+    /// across, laid out like Search Screenshots' grid.
+    fn cover_grid(&self, t: &Tokens, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let cols = self.grid_cols();
+        let me = cx.weak_entity();
+        let (selected, t) = (self.selected, *t);
+        let cells: Rc<Vec<Item>> = Rc::new(self.items.clone());
+        let rows = Rc::new(grid_rows(&self.items, cols));
+        let last = rows.len().saturating_sub(1);
+        let list = gpui::list(self.grid_list.clone(), move |k, _, _| match &rows[k] {
+            GridRow::Header(s) => design::section_header(s, None, &t).into_any_element(),
+            GridRow::Cells(row) => div()
+                .flex()
+                .w_full()
+                .px(px(design::sp::S16))
+                .pb(px(if k == last { design::sp::S8 } else { design::sp::S12 }))
+                .gap(px(design::sp::S12))
+                .children(row.iter().map(|&i| {
+                    let it = &cells[i];
+                    let image = if let Icon::Image(image) = &it.icon { Some(image.clone()) } else { None };
+                    let me = me.clone();
+                    design::cover(image, &it.title, &it.subtitle, i == selected, &t)
+                        .id(("cover", i))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                            me.update(cx, |this, cx| {
+                                this.selected = i;
+                                this.launch(window, cx);
+                            })
+                            .ok();
+                        })
+                        .into_any_element()
+                }))
+                .children((row.len()..cols).map(|_| div().flex_1().into_any_element()))
+                .into_any_element(),
+        });
+        div().flex_1().min_h_0().flex().flex_col().child(list.flex_1().min_h_0()).into_any_element()
     }
 
     /// Search Screenshots' grid (`.pc-grid`): the section with its count, then the thumbnails
@@ -5837,13 +5874,6 @@ fn shots_empty(busy: bool, filtered: bool) -> ShotsEmpty {
 
 /// An emoji cell's height.
 const EMOJI_CELL: f32 = 56.;
-
-/// What a grid cell draws.
-enum GridCell {
-    Emoji(SharedString),
-    /// An album or playlist: cover, title, subtitle.
-    Cover(Icon, String, String),
-}
 
 enum GridRow {
     Header(String),

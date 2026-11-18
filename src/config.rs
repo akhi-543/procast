@@ -965,9 +965,9 @@ skin_tone = "none"            # none | light | medium_light | medium | medium_da
 shortcodes = true             # typing :name: in any app (e.g. :thumbsup:) turns into the emoji
 
 [ytmusic]
-enabled = true                # search, library and playback controls for music.youtube.com in your browser
+enabled = true                # search, library and playback through the YouTube Music Desktop App
 tray = false                  # a tray icon with the current track and playback controls
-columns = 5                   # albums per row in the grid
+columns = 5                   # covers per row in the albums and playlists grid, 3 to 6
 volume_step = 10              # percent that Volume Up and Volume Down change the volume by
 desktop_url = "http://127.0.0.1:9863"  # YouTube Music Desktop App companion server
 

@@ -106,6 +106,7 @@ One line per stem. A procast stem that differs from its Lucide name gives the Lu
 - `power`
 - `quote`
 - `refresh-ccw`
+- `repeat`
 - `restart`: Lucide `refresh-cw`
 - `return`: Lucide `corner-down-left`
 - `rotate-ccw`
@@ -118,7 +119,10 @@ One line per stem. A procast stem that differs from its Lucide name gives the Lu
 - `shield-off`
 - `shield`
 - `shopping-cart`
+- `shuffle`
 - `sign-out`: Lucide `log-out`
+- `skip-back`
+- `skip-forward`
 - `sleep`: Lucide `moon`
 - `sliders-horizontal`
 - `sparkles`
@@ -131,6 +135,8 @@ One line per stem. A procast stem that differs from its Lucide name gives the Lu
 - `sun-moon`
 - `terminal`
 - `text-cursor-input`
+- `thumbs-down`
+- `thumbs-up`
 - `tiles`: Lucide `layout-grid`
 - `timer`
 - `type`
@@ -138,6 +144,7 @@ One line per stem. A procast stem that differs from its Lucide name gives the Lu
 - `usb`
 - `users`
 - `video`
+- `volume`
 - `volume-1`
 - `volume-2`
 - `volume-x`
