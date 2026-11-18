@@ -5723,9 +5723,13 @@ impl Launcher {
                 .gap(px(design::sp::S12))
                 .children(row.iter().map(|&i| {
                     let it = &cells[i];
-                    let image = if let Icon::Image(image) = &it.icon { Some(image.clone()) } else { None };
+                    let (image, glyph) = match &it.icon {
+                        Icon::Image(image) => (Some(image.clone()), g::AUDIO),
+                        Icon::Vector(glyph) => (None, *glyph),
+                        _ => (None, g::AUDIO),
+                    };
                     let me = me.clone();
-                    design::cover(image, &it.title, &it.subtitle, i == selected, &t)
+                    design::cover(image, glyph, &it.title, &it.subtitle, i == selected, &t)
                         .id(("cover", i))
                         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                             me.update(cx, |this, cx| {

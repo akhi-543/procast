@@ -1114,16 +1114,17 @@ pub fn thousands(n: usize) -> String {
 /// alone until it has loaded) over its one-line caption. Selected: a 2 px `accent` ring and
 /// the caption in `text`, no fill.
 pub fn thumb(image: Option<std::sync::Arc<gpui::RenderImage>>, caption: &str, on: bool, t: &Tokens) -> Div {
-    thumb_of(image, THUMB_ASPECT, caption, None, on, t)
+    thumb_of(image, None, THUMB_ASPECT, caption, None, on, t)
 }
 
 /// `.pc-thumb` for an album or playlist: the picture square, and a second line under the
-/// caption (`ts-small`, `text_faint`, `text_muted` when selected).
-pub fn cover(image: Option<std::sync::Arc<gpui::RenderImage>>, title: &str, subtitle: &str, on: bool, t: &Tokens) -> Div {
-    thumb_of(image, 1., title, Some(subtitle), on, t)
+/// caption (`ts-small`, `text_faint`, `text_muted` when selected). Without a picture (the
+/// Desktop App lists playlists with none) `glyph` shows at `ic-xl` in `text_faint`.
+pub fn cover(image: Option<std::sync::Arc<gpui::RenderImage>>, glyph: &'static str, title: &str, subtitle: &str, on: bool, t: &Tokens) -> Div {
+    thumb_of(image, Some(glyph), 1., title, Some(subtitle), on, t)
 }
 
-fn thumb_of(image: Option<std::sync::Arc<gpui::RenderImage>>, aspect: f32, caption: &str, second: Option<&str>, on: bool, t: &Tokens) -> Div {
+fn thumb_of(image: Option<std::sync::Arc<gpui::RenderImage>>, glyph: Option<&'static str>, aspect: f32, caption: &str, second: Option<&str>, on: bool, t: &Tokens) -> Div {
     let picture = div()
         .w_full()
         .aspect_ratio(aspect)
@@ -1132,6 +1133,8 @@ fn thumb_of(image: Option<std::sync::Arc<gpui::RenderImage>>, aspect: f32, capti
         .border_1()
         .border_color(t.hairline)
         .when(on, |d| d.ring(px(RING)).ring_color(t.accent))
+        .when(image.is_none() && glyph.is_some(), |d| d.flex().items_center().justify_center())
+        .children(glyph.filter(|_| image.is_none()).map(|g| icon(g, ic::XL, t.text_faint)))
         .children(image.map(|i| img(i).size_full().rounded(px(r::MD)).object_fit(gpui::ObjectFit::Cover)));
     div()
         .flex_1()
