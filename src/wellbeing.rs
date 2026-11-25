@@ -389,7 +389,7 @@ fn backups_dir() -> PathBuf {
 pub fn backup(con: &Connection, folder: &Path, day: i64) -> rusqlite::Result<()> {
     let io = |e: std::io::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
     std::fs::create_dir_all(folder).map_err(io)?;
-    let target = folder.join(format!("data-{}.db", iso(day)));
+    let target = folder.join(format!("screentime-{}.db", iso(day)));
     if !target.exists() {
         // Copied under another name, so a failed copy is never taken for the day's backup.
         let partial = target.with_extension("tmp");
@@ -400,7 +400,7 @@ pub fn backup(con: &Connection, folder: &Path, day: i64) -> rusqlite::Result<()>
         .map_err(io)?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("data-") && n.ends_with(".db")))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("screentime-") && n.ends_with(".db")))
         .collect();
     copies.sort();
     for old in &copies[..copies.len().saturating_sub(BACKUPS)] {
@@ -805,9 +805,9 @@ mod tests {
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
         assert_eq!(names.len(), 7);
-        assert_eq!((names[0].as_str(), names[6].as_str()), ("data-2026-09-03.db", "data-2026-09-09.db"));
+        assert_eq!((names[0].as_str(), names[6].as_str()), ("screentime-2026-09-03.db", "screentime-2026-09-09.db"));
         // A second call for the same day leaves the first copy alone.
-        let copy = dir.join("data-2026-09-09.db");
+        let copy = dir.join("screentime-2026-09-09.db");
         let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
         con.execute("INSERT INTO usage VALUES('2026-10-01', 1, 'app', 'x.exe', 1.0)", []).unwrap();
         backup(&con, &dir, first + 8).unwrap();
