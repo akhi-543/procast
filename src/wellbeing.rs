@@ -378,6 +378,13 @@ pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str)
     let is_app = name.ends_with(".exe");
     let norm: fn(&str) -> String = if is_app { focus::norm_app } else { focus::norm_site };
     let key = norm(&name);
+    // The key is what gets stored. A site must already be a plain host (no URL, user@ or :port,
+    // which `norm_site` would cut); "www." is left as "www" by it.
+    let host = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let ok = if is_app { key.len() > ".exe".len() } else { (1..=253).contains(&key.len()) && key != "www" && host(&name) };
+    if !ok {
+        return Err("bad name".into());
+    }
     let mut changed = Vec::new();
     for old in cats {
         let mut c = old.clone();
@@ -892,7 +899,7 @@ mod tests {
     fn move_name_rejects_bad_input() {
         let cats = cfg_of("");
         assert_eq!(move_name("", &cats, "x", "Nope"), Err("unknown category".into()));
-        for bad in ["", "   ", &"a".repeat(261), "a\nb", "a\u{7}b"] {
+        for bad in ["", "   ", &"a".repeat(261), "a\nb", "a\u{7}b", "/", "?", "#", ".", "@x", "www.", "a b", "a\"b", "b\u{fc}cher.de", ".exe", " .exe ", &"a".repeat(254)] {
             assert_eq!(move_name("", &cats, bad, "Other"), Err("bad name".into()), "{bad:?}");
         }
     }
