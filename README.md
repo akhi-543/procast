@@ -116,6 +116,7 @@ extensions run, so these figures are for a fresh start.<br>
 - **Calendar**: My Schedule and Join Meeting from ICS feeds (Google, Outlook), with a reminder before each meeting
 - **Screenshots**: search your screenshot folders by the text in each picture (Windows OCR), Quick Look, pin, paste the latest
 - **Notes**: a floating Markdown notes window with a live editor, search, and recently deleted notes
+- **Screen Time**: records which apps and websites are in front (idle time is skipped), shows today and this week by category, app and site (**Screen Time**, **Screen Time This Week**), and serves a dashboard at `http://127.0.0.1:8737`. Off by default (`[screen_time] enabled`); websites need the browser extension; **Import Screen Time from micro bot** brings that tracker's history in
 - **Auto HDR for games**: turns HDR on while a full-screen game is in front
 
 **AI**: Quick AI from the search bar with follow-ups, running the Claude Agent SDK on your own Claude Code login
@@ -187,6 +188,7 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Translator, dictionary, calendar | ✅ | ✅ |
 | Contacts | ✅ | ⬜ |
 | Floating notes, focus sessions, timer, screenshot search | ✅ | ✅ |
+| Screen time (apps and sites, per day and week, dashboard) | ⬜ | ✅ |
 | Auto HDR | ✅ | ✅ |
 | Taskbar widget | ✅ | ⬜ |
 | **App** | | |
@@ -236,6 +238,7 @@ Press <kbd>Alt</kbd>+<kbd>Space</kbd>. procast lives in the tray and can start a
 - Whole-drive file search: run **Enable Fast File Search** once (asks for admin), then turn on Settings → Files → Search whole drives
 - Extensions: **Browse Extension Store**, or **Install Extension** with a store name (`obsidian`) or a local folder
 - Browser tabs: run **Set Up Browser Extension**, then in Chrome, Edge or Brave load `%APPDATA%\procast\browser-extension` with "Load unpacked"
+- After updating procast, reload the unpacked extension on the browser's extensions page: Screen Time's website tracking needs the newer one
 - YouTube Music: run the YouTube Music Desktop App with its companion server on, then approve procast in that app (procast does not launch it). Search does not need Chrome. For the full library, run **Set Up Browser Extension**, reload it once after an update, then **Import YouTube Music Session**. Without that, library shelves ask you to sign in on music.youtube.com; Playlists can still fill from the desktop app. Settings → YouTube Music turns on the tray player
 - Quick AI: sign in to [Claude Code](https://claude.com/claude-code) once; procast uses that login
 

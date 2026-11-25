@@ -136,6 +136,12 @@ pub enum Act {
     SetAutoHdr(bool),
     /// Something in YouTube Music (see music_view.rs).
     Music(crate::music_view::MusicAct),
+    /// Screen Time: move an app or site (by name) to another category: a menu of categories.
+    MoveToCategory(String),
+    /// Screen Time: the shown span as a CSV in Downloads.
+    ExportScreenTime,
+    /// Screen Time: write `[screen_time] enabled = true`.
+    EnableScreenTime,
     /// A row with nothing to do (loading, empty views).
     None,
 }
@@ -167,7 +173,7 @@ impl Act {
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::YtMusic(_)) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ScreenTime | Cmd::ScreenTimeWeek | Cmd::OpenScreenTimeDashboard | Cmd::YtMusic(_)) => "Open",
             Act::Music(act) => act.label(),
             Act::Cmd(Cmd::CreateNote) => "Create Note",
             Act::OpenNote(_) => "Open Note",
@@ -211,6 +217,9 @@ impl Act {
             Act::DeleteLangSet(_) => "Delete",
             Act::SetAutoHdr(true) => "Turn Auto HDR On",
             Act::SetAutoHdr(false) => "Turn Auto HDR Off",
+            Act::MoveToCategory(_) => "Move to Category…",
+            Act::ExportScreenTime => "Export CSV",
+            Act::EnableScreenTime => "Turn On Screen Time",
             Act::None => "",
         }
     }

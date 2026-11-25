@@ -14,7 +14,9 @@ use std::time::Duration;
 
 const PORT: u16 = 8737;
 const HOSTS: [&str; 2] = ["127.0.0.1:8737", "localhost:8737"];
-const ORIGINS: [&str; 2] = ["http://127.0.0.1:8737", "http://localhost:8737"];
+/// Where the dashboard is, for the launcher's Open Dashboard.
+pub const URL: &str = "http://127.0.0.1:8737";
+const ORIGINS: [&str; 2] = [URL, "http://localhost:8737"];
 const API: [&str; 3] = ["/api/stats", "/api/days", "/api/export.csv"];
 const DASHBOARD: &str = include_str!("../assets/screen-time/dashboard.html");
 const MAX_HEAD: u64 = 8 * 1024;

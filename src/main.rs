@@ -186,6 +186,8 @@ enum Mode {
     LanguageSets,
     /// Search Notes or Recently Deleted Notes.
     Notes(NotesList),
+    /// Screen Time: today's or this week's categories, apps and sites (see `Launcher::st_stats`).
+    ScreenTime(wellbeing::Range),
 }
 
 /// Which notes `Mode::Notes` lists.
@@ -799,6 +801,36 @@ fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
     m
 }
 
+/// Screen Time's actions that need no row: the dashboard and the CSV.
+fn screen_time_actions() -> Vec<(String, Act)> {
+    vec![("Open Dashboard".into(), Act::Cmd(Cmd::OpenScreenTimeDashboard)), (Act::ExportScreenTime.label().into(), Act::ExportScreenTime)]
+}
+
+/// Screen Time while it is off: nothing is recorded, so one row says how to start.
+fn screen_time_off_row() -> Vec<Item> {
+    let actions = vec![("Import from micro bot".to_string(), Act::Cmd(Cmd::ImportScreenTime)), (Act::EnableScreenTime.label().to_string(), Act::EnableScreenTime)];
+    vec![empty_row(g::MONITOR, "Screen Time is off".into(), "Turn it on to start tracking, or bring micro bot's history in".into(), actions)]
+}
+
+/// Screen Time's list: the span's header (its total against the span before), then a row for
+/// each category, app and site. An app or site moves to another category; a category cannot.
+fn screen_time_rows(range: wellbeing::Range, stats: &Value) -> Vec<Item> {
+    let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
+    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), range), "", Icon::Vector(g::MONITOR), Act::Cmd(Cmd::OpenScreenTimeDashboard));
+    head.extra = screen_time_actions();
+    let rows = wellbeing::rows(stats).into_iter().map(|r| {
+        let (icon, sub, act) = match r.section {
+            "Categories" => (focus::category_icon(&r.name), String::new(), Act::Cmd(Cmd::OpenScreenTimeDashboard)),
+            section => (if section == "Apps" { g::APP } else { g::GLOBE }, r.category.clone(), Act::MoveToCategory(r.name.clone())),
+        };
+        let mut it = Item::new(&r.name, sub, Icon::Vector(icon), act.clone()).acc(wellbeing::duration(r.seconds as f64)).sec(r.section).with_hay(format!("{} {}", r.name, r.category));
+        it.extra = if matches!(act, Act::MoveToCategory(_)) { vec![(act.label().to_string(), act)] } else { vec![] };
+        it.extra.extend(screen_time_actions());
+        it
+    });
+    std::iter::once(head).chain(rows).collect()
+}
+
 /// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
 /// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 days ago · 397
 /// characters" ("● Current · 186 characters" for the Notes window's note, `current`, counted
@@ -947,6 +979,10 @@ struct Launcher {
     /// number (older answers are dropped).
     note_rows: Option<Vec<(NoteMeta, usize)>>,
     note_gen: u64,
+    /// `Mode::ScreenTime`: the span's stats once read (None until then), and the read's number
+    /// (older answers are dropped).
+    st_stats: Option<Result<Value, String>>,
+    st_gen: u64,
     matcher: Matcher,
     mode: Mode,
     items: Vec<Item>,
@@ -1167,6 +1203,8 @@ impl Launcher {
             notes_window: None,
             note_rows: None,
             note_gen: 0,
+            st_stats: None,
+            st_gen: 0,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
             items: vec![],
@@ -1701,6 +1739,7 @@ impl Launcher {
                 self.search_notes(list, &query, cx);
                 self.note_items(list, &query, cx)
             }
+            Mode::ScreenTime(range) => self.screen_time_items(range, &query),
             Mode::Define => match &self.define {
                 _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
                 Some(v) => define_rows(v, &self.cfg.search.fallback),
@@ -2608,6 +2647,10 @@ impl Launcher {
         if matches!(mode, Mode::Notes(_)) {
             self.note_rows = None;
         }
+        if let Mode::ScreenTime(range) = mode {
+            self.st_stats = None;
+            self.load_screen_time(range, focus::categories(&self.cfg.focus_category), cx);
+        }
         if mode == Mode::Tabs {
             self.tabs.clear();
             self.browsers.ask_all(json!({"t": "tabs"}));
@@ -2633,6 +2676,10 @@ impl Launcher {
         self.status = self.toast.and_then(|t| t.update(cx, |t, _, cx| t.dismiss(cx)).ok().flatten()).map(|(kind, text)| (Tone::of(kind), text));
         // Within the pop-to-root timeout the launcher reopens where it was.
         if mode == Mode::Root && self.keeps_state() {
+            // Reopened where it was: the numbers moved on meanwhile.
+            if let Mode::ScreenTime(range) = self.mode {
+                self.load_screen_time(range, focus::categories(&self.cfg.focus_category), cx);
+            }
             self.refresh(cx);
         } else {
             self.peek = false;
@@ -4082,6 +4129,28 @@ impl Launcher {
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
             Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
+            Act::Cmd(Cmd::ScreenTime) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Today), cx),
+            Act::Cmd(Cmd::ScreenTimeWeek) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Week), cx),
+            // The dashboard is served only while Screen Time is on.
+            Act::Cmd(Cmd::OpenScreenTimeDashboard) if self.cfg.screen_time.enabled => win::open(wellbeing_http::URL),
+            Act::Cmd(Cmd::OpenScreenTimeDashboard) => self.say(Msg::info("Screen Time is off. Run Screen Time to turn it on")),
+            Act::MoveToCategory(name) => return self.open_category_menu(name, window, cx),
+            Act::ExportScreenTime => return self.export_screen_time(cx),
+            Act::EnableScreenTime => {
+                match config::edit_file(&config::path(), |t| config::write_value(t, &["screen_time".into(), "enabled".into()], true.into())) {
+                    // The config poll starts the sampler and the dashboard.
+                    Ok(_) => {
+                        self.say(Msg::done("Screen Time is on"));
+                        self.set_mode(Mode::Root, cx);
+                        self.hide(true, cx);
+                    }
+                    Err(e) => {
+                        self.status = Some((Tone::Error, e));
+                        cx.notify();
+                    }
+                }
+                return;
+            }
             Act::Cmd(Cmd::SearchNotes) => return self.set_mode(Mode::Notes(NotesList::All), cx),
             Act::Cmd(Cmd::RecentlyDeletedNotes) => return self.set_mode(Mode::Notes(NotesList::Deleted), cx),
             Act::Cmd(Cmd::OpenNotes) => {
@@ -4487,7 +4556,7 @@ impl Launcher {
             Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
             // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
             Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
-            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories) | Cmd::ImportScreenTime) => true,
+            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories) | Cmd::ImportScreenTime | Cmd::ScreenTime | Cmd::ScreenTimeWeek) => true,
             Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::YtMusic(_)) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),
@@ -4639,6 +4708,130 @@ impl Launcher {
                 note_rows(list, rows, current, search::now() as i64, !query.trim().is_empty(), self.cfg.notes.keep_days())
             }
         }
+    }
+
+    /// Reads the span's stats on the background executor, after writing the sampler's pending
+    /// counters so the numbers are current; the answer fills the list (`screen_time_loaded`).
+    /// `cats` are the categories to file names under: the config's, or a move's fresh ones.
+    fn load_screen_time(&mut self, range: wellbeing::Range, cats: Vec<config::FocusCategory>, cx: &mut Context<Self>) {
+        if !self.cfg.screen_time.enabled {
+            return;
+        }
+        self.st_gen += 1;
+        let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(range, win::local_now().0), wellbeing::rules(&cats));
+        let read = cx.background_executor().spawn(async move {
+            let _ = wellbeing::flush_pending();
+            let con = wellbeing::open(&wellbeing::db_path()).map_err(|e| e.to_string())?;
+            wellbeing::stats(&con, span.0, span.1, before, &rules).map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let r = read.await;
+            _ = this.update(cx, |this, cx| this.screen_time_loaded(range, generation, r, cx));
+        })
+        .detach();
+    }
+
+    fn screen_time_loaded(&mut self, range: wellbeing::Range, generation: u64, r: Result<Value, String>, cx: &mut Context<Self>) {
+        if self.st_gen != generation || self.mode != Mode::ScreenTime(range) {
+            return;
+        }
+        self.st_stats = Some(r);
+        if self.confirm.is_none() {
+            let q = self.query(cx);
+            self.items = self.screen_time_items(range, &q);
+            self.selected = self.selected.min(self.items.len().saturating_sub(1));
+            self.scroll_to_selected();
+        }
+        cx.notify();
+    }
+
+    fn screen_time_items(&mut self, range: wellbeing::Range, query: &str) -> Vec<Item> {
+        match &self.st_stats {
+            _ if !self.cfg.screen_time.enabled => screen_time_off_row(),
+            None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
+            Some(Err(e)) => vec![empty_row(g::MONITOR, "Couldn't read screen time".into(), e.clone(), vec![])],
+            Some(Ok(stats)) => {
+                let mut rows = screen_time_rows(range, stats);
+                // Filtered rows come back best match first: keep each section together.
+                let mut found = search::filter(query, rows.split_off(1), &mut self.matcher);
+                found.sort_by_key(|it| ["Categories", "Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
+                if found.is_empty() {
+                    let (title, hint) = if query.trim().is_empty() { ("Nothing tracked yet", "Screen Time records while procast runs") } else { ("No matches", "") };
+                    return vec![empty_row(g::MONITOR, title.into(), hint.into(), screen_time_actions())];
+                }
+                rows.extend(found);
+                rows
+            }
+        }
+    }
+
+    /// Screen Time's right-hand pane: the selected row's numbers, the span's on the header row.
+    fn screen_time_detail(&self, t: &Tokens) -> gpui::AnyElement {
+        let Some(Ok(stats)) = &self.st_stats else { return div().flex_1().into_any_element() };
+        let row = self.items.get(self.selected).and_then(|it| wellbeing::rows(stats).into_iter().find(|r| Some(r.section) == it.section.as_deref() && r.name == it.title));
+        div().id("screen-time-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col().children(info_rows(&wellbeing::detail(stats, row.as_ref()), t)).into_any_element()
+    }
+
+    /// Move to Category…: a menu of the categories; the pick files `name` there.
+    fn open_category_menu(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = focus::categories(&self.cfg.focus_category).into_iter().map(|c| menu::Entry { icon: Some(focus::category_icon(&c.name)), id: c.name.clone(), label: c.name, ..Default::default() }).collect();
+        let m = menu::Menu::new(entries, Some("Search…".into()), menu::Place::Right);
+        self.open_menu(m, move |this, category, _, cx| this.move_to_category(name.clone(), category, cx), window, cx);
+    }
+
+    /// Writes the move to config.toml off the UI thread, then reads the span again with the new
+    /// categories (the config poll takes a moment to hand them over).
+    fn move_to_category(&mut self, name: String, category: String, cx: &mut Context<Self>) {
+        let Mode::ScreenTime(range) = self.mode else { return };
+        let (what, to) = (name.clone(), category.clone());
+        let write = cx.background_executor().spawn(async move {
+            config::edit_file(&config::path(), |text| {
+                let cats = focus::categories(&config::parse(text)?.focus_category);
+                wellbeing::move_name(text, &cats, &name, &category)
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let done = write.await;
+            _ = this.update(cx, |this, cx| match done {
+                Ok((c, _)) => {
+                    this.status = Some((Tone::Ok, format!("Moved {what} to {to}")));
+                    if this.mode == Mode::ScreenTime(range) {
+                        this.load_screen_time(range, focus::categories(&c.focus_category), cx);
+                    }
+                    cx.notify();
+                }
+                Err(e) => {
+                    this.status = Some((Tone::Error, e));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Writes the span as a CSV in Downloads on the background executor; the answer is a toast.
+    fn export_screen_time(&mut self, cx: &mut Context<Self>) {
+        let Mode::ScreenTime(range) = self.mode else { return };
+        let Ok(home) = std::env::var("USERPROFILE") else { return self.say(Msg::error("Couldn't find your Downloads folder")) };
+        let ((from, to), tx) = (wellbeing::span(range, win::local_now().0).0, self.tx.clone());
+        let rules = wellbeing::rules(&focus::categories(&self.cfg.focus_category));
+        let name = format!("screen-time-{}-to-{}.csv", wellbeing::iso(from), wellbeing::iso(to));
+        let path = PathBuf::from(home).join("Downloads").join(&name);
+        cx.background_executor()
+            .spawn(async move {
+                let _ = wellbeing::flush_pending();
+                let done = wellbeing::open(&wellbeing::db_path())
+                    .and_then(|con| wellbeing::export_csv(&con, from, to, &rules))
+                    .map_err(|e| e.to_string())
+                    .and_then(|csv| std::fs::write(&path, csv).map_err(|e| e.to_string()));
+                let _ = tx.unbounded_send(match done {
+                    Ok(()) => Msg::done(format!("Saved {name}")),
+                    Err(e) => Msg::error(format!("Couldn't export: {e}")),
+                });
+            })
+            .detach();
+        self.set_mode(Mode::Root, cx);
+        self.hide(true, cx);
     }
 
     /// Brings up the settings window, reusing it if it's already open; on `page` when given.
@@ -5144,6 +5337,8 @@ impl Launcher {
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Notes(NotesList::All) => Some("Search Notes".into()),
             Mode::Notes(NotesList::Deleted) => Some("Recently Deleted Notes".into()),
+            Mode::ScreenTime(wellbeing::Range::Today) => Some("Screen Time".into()),
+            Mode::ScreenTime(wellbeing::Range::Week) => Some("Screen Time This Week".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -5172,6 +5367,7 @@ impl Launcher {
             Mode::Schedule => "Search events…".into(),
             Mode::Notes(NotesList::All) => "Search notes…".into(),
             Mode::Notes(NotesList::Deleted) => "Search deleted notes…".into(),
+            Mode::ScreenTime(_) => "Search categories, apps and sites…".into(),
             Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
             Mode::LanguageSets => "Search language sets…".into(),
@@ -5237,6 +5433,8 @@ impl Launcher {
             Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
             Mode::Notes(NotesList::All) => Icon::Vector(g::NOTEBOOK_TABS),
             Mode::Notes(NotesList::Deleted) => Icon::Vector(g::ARCHIVE_RESTORE),
+            Mode::ScreenTime(wellbeing::Range::Today) => Icon::Vector(g::MONITOR),
+            Mode::ScreenTime(wellbeing::Range::Week) => Icon::Vector(g::CALENDAR_CLOCK),
             Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
@@ -6052,6 +6250,9 @@ fn act_glyph(act: &Act) -> &'static str {
         Act::DeleteClip(_) | Act::UninstallExt(_) | Act::DeleteShot(_) => g::DELETE,
         Act::Install(_) | Act::DownloadDictionary(_) => g::DOWNLOAD,
         Act::Define(_) | Act::SimilarWords(_) => g::BOOK_OPEN,
+        Act::MoveToCategory(_) => g::LIST_CHECKS,
+        Act::ExportScreenTime => g::DOWNLOAD,
+        Act::EnableScreenTime => g::CHECK,
         Act::Run(_) | Act::Script(_) | Act::Cmd(_) | Act::Layout(_) | Act::ExtRun(..) => g::PLAY,
         Act::ExtSet(..) | Act::FormSet(..) => g::FILTER,
         Act::Confirm(true) => g::CHECK,
@@ -6123,6 +6324,7 @@ impl Render for Launcher {
             Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
+            Mode::ScreenTime(_) if empty.is_none() && matches!(self.st_stats, Some(Ok(_))) => Some(self.screen_time_detail(&t)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
@@ -6239,7 +6441,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate | Mode::ScreenTime(_)) { 110. } else { design::ACCESSORY_MAX };
         let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
@@ -7596,5 +7798,25 @@ mod tests {
         assert!(lines.contains(&(0, "Thinking…".to_string())), "an unanswered question shows a placeholder");
         assert!(lines.iter().any(|l| l == &(9, "fn main() {".to_string())), "code stays code");
         assert!(lines[newest..].iter().all(|l| l.0 != 9), "a cut-off code block does not swallow the next question");
+    }
+
+    #[test]
+    fn screen_time_rows_and_their_actions() {
+        let stats = json!({
+            "total": 900, "previous": 600,
+            "categories": [{"name": "Development", "seconds": 600}],
+            "apps": [{"name": "code.exe", "seconds": 600, "category": "Development"}],
+            "sites": [{"name": "youtube.com", "seconds": 200, "category": "Streaming"}]
+        });
+        let rows = screen_time_rows(wellbeing::Range::Today, &stats);
+        assert_eq!(rows[0].title, "15m today · 5m more than yesterday");
+        assert_eq!(rows.iter().map(|r| r.section.as_deref()).collect::<Vec<_>>(), [None, Some("Categories"), Some("Apps"), Some("Sites")]);
+        let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
+        assert_eq!(labels(&rows[1]), ["Open Dashboard", "Export CSV"], "a category has nothing to move");
+        assert_eq!((labels(&rows[2]), rows[2].act.clone()), (vec!["Move to Category…".into(), "Open Dashboard".into(), "Export CSV".into()], Act::MoveToCategory("code.exe".into())));
+        assert_eq!((rows[3].title.as_str(), rows[3].subtitle.as_str(), rows[3].accessory.as_str()), ("youtube.com", "Streaming", "3m"));
+        let off = screen_time_off_row();
+        assert_eq!((off.len(), labels(&off[0])), (1, vec!["Import from micro bot".to_string(), "Turn On Screen Time".into()]));
+        assert_eq!(off[0].act, Act::Cmd(Cmd::ImportScreenTime));
     }
 }

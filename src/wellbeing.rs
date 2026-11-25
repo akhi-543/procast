@@ -1,6 +1,6 @@
 //! Screen-time accounting: what a sample is worth, categories, and the weekly summary text.
 
-use crate::calendar::{civil_from_days, days_from_civil};
+use crate::calendar::{civil_from_days, days_from_civil, weekday};
 use crate::config::{FocusCategory, ScreenTime};
 use crate::{apps, browser, focus, win};
 use futures::channel::mpsc::UnboundedSender;
@@ -337,9 +337,108 @@ pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqli
     Ok(out.into_bytes())
 }
 
-/// App seconds credited on `day`; 0 if the database can't be read.
-pub fn seconds_on(con: &Connection, day: i64) -> f64 {
-    con.query_row("SELECT COALESCE(SUM(seconds), 0) FROM usage WHERE kind = 'app' AND day = ?", [iso(day)], |r| r.get(0)).unwrap_or(0.0)
+// --- the launcher's Screen Time view ------------------------------------------
+
+/// Which span the launcher's Screen Time view shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Range {
+    Today,
+    Week,
+}
+
+/// The span shown and the one it is compared with, as `(from, to)` day numbers. Today against
+/// yesterday; Monday to today against last Monday to the same weekday (a fair partial week).
+pub fn span(range: Range, today: i64) -> ((i64, i64), (i64, i64)) {
+    match range {
+        Range::Today => ((today, today), (today - 1, today - 1)),
+        Range::Week => {
+            let monday = today - weekday(today);
+            ((monday, today), (monday - 7, today - 7))
+        }
+    }
+}
+
+/// The view's first line: "15m today · 5m more than yesterday".
+pub fn header(total: u64, previous: u64, range: Range) -> String {
+    let (now, then) = match range {
+        Range::Today => ("today", "yesterday"),
+        Range::Week => ("this week", "last week"),
+    };
+    let mut text = format!("{} {now}", duration(total as f64));
+    if previous > 0 {
+        let gap = duration(total.abs_diff(previous) as f64);
+        text += &if gap == "0m" { format!(" · same as {then}") } else { format!(" · {gap} {} than {then}", if total > previous { "more" } else { "less" }) };
+    }
+    text
+}
+
+/// One line of the view: a category, app or site, with its time and category.
+pub struct Row {
+    pub section: &'static str,
+    pub name: String,
+    pub seconds: u64,
+    pub category: String,
+}
+
+/// The view's lines from `stats()`: categories, then apps, then sites, biggest first.
+pub fn rows(stats: &Value) -> Vec<Row> {
+    ["Categories", "Apps", "Sites"]
+        .into_iter()
+        .flat_map(|section| {
+            let mut part: Vec<Row> = stats[section.to_lowercase()]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    let (name, seconds) = (r["name"].as_str()?, r["seconds"].as_u64()?);
+                    Some(Row { section, name: name.into(), seconds, category: r["category"].as_str().unwrap_or(name).into() })
+                })
+                .collect();
+            part.sort_by_key(|r| std::cmp::Reverse(r.seconds));
+            part
+        })
+        .collect()
+}
+
+/// The detail pane's key / value lines for `row` (None: the whole span): its time and share,
+/// a category's time per hour (per day over a week) or an app's category, then the focus numbers.
+pub fn detail(stats: &Value, row: Option<&Row>) -> Vec<(String, String)> {
+    let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
+    let line = |k: &str, v: String| (k.to_string(), v);
+    let mut out = match row {
+        None => vec![line("Total", duration(secs("total") as f64)), line("Before", duration(secs("previous") as f64))],
+        Some(r) => {
+            let mut out = vec![line("Time", duration(r.seconds as f64))];
+            if secs("total") > 0 {
+                out.push(line("Share", format!("{}% of total", (r.seconds as f64 * 100.0 / secs("total") as f64).round())));
+            }
+            if r.section == "Categories" {
+                for b in stats["buckets"].as_array().into_iter().flatten() {
+                    let label = b["label"].as_i64().map_or_else(|| b["label"].as_str().unwrap_or_default().to_string(), |h| format!("{h:02}:00"));
+                    out.extend(b["categories"][&r.name].as_u64().map(|s| line(&label, duration(s as f64))));
+                }
+            } else {
+                out.push(line("Category", r.category.clone()));
+            }
+            out
+        }
+    };
+    out.extend(focus_lines(stats));
+    out
+}
+
+/// The focus numbers of `stats` (none for a span with no tracked day).
+fn focus_lines(stats: &Value) -> Vec<(String, String)> {
+    let f = &stats["focus"];
+    if f["days"].as_u64().unwrap_or(0) == 0 {
+        return vec![];
+    }
+    let day = stats["from"] == stats["to"];
+    let mut out = vec![("Switches".to_string(), f["switches"].as_u64().unwrap_or(0).to_string()), ("Longest focus".into(), duration(f["longest"].as_u64().unwrap_or(0) as f64))];
+    for (key, label) in [("first", if day { "First active" } else { "Earliest start" }), ("last", if day { "Last active" } else { "Latest end" })] {
+        out.extend(f[key].as_str().map(|t| (label.to_string(), t.to_string())));
+    }
+    out
 }
 
 // --- categories, settings, files --------------------------------------------
@@ -676,17 +775,9 @@ pub static TAB: RwLock<Option<Tab>> = RwLock::new(None);
 
 /// Counters not yet on disk: the sampler adds, `flush_pending` writes.
 static PENDING: LazyLock<Mutex<Pending>> = LazyLock::new(Mutex::default);
-/// App seconds credited today, for the tray and the Screen Time command.
-static TODAY: Mutex<f64> = Mutex::new(0.0);
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// App seconds credited today, live (not waiting for a flush).
-#[allow(dead_code)] // Task 8 (Screen Time command)
-pub fn today_seconds() -> f64 {
-    *locked(&TODAY)
 }
 
 /// Write the pending counters to the database; they are kept for the next try if that fails.
@@ -729,7 +820,7 @@ fn idle_seconds() -> f64 {
 /// every `FLUSH` write it down, once a day back the database up. Ends when `stop` fires or is dropped.
 fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers, tx: UnboundedSender<win::Msg>, rules: Arc<RwLock<Rules>>, st: Arc<RwLock<ScreenTime>>) {
     let mut streak = Streak::default();
-    let (mut today, mut tidied) = (i64::MIN, i64::MIN);
+    let mut tidied = i64::MIN;
     let mut last = Instant::now();
     let mut last_flush = last;
     while stop.recv_timeout(POLL) == Err(RecvTimeoutError::Timeout) {
@@ -737,10 +828,6 @@ fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers, tx: UnboundedSende
         let dt = now.duration_since(last).as_secs_f64();
         last = now;
         let (day, hour, minute) = win::local_now();
-        if day != today {
-            today = day;
-            *locked(&TODAY) = open(&db_path()).map_or(0.0, |con| seconds_on(&con, day));
-        }
         let exe = foreground_exe();
         let (site, audible) = if BROWSERS.contains(&exe.as_str()) {
             // The answer lands in TAB for the next sample (a 2 s lag, accepted).
@@ -753,9 +840,6 @@ fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers, tx: UnboundedSende
         let credits = account(&exe, idle_seconds(), &site, audible, dt);
         let switched = streak.advance(credits.first().map_or("", |c| c.1.as_str()), dt);
         locked(&PENDING).credit(day, hour, &minute, &credits, switched, streak.seconds);
-        if !credits.is_empty() {
-            *locked(&TODAY) += dt;
-        }
         if now.duration_since(last_flush) >= FLUSH {
             last_flush = now;
             // A locked database must not stop the tracking: the counters stay and this runs again.
@@ -882,6 +966,11 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// App seconds credited on `day`.
+    fn seconds_on(con: &Connection, day: i64) -> f64 {
+        con.query_row("SELECT COALESCE(SUM(seconds), 0) FROM usage WHERE kind = 'app' AND day = ?", [iso(day)], |r| r.get(0)).unwrap()
     }
 
     fn mem() -> Connection {
@@ -1270,6 +1359,79 @@ mod tests {
         assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-10-19"));
         insert(&con, &[("2026-10-22", 9, "app", "code.exe", 3600.0)]);
         assert_eq!(weekly_summary(&con, monday + 21, &rules, true).as_deref(), Some("Last week 1h 0m, 50% less. Most: Development"));
+    }
+
+    #[test]
+    fn rows_from_stats() {
+        let d = parse_iso("2026-09-30").unwrap();
+        let s = stats(&fixture(), d, d, span(Range::Today, d).1, &rules()).unwrap();
+        let got: Vec<_> = rows(&s).into_iter().map(|r| (r.section, r.name, r.seconds, r.category)).collect();
+        let row = |s, n: &str, secs, c: &str| (s, n.to_string(), secs, c.to_string());
+        assert_eq!(
+            got,
+            [
+                row("Categories", "Development", 600, "Development"),
+                row("Categories", "Streaming", 200, "Streaming"),
+                row("Categories", "Browsing", 100, "Browsing"),
+                row("Apps", "code.exe", 600, "Development"),
+                row("Apps", "chrome.exe", 300, "Browsing"),
+                row("Sites", "youtube.com", 200, "Streaming"),
+            ]
+        );
+        let unsorted = rows(&json!({"categories": [{"name": "A", "seconds": 1}, {"name": "B", "seconds": 5}]}));
+        assert_eq!(unsorted.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["B", "A"], "biggest first");
+        assert!(rows(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn header_compares_with_the_span_before() {
+        assert_eq!(header(900, 300, Range::Today), "15m today · 10m more than yesterday");
+        assert_eq!(header(900, 600, Range::Today), "15m today · 5m more than yesterday");
+        assert_eq!(header(600, 900, Range::Week), "10m this week · 5m less than last week");
+        assert_eq!(header(600, 610, Range::Today), "10m today · same as yesterday");
+        assert_eq!(header(600, 0, Range::Today), "10m today", "nothing before to compare with");
+        assert_eq!(header(0, 0, Range::Week), "0m this week");
+    }
+
+    #[test]
+    fn week_compares_same_weekdays() {
+        let day = |s| parse_iso(s).unwrap();
+        // Wednesday: Monday to Wednesday against last Monday to Wednesday
+        let ((from, to), before) = span(Range::Week, day("2026-09-30"));
+        assert_eq!((iso(from), iso(to)), ("2026-09-28".into(), "2026-09-30".into()));
+        assert_eq!((iso(before.0), iso(before.1)), ("2026-09-21".into(), "2026-09-23".into()));
+        // Monday: the week is one day
+        let (week, before) = span(Range::Week, day("2026-09-28"));
+        assert_eq!((week.0, before), (week.1, (week.0 - 7, week.1 - 7)));
+        // Sunday: the whole week against the whole week before
+        let (week, before) = span(Range::Week, day("2026-10-04"));
+        assert_eq!((iso(week.0), iso(before.0), iso(before.1)), ("2026-09-28".into(), "2026-09-21".into(), "2026-09-27".into()));
+        assert_eq!(span(Range::Today, day("2026-09-30")), ((day("2026-09-30"), day("2026-09-30")), (day("2026-09-29"), day("2026-09-29"))));
+    }
+
+    #[test]
+    fn detail_for_a_row_and_the_whole_span() {
+        let (con, rules) = (fixture(), rules());
+        con.execute("INSERT INTO daily VALUES('2026-09-30', 12, 3000.0, '09:05', '17:40')", []).unwrap();
+        let d = parse_iso("2026-09-30").unwrap();
+        let s = stats(&con, d, d, span(Range::Today, d).1, &rules).unwrap();
+        let by = |section, name: &str| rows(&s).into_iter().find(|r| r.section == section && r.name == name);
+        let text = |v: Vec<(String, String)>| v.into_iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>();
+        let focus = ["Switches: 12", "Longest focus: 50m", "First active: 09:05", "Last active: 17:40"];
+        let dev = text(detail(&s, by("Categories", "Development").as_ref()));
+        assert_eq!(dev[..3], ["Time: 10m", "Share: 67% of total", "09:00: 10m"]);
+        assert_eq!(dev[3..], focus);
+        let chrome = text(detail(&s, by("Apps", "chrome.exe").as_ref()));
+        assert_eq!(chrome[..3], ["Time: 5m", "Share: 33% of total", "Category: Browsing"]);
+        assert_eq!(text(detail(&s, None))[..2], ["Total: 15m", "Before: 2m"]);
+        // no per-day focus rows: nothing about focus
+        let none = stats(&con, d - 5, d - 5, span(Range::Today, d - 5).1, &rules).unwrap();
+        assert_eq!(text(detail(&none, None)), ["Total: 0m", "Before: 0m"]);
+        // a week labels its buckets by day and calls the focus times what they are
+        let mon = d - 2;
+        let w = stats(&con, mon, d, span(Range::Week, d).1, &rules).unwrap();
+        let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development")));
+        assert!(dev.contains(&"2026-09-30: 10m".to_string()) && dev.contains(&"Earliest start: 09:05".to_string()), "{dev:?}");
     }
 
     #[test]
