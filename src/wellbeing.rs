@@ -400,9 +400,25 @@ pub fn rows(stats: &Value) -> Vec<Row> {
         .collect()
 }
 
+/// Seconds per hour of one day for each app and site (what `stats()` keeps only per category).
+pub type Hours = HashMap<(Kind, String), [f64; 24]>;
+
+pub fn hours_by_name(con: &Connection, day: i64) -> rusqlite::Result<Hours> {
+    let mut out = Hours::new();
+    let mut q = con.prepare("SELECT kind, name, hour, SUM(seconds) FROM usage WHERE day = ? GROUP BY kind, name, hour")?;
+    for row in q.query_map([iso(day)], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, f64>(3)?)))? {
+        let (kind, name, hour, seconds) = row?;
+        if let Some(h) = out.entry((if kind == "app" { Kind::App } else { Kind::Site }, name)).or_insert([0.0; 24]).get_mut(usize::try_from(hour).unwrap_or(usize::MAX)) {
+            *h += seconds;
+        }
+    }
+    Ok(out)
+}
+
 /// The detail pane's key / value lines for `row` (None: the whole span): its time and share,
-/// a category's time per hour (per day over a week) or an app's category, then the focus numbers.
-pub fn detail(stats: &Value, row: Option<&Row>) -> Vec<(String, String)> {
+/// its time per hour (per day over a week, for categories), an app's category, then the focus
+/// numbers. `hours` has the per-hour numbers of apps and sites when the span is one day.
+pub fn detail(stats: &Value, row: Option<&Row>, hours: &Hours) -> Vec<(String, String)> {
     let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
     let line = |k: &str, v: String| (k.to_string(), v);
     let mut out = match row {
@@ -419,6 +435,12 @@ pub fn detail(stats: &Value, row: Option<&Row>) -> Vec<(String, String)> {
                 }
             } else {
                 out.push(line("Category", r.category.clone()));
+                let kind = if r.section == "Apps" { Kind::App } else { Kind::Site };
+                for (h, s) in hours.get(&(kind, r.name.clone())).into_iter().flatten().enumerate() {
+                    if s.round() > 0.0 {
+                        out.push(line(&format!("{h:02}:00"), duration(*s)));
+                    }
+                }
             }
             out
         }
@@ -1410,27 +1432,47 @@ mod tests {
     }
 
     #[test]
+    fn hours_by_name_sums_a_day_per_hour() {
+        let con = fixture();
+        insert(&con, &[("2026-09-30", 14, "app", "code.exe", 30.5), ("2026-09-30", 14, "site", "code.exe", 7.0)]);
+        let hours = hours_by_name(&con, parse_iso("2026-09-30").unwrap()).unwrap();
+        let code = hours[&(Kind::App, "code.exe".to_string())];
+        assert_eq!((code[9], code[14], code.iter().sum::<f64>()), (600.0, 30.5, 630.5), "other days and kinds stay out");
+        assert_eq!(hours[&(Kind::Site, "youtube.com".to_string())][9], 200.0);
+        assert_eq!(hours[&(Kind::Site, "code.exe".to_string())][14], 7.0);
+        assert!(hours_by_name(&con, parse_iso("2026-09-01").unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
     fn detail_for_a_row_and_the_whole_span() {
         let (con, rules) = (fixture(), rules());
         con.execute("INSERT INTO daily VALUES('2026-09-30', 12, 3000.0, '09:05', '17:40')", []).unwrap();
         let d = parse_iso("2026-09-30").unwrap();
         let s = stats(&con, d, d, span(Range::Today, d).1, &rules).unwrap();
+        let none_hours = Hours::new();
         let by = |section, name: &str| rows(&s).into_iter().find(|r| r.section == section && r.name == name);
         let text = |v: Vec<(String, String)>| v.into_iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>();
         let focus = ["Switches: 12", "Longest focus: 50m", "First active: 09:05", "Last active: 17:40"];
-        let dev = text(detail(&s, by("Categories", "Development").as_ref()));
+        let dev = text(detail(&s, by("Categories", "Development").as_ref(), &none_hours));
         assert_eq!(dev[..3], ["Time: 10m", "Share: 67% of total", "09:00: 10m"]);
         assert_eq!(dev[3..], focus);
-        let chrome = text(detail(&s, by("Apps", "chrome.exe").as_ref()));
+        let chrome = text(detail(&s, by("Apps", "chrome.exe").as_ref(), &none_hours));
         assert_eq!(chrome[..3], ["Time: 5m", "Share: 33% of total", "Category: Browsing"]);
-        assert_eq!(text(detail(&s, None))[..2], ["Total: 15m", "Before: 2m"]);
+        assert_eq!(chrome[3..], focus, "no hours read: only the focus numbers follow");
+        let hours = hours_by_name(&con, d).unwrap();
+        let chrome = text(detail(&s, by("Apps", "chrome.exe").as_ref(), &hours));
+        assert_eq!(chrome[..4], ["Time: 5m", "Share: 33% of total", "Category: Browsing", "09:00: 5m"]);
+        assert_eq!(chrome[4..], focus);
+        let site = text(detail(&s, by("Sites", "youtube.com").as_ref(), &hours));
+        assert_eq!(site[..4], ["Time: 3m", "Share: 22% of total", "Category: Streaming", "09:00: 3m"]);
+        assert_eq!(text(detail(&s, None, &hours))[..2], ["Total: 15m", "Before: 2m"]);
         // no per-day focus rows: nothing about focus
         let none = stats(&con, d - 5, d - 5, span(Range::Today, d - 5).1, &rules).unwrap();
-        assert_eq!(text(detail(&none, None)), ["Total: 0m", "Before: 0m"]);
+        assert_eq!(text(detail(&none, None, &none_hours)), ["Total: 0m", "Before: 0m"]);
         // a week labels its buckets by day and calls the focus times what they are
         let mon = d - 2;
         let w = stats(&con, mon, d, span(Range::Week, d).1, &rules).unwrap();
-        let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development")));
+        let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development"), &none_hours));
         assert!(dev.contains(&"2026-09-30: 10m".to_string()) && dev.contains(&"Earliest start: 09:05".to_string()), "{dev:?}");
     }
 

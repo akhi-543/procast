@@ -982,6 +982,8 @@ struct Launcher {
     /// `Mode::ScreenTime`: the span's stats once read (None until then), and the read's number
     /// (older answers are dropped).
     st_stats: Option<Result<Value, String>>,
+    /// Its apps' and sites' time per hour, when the span is one day.
+    st_hours: wellbeing::Hours,
     st_gen: u64,
     matcher: Matcher,
     mode: Mode,
@@ -1204,6 +1206,7 @@ impl Launcher {
             note_rows: None,
             note_gen: 0,
             st_stats: None,
+            st_hours: Default::default(),
             st_gen: 0,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
@@ -4722,7 +4725,9 @@ impl Launcher {
         let read = cx.background_executor().spawn(async move {
             let _ = wellbeing::flush_pending();
             let con = wellbeing::open(&wellbeing::db_path()).map_err(|e| e.to_string())?;
-            wellbeing::stats(&con, span.0, span.1, before, &rules).map_err(|e| e.to_string())
+            let stats = wellbeing::stats(&con, span.0, span.1, before, &rules).map_err(|e| e.to_string())?;
+            let hours = if span.0 == span.1 { wellbeing::hours_by_name(&con, span.0).map_err(|e| e.to_string())? } else { Default::default() };
+            Ok((stats, hours))
         });
         cx.spawn(async move |this, cx| {
             let r = read.await;
@@ -4731,11 +4736,15 @@ impl Launcher {
         .detach();
     }
 
-    fn screen_time_loaded(&mut self, range: wellbeing::Range, generation: u64, r: Result<Value, String>, cx: &mut Context<Self>) {
+    fn screen_time_loaded(&mut self, range: wellbeing::Range, generation: u64, r: Result<(Value, wellbeing::Hours), String>, cx: &mut Context<Self>) {
         if self.st_gen != generation || self.mode != Mode::ScreenTime(range) {
             return;
         }
-        self.st_stats = Some(r);
+        let (stats, hours) = match r {
+            Ok((stats, hours)) => (Ok(stats), hours),
+            Err(e) => (Err(e), Default::default()),
+        };
+        (self.st_stats, self.st_hours) = (Some(stats), hours);
         if self.confirm.is_none() {
             let q = self.query(cx);
             self.items = self.screen_time_items(range, &q);
@@ -4769,7 +4778,7 @@ impl Launcher {
     fn screen_time_detail(&self, t: &Tokens) -> gpui::AnyElement {
         let Some(Ok(stats)) = &self.st_stats else { return div().flex_1().into_any_element() };
         let row = self.items.get(self.selected).and_then(|it| wellbeing::rows(stats).into_iter().find(|r| Some(r.section) == it.section.as_deref() && r.name == it.title));
-        div().id("screen-time-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col().children(info_rows(&wellbeing::detail(stats, row.as_ref()), t)).into_any_element()
+        div().id("screen-time-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col().children(info_rows(&wellbeing::detail(stats, row.as_ref(), &self.st_hours), t)).into_any_element()
     }
 
     /// Move to Category…: a menu of the categories; the pick files `name` there.
