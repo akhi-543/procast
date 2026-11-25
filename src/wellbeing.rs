@@ -364,6 +364,43 @@ pub fn rules(cats: &[FocusCategory]) -> Rules {
     rules
 }
 
+/// Moves an app (`.exe`) or site out of every category into `category`, returning the new
+/// config.toml text. Each category that changes is written as a `[[focus_category]]` override
+/// (a built-in becomes one), so comments elsewhere stay. `Other` holds an explicit entry that
+/// beats a broader suffix rule (m.example.com vs example.com).
+#[allow(dead_code)] // Task 7 (dashboard server)
+pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str) -> Result<String, String> {
+    let name = name.trim().to_lowercase();
+    if name.is_empty() || name.chars().count() > 260 || name.chars().any(char::is_control) {
+        return Err("bad name".into());
+    }
+    let target = focus::category(cats, category).ok_or("unknown category")?.name.clone();
+    let is_app = name.ends_with(".exe");
+    let norm: fn(&str) -> String = if is_app { focus::norm_app } else { focus::norm_site };
+    let key = norm(&name);
+    let mut changed = Vec::new();
+    for old in cats {
+        let mut c = old.clone();
+        let list = if is_app { &mut c.apps } else { &mut c.sites };
+        list.retain(|n| norm(n) != key);
+        if c.name == target {
+            if is_app { c.apps.push(key.clone()) } else { c.sites.push(key.clone()) }
+        }
+        if c != *old {
+            changed.push(c);
+        }
+    }
+    let text = focus::add_categories(text, &changed)?.0; // creates the overrides that are missing
+    let own = crate::config::parse(&text)?.focus_category;
+    let array = |l: &[String]| toml_edit::Value::from(toml_edit::Array::from_iter(l.iter().map(String::as_str)));
+    changed.iter().try_fold(text, |text, c| {
+        let i = own.iter().position(|o| o.name.eq_ignore_ascii_case(&c.name)).ok_or("category override missing")?;
+        let path = |field: &str| ["focus_category".to_string(), i.to_string(), field.to_string()];
+        let text = crate::config::write_value(&text, &path("apps"), array(&c.apps))?;
+        crate::config::write_value(&text, &path("sites"), array(&c.sites))
+    })
+}
+
 /// `{category: "productive" | "distracting"}`; anything unlisted is neutral.
 #[allow(dead_code)] // Task 7 (dashboard server)
 pub fn kinds(st: &ScreenTime) -> Value {
@@ -818,6 +855,46 @@ mod tests {
         assert_eq!((rows(&copied), rows(&con)), (4, 5));
         drop(copied);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cfg_of(text: &str) -> Vec<FocusCategory> {
+        focus::categories(&crate::config::parse(text).unwrap().focus_category)
+    }
+
+    fn holders(cats: &[FocusCategory], name: &str) -> Vec<String> {
+        cats.iter().filter(|c| c.apps.iter().chain(&c.sites).any(|n| n == name)).map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn move_name_rewrites_categories() {
+        let text = "# keep me\n";
+        let moved = move_name(text, &cfg_of(text), "YouTube.com", "Development").unwrap();
+        let cats = cfg_of(&moved);
+        assert_eq!(holders(&cats, "youtube.com"), ["Development"]);
+        assert!(moved.contains("# keep me"), "comments survive");
+        assert!(moved.contains("[[focus_category]]"), "built-ins touched become overrides");
+        assert!(focus::category(&cats, "Streaming").unwrap().sites.contains(&"netflix.com".to_string()), "the rest of the category stays");
+        // an app moves too, and Other holds explicit entries
+        let moved = move_name(&moved, &cats, "spotify.exe", "Other").unwrap();
+        let cats = cfg_of(&moved);
+        assert_eq!(holders(&cats, "spotify.exe"), ["Other"]);
+        assert_eq!(holders(&cats, "youtube.com"), ["Development"], "earlier moves stay");
+        // moving again rewrites the existing override instead of adding another
+        let moved = move_name(&moved, &cats, "youtube.com", "Streaming").unwrap();
+        assert_eq!(holders(&cfg_of(&moved), "youtube.com"), ["Streaming"]);
+        assert_eq!(moved.matches("name = \"Streaming\"").count(), 1);
+        // without .exe it is a site
+        let moved = move_name("", &cfg_of(""), "m.example.com", "Other").unwrap();
+        assert!(focus::category(&cfg_of(&moved), "Other").unwrap().sites.contains(&"m.example.com".to_string()));
+    }
+
+    #[test]
+    fn move_name_rejects_bad_input() {
+        let cats = cfg_of("");
+        assert_eq!(move_name("", &cats, "x", "Nope"), Err("unknown category".into()));
+        for bad in ["", "   ", &"a".repeat(261), "a\nb", "a\u{7}b"] {
+            assert_eq!(move_name("", &cats, bad, "Other"), Err("bad name".into()), "{bad:?}");
+        }
     }
 
     #[test]
