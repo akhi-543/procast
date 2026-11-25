@@ -895,6 +895,10 @@ struct Launcher {
     /// Program icons by path, so the running list fills in at once next time.
     exe_icons: HashMap<String, Option<Arc<RenderImage>>>,
     autoquit: apps::AutoQuit,
+    /// The Screen Time sampler while `[screen_time] enabled`, with the settings it shares.
+    tracker: Option<wellbeing::Tracker>,
+    st_rules: Arc<RwLock<wellbeing::Rules>>,
+    st_cfg: Arc<RwLock<config::ScreenTime>>,
     /// Running timers and stopwatches, and the flag that stops the 1 s tick thread (present
     /// only while something runs).
     timers: timers::Timers,
@@ -1084,6 +1088,9 @@ impl Launcher {
         let browsers = browser::serve(tx.clone());
         let auto_hdr = hdr::Auto::start(tx.clone());
         let notes = Notes::start(cfg.notes.dir(), cx);
+        let st_rules = Arc::new(RwLock::new(wellbeing::rules(&focus::categories(&cfg.focus_category))));
+        let st_cfg = Arc::new(RwLock::new(cfg.screen_time.clone()));
+        let tracker = cfg.screen_time.enabled.then(|| wellbeing::Tracker::start(tx.clone(), browsers.clone(), st_rules.clone(), st_cfg.clone()));
         let mut this = Self {
             input,
             hotkeys: {
@@ -1108,6 +1115,9 @@ impl Launcher {
             media: None,
             exe_icons: HashMap::new(),
             autoquit: apps::AutoQuit::default(),
+            tracker,
+            st_rules,
+            st_cfg,
             timers: timers::Timers::load(config::dir().join("timers.json")),
             timer_tick: None,
             focus: focus::Focus::load(config::dir().join("focus.json")),
@@ -4287,7 +4297,7 @@ impl Launcher {
             }
             Act::Cmd(Cmd::EditConfig) => win::open(&config::path().to_string_lossy()),
             Act::Cmd(Cmd::ReloadApps) => self.scan_apps(true, true),
-            Act::Cmd(Cmd::Quit) => return cx.quit(),
+            Act::Cmd(Cmd::Quit) => return self.quit(cx),
             Act::Layout(name) => {
                 self.hide(true, cx);
                 let Some(layout) = self.cfg.window.layouts.iter().find(|l| l.name == name).cloned() else { return };
@@ -4703,6 +4713,28 @@ impl Launcher {
         });
     }
 
+    /// Quit, writing Screen Time's last seconds first.
+    fn quit(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.tracker.take() {
+            t.stop();
+        }
+        cx.quit()
+    }
+
+    /// New `[screen_time]` and categories for the sampler; starts or stops it when `enabled` flips.
+    fn reload_screen_time(&mut self, cfg: &Config) {
+        if cfg.focus_category != self.cfg.focus_category {
+            *self.st_rules.write().unwrap_or_else(|e| e.into_inner()) = wellbeing::rules(&focus::categories(&cfg.focus_category));
+        }
+        *self.st_cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg.screen_time.clone();
+        match (cfg.screen_time.enabled, self.tracker.is_some()) {
+            (true, false) => self.tracker = Some(wellbeing::Tracker::start(self.tx.clone(), self.browsers.clone(), self.st_rules.clone(), self.st_cfg.clone())),
+            // Off the UI thread: the last write goes to SQLite.
+            (false, true) => drop(self.tracker.take().map(|t| std::thread::spawn(move || t.stop()))),
+            _ => {}
+        }
+    }
+
     /// The caller refreshes the glass decision first (it holds the window, for the backdrop).
     fn reload(&mut self, cx: &mut Context<Self>) {
         match config::load() {
@@ -4767,6 +4799,7 @@ impl Launcher {
                     }));
                 }
                 self.scripts = scripts::scan(&cfg.scripts.dirs());
+                self.reload_screen_time(&cfg);
                 self.cfg = cfg;
                 self.music_tray_sync();
                 self.notice = None;
@@ -4799,7 +4832,7 @@ impl Launcher {
             Msg::Hud(hud::Click::Complete) => self.focus_end(true, cx),
             Msg::Tray(TrayCmd::Settings) => self.open_settings(None, cx),
             Msg::Tray(TrayCmd::EditConfig) => win::open(&config::path().to_string_lossy()),
-            Msg::Tray(TrayCmd::Quit) => cx.quit(),
+            Msg::Tray(TrayCmd::Quit) => self.quit(cx),
             Msg::Apps(apps) => {
                 self.apps = apps;
                 self.rebuild_catalog(cx);
@@ -7471,16 +7504,16 @@ mod tests {
         let mut entries = block_entries(&cats, &apps, &picks);
         let m = menu::Menu::new(entries.clone(), Some("Search…".into()), menu::Place::Right);
         assert_eq!(m.rows()[0], menu::Row::Header("Focus Categories"));
-        assert_eq!(entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Streaming", "Travel", "News", "Shopping", "Gaming", "Discord"], "picked ones leave the menu");
-        assert_eq!((entries[0].id.as_str(), entries[0].icon, entries[5].id.as_str(), entries[5].section.as_deref()), ("cat:Streaming", Some(g::CIRCLE_PLAY), "app:discord.exe", Some("Applications")));
+        assert_eq!(entries.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["Streaming", "Travel", "News", "Shopping", "Gaming", "Development", "Productivity", "Browsing", "Other", "Discord"], "picked ones leave the menu");
+        assert_eq!((entries[0].id.as_str(), entries[0].icon, entries[9].id.as_str(), entries[9].section.as_deref()), ("cat:Streaming", Some(g::CIRCLE_PLAY), "app:discord.exe", Some("Applications")));
         site_lead(&mut entries, "Block", "Reddit.com");
         assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].always), ("Block reddit.com", "site:reddit.com", true));
         site_lead(&mut entries, "Allow", "x.com");
-        assert_eq!((entries[0].label.as_str(), entries.len()), ("Allow x.com", 7), "the typed row is replaced, never stacked");
+        assert_eq!((entries[0].label.as_str(), entries.len()), ("Allow x.com", 11), "the typed row is replaced, never stacked");
         site_lead(&mut entries, "Block", "Steam.exe");
         assert_eq!((entries[0].label.as_str(), entries[0].id.as_str(), entries[0].icon), ("Block steam.exe", "app:steam.exe", Some(g::APP)), "a program, never a website");
         site_lead(&mut entries, "Block", "news");
-        assert_eq!(entries.len(), 6, "not a website: no row");
+        assert_eq!(entries.len(), 10, "not a website: no row");
     }
 
     #[test]

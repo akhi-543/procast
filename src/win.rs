@@ -696,6 +696,12 @@ pub fn local_date_time() -> (String, String) {
     (format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay), format!("{:02}:{:02}", t.wHour, t.wMinute))
 }
 
+/// Local time as (days since 1970-01-01, hour, "HH:MM"): what the Screen Time sampler files a sample under.
+pub fn local_now() -> (i64, u8, String) {
+    let t = unsafe { GetLocalTime() };
+    (crate::calendar::days_from_civil(t.wYear.into(), t.wMonth.into(), t.wDay.into()), t.wHour as u8, format!("{:02}:{:02}", t.wHour, t.wMinute))
+}
+
 /// Unix seconds as "YYYY-MM-DD HH:MM" in local time.
 pub fn local_time_of(unix: u64) -> String {
     use windows::Win32::{Foundation::FILETIME, System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime}};

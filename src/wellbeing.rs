@@ -1,12 +1,24 @@
-// ponytail: removed once the sampler (Task 3) uses everything
-#![allow(dead_code)]
 //! Screen-time accounting: what a sample is worth, categories, and the weekly summary text.
 
 use crate::calendar::{civil_from_days, days_from_civil};
-use rusqlite::{Connection, OptionalExtension};
+use crate::config::{FocusCategory, ScreenTime};
+use crate::{apps, browser, focus, win};
+use futures::channel::mpsc::UnboundedSender;
+use rusqlite::{Connection, MAIN_DB, OptionalExtension};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use windows::Win32::{
+    System::SystemInformation::GetTickCount,
+    UI::{
+        Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+        WindowsAndMessaging::GetWindowThreadProcessId,
+    },
+};
 
 /// A sample later than this means the machine slept; discard it.
 const GAP_S: f64 = 10.0;
@@ -14,6 +26,10 @@ const GAP_S: f64 = 10.0;
 const IDLE_S: f64 = 120.0;
 const BROWSERS: [&str; 5] = ["chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe"];
 const IGNORED: [&str; 2] = ["", "lockapp.exe"];
+const POLL: Duration = Duration::from_secs(2);
+const FLUSH: Duration = Duration::from_secs(30);
+/// Daily database copies kept.
+const BACKUPS: usize = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -89,6 +105,7 @@ pub fn duration(seconds: f64) -> String {
 }
 
 /// The weekly toast body, short enough for a toast.
+#[allow(dead_code)] // Task 6 (weekly summary)
 pub fn summary_text(total: u64, previous: u64, top: &str) -> String {
     let mut text = format!("Last week {}", duration(total as f64));
     if previous > 0 {
@@ -198,6 +215,7 @@ pub fn flush(con: &mut Connection, p: &mut Pending) -> rusqlite::Result<()> {
 }
 
 /// The span of the same length just before `from..=to`.
+#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn prior(from: i64, to: i64) -> (i64, i64) {
     let len = to - from + 1;
     (from - len, from - 1)
@@ -249,6 +267,7 @@ fn by_category(buckets: &[Seconds]) -> Seconds {
 }
 
 /// Stats for `from..=to`, compared with the `before` span.
+#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn stats(con: &Connection, from: i64, to: i64, before: (i64, i64), rules: &Rules) -> rusqlite::Result<Value> {
     let hourly = from == to;
     let (buckets, apps, sites) = aggregate(con, from, to, rules, hourly)?;
@@ -296,6 +315,7 @@ pub fn stats(con: &Connection, from: i64, to: i64, before: (i64, i64), rules: &R
 }
 
 /// `{"days": {iso day: {category: seconds}}}`
+#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn days(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqlite::Result<Value> {
     let (buckets, _, _) = aggregate(con, from, to, rules, false)?;
     let days: serde_json::Map<String, Value> = buckets.iter().enumerate().map(|(i, b)| (iso(from + i as i64), json!(clean(b)))).collect();
@@ -307,6 +327,7 @@ fn csv_field(s: &str) -> String {
 }
 
 /// One CSV row per counter, UTF-8 with a BOM so Excel reads it right.
+#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqlite::Result<Vec<u8>> {
     let mut out = String::from("\u{feff}day,hour,kind,name,category,seconds\r\n");
     let mut q = con.prepare("SELECT day, hour, kind, name, seconds FROM usage WHERE day BETWEEN ? AND ? ORDER BY day, hour, kind, name")?;
@@ -324,6 +345,191 @@ pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqli
 /// App seconds credited on `day`; 0 if the database can't be read.
 pub fn seconds_on(con: &Connection, day: i64) -> f64 {
     con.query_row("SELECT COALESCE(SUM(seconds), 0) FROM usage WHERE kind = 'app' AND day = ?", [iso(day)], |r| r.get(0)).unwrap_or(0.0)
+}
+
+// --- categories, settings, files --------------------------------------------
+
+/// The classification rules: every app and site of the categories, lower case; a name in two
+/// categories belongs to the first. `Other`'s entries override a broader suffix rule.
+pub fn rules(cats: &[FocusCategory]) -> Rules {
+    let mut rules = Rules::new();
+    for c in cats {
+        let name = if c.name.eq_ignore_ascii_case("other") { "Other" } else { c.name.as_str() };
+        let apps = c.apps.iter().map(|a| focus::norm_app(a));
+        let sites = c.sites.iter().map(|s| focus::norm_site(s));
+        for key in apps.chain(sites).filter(|k| !k.is_empty()) {
+            rules.entry(key).or_insert_with(|| name.to_string());
+        }
+    }
+    rules
+}
+
+/// `{category: "productive" | "distracting"}`; anything unlisted is neutral.
+#[allow(dead_code)] // Task 7 (dashboard server)
+pub fn kinds(st: &ScreenTime) -> Value {
+    let mut out = serde_json::Map::new();
+    for (list, kind) in [(&st.productive, "productive"), (&st.distracting, "distracting")] {
+        for c in list {
+            out.insert(c.clone(), json!(kind));
+        }
+    }
+    Value::Object(out)
+}
+
+pub fn db_path() -> PathBuf {
+    crate::config::dir().join("screentime.db")
+}
+
+fn backups_dir() -> PathBuf {
+    crate::config::dir().join("screentime-backups")
+}
+
+/// One copy of the database per day in `folder` (the SQLite backup API, so it is consistent
+/// while the sampler writes); the newest `BACKUPS` are kept.
+pub fn backup(con: &Connection, folder: &Path, day: i64) -> rusqlite::Result<()> {
+    let io = |e: std::io::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(e));
+    std::fs::create_dir_all(folder).map_err(io)?;
+    let target = folder.join(format!("data-{}.db", iso(day)));
+    if !target.exists() {
+        // Copied under another name, so a failed copy is never taken for the day's backup.
+        let partial = target.with_extension("tmp");
+        con.backup(MAIN_DB, &partial, None)?;
+        std::fs::rename(&partial, &target).map_err(io)?;
+    }
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(folder)
+        .map_err(io)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("data-") && n.ends_with(".db")))
+        .collect();
+    copies.sort();
+    for old in &copies[..copies.len().saturating_sub(BACKUPS)] {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(())
+}
+
+// --- sampler ------------------------------------------------------------------
+
+/// The active tab of the browser in front, as the browser extension last reported it.
+pub struct Tab {
+    pub host: String,
+    pub audible: bool,
+}
+
+pub static TAB: RwLock<Option<Tab>> = RwLock::new(None);
+
+/// Counters not yet on disk: the sampler adds, `flush_pending` writes.
+static PENDING: LazyLock<Mutex<Pending>> = LazyLock::new(Mutex::default);
+/// App seconds credited today, for the tray and the Screen Time command.
+static TODAY: Mutex<f64> = Mutex::new(0.0);
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// App seconds credited today, live (not waiting for a flush).
+#[allow(dead_code)] // Task 8 (Screen Time command)
+pub fn today_seconds() -> f64 {
+    *locked(&TODAY)
+}
+
+/// Write the pending counters to the database; they are kept for the next try if that fails.
+/// Blocks on SQLite: never call it from the UI thread.
+pub fn flush_pending() -> Result<(), String> {
+    let mut pending = locked(&PENDING);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let path = db_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut con = open(&path).map_err(|e| e.to_string())?;
+    flush(&mut con, &mut pending).map_err(|e| e.to_string())
+}
+
+/// Lower-case file name of the program in front: "" without a window, "system" when its path
+/// can't be read (a protected process is still screen time).
+fn foreground_exe() -> String {
+    let hwnd = win::foreground();
+    if hwnd.is_invalid() {
+        return String::new();
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    apps::exe_path(pid).map_or_else(|| "system".into(), |p| p.rsplit('\\').next().unwrap_or_default().to_lowercase())
+}
+
+/// Seconds since the last keyboard or mouse input; 0 if Windows won't say.
+fn idle_seconds() -> f64 {
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    // The tick count wraps every 49 days, so subtract wrapping.
+    unsafe {
+        if GetLastInputInfo(&mut info).as_bool() { GetTickCount().wrapping_sub(info.dwTime) as f64 / 1000.0 } else { 0.0 }
+    }
+}
+
+/// The sampling loop (port of `tracker.py` `run()`): every `POLL` credit what is in front,
+/// every `FLUSH` write it down, once a day back the database up. Ends when `stop` fires or is dropped.
+fn run(stop: mpsc::Receiver<()>) {
+    let mut streak = Streak::default();
+    let (mut today, mut tidied) = (i64::MIN, i64::MIN);
+    let mut last = Instant::now();
+    let mut last_flush = last;
+    while stop.recv_timeout(POLL) == Err(RecvTimeoutError::Timeout) {
+        let now = Instant::now();
+        let dt = now.duration_since(last).as_secs_f64();
+        last = now;
+        let (day, hour, minute) = win::local_now();
+        if day != today {
+            today = day;
+            *locked(&TODAY) = open(&db_path()).map_or(0.0, |con| seconds_on(&con, day));
+        }
+        let exe = foreground_exe();
+        let (site, audible) = if BROWSERS.contains(&exe.as_str()) {
+            // Task 4: ask browsers for the active tab here
+            TAB.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|t| (t.host.clone(), t.audible)).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        let credits = account(&exe, idle_seconds(), &site, audible, dt);
+        let switched = streak.advance(credits.first().map_or("", |c| c.1.as_str()), dt);
+        locked(&PENDING).credit(day, hour, &minute, &credits, switched, streak.seconds);
+        if !credits.is_empty() {
+            *locked(&TODAY) += dt;
+        }
+        if now.duration_since(last_flush) >= FLUSH {
+            last_flush = now;
+            // A locked database must not stop the tracking: the counters stay and this runs again.
+            if flush_pending().is_ok() && tidied != day && open(&db_path()).and_then(|con| backup(&con, &backups_dir(), day)).is_ok() {
+                // Task 6: weekly-summary check here
+                tidied = day;
+            }
+        }
+    }
+}
+
+/// The running sampler thread.
+pub struct Tracker {
+    stop: mpsc::Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+impl Tracker {
+    /// `tx`, `browsers`, `rules` and `st` are for the later tasks: the weekly toast (6), the
+    /// browser's active tab (4) and the dashboard's queries (7).
+    pub fn start(_tx: UnboundedSender<win::Msg>, _browsers: browser::Browsers, _rules: Arc<RwLock<Rules>>, _st: Arc<RwLock<ScreenTime>>) -> Tracker {
+        let (stop, rx) = mpsc::channel();
+        Tracker { stop, thread: std::thread::spawn(move || run(rx)) }
+    }
+
+    /// Stop sampling and write what is pending.
+    pub fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+        let _ = flush_pending();
+    }
 }
 
 #[cfg(test)]
@@ -554,5 +760,70 @@ mod tests {
         assert_eq!(p.daily[&100].last, "23:59");
         p.credit(101, 0, "00:01", &[], 0, 0.0); // nothing credited: no daily change
         assert_eq!(p.daily[&101].last, "00:00");
+    }
+
+    fn cat(name: &str, apps: &[&str], sites: &[&str]) -> crate::config::FocusCategory {
+        let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+        crate::config::FocusCategory { name: name.into(), apps: own(apps), sites: own(sites) }
+    }
+
+    #[test]
+    fn rules_first_category_wins() {
+        let r = super::rules(&[cat("Social", &[], &["reddit.com"]), cat("Streaming", &[], &["reddit.com", "youtube.com"])]);
+        assert_eq!(classify(Kind::Site, "reddit.com", &r), "Social");
+        assert_eq!(classify(Kind::Site, "youtube.com", &r), "Streaming");
+    }
+
+    #[test]
+    fn rules_other_overrides_suffix() {
+        let r = super::rules(&[cat("Streaming", &[], &["youtube.com"]), cat("Other", &[], &["m.youtube.com"])]);
+        assert_eq!(classify(Kind::Site, "m.youtube.com", &r), "Other");
+        assert_eq!(classify(Kind::Site, "www2.youtube.com", &r), "Streaming");
+    }
+
+    #[test]
+    fn rules_lowercase_names() {
+        let r = super::rules(&[cat("Development", &["Code.EXE"], &[])]);
+        assert_eq!(classify(Kind::App, "code.exe", &r), "Development");
+    }
+
+    #[test]
+    fn kinds_by_setting() {
+        let st = crate::config::ScreenTime::default();
+        assert_eq!(kinds(&st), json!({"Development": "productive", "Productivity": "productive", "Social": "distracting", "Streaming": "distracting", "Gaming": "distracting"}));
+    }
+
+    #[test]
+    fn backup_keeps_seven() {
+        let dir = std::env::temp_dir().join(format!("procast-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let con = fixture();
+        let first = parse_iso("2026-09-01").unwrap();
+        for d in 0..9 {
+            backup(&con, &dir, first + d).unwrap();
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names.len(), 7);
+        assert_eq!((names[0].as_str(), names[6].as_str()), ("data-2026-09-03.db", "data-2026-09-09.db"));
+        // A second call for the same day leaves the first copy alone.
+        let copy = dir.join("data-2026-09-09.db");
+        let before = std::fs::metadata(&copy).unwrap().modified().unwrap();
+        con.execute("INSERT INTO usage VALUES('2026-10-01', 1, 'app', 'x.exe', 1.0)", []).unwrap();
+        backup(&con, &dir, first + 8).unwrap();
+        assert_eq!(std::fs::metadata(&copy).unwrap().modified().unwrap(), before);
+        let copied = open(&copy).unwrap();
+        let rows = |c: &Connection| c.query_row("SELECT COUNT(*) FROM usage", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!((rows(&copied), rows(&con)), (4, 5));
+        drop(copied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_now_shape() {
+        let (day, hour, hm) = win::local_now();
+        assert!(day > 20_000 && hour < 24);
+        assert_eq!((hm.len(), &hm[2..3]), (5, ":"));
+        assert_eq!(hm[..2].parse::<u8>().unwrap(), hour);
     }
 }
