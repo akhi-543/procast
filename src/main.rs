@@ -32,6 +32,7 @@ mod system;
 mod timers;
 mod toast;
 mod translate;
+mod wellbeing;
 mod win;
 mod ytmdesktop;
 mod ytmusic;

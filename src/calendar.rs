@@ -61,7 +61,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// Weekday of a day number, Monday = 0 (1970-01-01 was a Thursday).
-fn weekday(day: i64) -> i64 {
+pub(crate) fn weekday(day: i64) -> i64 {
     (day + 3).rem_euclid(7)
 }
 
