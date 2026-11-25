@@ -214,7 +214,6 @@ pub fn flush(con: &mut Connection, p: &mut Pending) -> rusqlite::Result<()> {
 }
 
 /// The span of the same length just before `from..=to`.
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn prior(from: i64, to: i64) -> (i64, i64) {
     let len = to - from + 1;
     (from - len, from - 1)
@@ -266,7 +265,6 @@ fn by_category(buckets: &[Seconds]) -> Seconds {
 }
 
 /// Stats for `from..=to`, compared with the `before` span.
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn stats(con: &Connection, from: i64, to: i64, before: (i64, i64), rules: &Rules) -> rusqlite::Result<Value> {
     let hourly = from == to;
     let (buckets, apps, sites) = aggregate(con, from, to, rules, hourly)?;
@@ -314,7 +312,6 @@ pub fn stats(con: &Connection, from: i64, to: i64, before: (i64, i64), rules: &R
 }
 
 /// `{"days": {iso day: {category: seconds}}}`
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn days(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqlite::Result<Value> {
     let (buckets, _, _) = aggregate(con, from, to, rules, false)?;
     let days: serde_json::Map<String, Value> = buckets.iter().enumerate().map(|(i, b)| (iso(from + i as i64), json!(clean(b)))).collect();
@@ -326,7 +323,6 @@ fn csv_field(s: &str) -> String {
 }
 
 /// One CSV row per counter, UTF-8 with a BOM so Excel reads it right.
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqlite::Result<Vec<u8>> {
     let mut out = String::from("\u{feff}day,hour,kind,name,category,seconds\r\n");
     let mut q = con.prepare("SELECT day, hour, kind, name, seconds FROM usage WHERE day BETWEEN ? AND ? ORDER BY day, hour, kind, name")?;
@@ -396,7 +392,6 @@ fn write_categories(text: &str, changed: &[FocusCategory]) -> Result<String, Str
 /// config.toml text. Each category that changes is written as a `[[focus_category]]` override
 /// (a built-in becomes one), so comments elsewhere stay. `Other` holds an explicit entry that
 /// beats a broader suffix rule (m.example.com vs example.com).
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str) -> Result<String, String> {
     let (is_app, key) = name_key(name).ok_or("bad name")?;
     let target = focus::category(cats, category).ok_or("unknown category")?.name.clone();
@@ -417,7 +412,6 @@ pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str)
 }
 
 /// `{category: "productive" | "distracting"}`; anything unlisted is neutral.
-#[allow(dead_code)] // Task 7 (dashboard server)
 pub fn kinds(st: &ScreenTime) -> Value {
     let mut out = serde_json::Map::new();
     for (list, kind) in [(&st.productive, "productive"), (&st.distracting, "distracting")] {

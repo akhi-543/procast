@@ -33,6 +33,7 @@ mod timers;
 mod toast;
 mod translate;
 mod wellbeing;
+mod wellbeing_http;
 mod win;
 mod ytmdesktop;
 mod ytmusic;
@@ -446,6 +447,12 @@ impl Mode {
 fn hotkey_specs(cfg: &Config) -> Vec<String> {
     let builtin = [&cfg.hotkey, &cfg.clipboard.hotkey, &cfg.emoji.hotkey, &cfg.files.hotkey];
     builtin.into_iter().chain(cfg.launcher.command_hotkeys().map(|(_, h)| h)).cloned().collect()
+}
+
+/// The sampler, plus the dashboard on 127.0.0.1:8737 (which stays up if Screen Time is switched off and on).
+fn start_screen_time(tx: &UnboundedSender<Msg>, browsers: &browser::Browsers, rules: &Arc<RwLock<wellbeing::Rules>>, st: &Arc<RwLock<config::ScreenTime>>) -> wellbeing::Tracker {
+    wellbeing_http::serve(tx.clone(), || _ = wellbeing::flush_pending());
+    wellbeing::Tracker::start(tx.clone(), browsers.clone(), rules.clone(), st.clone())
 }
 
 fn start_files(cfg: &Config, tx: &UnboundedSender<Msg>) -> Option<files::Files> {
@@ -1106,7 +1113,7 @@ impl Launcher {
         let notes = Notes::start(cfg.notes.dir(), cx);
         let st_rules = Arc::new(RwLock::new(wellbeing::rules(&focus::categories(&cfg.focus_category))));
         let st_cfg = Arc::new(RwLock::new(cfg.screen_time.clone()));
-        let tracker = cfg.screen_time.enabled.then(|| wellbeing::Tracker::start(tx.clone(), browsers.clone(), st_rules.clone(), st_cfg.clone()));
+        let tracker = cfg.screen_time.enabled.then(|| start_screen_time(&tx, &browsers, &st_rules, &st_cfg));
         let mut this = Self {
             input,
             hotkeys: {
@@ -4774,7 +4781,7 @@ impl Launcher {
         }
         *self.st_cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg.screen_time.clone();
         match (cfg.screen_time.enabled, self.tracker.is_some()) {
-            (true, false) => self.tracker = Some(wellbeing::Tracker::start(self.tx.clone(), self.browsers.clone(), self.st_rules.clone(), self.st_cfg.clone())),
+            (true, false) => self.tracker = Some(start_screen_time(&self.tx, &self.browsers, &self.st_rules, &self.st_cfg)),
             // Off the UI thread: the last write goes to SQLite.
             (false, true) => drop(self.tracker.take().map(|t| std::thread::spawn(move || t.stop()))),
             _ => {}
