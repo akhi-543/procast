@@ -5023,6 +5023,12 @@ impl Launcher {
                     let _ = self.tx.unbounded_send(Msg::error(e));
                 }
                 browser::Reply::Done(Ok(())) => {}
+                // Screen Time's active tab: the newest answer from a window that has OS focus wins.
+                browser::Reply::Active { focused, host, audible } => {
+                    if focused {
+                        *wellbeing::TAB.write().unwrap_or_else(|e| e.into_inner()) = Some(wellbeing::Tab { host, audible });
+                    }
+                }
                 browser::Reply::Music(reply) => self.music_reply(reply, cx),
             },
             Msg::Music(reply) => self.music_reply(reply, cx),

@@ -472,7 +472,7 @@ fn idle_seconds() -> f64 {
 
 /// The sampling loop (port of `tracker.py` `run()`): every `POLL` credit what is in front,
 /// every `FLUSH` write it down, once a day back the database up. Ends when `stop` fires or is dropped.
-fn run(stop: mpsc::Receiver<()>) {
+fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers) {
     let mut streak = Streak::default();
     let (mut today, mut tidied) = (i64::MIN, i64::MIN);
     let mut last = Instant::now();
@@ -488,9 +488,11 @@ fn run(stop: mpsc::Receiver<()>) {
         }
         let exe = foreground_exe();
         let (site, audible) = if BROWSERS.contains(&exe.as_str()) {
-            // Task 4: ask browsers for the active tab here
+            // The answer lands in TAB for the next sample (a 2 s lag, accepted).
+            browsers.ask_all(json!({"t": "active"}));
             TAB.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|t| (t.host.clone(), t.audible)).unwrap_or_default()
         } else {
+            *TAB.write().unwrap_or_else(PoisonError::into_inner) = None;
             Default::default()
         };
         let credits = account(&exe, idle_seconds(), &site, audible, dt);
@@ -517,11 +519,10 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// `tx`, `browsers`, `rules` and `st` are for the later tasks: the weekly toast (6), the
-    /// browser's active tab (4) and the dashboard's queries (7).
-    pub fn start(_tx: UnboundedSender<win::Msg>, _browsers: browser::Browsers, _rules: Arc<RwLock<Rules>>, _st: Arc<RwLock<ScreenTime>>) -> Tracker {
+    /// `tx`, `rules` and `st` are for the later tasks: the weekly toast (6) and the dashboard's queries (7).
+    pub fn start(_tx: UnboundedSender<win::Msg>, browsers: browser::Browsers, _rules: Arc<RwLock<Rules>>, _st: Arc<RwLock<ScreenTime>>) -> Tracker {
         let (stop, rx) = mpsc::channel();
-        Tracker { stop, thread: std::thread::spawn(move || run(rx)) }
+        Tracker { stop, thread: std::thread::spawn(move || run(rx, browsers)) }
     }
 
     /// Stop sampling and write what is pending.

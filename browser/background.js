@@ -6,6 +6,8 @@
 //   {t: "focusSites", mode, sites, snooze} -> {t: "focusSites", ok}: Focus. mode "block" sends tabs on those domains
 //                                       (and their subdomains) to blocked.html, "allow" sends every other tab there, "off"
 //                                       stops. The page's Snooze lets its site through for `snooze` minutes.
+//   {t: "active"}                   -> {t: "active", browser, focused, host, audible}: Screen Time. The active tab of the last
+//                                       focused window; focused = that window has OS focus, host = "" unless an http(s) page.
 //   {t: "ytm", req, op, ...}         -> {t: "ytm", req, op, title, items, current, error?}: YouTube Music, see ytmusic.js
 
 importScripts("ytmusic.js");
@@ -43,16 +45,21 @@ let focusRule = { mode: "off", sites: [], snooze: 0 };
 // sends no session id); send one with the rule if that matters.
 const snoozed = new Map();
 
-function blockedHost(url) {
-  if (focusRule.mode === "off") return null;
-  let host;
+// The host of an http(s) page, lower-case without "www."; null for anything else.
+function webHost(url) {
   try {
     const u = new URL(url);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    host = u.hostname.toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
+    return u.hostname.toLowerCase().replace(/\.$/, "").replace(/^www\./, "");
   } catch (e) {
     return null;
   }
+}
+
+function blockedHost(url) {
+  if (focusRule.mode === "off") return null;
+  const host = webHost(url);
+  if (host === null) return null;
   if ((snoozed.get(host) || 0) > Date.now()) return null;
   const listed = focusRule.sites.some((s) => host === s || host.endsWith("." + s));
   return (focusRule.mode === "block") === listed ? host : null;
@@ -110,6 +117,12 @@ async function handle(req) {
       focusRule = rule;
       for (const t of await chrome.tabs.query({})) redirect(t.id, t.url);
       return { t: "focusSites", ok: true };
+    }
+    case "active": {
+      // Screen Time: the active tab of the window that was in front last, and whether that window has OS focus.
+      const win = await chrome.windows.getLastFocused({ populate: true });
+      const tab = (win.tabs || []).find((t) => t.active);
+      return { t: "active", browser: browserName(), focused: !!win.focused, host: (tab && webHost(tab.url)) || "", audible: !!(tab && tab.audible) };
     }
     case "ytm":
       return ytm.handle(req);
