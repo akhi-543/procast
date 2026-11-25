@@ -190,8 +190,10 @@ exactly as `Handler`:
   3. merges `categories.json` into the category list and `settings.json` into `[screen_time]`.
      **Focus wins** (user's decision): a name Focus already files somewhere stays there
      (`reddit.com`, `instagram.com` stay Social; micro bot's Communication sites already in
-     Messaging stay there); only names Focus lacks are added, to the mapped category. Focus
-     blocking does not change on import. History re-labels with it, since categories are
+     Messaging stay there); only names Focus lacks are added, to the mapped category. Names
+     Focus already files keep their category; new names do join it, so a Focus block of that
+     category (e.g. Messaging gaining Outlook, Teams, Zoom) covers them too, and the import
+     form says so (*controller ruling R14*). History re-labels with it, since categories are
      resolved at read time;
   4. sets `[screen_time] enabled = true` (tracking starts only now, so micro bot and procast
      never record the same hour; *builder's call, from the check*);
