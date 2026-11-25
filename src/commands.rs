@@ -114,6 +114,8 @@ pub enum Cmd {
     CreateNote,
     /// Notes deleted in the last `[notes] keep_deleted_days`, to restore or remove for good.
     RecentlyDeletedNotes,
+    /// Ask for micro bot's folder, then bring its screen-time history, categories and settings in.
+    ImportScreenTime,
     Quit,
 }
 
@@ -212,6 +214,7 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::LIST_CHECKS),
     (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::LIST_PLUS),
     (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::IMPORT),
+    (Cmd::ImportScreenTime, "Import Screen Time from micro bot", "wellbeing usage history tracker categories settings migrate", g::IMPORT),
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::ALARM_CLOCK),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator google language tr", g::LANGUAGES),
@@ -356,6 +359,7 @@ impl Cmd {
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
             Cmd::Focus(_) => "Focus",
+            Cmd::ImportScreenTime => "Screen Time",
             Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste => "Translator",
             Cmd::Define => "Dictionary",
             Cmd::MySchedule | Cmd::JoinMeeting => "Calendar",
@@ -415,7 +419,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes | Cmd::ImportScreenTime | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
         }
     }
     Ok(None)
@@ -789,6 +793,7 @@ mod tests {
             (Cmd::Focus(F::SearchCategories), g::LIST_CHECKS, Tint::System),
             (Cmd::Focus(F::CreateCategory), g::LIST_PLUS, Tint::System),
             (Cmd::Focus(F::ImportCategories), g::IMPORT, Tint::System),
+            (Cmd::ImportScreenTime, g::IMPORT, Tint::System),
         ];
         for (cmd, glyph, tint) in map {
             let (_, title, _, icon) = ALL.iter().find(|(c, ..)| *c == cmd).unwrap_or_else(|| panic!("{cmd:?} not in ALL"));

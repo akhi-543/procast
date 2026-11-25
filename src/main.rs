@@ -201,6 +201,7 @@ enum FormKind {
     AddCalendar,
     /// Some(i) edits language set `i`.
     AddLanguageSet(Option<usize>),
+    ImportScreenTime,
 }
 
 impl FormKind {
@@ -211,6 +212,7 @@ impl FormKind {
             FormKind::AddCalendar => (g::CALENDAR_CLOCK, "Add Calendar", "Add Calendar"),
             FormKind::AddLanguageSet(None) => (g::LANGUAGES, "Add Language Set", "Add Language Set"),
             FormKind::AddLanguageSet(Some(_)) => (g::LANGUAGES, "Edit Language Set", "Save Language Set"),
+            FormKind::ImportScreenTime => (g::IMPORT, "Import Screen Time", "Import Screen Time"),
         }
     }
 }
@@ -343,6 +345,20 @@ fn calendar_form() -> Vec<FormField> {
         field("Name", text("Work", None), ""),
         field("Colour", Ctl::Swatches, calendar::COLOURS[0].0),
         field("", Ctl::Note, "Google: Settings → your calendar → Secret address in iCal format. Outlook: Settings → Shared calendars → Publish → ICS."),
+    ]
+}
+
+/// Import Screen Time from micro bot: its folder, and what to do if that was imported before.
+fn import_screen_time_form() -> Vec<FormField> {
+    let field = |label: &str, ctl: Ctl, value: &str| FormField { label: label.to_string().into(), ctl, value: value.into(), input: None, error: None };
+    let again = vec![
+        menu::Entry { id: "stop".into(), label: "Stop and tell me".into(), ..Default::default() },
+        menu::Entry { id: "again".into(), label: "Add the hours again".into(), ..Default::default() },
+    ];
+    vec![
+        field("micro bot folder", Ctl::Text { placeholder: r"D:\Pro\micro bot".into(), icon: Some(g::FOLDER), tall: false, presets: &[] }, r"D:\Pro\micro bot"),
+        field("If imported before", Ctl::Select(again, false), "stop"),
+        field("", Ctl::Note, "Stops and disables micro bot's WellbeingTracker task, adds data.db, categories.json and settings.json, and turns Screen Time on. Running it twice adds the hours twice."),
     ]
 }
 
@@ -2221,6 +2237,34 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Ctrl+Enter in Import Screen Time: stops micro bot and brings its history in on a thread of
+    /// its own (it waits on SQLite and `schtasks`); the answer is a toast.
+    fn import_screen_time(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.form else { return };
+        let v = form_values(&form.fields);
+        let folder = PathBuf::from(v["micro bot folder"].trim().trim_matches('"'));
+        let force = v["If imported before"] == "again";
+        if folder.as_os_str().is_empty() {
+            if let Some(i) = form.fields.iter().position(|f| f.label == "micro bot folder") {
+                form.fields[i].error = Some("Type the folder micro bot is in".into());
+                form.field = i;
+            }
+            return self.focus_field(window, cx);
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // The answer is always sent, so a crash cannot leave the user waiting.
+            let done = std::panic::catch_unwind(|| wellbeing::import_from(&folder, force)).unwrap_or_else(|_| Err("the import failed".into()));
+            let _ = tx.unbounded_send(match done {
+                Ok(text) => Msg::done(text),
+                Err(e) => Msg::error(format!("Screen Time import: {e}")),
+            });
+        });
+        self.say(Msg::info("Importing Screen Time…"));
+        self.set_mode(Mode::Root, cx);
+        self.hide(true, cx);
+    }
+
     /// Ctrl+Enter in the Focus form: starts the session (replacing one that runs) and closes.
     /// A Duration that does not parse stays, with why under it.
     fn submit_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3782,6 +3826,7 @@ impl Launcher {
                 FormKind::Focus => self.submit_focus(window, cx),
                 FormKind::AddCalendar => self.add_calendar(cx),
                 FormKind::AddLanguageSet(edit) => self.save_lang_set(edit, window, cx),
+                FormKind::ImportScreenTime => self.import_screen_time(window, cx),
             }
             return;
         }
@@ -4096,6 +4141,7 @@ impl Launcher {
                 return self.refresh(cx);
             }
             Act::AddCalendar => return self.open_form(FormKind::AddCalendar, calendar_form(), window, cx),
+            Act::Cmd(Cmd::ImportScreenTime) => return self.open_form(FormKind::ImportScreenTime, import_screen_time_form(), window, cx),
             Act::Cmd(Cmd::PasteLatestScreenshot) => return self.shot_to_clipboard(None, true, cx),
             Act::CopyShot(path) => return self.shot_to_clipboard(Some(path.into()), false, cx),
             Act::PasteShot(path) => return self.shot_to_clipboard(Some(path.into()), true, cx),
@@ -4434,7 +4480,7 @@ impl Launcher {
             Act::Cmd(Cmd::Focus(FocusCmd::Toggle)) => self.focus.session.is_none() && self.focus.preset.is_none(),
             // Join Meeting asks first: its hotkey opens the launcher on the question (`ask_join`).
             Act::Cmd(Cmd::JoinMeeting) => self.cfg.calendar.confirm_join && self.join_target(act).is_some(),
-            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories)) => true,
+            Act::Cmd(Cmd::Focus(FocusCmd::Start | FocusCmd::Edit | FocusCmd::SearchCategories | FocusCmd::CreateCategory | FocusCmd::ImportCategories) | Cmd::ImportScreenTime) => true,
             Act::Cmd(Cmd::SearchFiles | Cmd::SearchScreenshots | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::YtMusic(_)) | Act::Define(_) => true,
             Act::Script(i) => self.scripts.get(*i).is_some_and(|s| matches!(s.output, Output::Full)),
             Act::ExtRun(e, c) => self.exts.get(*e).and_then(|(x, _)| x.commands.get(*c)).is_some_and(|c| c.mode == "view"),

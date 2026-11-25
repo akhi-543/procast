@@ -105,7 +105,6 @@ pub fn duration(seconds: f64) -> String {
 }
 
 /// The weekly toast body, short enough for a toast.
-#[allow(dead_code)] // Task 6 (weekly summary)
 pub fn summary_text(total: u64, previous: u64, top: &str) -> String {
     let mut text = format!("Last week {}", duration(total as f64));
     if previous > 0 {
@@ -364,27 +363,44 @@ pub fn rules(cats: &[FocusCategory]) -> Rules {
     rules
 }
 
+/// What an app (`.exe`) or site is stored as: (is_app, key). None for junk: empty, too long,
+/// control characters, or a "site" that is not a plain host (no URL, user@ or :port, which
+/// `norm_site` would cut; "www." is left as "www" by it).
+fn name_key(name: &str) -> Option<(bool, String)> {
+    let name = name.trim().to_lowercase();
+    if name.is_empty() || name.chars().count() > 260 || name.chars().any(char::is_control) {
+        return None;
+    }
+    let is_app = name.ends_with(".exe");
+    let key = if is_app { focus::norm_app(&name) } else { focus::norm_site(&name) };
+    let host = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    let ok = if is_app { key.len() > ".exe".len() } else { (1..=253).contains(&key.len()) && key != "www" && host(&name) };
+    ok.then_some((is_app, key))
+}
+
+/// Writes `changed` categories into config.toml's text as `[[focus_category]]` overrides (a
+/// built-in becomes one; comments elsewhere stay).
+fn write_categories(text: &str, changed: &[FocusCategory]) -> Result<String, String> {
+    let text = focus::add_categories(text, changed)?.0; // creates the overrides that are missing
+    let own = crate::config::parse(&text)?.focus_category;
+    let array = |l: &[String]| toml_edit::Value::from(toml_edit::Array::from_iter(l.iter().map(String::as_str)));
+    changed.iter().try_fold(text, |text, c| {
+        let i = own.iter().position(|o| o.name.eq_ignore_ascii_case(&c.name)).ok_or("category override missing")?;
+        let path = |field: &str| ["focus_category".to_string(), i.to_string(), field.to_string()];
+        let text = crate::config::write_value(&text, &path("apps"), array(&c.apps))?;
+        crate::config::write_value(&text, &path("sites"), array(&c.sites))
+    })
+}
+
 /// Moves an app (`.exe`) or site out of every category into `category`, returning the new
 /// config.toml text. Each category that changes is written as a `[[focus_category]]` override
 /// (a built-in becomes one), so comments elsewhere stay. `Other` holds an explicit entry that
 /// beats a broader suffix rule (m.example.com vs example.com).
 #[allow(dead_code)] // Task 7 (dashboard server)
 pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str) -> Result<String, String> {
-    let name = name.trim().to_lowercase();
-    if name.is_empty() || name.chars().count() > 260 || name.chars().any(char::is_control) {
-        return Err("bad name".into());
-    }
+    let (is_app, key) = name_key(name).ok_or("bad name")?;
     let target = focus::category(cats, category).ok_or("unknown category")?.name.clone();
-    let is_app = name.ends_with(".exe");
     let norm: fn(&str) -> String = if is_app { focus::norm_app } else { focus::norm_site };
-    let key = norm(&name);
-    // The key is what gets stored. A site must already be a plain host (no URL, user@ or :port,
-    // which `norm_site` would cut); "www." is left as "www" by it.
-    let host = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
-    let ok = if is_app { key.len() > ".exe".len() } else { (1..=253).contains(&key.len()) && key != "www" && host(&name) };
-    if !ok {
-        return Err("bad name".into());
-    }
     let mut changed = Vec::new();
     for old in cats {
         let mut c = old.clone();
@@ -397,15 +413,7 @@ pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str)
             changed.push(c);
         }
     }
-    let text = focus::add_categories(text, &changed)?.0; // creates the overrides that are missing
-    let own = crate::config::parse(&text)?.focus_category;
-    let array = |l: &[String]| toml_edit::Value::from(toml_edit::Array::from_iter(l.iter().map(String::as_str)));
-    changed.iter().try_fold(text, |text, c| {
-        let i = own.iter().position(|o| o.name.eq_ignore_ascii_case(&c.name)).ok_or("category override missing")?;
-        let path = |field: &str| ["focus_category".to_string(), i.to_string(), field.to_string()];
-        let text = crate::config::write_value(&text, &path("apps"), array(&c.apps))?;
-        crate::config::write_value(&text, &path("sites"), array(&c.sites))
-    })
+    write_categories(text, &changed)
 }
 
 /// `{category: "productive" | "distracting"}`; anything unlisted is neutral.
@@ -451,6 +459,215 @@ pub fn backup(con: &Connection, folder: &Path, day: i64) -> rusqlite::Result<()>
         let _ = std::fs::remove_file(old);
     }
     Ok(())
+}
+
+// --- weekly summary ---------------------------------------------------------------
+
+/// The toast about the week that just ended, once per week (the first call on or after its
+/// Monday): `on` is `[screen_time] weekly_summary`. The week is recorded in `meta` whether or not
+/// there is anything to say; None too when the database can't be read (tried again next time).
+pub fn weekly_summary(con: &Connection, today: i64, rules: &Rules, on: bool) -> Option<String> {
+    let monday = today - crate::calendar::weekday(today);
+    let week = iso(monday);
+    let seen: Option<String> = con.query_row("SELECT value FROM meta WHERE key = 'summary_week'", [], |r| r.get(0)).optional().ok()?;
+    if seen.as_deref() == Some(week.as_str()) {
+        return None;
+    }
+    let last = (monday - 7, monday - 1);
+    let s = stats(con, last.0, last.1, prior(last.0, last.1), rules).ok()?;
+    con.execute("INSERT OR REPLACE INTO meta VALUES('summary_week', ?)", [&week]).ok()?;
+    let total = s["total"].as_u64()?;
+    if !on || total < 60 {
+        return None;
+    }
+    Some(summary_text(total, s["previous"].as_u64().unwrap_or(0), s["categories"][0]["name"].as_str().unwrap_or("Other")))
+}
+
+// --- import from micro bot ----------------------------------------------------------
+
+/// micro bot's category names that Focus has under another name: Focus's is kept.
+pub const RENAME: &[(&str, &str)] = &[("Communication", "Messaging"), ("Entertainment", "Streaming"), ("Games", "Gaming")];
+
+fn renamed(name: &str) -> &str {
+    let name = name.trim();
+    RENAME.iter().find(|(from, _)| from.eq_ignore_ascii_case(name)).map_or(name, |(_, to)| to)
+}
+
+/// What an import brought in.
+pub struct Imported {
+    pub rows: usize,
+    pub days: usize,
+    pub names_added: usize,
+}
+
+const NOT_MICRO_BOT: &str = "not a micro bot database";
+
+/// Adds micro bot's `data.db` (`from`) to `con`: seconds are added, daily focus numbers merged as
+/// `flush` does. All or nothing; returns (usage rows, days). A second import adds the hours
+/// again, so it is refused with a warning unless `force`.
+pub fn import_db(con: &mut Connection, from: &Path, force: bool) -> Result<(usize, usize), String> {
+    // ATTACH would create a missing file.
+    if !from.is_file() {
+        return Err(format!("No data.db at {}", from.display()));
+    }
+    let attach = con.execute("ATTACH ?1 AS mb", [from.to_string_lossy()]);
+    attach.map_err(|e| if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) { NOT_MICRO_BOT.to_string() } else { e.to_string() })?;
+    let done = merge_attached(con, from, force);
+    let _ = con.execute("DETACH mb", []);
+    done
+}
+
+fn merge_attached(con: &mut Connection, from: &Path, force: bool) -> Result<(usize, usize), String> {
+    let tables: Vec<String> = con
+        .prepare("SELECT name FROM mb.sqlite_master WHERE type = 'table'")
+        .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
+        .map_err(|_| NOT_MICRO_BOT.to_string())?;
+    if !tables.iter().any(|t| t == "usage") {
+        return Err(NOT_MICRO_BOT.into());
+    }
+    let meta = |key: &str| con.query_row("SELECT value FROM meta WHERE key = ?", [key], |r| r.get::<_, String>(0)).optional().map_err(|e| e.to_string());
+    if !force && let Some(before) = meta("imported_from")? {
+        let at = meta("imported_at")?.unwrap_or_default();
+        return Err(format!("Already imported from {before} {at}. Importing again adds the hours twice"));
+    }
+    let db = |e: rusqlite::Error| e.to_string();
+    let tx = con.transaction().map_err(db)?;
+    let rows = tx
+        .execute(
+            "INSERT INTO usage SELECT day, hour, kind, name, seconds FROM mb.usage WHERE true \
+             ON CONFLICT(day, hour, kind, name) DO UPDATE SET seconds = seconds + excluded.seconds",
+            [],
+        )
+        .map_err(db)?;
+    let days = tx.query_row("SELECT COUNT(DISTINCT day) FROM mb.usage", [], |r| r.get::<_, usize>(0)).map_err(db)?;
+    if tables.iter().any(|t| t == "daily") {
+        tx.execute(
+            "INSERT INTO daily SELECT day, switches, longest, first, last FROM mb.daily WHERE true ON CONFLICT(day) DO UPDATE SET \
+             switches = switches + excluded.switches, longest = MAX(longest, excluded.longest), \
+             first = MIN(first, excluded.first), last = MAX(last, excluded.last)",
+            [],
+        )
+        .map_err(db)?;
+    }
+    tx.execute("INSERT OR REPLACE INTO meta VALUES('imported_from', ?)", [from.to_string_lossy()]).map_err(db)?;
+    tx.execute("INSERT OR REPLACE INTO meta VALUES('imported_at', 'on ' || datetime('now', 'localtime'))", []).map_err(db)?;
+    tx.commit().map_err(db)?;
+    Ok((rows, days))
+}
+
+fn names_of(c: &mut FocusCategory, is_app: bool) -> &mut Vec<String> {
+    if is_app { &mut c.apps } else { &mut c.sites }
+}
+
+/// micro bot's `categories.json` (`{category: [app or site, ...]}`) merged into config.toml's
+/// text, with the count of names added. Focus wins: a name some category already holds stays
+/// there; the rest go to the category of the same name (see `RENAME`), created if Focus lacks
+/// it. Names that are not a program or a plain host are skipped.
+pub fn import_categories(text: &str, cats: &[FocusCategory], json: &str) -> Result<(String, usize), String> {
+    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Not a micro bot categories.json: {e}"))?;
+    let map = v.as_object().ok_or("Not a micro bot categories.json: expected {category: [names]}")?;
+    let mut now = cats.to_vec();
+    let mut added = 0;
+    for (name, list) in map {
+        let target = renamed(name);
+        for item in list.as_array().into_iter().flatten().filter_map(Value::as_str) {
+            let Some((is_app, key)) = name_key(item) else { continue };
+            let norm: fn(&str) -> String = if is_app { focus::norm_app } else { focus::norm_site };
+            if now.iter_mut().any(|c| names_of(c, is_app).iter().any(|n| norm(n) == key)) {
+                continue;
+            }
+            let i = now.iter().position(|c| c.name.eq_ignore_ascii_case(target)).unwrap_or_else(|| {
+                now.push(FocusCategory { name: target.to_string(), apps: vec![], sites: vec![] });
+                now.len() - 1
+            });
+            names_of(&mut now[i], is_app).push(key);
+            added += 1;
+        }
+    }
+    let changed: Vec<FocusCategory> = now.into_iter().filter(|c| !cats.contains(c)).collect();
+    if changed.is_empty() {
+        return Ok((text.to_string(), 0));
+    }
+    Ok((write_categories(text, &changed)?, added))
+}
+
+/// micro bot's `settings.json` as `[screen_time]` in config.toml's text, category names mapped
+/// (see `RENAME`), and tracking switched on. What the file leaves out stays as it was.
+pub fn import_settings(text: &str, json: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Not a micro bot settings.json: {e}"))?;
+    if !v.is_object() {
+        return Err("Not a micro bot settings.json: expected {settings}".into());
+    }
+    let set = |text: String, field: &str, value: toml_edit::Value| crate::config::write_value(&text, &["screen_time".to_string(), field.to_string()], value);
+    let mut text = text.to_string();
+    for field in ["productive", "distracting"] {
+        let Some(list) = v[field].as_array() else { continue };
+        let mut names: Vec<&str> = vec![];
+        for name in list.iter().filter_map(Value::as_str).map(renamed) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        text = set(text, field, toml_edit::Array::from_iter(names).into())?;
+    }
+    if let Some(on) = v["weekly_summary"].as_bool() {
+        text = set(text, "weekly_summary", on.into())?;
+    }
+    set(text, "enabled", true.into())
+}
+
+/// Everything in micro bot's `folder` into procast: the database into `db`, categories and
+/// settings into the config file. Files that don't read fail before anything changes; the
+/// config is written after the database, so a retry after a failure never counts hours twice.
+pub fn import_folder(folder: &Path, config: &Path, db: &Path, force: bool) -> Result<Imported, String> {
+    let read = |name: &str| match std::fs::read_to_string(folder.join(name)) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Could not read {name}: {e}")),
+    };
+    let (categories, settings) = (read("categories.json")?, read("settings.json")?.unwrap_or_else(|| "{}".into()));
+    let merge = |text: &str| -> Result<(String, usize), String> {
+        let cats = focus::categories(&crate::config::parse(text)?.focus_category);
+        let (text, names) = match &categories {
+            Some(json) => import_categories(text, &cats, json)?,
+            None => (text.to_string(), 0),
+        };
+        Ok((import_settings(&text, &settings)?, names))
+    };
+    merge(&focus::text_or_empty(std::fs::read_to_string(config))?)?; // a dry run: bad files fail here
+    if let Some(dir) = db.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut con = open(db).map_err(|e| e.to_string())?;
+    let (rows, days) = import_db(&mut con, &folder.join("data.db"), force)?;
+    drop(con);
+    let mut names_added = 0;
+    crate::config::edit_file(config, |text| {
+        let (new, names) = merge(text)?;
+        names_added = names;
+        Ok(new)
+    })?;
+    Ok(Imported { rows, days, names_added })
+}
+
+/// The Import Screen Time command: stops micro bot's scheduled tracker (its last 30 s of
+/// counters are lost, accepted), then `import_folder` on procast's own files. Returns the toast
+/// text. Blocks on SQLite and `schtasks`: never call it from the UI thread.
+pub fn import_from(folder: &Path, force: bool) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static BUSY: Mutex<()> = Mutex::new(());
+    let Ok(_one) = BUSY.try_lock() else { return Err("An import is already running".into()) };
+    // Before it stops anything.
+    if !folder.join("data.db").is_file() {
+        return Err(format!("No data.db in {}", folder.display()));
+    }
+    // A missing task is fine: micro bot may never have been scheduled.
+    for args in [&["/End", "/TN", "WellbeingTracker"][..], &["/Change", "/TN", "WellbeingTracker", "/Disable"]] {
+        let _ = std::process::Command::new("schtasks").args(args).creation_flags(CREATE_NO_WINDOW).status();
+    }
+    let got = import_folder(folder, &crate::config::path(), &db_path(), force)?;
+    Ok(format!("Imported {} days of screen time ({} rows, {} names)", got.days, got.rows, got.names_added))
 }
 
 // --- sampler ------------------------------------------------------------------
@@ -516,7 +733,7 @@ fn idle_seconds() -> f64 {
 
 /// The sampling loop (port of `tracker.py` `run()`): every `POLL` credit what is in front,
 /// every `FLUSH` write it down, once a day back the database up. Ends when `stop` fires or is dropped.
-fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers) {
+fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers, tx: UnboundedSender<win::Msg>, rules: Arc<RwLock<Rules>>, st: Arc<RwLock<ScreenTime>>) {
     let mut streak = Streak::default();
     let (mut today, mut tidied) = (i64::MIN, i64::MIN);
     let mut last = Instant::now();
@@ -548,9 +765,18 @@ fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers) {
         if now.duration_since(last_flush) >= FLUSH {
             last_flush = now;
             // A locked database must not stop the tracking: the counters stay and this runs again.
-            if flush_pending().is_ok() && tidied != day && open(&db_path()).and_then(|con| backup(&con, &backups_dir(), day)).is_ok() {
-                // Task 6: weekly-summary check here
+            if flush_pending().is_ok()
+                && tidied != day
+                && let Ok(con) = open(&db_path())
+                && backup(&con, &backups_dir(), day).is_ok()
+            {
                 tidied = day;
+                let on = st.read().unwrap_or_else(PoisonError::into_inner).weekly_summary;
+                let text = weekly_summary(&con, day, &rules.read().unwrap_or_else(PoisonError::into_inner), on);
+                // Sticky: the first flush comes ~30 s after sign-in, when a toast that closes itself is missed.
+                if let Some(text) = text {
+                    let _ = tx.unbounded_send(win::Msg::sticky(crate::toast::Kind::Info, text));
+                }
             }
         }
     }
@@ -563,10 +789,10 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// `tx`, `rules` and `st` are for the later tasks: the weekly toast (6) and the dashboard's queries (7).
-    pub fn start(_tx: UnboundedSender<win::Msg>, browsers: browser::Browsers, _rules: Arc<RwLock<Rules>>, _st: Arc<RwLock<ScreenTime>>) -> Tracker {
+    /// `tx` carries the weekly toast; `rules` and `st` are read at each use, so a config reload applies.
+    pub fn start(tx: UnboundedSender<win::Msg>, browsers: browser::Browsers, rules: Arc<RwLock<Rules>>, st: Arc<RwLock<ScreenTime>>) -> Tracker {
         let (stop, rx) = mpsc::channel();
-        Tracker { stop, thread: std::thread::spawn(move || run(rx, browsers)) }
+        Tracker { stop, thread: std::thread::spawn(move || run(rx, browsers, tx, rules, st)) }
     }
 
     /// Stop sampling and write what is pending.
@@ -902,6 +1128,154 @@ mod tests {
         for bad in ["", "   ", &"a".repeat(261), "a\nb", "a\u{7}b", "/", "?", "#", ".", "@x", "www.", "a b", "a\"b", "b\u{fc}cher.de", ".exe", " .exe ", &"a".repeat(254)] {
             assert_eq!(move_name("", &cats, bad, "Other"), Err("bad name".into()), "{bad:?}");
         }
+    }
+
+    // --- import and weekly summary ---
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("procast-st-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A micro bot `data.db` with two days of usage and one daily row.
+    fn micro_bot_db(dir: &Path) -> PathBuf {
+        let path = dir.join("data.db");
+        let con = open(&path).unwrap();
+        insert(&con, &[("2026-09-30", 9, "app", "code.exe", 100.0), ("2026-09-29", 9, "app", "code.exe", 50.0)]);
+        con.execute("INSERT INTO daily VALUES('2026-09-30', 2, 90.0, '09:00', '17:00')", []).unwrap();
+        path
+    }
+
+    fn meta(con: &Connection, key: &str) -> Option<String> {
+        con.query_row("SELECT value FROM meta WHERE key = ?", [key], |r| r.get(0)).optional().unwrap()
+    }
+
+    #[test]
+    fn import_db_adds_rows() {
+        let dir = scratch("adds");
+        let from = micro_bot_db(&dir);
+        let mut con = mem();
+        insert(&con, &[("2026-09-30", 9, "app", "code.exe", 10.0)]);
+        con.execute("INSERT INTO daily VALUES('2026-09-30', 1, 120.0, '10:00', '18:00')", []).unwrap();
+        assert_eq!(import_db(&mut con, &from, false), Ok((2, 2)));
+        let seconds = |day: &str| con.query_row("SELECT seconds FROM usage WHERE day = ?", [day], |r| r.get::<_, f64>(0)).unwrap();
+        assert_eq!((seconds("2026-09-30"), seconds("2026-09-29")), (110.0, 50.0));
+        let daily: (u32, f64, String, String) =
+            con.query_row("SELECT switches, longest, first, last FROM daily", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!(daily, (3, 120.0, "09:00".into(), "18:00".into()));
+        assert_eq!(meta(&con, "imported_from"), Some(from.to_string_lossy().into_owned()));
+        // The source is detached again: attaching it a second time works.
+        assert!(import_db(&mut con, &from, true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_db_rejects_wrong_file() {
+        let dir = scratch("wrong");
+        let mut con = mem();
+        insert(&con, &[("2026-09-30", 9, "app", "code.exe", 10.0)]);
+        let missing = dir.join("data.db");
+        assert!(import_db(&mut con, &missing, false).unwrap_err().contains("data.db"));
+        assert!(!missing.exists(), "a missing file is not created by the attach");
+        let other = dir.join("other.db");
+        rusqlite::Connection::open(&other).unwrap().execute_batch("CREATE TABLE notes(a)").unwrap();
+        assert_eq!(import_db(&mut con, &other, false), Err("not a micro bot database".into()));
+        let text = dir.join("text.db");
+        std::fs::write(&text, "this is not sqlite at all, just some text to fill a header").unwrap();
+        assert_eq!(import_db(&mut con, &text, false), Err("not a micro bot database".into()));
+        assert_eq!((seconds_on(&con, parse_iso("2026-09-30").unwrap()), meta(&con, "imported_from")), (10.0, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_db_second_run_warns() {
+        let dir = scratch("twice");
+        let from = micro_bot_db(&dir);
+        let mut con = mem();
+        import_db(&mut con, &from, false).unwrap();
+        let err = import_db(&mut con, &from, false).unwrap_err();
+        assert!(err.starts_with("Already imported"), "{err}");
+        assert_eq!(seconds_on(&con, parse_iso("2026-09-30").unwrap()), 100.0, "the warning changes nothing");
+        import_db(&mut con, &from, true).unwrap();
+        assert_eq!(seconds_on(&con, parse_iso("2026-09-30").unwrap()), 200.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_categories_focus_wins() {
+        let cats = focus::categories(&[]);
+        let json = r#"{"Entertainment":["reddit.com","crunchyroll.com"],"Communication":["slack.com","zoom.us","not a host","/","x.exe"],"Mine":["thing.exe"]}"#;
+        let (text, added) = import_categories("# keep me\n", &cats, json).unwrap();
+        let got = cfg_of(&text);
+        assert_eq!(holders(&got, "reddit.com"), ["Social"], "Focus already files it");
+        assert_eq!(holders(&got, "crunchyroll.com"), ["Streaming"]);
+        assert_eq!(holders(&got, "slack.com"), ["Messaging"]);
+        assert_eq!(holders(&got, "zoom.us"), ["Messaging"]);
+        assert_eq!(holders(&got, "x.exe"), ["Messaging"], "an app is told by its .exe");
+        assert_eq!(holders(&got, "thing.exe"), ["Mine"], "a category Focus lacks is created");
+        assert!(holders(&got, "not a host").is_empty() && holders(&got, "/").is_empty(), "junk is skipped");
+        assert_eq!(added, 4);
+        assert!(text.contains("# keep me"));
+        // a second import finds nothing to add
+        assert_eq!(import_categories(&text, &got, json).unwrap().1, 0);
+        assert!(import_categories("", &cats, "[1]").is_err());
+    }
+
+    #[test]
+    fn import_settings_maps_names() {
+        let json = r#"{"productive":["Development"],"distracting":["Entertainment","Games"],"weekly_summary":false}"#;
+        let text = import_settings("# keep me\n", json).unwrap();
+        let st = crate::config::parse(&text).unwrap().screen_time;
+        assert_eq!((st.productive, st.distracting, st.weekly_summary, st.enabled), (vec!["Development".to_string()], vec!["Streaming".to_string(), "Gaming".to_string()], false, true));
+        assert!(text.contains("# keep me"));
+        // what micro bot did not set stays as it was; tracking still turns on
+        let st = crate::config::parse(&import_settings("", "{}").unwrap()).unwrap().screen_time;
+        assert_eq!((st.enabled, st.weekly_summary, st.productive), (true, true, ScreenTime::default().productive));
+        assert!(import_settings("", "nope").is_err());
+    }
+
+    #[test]
+    fn import_folder_moves_everything_and_changes_nothing_on_failure() {
+        let dir = scratch("folder");
+        micro_bot_db(&dir);
+        std::fs::write(dir.join("categories.json"), r#"{"Entertainment":["crunchyroll.com"]}"#).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"distracting":["Games"]}"#).unwrap();
+        let (cfg, db) = (dir.join("config.toml"), dir.join("screentime.db"));
+        std::fs::write(&cfg, "# mine\n").unwrap();
+        let got = import_folder(&dir, &cfg, &db, false).unwrap();
+        assert_eq!((got.rows, got.days, got.names_added), (2, 2, 1));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("# mine") && text.contains("crunchyroll.com") && text.contains("enabled = true"));
+        // a bad categories.json fails before the database is touched
+        let fresh = dir.join("fresh.db");
+        std::fs::write(dir.join("categories.json"), "oops").unwrap();
+        assert!(import_folder(&dir, &cfg, &fresh, false).is_err());
+        assert!(!fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weekly_summary_once_per_week() {
+        let monday = parse_iso("2026-10-05").unwrap();
+        assert_eq!(crate::calendar::weekday(monday), 0);
+        let con = mem();
+        insert(&con, &[("2026-10-01", 9, "app", "code.exe", 3600.0)]);
+        let rules = rules();
+        assert_eq!(weekly_summary(&con, monday, &rules, true).as_deref(), Some("Last week 1h 0m. Most: Development"));
+        assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-10-05"));
+        assert_eq!(weekly_summary(&con, monday + 2, &rules, true), None, "once per week");
+        // under a minute: nothing to say, but the week is done
+        insert(&con, &[("2026-10-08", 9, "app", "code.exe", 59.0)]);
+        assert_eq!(weekly_summary(&con, monday + 7, &rules, true), None);
+        assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-10-12"));
+        // switched off: recorded, not shown; and a week later it compares with the one before
+        insert(&con, &[("2026-10-15", 9, "app", "code.exe", 7200.0)]);
+        assert_eq!(weekly_summary(&con, monday + 14, &rules, false), None);
+        assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-10-19"));
+        insert(&con, &[("2026-10-22", 9, "app", "code.exe", 3600.0)]);
+        assert_eq!(weekly_summary(&con, monday + 21, &rules, true).as_deref(), Some("Last week 1h 0m, 50% less. Most: Development"));
     }
 
     #[test]
