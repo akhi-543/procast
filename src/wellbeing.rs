@@ -619,20 +619,21 @@ const NOT_MICRO_BOT: &str = "not a micro bot database";
 
 /// Adds micro bot's `data.db` (`from`) to `con`: seconds are added, daily focus numbers merged as
 /// `flush` does. All or nothing; returns (usage rows, days). A second import adds the hours
-/// again, so it is refused with a warning unless `force`.
-pub fn import_db(con: &mut Connection, from: &Path, force: bool) -> Result<(usize, usize), String> {
+/// again, so it is refused with a warning unless `force`. `stop` runs once, after every check
+/// has passed and just before anything is written.
+pub fn import_db(con: &mut Connection, from: &Path, force: bool, stop: impl FnOnce()) -> Result<(usize, usize), String> {
     // ATTACH would create a missing file.
     if !from.is_file() {
-        return Err(format!("No data.db at {}", from.display()));
+        return Err("No data.db in that folder".into());
     }
     let attach = con.execute("ATTACH ?1 AS mb", [from.to_string_lossy()]);
     attach.map_err(|e| if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) { NOT_MICRO_BOT.to_string() } else { e.to_string() })?;
-    let done = merge_attached(con, from, force);
+    let done = merge_attached(con, from, force, stop);
     let _ = con.execute("DETACH mb", []);
     done
 }
 
-fn merge_attached(con: &mut Connection, from: &Path, force: bool) -> Result<(usize, usize), String> {
+fn merge_attached(con: &mut Connection, from: &Path, force: bool, stop: impl FnOnce()) -> Result<(usize, usize), String> {
     let tables: Vec<String> = con
         .prepare("SELECT name FROM mb.sqlite_master WHERE type = 'table'")
         .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
@@ -641,10 +642,11 @@ fn merge_attached(con: &mut Connection, from: &Path, force: bool) -> Result<(usi
         return Err(NOT_MICRO_BOT.into());
     }
     let meta = |key: &str| con.query_row("SELECT value FROM meta WHERE key = ?", [key], |r| r.get::<_, String>(0)).optional().map_err(|e| e.to_string());
-    if !force && let Some(before) = meta("imported_from")? {
+    if !force && meta("imported_from")?.is_some() {
         let at = meta("imported_at")?.unwrap_or_default();
-        return Err(format!("Already imported from {before} {at}. Importing again adds the hours twice"));
+        return Err(format!("Already imported {at}"));
     }
+    stop();
     let db = |e: rusqlite::Error| e.to_string();
     let tx = con.transaction().map_err(db)?;
     let rows = tx
@@ -664,6 +666,10 @@ fn merge_attached(con: &mut Connection, from: &Path, force: bool) -> Result<(usi
         )
         .map_err(db)?;
     }
+    // micro bot's weekly toast is not due again at once.
+    if tables.iter().any(|t| t == "meta") {
+        tx.execute("INSERT OR IGNORE INTO meta(key, value) SELECT key, value FROM mb.meta WHERE key = 'summary_week'", []).map_err(db)?;
+    }
     tx.execute("INSERT OR REPLACE INTO meta VALUES('imported_from', ?)", [from.to_string_lossy()]).map_err(db)?;
     tx.execute("INSERT OR REPLACE INTO meta VALUES('imported_at', 'on ' || datetime('now', 'localtime'))", []).map_err(db)?;
     tx.commit().map_err(db)?;
@@ -679,8 +685,8 @@ fn names_of(c: &mut FocusCategory, is_app: bool) -> &mut Vec<String> {
 /// there; the rest go to the category of the same name (see `RENAME`), created if Focus lacks
 /// it. Names that are not a program or a plain host are skipped.
 pub fn import_categories(text: &str, cats: &[FocusCategory], json: &str) -> Result<(String, usize), String> {
-    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Not a micro bot categories.json: {e}"))?;
-    let map = v.as_object().ok_or("Not a micro bot categories.json: expected {category: [names]}")?;
+    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Bad categories.json, line {}", e.line()))?;
+    let map = v.as_object().ok_or("categories.json isn't {category: [names]}")?;
     let mut now = cats.to_vec();
     let mut added = 0;
     for (name, list) in map {
@@ -709,9 +715,9 @@ pub fn import_categories(text: &str, cats: &[FocusCategory], json: &str) -> Resu
 /// micro bot's `settings.json` as `[screen_time]` in config.toml's text, category names mapped
 /// (see `RENAME`), and tracking switched on. What the file leaves out stays as it was.
 pub fn import_settings(text: &str, json: &str) -> Result<String, String> {
-    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Not a micro bot settings.json: {e}"))?;
+    let v: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| format!("Bad settings.json, line {}", e.line()))?;
     if !v.is_object() {
-        return Err("Not a micro bot settings.json: expected {settings}".into());
+        return Err("settings.json isn't an object".into());
     }
     let set = |text: String, field: &str, value: toml_edit::Value| crate::config::write_value(&text, &["screen_time".to_string(), field.to_string()], value);
     let mut text = text.to_string();
@@ -732,13 +738,14 @@ pub fn import_settings(text: &str, json: &str) -> Result<String, String> {
 }
 
 /// Everything in micro bot's `folder` into procast: the database into `db`, categories and
-/// settings into the config file. Files that don't read fail before anything changes; the
-/// config is written after the database, so a retry after a failure never counts hours twice.
-pub fn import_folder(folder: &Path, config: &Path, db: &Path, force: bool) -> Result<Imported, String> {
+/// settings into the config file. Files that don't read or parse fail before anything changes,
+/// and `stop` (see `import_db`) runs only after that. The config is written after the database:
+/// if that write fails, a retry needs "Add the hours again", which counts them twice.
+pub fn import_folder(folder: &Path, config: &Path, db: &Path, force: bool, stop: impl FnOnce()) -> Result<Imported, String> {
     let read = |name: &str| match std::fs::read_to_string(folder.join(name)) {
         Ok(t) => Ok(Some(t)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("Could not read {name}: {e}")),
+        Err(_) => Err(format!("Could not read {name}")),
     };
     let (categories, settings) = (read("categories.json")?, read("settings.json")?.unwrap_or_else(|| "{}".into()));
     let merge = |text: &str| -> Result<(String, usize), String> {
@@ -754,7 +761,7 @@ pub fn import_folder(folder: &Path, config: &Path, db: &Path, force: bool) -> Re
         let _ = std::fs::create_dir_all(dir);
     }
     let mut con = open(db).map_err(|e| e.to_string())?;
-    let (rows, days) = import_db(&mut con, &folder.join("data.db"), force)?;
+    let (rows, days) = import_db(&mut con, &folder.join("data.db"), force, stop)?;
     drop(con);
     let mut names_added = 0;
     crate::config::edit_file(config, |text| {
@@ -765,23 +772,36 @@ pub fn import_folder(folder: &Path, config: &Path, db: &Path, force: bool) -> Re
     Ok(Imported { rows, days, names_added })
 }
 
-/// The Import Screen Time command: stops micro bot's scheduled tracker (its last 30 s of
-/// counters are lost, accepted), then `import_folder` on procast's own files. Returns the toast
-/// text. Blocks on SQLite and `schtasks`: never call it from the UI thread.
-pub fn import_from(folder: &Path, force: bool) -> Result<String, String> {
+/// The Import Screen Time command: `import_folder` on procast's own files, which stops micro
+/// bot's scheduled tracker (its last 30 s of counters are lost, accepted) once the import can go
+/// ahead. Returns the toast text; a task that won't disable is a toast of its own on `tx`.
+/// Blocks on SQLite and `schtasks`: never call it from the UI thread.
+pub fn import_from(folder: &Path, force: bool, tx: &UnboundedSender<win::Msg>) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const TASK: &str = "WellbeingTracker";
     static BUSY: Mutex<()> = Mutex::new(());
     let Ok(_one) = BUSY.try_lock() else { return Err("An import is already running".into()) };
-    // Before it stops anything.
+    // Before it does anything.
     if !folder.join("data.db").is_file() {
-        return Err(format!("No data.db in {}", folder.display()));
+        return Err("No data.db in that folder".into());
     }
-    // A missing task is fine: micro bot may never have been scheduled.
-    for args in [&["/End", "/TN", "WellbeingTracker"][..], &["/Change", "/TN", "WellbeingTracker", "/Disable"]] {
-        let _ = std::process::Command::new("schtasks").args(args).creation_flags(CREATE_NO_WINDOW).status();
-    }
-    let got = import_folder(folder, &crate::config::path(), &db_path(), force)?;
+    let stop = || {
+        // The dev instance must not disable the micro bot that is live.
+        if win::dev() {
+            return;
+        }
+        let schtasks = |args: &[&str]| std::process::Command::new("schtasks").args(args).creation_flags(CREATE_NO_WINDOW).status().is_ok_and(|s| s.success());
+        // No such task is fine: micro bot may never have been scheduled.
+        if !schtasks(&["/Query", "/TN", TASK]) {
+            return;
+        }
+        schtasks(&["/End", "/TN", TASK]);
+        if !schtasks(&["/Change", "/TN", TASK, "/Disable"]) {
+            let _ = tx.unbounded_send(win::Msg::error("micro bot's task wasn't disabled"));
+        }
+    };
+    let got = import_folder(folder, &crate::config::path(), &db_path(), force, stop)?;
     Ok(format!("Imported {} days of screen time ({} rows, {} names)", got.days, got.rows, got.names_added))
 }
 
@@ -794,6 +814,11 @@ pub struct Tab {
 }
 
 pub static TAB: RwLock<Option<Tab>> = RwLock::new(None);
+
+/// The tab answer that came in since the last call, if any.
+fn take_tab() -> (String, bool) {
+    TAB.write().unwrap_or_else(PoisonError::into_inner).take().map(|t| (t.host, t.audible)).unwrap_or_default()
+}
 
 /// Counters not yet on disk: the sampler adds, `flush_pending` writes.
 static PENDING: LazyLock<Mutex<Pending>> = LazyLock::new(Mutex::default);
@@ -851,12 +876,14 @@ fn run(stop: mpsc::Receiver<()>, browsers: browser::Browsers, tx: UnboundedSende
         last = now;
         let (day, hour, minute) = win::local_now();
         let exe = foreground_exe();
+        // Only an answer that came in since the last sample counts: a browser that stops answering
+        // (no extension, a PWA window) must not keep the last site alive.
+        let tab = take_tab();
         let (site, audible) = if BROWSERS.contains(&exe.as_str()) {
             // The answer lands in TAB for the next sample (a 2 s lag, accepted).
             browsers.ask_all(json!({"t": "active"}));
-            TAB.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|t| (t.host.clone(), t.audible)).unwrap_or_default()
+            tab
         } else {
-            *TAB.write().unwrap_or_else(PoisonError::into_inner) = None;
             Default::default()
         };
         let credits = account(&exe, idle_seconds(), &site, audible, dt);
@@ -906,6 +933,7 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn account_rules() {
@@ -1264,7 +1292,9 @@ mod tests {
         let mut con = mem();
         insert(&con, &[("2026-09-30", 9, "app", "code.exe", 10.0)]);
         con.execute("INSERT INTO daily VALUES('2026-09-30', 1, 120.0, '10:00', '18:00')", []).unwrap();
-        assert_eq!(import_db(&mut con, &from, false), Ok((2, 2)));
+        let stops = Cell::new(0);
+        assert_eq!(import_db(&mut con, &from, false, || stops.set(stops.get() + 1)), Ok((2, 2)));
+        assert_eq!(stops.get(), 1, "stopped once, after the checks");
         let seconds = |day: &str| con.query_row("SELECT seconds FROM usage WHERE day = ?", [day], |r| r.get::<_, f64>(0)).unwrap();
         assert_eq!((seconds("2026-09-30"), seconds("2026-09-29")), (110.0, 50.0));
         let daily: (u32, f64, String, String) =
@@ -1272,7 +1302,22 @@ mod tests {
         assert_eq!(daily, (3, 120.0, "09:00".into(), "18:00".into()));
         assert_eq!(meta(&con, "imported_from"), Some(from.to_string_lossy().into_owned()));
         // The source is detached again: attaching it a second time works.
-        assert!(import_db(&mut con, &from, true).is_ok());
+        assert!(import_db(&mut con, &from, true, || {}).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_db_keeps_micro_bots_weekly_summary_mark() {
+        let dir = scratch("weekmark");
+        let from = micro_bot_db(&dir);
+        rusqlite::Connection::open(&from).unwrap().execute("INSERT INTO meta VALUES('summary_week', '2026-09-28')", []).unwrap();
+        let mut con = mem();
+        import_db(&mut con, &from, false, || {}).unwrap();
+        assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-09-28"), "no repeat of the toast micro bot gave");
+        // procast's own mark wins
+        con.execute("INSERT OR REPLACE INTO meta VALUES('summary_week', '2026-10-05')", []).unwrap();
+        import_db(&mut con, &from, true, || {}).unwrap();
+        assert_eq!(meta(&con, "summary_week").as_deref(), Some("2026-10-05"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1282,14 +1327,17 @@ mod tests {
         let mut con = mem();
         insert(&con, &[("2026-09-30", 9, "app", "code.exe", 10.0)]);
         let missing = dir.join("data.db");
-        assert!(import_db(&mut con, &missing, false).unwrap_err().contains("data.db"));
+        let stops = Cell::new(0);
+        let stop = || stops.set(stops.get() + 1);
+        assert!(import_db(&mut con, &missing, false, stop).unwrap_err().contains("data.db"));
         assert!(!missing.exists(), "a missing file is not created by the attach");
         let other = dir.join("other.db");
         rusqlite::Connection::open(&other).unwrap().execute_batch("CREATE TABLE notes(a)").unwrap();
-        assert_eq!(import_db(&mut con, &other, false), Err("not a micro bot database".into()));
+        assert_eq!(import_db(&mut con, &other, false, stop), Err("not a micro bot database".into()));
         let text = dir.join("text.db");
         std::fs::write(&text, "this is not sqlite at all, just some text to fill a header").unwrap();
-        assert_eq!(import_db(&mut con, &text, false), Err("not a micro bot database".into()));
+        assert_eq!(import_db(&mut con, &text, false, stop), Err("not a micro bot database".into()));
+        assert_eq!(stops.get(), 0, "nothing is stopped for a file that is no good");
         assert_eq!((seconds_on(&con, parse_iso("2026-09-30").unwrap()), meta(&con, "imported_from")), (10.0, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1299,11 +1347,11 @@ mod tests {
         let dir = scratch("twice");
         let from = micro_bot_db(&dir);
         let mut con = mem();
-        import_db(&mut con, &from, false).unwrap();
-        let err = import_db(&mut con, &from, false).unwrap_err();
-        assert!(err.starts_with("Already imported"), "{err}");
+        import_db(&mut con, &from, false, || {}).unwrap();
+        let err = import_db(&mut con, &from, false, || panic!("stopped for a refused import")).unwrap_err();
+        assert!(err.starts_with("Already imported on 20") && err.len() < 50, "{err}");
         assert_eq!(seconds_on(&con, parse_iso("2026-09-30").unwrap()), 100.0, "the warning changes nothing");
-        import_db(&mut con, &from, true).unwrap();
+        import_db(&mut con, &from, true, || {}).unwrap();
         assert_eq!(seconds_on(&con, parse_iso("2026-09-30").unwrap()), 200.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1349,15 +1397,33 @@ mod tests {
         std::fs::write(dir.join("settings.json"), r#"{"distracting":["Games"]}"#).unwrap();
         let (cfg, db) = (dir.join("config.toml"), dir.join("screentime.db"));
         std::fs::write(&cfg, "# mine\n").unwrap();
-        let got = import_folder(&dir, &cfg, &db, false).unwrap();
-        assert_eq!((got.rows, got.days, got.names_added), (2, 2, 1));
+        let stops = Cell::new(0);
+        let stop = || stops.set(stops.get() + 1);
+        let got = import_folder(&dir, &cfg, &db, false, stop).unwrap();
+        assert_eq!((got.rows, got.days, got.names_added, stops.get()), (2, 2, 1, 1));
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert!(text.contains("# mine") && text.contains("crunchyroll.com") && text.contains("enabled = true"));
         // a bad categories.json fails before the database is touched
         let fresh = dir.join("fresh.db");
         std::fs::write(dir.join("categories.json"), "oops").unwrap();
-        assert!(import_folder(&dir, &cfg, &fresh, false).is_err());
+        assert!(import_folder(&dir, &cfg, &fresh, false, stop).is_err());
         assert!(!fresh.exists());
+        // so do a bad settings.json, a typo in config.toml, a database that is no good and an import done before
+        std::fs::write(dir.join("categories.json"), "{}").unwrap();
+        std::fs::write(dir.join("settings.json"), "oops").unwrap();
+        assert!(import_folder(&dir, &cfg, &fresh, false, stop).is_err());
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        let good = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(&cfg, "enabled = = oops").unwrap();
+        assert!(import_folder(&dir, &cfg, &fresh, false, stop).is_err());
+        std::fs::write(&cfg, &good).unwrap();
+        assert!(!fresh.exists());
+        let err = import_folder(&dir, &cfg, &db, false, stop).err().unwrap();
+        assert!(err.starts_with("Already imported"), "{err}");
+        std::fs::rename(dir.join("data.db"), dir.join("moved.db")).unwrap();
+        std::fs::copy(&cfg, dir.join("data.db")).unwrap();
+        assert!(import_folder(&dir, &cfg, &fresh, false, stop).is_err());
+        assert_eq!(stops.get(), 1, "micro bot is stopped only once the import can go ahead");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1474,6 +1540,14 @@ mod tests {
         let w = stats(&con, mon, d, span(Range::Week, d).1, &rules).unwrap();
         let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development"), &none_hours));
         assert!(dev.contains(&"2026-09-30: 10m".to_string()) && dev.contains(&"Earliest start: 09:05".to_string()), "{dev:?}");
+    }
+
+    #[test]
+    fn a_tab_answer_counts_once() {
+        // The only test that touches TAB.
+        *TAB.write().unwrap() = Some(Tab { host: "a.com".into(), audible: true });
+        assert_eq!(take_tab(), ("a.com".to_string(), true));
+        assert_eq!(take_tab(), (String::new(), false), "no new answer: no site");
     }
 
     #[test]

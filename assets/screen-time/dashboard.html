@@ -868,11 +868,11 @@ async function load() {
     const response = await fetch(`/api/stats?from=${iso(from)}&to=${iso(to)}`).catch(() => null);
     if (mine !== request) return;
     if (!response) {
-      showError("The tracker isn't running. Start it with ", el("code", "", "python tracker.py"), " and this page will pick up again.");
+      showError("Screen Time isn't running. Turn it on in procast and this page will pick up again.");
     } else if (!response.ok) {
       const detail = await response.json().catch(() => ({}));
       showError("Couldn't read your data", detail.error ? `: ${detail.error}. ` : ". ",
-        "If you just edited categories.json or settings.json, check it for a typo.");
+        "If you just edited config.toml, check it for a typo.");
     } else {
       render(await response.json(), key !== shown);
       shown = key;

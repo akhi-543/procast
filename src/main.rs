@@ -361,7 +361,7 @@ fn import_screen_time_form() -> Vec<FormField> {
     vec![
         field("micro bot folder", Ctl::Text { placeholder: r"D:\Pro\micro bot".into(), icon: Some(g::FOLDER), tall: false, presets: &[] }, r"D:\Pro\micro bot"),
         field("If imported before", Ctl::Select(again, false), "stop"),
-        field("", Ctl::Note, "Stops and disables micro bot's WellbeingTracker task, adds data.db, categories.json and settings.json, and turns Screen Time on. Running it twice adds the hours twice."),
+        field("", Ctl::Note, "Stops and disables micro bot's WellbeingTracker task, adds data.db, categories.json and settings.json, and turns Screen Time on. Running it twice adds the hours twice, and so does turning Screen Time on before importing. Imported apps and sites join procast's categories, so Focus blocks using them (e.g. Messaging, Gaming) include them."),
     ]
 }
 
@@ -2303,10 +2303,10 @@ impl Launcher {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // The answer is always sent, so a crash cannot leave the user waiting.
-            let done = std::panic::catch_unwind(|| wellbeing::import_from(&folder, force)).unwrap_or_else(|_| Err("the import failed".into()));
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wellbeing::import_from(&folder, force, &tx))).unwrap_or_else(|_| Err("the import failed".into()));
             let _ = tx.unbounded_send(match done {
                 Ok(text) => Msg::done(text),
-                Err(e) => Msg::error(format!("Screen Time import: {e}")),
+                Err(e) => Msg::error(format!("Import: {e}")),
             });
         });
         self.say(Msg::info("Importing Screen Time…"));
@@ -4134,8 +4134,11 @@ impl Launcher {
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
             Act::Cmd(Cmd::ScreenTime) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Today), cx),
             Act::Cmd(Cmd::ScreenTimeWeek) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Week), cx),
-            // The dashboard is served only while Screen Time is on.
-            Act::Cmd(Cmd::OpenScreenTimeDashboard) if self.cfg.screen_time.enabled => win::open(wellbeing_http::URL),
+            // The dashboard is served only while Screen Time is on; asking again retries a bind that failed (a no-op while it runs).
+            Act::Cmd(Cmd::OpenScreenTimeDashboard) if self.cfg.screen_time.enabled => {
+                wellbeing_http::serve(self.tx.clone(), || _ = wellbeing::flush_pending());
+                win::open(wellbeing_http::URL)
+            }
             Act::Cmd(Cmd::OpenScreenTimeDashboard) => self.say(Msg::info("Screen Time is off. Run Screen Time to turn it on")),
             Act::MoveToCategory(name) => return self.open_category_menu(name, window, cx),
             Act::ExportScreenTime => return self.export_screen_time(cx),

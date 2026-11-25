@@ -471,7 +471,7 @@ mod tests {
         for length in ["-1", "abc", "", "99999999999999999999999"] {
             assert!(parse(&format!("POST / HTTP/1.1\r\nContent-Length: {length}\r\n\r\nabc")).unwrap().body.is_empty(), "{length:?}");
         }
-        // the route itself refuses an oversize body too
+        // route() does not look at the size (only parse_request enforces the limit): this 400 is the cut JSON failing to parse
         let mut req = post_category("http://127.0.0.1:8737", &format!(r#"{{"name":"{}","category":"Other"}}"#, "a".repeat(2000)));
         req.body.truncate(2000);
         assert_eq!(route(&req, &db, &cfg).code, 400);
