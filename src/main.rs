@@ -984,6 +984,8 @@ struct Launcher {
     st_stats: Option<Result<Value, String>>,
     /// Its apps' and sites' time per hour, when the span is one day.
     st_hours: wellbeing::Hours,
+    /// Each day's categories over the last 371 days, for the trend line and the heatmap.
+    st_days: Option<Value>,
     st_gen: u64,
     matcher: Matcher,
     mode: Mode,
@@ -1207,6 +1209,7 @@ impl Launcher {
             note_gen: 0,
             st_stats: None,
             st_hours: Default::default(),
+            st_days: None,
             st_gen: 0,
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
@@ -2651,7 +2654,7 @@ impl Launcher {
             self.note_rows = None;
         }
         if let Mode::ScreenTime(p) = mode {
-            self.st_stats = None;
+            (self.st_stats, self.st_days) = (None, None);
             self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
         }
         if mode == Mode::Tabs {
@@ -4724,13 +4727,15 @@ impl Launcher {
             return;
         }
         self.st_gen += 1;
-        let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, win::local_now().0), wellbeing::rules(&cats));
+        let today = win::local_now().0;
+        let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, today), wellbeing::rules(&cats));
         let read = cx.background_executor().spawn(async move {
             let _ = wellbeing::flush_pending();
             let con = wellbeing::open(&wellbeing::db_path()).map_err(|e| e.to_string())?;
             let stats = wellbeing::stats(&con, span.0, span.1, before, &rules).map_err(|e| e.to_string())?;
             let hours = if span.0 == span.1 { wellbeing::hours_by_name(&con, span.0).map_err(|e| e.to_string())? } else { Default::default() };
-            Ok((stats, hours))
+            let days = wellbeing::days(&con, today - 370, today, &rules).map_err(|e| e.to_string())?;
+            Ok((stats, hours, days))
         });
         cx.spawn(async move |this, cx| {
             let r = read.await;
@@ -4739,16 +4744,16 @@ impl Launcher {
         .detach();
     }
 
-    fn screen_time_loaded(&mut self, p: wellbeing::Period, generation: u64, r: Result<(Value, wellbeing::Hours), String>, cx: &mut Context<Self>) {
+    fn screen_time_loaded(&mut self, p: wellbeing::Period, generation: u64, r: Result<(Value, wellbeing::Hours, Value), String>, cx: &mut Context<Self>) {
         let Mode::ScreenTime(current) = self.mode else { return };
         if !wellbeing::fresh(current, p, self.st_gen, generation) {
             return;
         }
-        let (stats, hours) = match r {
-            Ok((stats, hours)) => (Ok(stats), hours),
-            Err(e) => (Err(e), Default::default()),
+        let (stats, hours, days) = match r {
+            Ok((stats, hours, days)) => (Ok(stats), hours, Some(days)),
+            Err(e) => (Err(e), Default::default(), None),
         };
-        (self.st_stats, self.st_hours) = (Some(stats), hours);
+        (self.st_stats, self.st_hours, self.st_days) = (Some(stats), hours, days);
         if self.confirm.is_none() {
             let q = self.query(cx);
             self.items = self.screen_time_items(p, &q);

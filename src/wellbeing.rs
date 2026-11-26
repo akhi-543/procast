@@ -463,6 +463,79 @@ pub fn caption(p: Period, today: i64) -> String {
     }
 }
 
+/// The categories that own a colour slot, in slot order; a category outside them gets the spare
+/// colour (the largest one) or grey.
+#[allow(dead_code)] // drawn by the dashboard
+pub const SLOTS: [&str; 7] = ["Development", "Productivity", "Messaging", "Social", "Streaming", "Gaming", "Browsing"];
+
+fn day_total(day: Option<&Value>) -> u64 {
+    day.and_then(Value::as_object).map_or(0, |m| m.values().filter_map(Value::as_u64).sum())
+}
+
+/// Productive seconds over total seconds for each of `weeks` weeks from `first_monday`; None for
+/// a week under a minute.
+#[allow(dead_code)] // drawn by the dashboard
+pub fn week_shares(days: &Value, productive: &[String], first_monday: i64, weeks: usize) -> Vec<Option<f64>> {
+    (0..weeks as i64)
+        .map(|w| {
+            let (mut total, mut good) = (0, 0);
+            for day in first_monday + w * 7..first_monday + w * 7 + 7 {
+                let d = &days["days"][iso(day)];
+                total += day_total(Some(d));
+                good += productive.iter().map(|c| d[c.as_str()].as_u64().unwrap_or(0)).sum::<u64>();
+            }
+            (total >= 60).then(|| good as f64 / total as f64)
+        })
+        .collect()
+}
+
+/// A heatmap shade 0..=4 for each day of `from..=to`: 0 under a minute, else by share of the busiest day.
+#[allow(dead_code)] // drawn by the dashboard
+pub fn heat_levels(days: &Value, from: i64, to: i64) -> Vec<u8> {
+    let totals: Vec<u64> = (from..=to).map(|d| day_total(days["days"].get(iso(d)))).collect();
+    let max = totals.iter().copied().max().unwrap_or(0);
+    totals.iter().map(|&t| if t < 60 { 0 } else { (1 + t * 4 / max).min(4) as u8 }).collect()
+}
+
+/// `(category, now, before)`: the slot categories always, then any other with time in either period.
+#[allow(dead_code)] // drawn by the dashboard
+pub fn compare_rows(stats: &Value) -> Vec<(String, u64, u64)> {
+    let now: Vec<(&str, u64)> = stats["categories"].as_array().into_iter().flatten().filter_map(|c| Some((c["name"].as_str()?, c["seconds"].as_u64()?))).collect();
+    let before = |n: &str| stats["previous_categories"][n].as_u64().unwrap_or(0);
+    let seconds = |n: &str| now.iter().find(|(c, _)| *c == n).map_or(0, |(_, s)| *s);
+    let mut rows: Vec<_> = SLOTS.iter().map(|&n| (n.to_string(), seconds(n), before(n))).collect();
+    let mut rest: Vec<(String, u64, u64)> = now.iter().filter(|(n, _)| !SLOTS.contains(n)).map(|&(n, s)| (n.to_string(), s, before(n))).collect();
+    rest.extend(stats["previous_categories"].as_object().into_iter().flatten().filter(|(n, _)| !SLOTS.contains(&n.as_str()) && seconds(n) == 0).filter_map(|(n, s)| Some((n.clone(), 0, s.as_u64()?))));
+    rest.retain(|r| r.1 + r.2 > 0);
+    rest.sort_by_key(|r| std::cmp::Reverse(r.1));
+    rows.extend(rest);
+    rows
+}
+
+/// The colour slot of a category: 0..7 its own, 7 the spare for the largest other category, None grey.
+#[allow(dead_code)] // drawn by the dashboard
+pub fn color_slot(category: &str, stats: &Value) -> Option<usize> {
+    if let Some(i) = SLOTS.iter().position(|&s| s == category) {
+        return Some(i);
+    }
+    let first = stats["categories"].as_array()?.iter().filter_map(|c| c["name"].as_str()).find(|n| *n != "Other" && !SLOTS.contains(n));
+    (first == Some(category)).then_some(7)
+}
+
+/// The bucket with the most time: "11 AM" for an hour, "Wed 19" for a day; None when all are empty.
+#[allow(dead_code)] // drawn by the dashboard
+pub fn busiest(stats: &Value) -> Option<(String, u64)> {
+    let (label, seconds) = stats["buckets"].as_array()?.iter().map(|b| (&b["label"], day_total(Some(&b["categories"])))).fold((None, 0), |best, (l, s)| if s > best.1 { (Some(l), s) } else { best });
+    let name = match label?.as_str().and_then(parse_iso) {
+        Some(day) => format!("{} {}", WEEKDAYS[weekday(day) as usize], civil_from_days(day).2),
+        None => {
+            let h = label?.as_u64()?;
+            format!("{} {}", if h % 12 == 0 { 12 } else { h % 12 }, if h < 12 { "AM" } else { "PM" })
+        }
+    };
+    Some((name, seconds))
+}
+
 /// Whether an answer read for `asked` under `asked_gen` still fits what is on screen.
 pub fn fresh(current: Period, asked: Period, current_gen: u64, asked_gen: u64) -> bool {
     current == asked && current_gen == asked_gen
@@ -1639,6 +1712,7 @@ mod tests {
         let p = |range, a| Period { range, anchor: d(a) };
         assert_eq!(step(p(Range::Month, "2026-01-31"), 1, today), p(Range::Month, "2026-02-01"));
         assert_eq!(step(p(Range::Month, "2026-01-15"), -1, today), p(Range::Month, "2025-12-01"));
+        assert_eq!(step(p(Range::Month, "2025-12-15"), 1, today), p(Range::Month, "2026-01-01"));
         assert_eq!(step(p(Range::Day, "2026-11-26"), 1, today), p(Range::Day, "2026-11-26"), "no future");
         assert_eq!(step(p(Range::Week, "2026-11-26"), 1, today), p(Range::Week, "2026-11-26"));
         assert_eq!(step(p(Range::Week, "2026-11-26"), -1, today), p(Range::Week, "2026-11-19"));
@@ -1706,6 +1780,39 @@ mod tests {
         let w = stats(&con, mon, d, span(Period { range: Range::Week, anchor: d }, d).1, &rules).unwrap();
         let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development"), &none_hours));
         assert!(dev.contains(&"2026-09-30: 10m".to_string()) && dev.contains(&"Earliest start: 09:05".to_string()), "{dev:?}");
+    }
+
+    #[test]
+    fn comparison_keeps_categories_that_went_quiet() {
+        let stats = json!({"categories": [{"name": "Development", "seconds": 120}, {"name": "Reading", "seconds": 60}],
+                           "previous_categories": {"Development": 2340, "Messaging": 120}});
+        let rows = compare_rows(&stats);
+        assert_eq!(&rows[..3], &[("Development".to_string(), 120, 2340), ("Productivity".into(), 0, 0), ("Messaging".into(), 0, 120)]);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[7], ("Reading".to_string(), 60, 0));
+    }
+
+    #[test]
+    fn shares_levels_colours_and_busiest() {
+        let d = |s| parse_iso(s).unwrap();
+        let days = json!({"days": {"2026-11-16": {"Development": 3000, "Other": 1000}, "2026-11-24": {"Other": 30}}});
+        let shares = week_shares(&days, &["Development".into()], d("2026-11-16"), 2);
+        assert_eq!(shares, vec![Some(0.75), None]);
+        assert_eq!(heat_levels(&days, d("2026-11-16"), d("2026-11-17")), vec![4, 0]);
+        let stats = json!({"categories": [{"name": "Development", "seconds": 9}, {"name": "Reading", "seconds": 8}, {"name": "Cooking", "seconds": 7}, {"name": "Other", "seconds": 6}],
+                           "buckets": [{"label": 10, "categories": {"Other": 5}}, {"label": 11, "categories": {"Development": 9}}]});
+        assert_eq!(color_slot("Development", &stats), Some(0));
+        assert_eq!(color_slot("Reading", &stats), Some(7));
+        assert_eq!(color_slot("Cooking", &stats), None);
+        assert_eq!(color_slot("Other", &stats), None);
+        assert_eq!(busiest(&stats), Some(("11 AM".into(), 9)));
+    }
+
+    #[test]
+    fn busiest_names_days_and_skips_empty() {
+        let daily = json!({"buckets": [{"label": "2026-11-18", "categories": {"Other": 5}}, {"label": "2026-11-19", "categories": {"Development": 9}}]});
+        assert_eq!(busiest(&daily), Some(("Thu 19".into(), 9)));
+        assert_eq!(busiest(&json!({"buckets": [{"label": 0, "categories": {}}]})), None);
     }
 
     #[test]
