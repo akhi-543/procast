@@ -114,6 +114,11 @@ pub enum Cmd {
     CreateNote,
     /// Notes deleted in the last `[notes] keep_deleted_days`, to restore or remove for good.
     RecentlyDeletedNotes,
+    /// Ask for micro bot's folder, then bring its screen-time history, categories and settings in.
+    ImportScreenTime,
+    /// Today's screen time by category, app and site; or Monday to today.
+    ScreenTime,
+    ScreenTimeWeek,
     Quit,
 }
 
@@ -212,6 +217,9 @@ pub const ALL: &[(Cmd, &str, &str, &str)] = &[
     (Cmd::Focus(FocusCmd::SearchCategories), "Search Focus Categories", "lists apps websites block allow", g::LIST_CHECKS),
     (Cmd::Focus(FocusCmd::CreateCategory), "Create Focus Category", "new list apps websites block allow", g::LIST_PLUS),
     (Cmd::Focus(FocusCmd::ImportCategories), "Import Focus Categories", "raycast json export lists apps websites", g::IMPORT),
+    (Cmd::ScreenTime, "Screen Time", "wellbeing usage today apps websites categories productivity tracker", g::MONITOR),
+    (Cmd::ScreenTimeWeek, "Screen Time This Week", "wellbeing usage weekly apps websites categories productivity tracker", g::CALENDAR_CLOCK),
+    (Cmd::ImportScreenTime, "Import Screen Time from micro bot", "wellbeing usage history tracker categories settings migrate", g::IMPORT),
     (Cmd::StartTimer, "Start Timer", "countdown alarm remind minutes", g::ALARM_CLOCK),
     (Cmd::StartStopwatch, "Start Stopwatch", "count up elapsed time", g::TIMER),
     (Cmd::Translate, "Translate", "translator google language tr", g::LANGUAGES),
@@ -356,6 +364,7 @@ impl Cmd {
             Cmd::SearchTabs | Cmd::BrowserSetup => "Browser",
             Cmd::StartTimer | Cmd::StartStopwatch => "Timer",
             Cmd::Focus(_) => "Focus",
+            Cmd::ScreenTime | Cmd::ScreenTimeWeek | Cmd::ImportScreenTime => "Screen Time",
             Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste => "Translator",
             Cmd::Define => "Dictionary",
             Cmd::MySchedule | Cmd::JoinMeeting => "Calendar",
@@ -415,7 +424,7 @@ pub fn run(cmd: Cmd, target: HWND, w: &config::Window) -> Result<Option<String>,
             // Windows asks for admin once; the helper then starts at every logon.
             Cmd::FastFileSearch(on) => crate::win::run_self_as_admin(if on { "--install-indexer" } else { "--uninstall-indexer" }),
             // Handled on the UI thread.
-            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
+            Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::ClearClipboardHistory | Cmd::ClearSearchHistory | Cmd::Emoji | Cmd::Settings | Cmd::EditConfig | Cmd::ReloadApps | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::Quit | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchTabs | Cmd::BrowserSetup | Cmd::Focus(_) | Cmd::StartTimer | Cmd::StartStopwatch | Cmd::Translate | Cmd::InstantTranslateCopy | Cmd::InstantTranslatePaste | Cmd::Define | Cmd::MySchedule | Cmd::JoinMeeting | Cmd::SearchScreenshots | Cmd::PasteLatestScreenshot | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::CreateNote | Cmd::RecentlyDeletedNotes | Cmd::ImportScreenTime | Cmd::ScreenTime | Cmd::ScreenTimeWeek | Cmd::YtMusic(_) | Cmd::YtImportSession | Cmd::YtControl(_) => {}
         }
     }
     Ok(None)
@@ -789,6 +798,9 @@ mod tests {
             (Cmd::Focus(F::SearchCategories), g::LIST_CHECKS, Tint::System),
             (Cmd::Focus(F::CreateCategory), g::LIST_PLUS, Tint::System),
             (Cmd::Focus(F::ImportCategories), g::IMPORT, Tint::System),
+            (Cmd::ScreenTime, g::MONITOR, Tint::System),
+            (Cmd::ScreenTimeWeek, g::CALENDAR_CLOCK, Tint::System),
+            (Cmd::ImportScreenTime, g::IMPORT, Tint::System),
         ];
         for (cmd, glyph, tint) in map {
             let (_, title, _, icon) = ALL.iter().find(|(c, ..)| *c == cmd).unwrap_or_else(|| panic!("{cmd:?} not in ALL"));
@@ -936,6 +948,11 @@ mod tests {
         assert_eq!((titles[0], titles[9], titles[10], titles[19]), ("Open Desktop 1", "Open Desktop 10", "Move to Desktop 1", "Move to Desktop 10"));
         assert!(ALL.iter().any(|&(c, t, ..)| c == Cmd::Desktop(Desk::Rename) && t == "Rename Desktop"));
         assert!(ALL.iter().filter(|(c, ..)| matches!(c, Cmd::Desktop(_))).all(|&(c, ..)| c.subtitle() == "Window"));
+    }
+
+    #[test]
+    fn no_web_dashboard_command() {
+        assert!(!ALL.iter().any(|(_, title, _, _)| title.contains("Dashboard")));
     }
 
     #[test]

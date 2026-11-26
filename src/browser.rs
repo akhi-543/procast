@@ -121,6 +121,9 @@ pub enum Reply {
     Tabs(String, Vec<Tab>),
     /// Done (activate, open) or failed.
     Done(Result<(), String>),
+    /// The active tab of the browser's last focused window; `focused` if that window has OS focus.
+    /// An extension too old to know `active` answers with nothing focused.
+    Active { focused: bool, host: String, audible: bool },
     /// YouTube Music's answer, errors included.
     Music(crate::ytmusic::Reply),
 }
@@ -218,6 +221,12 @@ fn parse_reply(body: &[u8]) -> Reply {
         });
         return Reply::Music(music);
     }
+    if v["t"] == "active" {
+        // Hostname only, lower-case, no "www."; anything else is no site.
+        let host = crate::focus::norm_site(v["host"].as_str().unwrap_or_default());
+        let valid = host.len() <= 253 && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+        return Reply::Active { focused: v["focused"] == true, host: if valid { host } else { String::new() }, audible: v["audible"] == true };
+    }
     if let Some(e) = v["error"].as_str() {
         return Reply::Done(Err(e.to_string()));
     }
@@ -287,6 +296,21 @@ mod tests {
         }
         assert!(matches!(parse_reply(br#"{"t":"open","ok":true}"#), Reply::Done(Ok(()))));
         assert!(matches!(parse_reply(br#"{"t":"activate","error":"No tab with id: 9."}"#), Reply::Done(Err(_))));
+    }
+
+    #[test]
+    fn active_reply_parses_and_validates() {
+        let r = parse_reply(br#"{"t":"active","browser":"Edge","focused":true,"host":"WWW.GitHub.com","audible":false}"#);
+        assert!(matches!(&r, Reply::Active { focused: true, host, audible: false } if host == "github.com"), "{r:?}");
+        let r = parse_reply(br#"{"t":"active","browser":"Edge","focused":true,"host":"evil host/../","audible":true}"#);
+        assert!(matches!(&r, Reply::Active { focused: true, host, audible: true } if host.is_empty()), "{r:?}");
+    }
+
+    #[test]
+    fn active_error_is_silent() {
+        // An extension from before Screen Time answers every unknown request with an error.
+        let r = parse_reply(br#"{"t":"active","error":"unknown request"}"#);
+        assert!(matches!(&r, Reply::Active { focused: false, host, audible: false } if host.is_empty()), "{r:?}");
     }
 
     #[test]

@@ -458,7 +458,8 @@ pub struct Start {
 }
 
 /// The categories every install has: name, icon, apps, sites. A `[[focus_category]]` of the
-/// same name takes its place.
+/// same name takes its place. Development, Productivity, Browsing and Other are Screen Time's
+/// (micro bot's lists); `Other` holds entries that override a broader suffix rule.
 pub const BUILT_IN: &[(&str, &str, &[&str], &[&str])] = &[
     ("Messaging", g::MESSAGE_CIRCLE, &["discord.exe", "slack.exe", "telegram.exe", "whatsapp.exe", "signal.exe"], &["discord.com", "slack.com", "web.whatsapp.com", "web.telegram.org", "messenger.com"]),
     ("Social", g::USERS, &[], &["facebook.com", "instagram.com", "x.com", "twitter.com", "tiktok.com", "reddit.com", "linkedin.com", "threads.net", "bsky.app"]),
@@ -467,6 +468,10 @@ pub const BUILT_IN: &[(&str, &str, &[&str], &[&str])] = &[
     ("News", g::NEWSPAPER, &[], &["news.google.com", "cnn.com", "bbc.com", "nytimes.com", "theguardian.com"]),
     ("Shopping", g::SHOPPING_CART, &[], &["amazon.com", "ebay.com", "etsy.com", "aliexpress.com"]),
     ("Gaming", g::GAMEPAD_2, &["steam.exe", "epicgameslauncher.exe", "battle.net.exe", "riotclientservices.exe"], &["store.steampowered.com", "epicgames.com"]),
+    ("Development", g::CODE, &["code.exe", "cursor.exe", "devenv.exe", "pycharm64.exe", "idea64.exe", "webstorm64.exe", "studio64.exe", "sublime_text.exe", "notepad++.exe", "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "wezterm-gui.exe", "docker desktop.exe", "postman.exe"], &["github.com", "gitlab.com", "bitbucket.org", "stackoverflow.com", "stackexchange.com", "developer.mozilla.org", "npmjs.com", "pypi.org", "docs.python.org", "rust-lang.org", "crates.io", "huggingface.co", "kaggle.com", "colab.research.google.com", "leetcode.com", "hackerrank.com", "geeksforgeeks.org", "w3schools.com", "vercel.com", "netlify.com", "console.cloud.google.com", "aws.amazon.com", "localhost", "127.0.0.1"]),
+    ("Productivity", g::NOTEBOOK_PEN, &["winword.exe", "excel.exe", "powerpnt.exe", "onenote.exe", "notepad.exe", "notion.exe", "obsidian.exe", "acrobat.exe", "acrord32.exe", "explorer.exe", "claude.exe", "figma.exe", "chatgpt.exe"], &["docs.google.com", "drive.google.com", "sheets.google.com", "slides.google.com", "calendar.google.com", "classroom.google.com", "notion.so", "office.com", "sharepoint.com", "figma.com", "canva.com", "overleaf.com", "arxiv.org", "scholar.google.com", "wikipedia.org", "claude.ai", "chatgpt.com", "gemini.google.com", "perplexity.ai", "coursera.org", "udemy.com", "nptel.ac.in", "khanacademy.org", "deeplearning.ai", "codechef.com", "monkeytype.com", "keybr.com"]),
+    ("Browsing", g::GLOBE, &["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"], &["google.com", "bing.com", "duckduckgo.com"]),
+    ("Other", g::CIRCLE_HELP, &[], &[]),
 ];
 
 /// The built-in categories (each replaced by the user's own of that name), then the user's others.
@@ -713,6 +718,16 @@ pub fn add_categories(text: &str, cats: &[FocusCategory]) -> Result<(String, usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_ins_include_screen_time_categories() {
+        let cats = categories(&[]);
+        for name in ["Development", "Productivity", "Browsing", "Other"] {
+            assert!(category(&cats, name).is_some(), "{name}");
+        }
+        assert!(category(&cats, "Browsing").unwrap().apps.iter().any(|a| a == "chrome.exe"));
+        assert!(category(&cats, "Other").unwrap().sites.is_empty());
+    }
 
     fn session(mode: Mode, apps: &[&str], sites: &[&str], now: SystemTime) -> Session {
         let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1078,12 +1093,12 @@ mod tests {
             FocusCategory { name: "Work".into(), apps: vec![], sites: vec!["jira.com".into()] },
         ];
         let all = categories(&own);
-        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Messaging", "Social", "Streaming", "Travel", "News", "Shopping", "Gaming", "Work"]);
+        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Messaging", "Social", "Streaming", "Travel", "News", "Shopping", "Gaming", "Development", "Productivity", "Browsing", "Other", "Work"]);
         assert_eq!((all[1].apps.clone(), all[1].sites.clone()), (vec!["x.exe".to_string()], vec![]), "the user's lists, not the built-in ones");
         assert_eq!(categories(&[])[0].apps, ["discord.exe", "slack.exe", "telegram.exe", "whatsapp.exe", "signal.exe"]);
         use crate::design::g;
         let icons: Vec<&str> = all.iter().map(|c| category_icon(&c.name)).collect();
-        assert_eq!(icons, [g::MESSAGE_CIRCLE, g::USERS, g::CIRCLE_PLAY, g::PLANE, g::NEWSPAPER, g::SHOPPING_CART, g::GAMEPAD_2, g::LIST_CHECKS]);
+        assert_eq!(icons, [g::MESSAGE_CIRCLE, g::USERS, g::CIRCLE_PLAY, g::PLANE, g::NEWSPAPER, g::SHOPPING_CART, g::GAMEPAD_2, g::CODE, g::NOTEBOOK_PEN, g::GLOBE, g::CIRCLE_HELP, g::LIST_CHECKS]);
     }
 
     #[test]

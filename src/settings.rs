@@ -1926,10 +1926,14 @@ mod tests {
                 ("Focus categories", "News", g::NEWSPAPER),
                 ("Focus categories", "Shopping", g::SHOPPING_CART),
                 ("Focus categories", "Gaming", g::GAMEPAD_2),
+                ("Focus categories", "Development", g::CODE),
+                ("Focus categories", "Productivity", g::NOTEBOOK_PEN),
+                ("Focus categories", "Browsing", g::GLOBE),
+                ("Focus categories", "Other", g::CIRCLE_HELP),
                 ("Your categories", "Work", g::LIST_CHECKS),
             ]
         );
-        assert_eq!(cats[7].help, "0 apps · 1 websites");
+        assert_eq!(cats[11].help, "0 apps · 1 websites");
         assert!(cats.iter().all(|r| r.kind == Kind::Status(Live::Nothing) && r.path.is_empty()), "names to read, nothing to edit");
     }
 

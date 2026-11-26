@@ -52,6 +52,7 @@ pub struct Config {
     pub focus: Focus,
     /// `[[focus_category]]`: named app and website lists a Focus session can use.
     pub focus_category: Vec<FocusCategory>,
+    pub screen_time: ScreenTime,
     pub calendar: Calendar,
     /// `[[calendar_feed]]`: the calendars My Schedule shows.
     pub calendar_feed: Vec<CalendarFeed>,
@@ -93,6 +94,26 @@ pub struct CalendarFeed {
 impl Default for CalendarFeed {
     fn default() -> Self {
         Self { url: String::new(), name: String::new(), colour: "system".into() }
+    }
+}
+
+/// Screen Time: tracks the app in front (and the website in a browser) in `screentime.db`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ScreenTime {
+    pub enabled: bool,
+    /// Categories that count as productive on the dashboard.
+    pub productive: Vec<String>,
+    /// Categories that count as distracting.
+    pub distracting: Vec<String>,
+    /// A toast on Monday with last week's total.
+    pub weekly_summary: bool,
+}
+
+impl Default for ScreenTime {
+    fn default() -> Self {
+        let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+        Self { enabled: false, productive: own(&["Development", "Productivity"]), distracting: own(&["Social", "Streaming", "Gaming"]), weekly_summary: true }
     }
 }
 
@@ -605,6 +626,7 @@ impl Default for Config {
             games: Games::default(),
             focus: Focus::default(),
             focus_category: vec![],
+            screen_time: ScreenTime::default(),
             calendar: Calendar::default(),
             calendar_feed: vec![],
         }
@@ -947,6 +969,12 @@ pill = true                   # false hides the floating Focus timer
 # name = "Social"
 # apps = ["discord.exe", "slack.exe"]
 # sites = ["reddit.com", "x.com"]
+
+[screen_time]
+enabled = false               # track time per app and website (shared categories with Focus)
+productive = ["Development", "Productivity"]  # categories the dashboard counts as productive
+distracting = ["Social", "Streaming", "Gaming"]  # ... and as distracting
+weekly_summary = true         # a notice on Monday with last week's total
 
 [calendar]
 refresh_minutes = 15          # how often the ICS feeds are fetched: 5, 15, 30 or 60
@@ -1457,6 +1485,17 @@ to = \"PT-BR\"").unwrap();
         assert_eq!((c.translator.primary.as_str(), c.translator.action.as_str()), ("EN-US", "paste"));
         assert_eq!(c.translate[0].to, "PT-BR");
         assert!(!TEMPLATE.to_lowercase().contains("deepl"));
+    }
+
+    #[test]
+    fn screen_time_defaults() {
+        let st = parse("").unwrap().screen_time;
+        assert!(!st.enabled && st.weekly_summary);
+        assert_eq!(st.productive, ["Development", "Productivity"]);
+        assert_eq!(st.distracting, ["Social", "Streaming", "Gaming"]);
+        assert_eq!(parse(TEMPLATE).unwrap().screen_time, st, "the template shows the defaults");
+        assert!(parse("[screen_time]
+enabled = true").unwrap().screen_time.enabled);
     }
 
     #[test]
