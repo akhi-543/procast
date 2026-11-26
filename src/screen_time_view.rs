@@ -77,6 +77,10 @@ fn row_child(items: &[Item], i: usize) -> usize {
     if i == 0 || i >= items.len() {
         return 0;
     }
+    // The no-hits line is the only child after the cards: no header, no rows.
+    if items[i].section.as_deref() == Some(crate::EMPTY) {
+        return CARDS;
+    }
     let headers = (1..=i).filter(|&k| k == 1 || items[k].section != items[k - 1].section).count();
     CARDS + i - 1 + headers
 }
@@ -147,6 +151,13 @@ impl Launcher {
         self.refresh(cx);
     }
 
+    /// A Tab or arrow key: `to` picks the period to show from the current one and today.
+    pub(crate) fn screen_time_key(&mut self, to: impl Fn(Period, i64) -> Period, cx: &mut Context<Self>) {
+        if let Mode::ScreenTime(p) = self.mode {
+            self.screen_time_go(to(p, win::local_now().0), cx);
+        }
+    }
+
     /// Scrolls the dashboard to the selected item.
     pub(crate) fn screen_time_scroll(&self) {
         self.st_scroll.scroll_to_item(row_child(&self.items, self.selected));
@@ -176,6 +187,11 @@ impl Launcher {
             .child(self.st_year(p, today, t));
         let mut section: Option<&str> = None;
         for (i, it) in self.items.iter().enumerate().skip(1) {
+            // A filter with no hits: one line where the rows would be.
+            if it.section.as_deref() == Some(crate::EMPTY) {
+                col = col.child(muted(it.title.clone(), t).flex_none().px(px(8.)).py(px(8.)));
+                continue;
+            }
             if it.section.as_deref() != section {
                 section = it.section.as_deref();
                 col = col.child(design::section_header(if section == Some("Sites") { "Websites" } else { section.unwrap_or_default() }, None, t).flex_none());
@@ -192,7 +208,7 @@ impl Launcher {
                 );
             // Under the row's title: past the list row's two paddings, its icon and the gap.
             let line = on.then(|| detail_line(stats, it, &self.st_hours)).filter(|s| !s.is_empty());
-            col = col.child(div().flex_none().flex().flex_col().child(row).children(line.map(|s| muted(s, t).pl(px(56.)).pb(px(4.)))));
+            col = col.child(div().flex_none().flex().flex_col().child(row).children(line.map(|s| muted(s, t).truncate().pl(px(56.)).pb(px(4.)))));
         }
         col.into_any_element()
     }
@@ -272,7 +288,7 @@ impl Launcher {
         )
         .w_full()
         .h(px(LINE_H));
-        let legend = [(pc, prod, "productive"), (t.text_faint, neutral, "neutral"), (dc, dist, "distracting")]
+        let legend = [(pc, prod, "productive"), (t.surface_strong, neutral, "neutral"), (dc, dist, "distracting")]
             .map(|(color, s, name)| div().flex().items_center().gap(px(6.)).child(dot(color)).child(muted(format!("{} {name}", duration(s as f64)), t)));
         let bar = div()
             .flex()
@@ -481,6 +497,7 @@ mod tests {
         };
         let items = [row(None), row(Some("Apps")), row(Some("Apps")), row(Some("Sites"))];
         assert_eq!((0..4).map(|i| row_child(&items, i)).collect::<Vec<_>>(), [0, CARDS + 1, CARDS + 2, CARDS + 4]);
+        assert_eq!(row_child(&[row(None), row(Some(crate::EMPTY))], 1), CARDS, "the no-hits line follows the cards");
     }
 
     #[test]

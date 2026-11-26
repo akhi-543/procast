@@ -409,6 +409,19 @@ pub fn with_range(p: Period, r: Range) -> Period {
     Period { range: r, ..p }
 }
 
+/// The next (`dir` 1) or previous (-1) range in Day, Week, Month order, wrapping, on the same anchor.
+pub fn cycle(p: Period, dir: i64) -> Period {
+    const ORDER: [Range; 3] = [Range::Day, Range::Week, Range::Month];
+    let at = ORDER.iter().position(|&r| r == p.range).unwrap_or(0) as i64;
+    with_range(p, ORDER[(at + dir).rem_euclid(3) as usize])
+}
+
+/// The period after the launcher sat closed: one that held `loaded_on` (then "today") but no
+/// longer holds today moves to today, so Today stays Today past midnight; an earlier one stays.
+pub fn reanchor(p: Period, loaded_on: i64, today: i64) -> Period {
+    if is_current(p, loaded_on) && !is_current(p, today) { Period { anchor: today, ..p } } else { p }
+}
+
 fn is_current(p: Period, today: i64) -> bool {
     let (from, to) = bounds(p);
     (from..=to).contains(&today)
@@ -1708,6 +1721,8 @@ mod tests {
         assert_eq!(step(p(Range::Week, "2026-11-26"), 1, today), p(Range::Week, "2026-11-26"));
         assert_eq!(step(p(Range::Week, "2026-11-26"), -1, today), p(Range::Week, "2026-11-19"));
         assert_eq!(with_range(p(Range::Day, "2026-11-19"), Range::Month), p(Range::Month, "2026-11-19"));
+        assert_eq!([Range::Day, Range::Week, Range::Month].map(|r| cycle(p(r, "2026-11-19"), 1).range), [Range::Week, Range::Month, Range::Day], "Tab wraps");
+        assert_eq!([Range::Day, Range::Week, Range::Month].map(|r| cycle(p(r, "2026-11-19"), -1).range), [Range::Month, Range::Day, Range::Week], "Shift+Tab wraps");
         assert_eq!(title(p(Range::Day, "2026-11-26"), today), "Today");
         assert_eq!(title(p(Range::Day, "2026-11-25"), today), "Yesterday");
         assert_eq!(title(p(Range::Day, "2026-11-19"), today), "Thu 19 Nov");
@@ -1726,6 +1741,17 @@ mod tests {
         assert!(fresh(a, a, 3, 3));
         assert!(!fresh(p(Range::Week, "2026-11-26"), a, 3, 3), "an answer for another period is dropped");
         assert!(!fresh(a, a, 4, 3));
+    }
+
+    #[test]
+    fn a_period_that_was_today_follows_the_day() {
+        let d = |s| parse_iso(s).unwrap();
+        let p = |range, a| Period { range, anchor: d(a) };
+        let (was, now) = (d("2026-11-26"), d("2026-11-27"));
+        assert_eq!(reanchor(p(Range::Day, "2026-11-26"), was, now), p(Range::Day, "2026-11-27"), "Today stays Today");
+        assert_eq!(reanchor(p(Range::Day, "2026-11-25"), was, now), p(Range::Day, "2026-11-25"), "Yesterday stays that day");
+        assert_eq!(reanchor(p(Range::Week, "2026-11-26"), was, d("2026-11-30")), p(Range::Week, "2026-11-30"), "This week moves into the new week");
+        assert_eq!(reanchor(p(Range::Week, "2026-11-26"), was, now), p(Range::Week, "2026-11-26"), "the same day or week: untouched");
     }
 
     #[test]

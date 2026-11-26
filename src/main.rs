@@ -98,6 +98,8 @@ actions!(procast, [NextBox, PrevBox]);
 actions!(procast, [PopToken]);
 // Tab in YouTube Music's Search and Library: the next filter.
 actions!(procast, [NextFilter]);
+// Screen Time: Tab and Shift+Tab cycle Day, Week and Month; Left and Right step the period.
+actions!(procast, [NextPeriodKind, PrevPeriodKind, PrevPeriod, NextPeriod]);
 // Navigation-key styles; each does something only when `[launcher] navigation` picks it.
 actions!(procast, [EmacsNext, EmacsPrev, EmacsBack, VimNext, VimPrev, VimBack]);
 // An action's own shortcut (`search::act_keys`) on the selected row: Ctrl+O, Ctrl+Shift+O, Ctrl+Y, Ctrl+Alt+O.
@@ -833,6 +835,28 @@ fn screen_time_rows(p: wellbeing::Period, stats: &Value) -> Vec<Item> {
     std::iter::once(head).chain(rows).collect()
 }
 
+/// `Launcher::screen_time_items`: the anchor and the rows matching `query`; or the one row
+/// saying Screen Time is off, loading, or couldn't read. A filter with no hits keeps the
+/// anchor (so the dashboard stays) and adds a line where the rows would be.
+fn screen_time_list(enabled: bool, stats: &Option<Result<Value, String>>, p: wellbeing::Period, query: &str, matcher: &mut Matcher) -> Vec<Item> {
+    match stats {
+        _ if !enabled => screen_time_off_row(),
+        None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
+        Some(Err(e)) => vec![empty_row(g::MONITOR, "Couldn't read screen time".into(), e.clone(), vec![])],
+        Some(Ok(stats)) => {
+            let mut rows = screen_time_rows(p, stats);
+            // Filtered rows come back best match first: keep each section together.
+            let mut found = search::filter(query, rows.split_off(1), matcher);
+            found.sort_by_key(|it| ["Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
+            if found.is_empty() && !query.trim().is_empty() {
+                found.push(empty_row(g::MONITOR, "No matching apps or sites".into(), String::new(), vec![]));
+            }
+            rows.extend(found);
+            rows
+        }
+    }
+}
+
 /// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
 /// opens it; Ctrl+K also deletes it for good): the title, then "Opened 2 days ago · 397
 /// characters" ("● Current · 186 characters" for the Notes window's note, `current`, counted
@@ -988,6 +1012,8 @@ struct Launcher {
     st_hours: wellbeing::Hours,
     /// Each day's categories over the last 371 days, for the trend line and the heatmap.
     st_days: Option<Value>,
+    /// The day the span was last read as "today" (`wellbeing::reanchor`).
+    st_day: i64,
     st_gen: u64,
     /// The dashboard column's scroll (`screen_time_view`).
     st_scroll: ScrollHandle,
@@ -1214,6 +1240,7 @@ impl Launcher {
             st_stats: None,
             st_hours: Default::default(),
             st_days: None,
+            st_day: 0,
             st_gen: 0,
             st_scroll: ScrollHandle::new(),
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
@@ -2703,6 +2730,9 @@ impl Launcher {
         if mode == Mode::Root && self.keeps_state() {
             // Reopened where it was: the numbers moved on meanwhile.
             if let Mode::ScreenTime(p) = self.mode {
+                // Opened on Today yesterday: Today again.
+                let p = wellbeing::reanchor(p, self.st_day, win::local_now().0);
+                self.mode = Mode::ScreenTime(p);
                 self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
             }
             self.refresh(cx);
@@ -4747,6 +4777,7 @@ impl Launcher {
         }
         self.st_gen += 1;
         let today = win::local_now().0;
+        self.st_day = today;
         let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, today), wellbeing::rules(&cats));
         // A failed read of the days only leaves the trend line and the heatmap empty.
         let read = cx.background_executor().spawn(async move {
@@ -4777,7 +4808,8 @@ impl Launcher {
             Ok((stats, hours)) => (Ok(stats), hours),
             Err(e) => (Err(e), Default::default()),
         };
-        (self.st_stats, self.st_hours, self.st_days) = (Some(stats), hours, days);
+        // A failed read of the days keeps the last good ones (they cover the year, not the span).
+        (self.st_stats, self.st_hours, self.st_days) = (Some(stats), hours, days.or(self.st_days.take()));
         self.request_resize(cx);
         if self.confirm.is_none() {
             let q = self.query(cx);
@@ -4789,23 +4821,7 @@ impl Launcher {
     }
 
     fn screen_time_items(&mut self, p: wellbeing::Period, query: &str) -> Vec<Item> {
-        match &self.st_stats {
-            _ if !self.cfg.screen_time.enabled => screen_time_off_row(),
-            None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
-            Some(Err(e)) => vec![empty_row(g::MONITOR, "Couldn't read screen time".into(), e.clone(), vec![])],
-            Some(Ok(stats)) => {
-                let mut rows = screen_time_rows(p, stats);
-                // Filtered rows come back best match first: keep each section together.
-                let mut found = search::filter(query, rows.split_off(1), &mut self.matcher);
-                found.sort_by_key(|it| ["Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
-                // With nothing typed an empty span still draws its (empty) cards.
-                if found.is_empty() && !query.trim().is_empty() {
-                    return vec![empty_row(g::MONITOR, "No matches".into(), String::new(), screen_time_actions())];
-                }
-                rows.extend(found);
-                rows
-            }
-        }
+        screen_time_list(self.cfg.screen_time.enabled, &self.st_stats, p, query, &mut self.matcher)
     }
 
     /// Move to Category…: a menu of the categories; the pick files `name` there.
@@ -5410,7 +5426,7 @@ impl Launcher {
             Mode::Schedule => "Search events…".into(),
             Mode::Notes(NotesList::All) => "Search notes…".into(),
             Mode::Notes(NotesList::Deleted) => "Search deleted notes…".into(),
-            Mode::ScreenTime(_) => "Search categories, apps and sites…".into(),
+            Mode::ScreenTime(_) => "Search apps and sites…".into(),
             Mode::Form(_) => "".into(),
             Mode::Translate => "Text to translate…".into(),
             Mode::LanguageSets => "Search language sets…".into(),
@@ -5909,6 +5925,14 @@ impl Launcher {
             (false, true) => Some("Music"),
             (false, false) => None,
         }
+    }
+
+    /// Where Tab cycles Screen Time's range and, with nothing typed, Left and Right step its period.
+    fn screen_time_keys(&self, cx: &App) -> Option<&'static str> {
+        if !matches!(self.mode, Mode::ScreenTime(_)) || self.panel.is_some() || self.menu.is_some() || self.confirm.is_some() {
+            return None;
+        }
+        Some(if self.query(cx).is_empty() { "ScreenTime ScreenTimeArrows" } else { "ScreenTime" })
     }
 
     /// The open ActionPanel's actions, each with its place among all of them; with a search
@@ -6912,6 +6936,11 @@ impl Render for Launcher {
             .on_action(cx.listener(|this, _: &NextFilter, _, cx| this.music_cycle(cx)))
             // Left and Right move through a grid instead of the search text; Tab cycles YouTube Music's filters.
             .when_some(self.grid_keys(), |d, context| d.key_context(context))
+            .when_some(self.screen_time_keys(cx), |d, context| d.key_context(context))
+            .on_action(cx.listener(|this, _: &NextPeriodKind, _, cx| this.screen_time_key(|p, _| wellbeing::cycle(p, 1), cx)))
+            .on_action(cx.listener(|this, _: &PrevPeriodKind, _, cx| this.screen_time_key(|p, _| wellbeing::cycle(p, -1), cx)))
+            .on_action(cx.listener(|this, _: &PrevPeriod, _, cx| this.screen_time_key(|p, today| wellbeing::step(p, -1, today), cx)))
+            .on_action(cx.listener(|this, _: &NextPeriod, _, cx| this.screen_time_key(|p, today| wellbeing::step(p, 1, today), cx)))
             // Tab and Shift+Tab move between the query and the boxes.
             .when(arg_row.is_some() && self.panel.is_none(), |d| d.key_context("ArgBoxes"))
             // Anywhere but a token field (or its menu's empty search), Backspace edits the text.
@@ -7019,6 +7048,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("left", SelectLeft, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("right", SelectRight, Some(&format!("EmojiGrid > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("tab", NextFilter, Some(&format!("Music > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("tab", NextPeriodKind, Some(&format!("ScreenTime > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("shift-tab", PrevPeriodKind, Some(&format!("ScreenTime > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("left", PrevPeriod, Some(&format!("ScreenTimeArrows > {DEFAULT_INPUT_CONTEXT}"))),
+        KeyBinding::new("right", NextPeriod, Some(&format!("ScreenTimeArrows > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("tab", NextBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
         KeyBinding::new("shift-tab", PrevBox, Some(&format!("ArgBoxes > {DEFAULT_INPUT_CONTEXT}"))),
         // In a form's text box Tab moves to the next control, never into a menu (Down does that).
@@ -7775,6 +7808,41 @@ mod tests {
         assert_eq!(first("backspace", &["Form"]), "PopToken", "on the token field itself");
         assert_eq!((first("left", &["Form"]), first("right", &["Form"])), ("SelectLeft".into(), "SelectRight".into()), "Left and Right move between swatches");
         assert_ne!(first("left", &["Form", input]), "SelectLeft", "a text box keeps its caret keys");
+    }
+
+    #[test]
+    fn screen_time_keys_cycle_the_range_and_step_the_period() {
+        let keymap = gpui::Keymap::new(key_bindings());
+        let first = |key: &str, stack: &[&str]| {
+            let stack: Vec<gpui::KeyContext> = stack.iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+            let found = keymap.bindings_for_input(&[gpui::Keystroke::parse(key).unwrap()], &stack).0;
+            found.first().map(|b| b.action().name().rsplit("::").next().unwrap_or_default().to_string()).unwrap_or_default()
+        };
+        let input = DEFAULT_INPUT_CONTEXT;
+        assert_eq!(first("tab", &["ScreenTime", input]), "NextPeriodKind");
+        assert_eq!(first("shift-tab", &["ScreenTime", input]), "PrevPeriodKind");
+        assert_eq!(first("left", &["ScreenTime", "ScreenTimeArrows", input]), "PrevPeriod");
+        assert_eq!(first("right", &["ScreenTime", "ScreenTimeArrows", input]), "NextPeriod");
+        assert_ne!(first("left", &["ScreenTime", input]), "PrevPeriod", "a typed filter keeps its caret keys");
+        assert_eq!(first("tab", &[input]), "SelectNext", "other views keep Tab");
+    }
+
+    #[test]
+    fn a_filter_with_no_hits_keeps_the_dashboard() {
+        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let p = wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 };
+        let empty = Some(Ok(json!({"total": 0, "previous": 0, "apps": [], "sites": []})));
+        let stats = Some(Ok(json!({"total": 900, "previous": 600, "apps": [{"name": "code.exe", "seconds": 600, "category": "Development"}], "sites": []})));
+        let sections = |rows: &[Item]| rows.iter().map(|r| r.section.clone()).collect::<Vec<_>>();
+        assert_eq!(screen_time_list(true, &empty, p, "", &mut matcher).len(), 1, "an empty span is the anchor alone: its cards still draw");
+        let rows = screen_time_list(true, &stats, p, "zzzz", &mut matcher);
+        assert_eq!(sections(&rows), [None, Some(EMPTY.to_string())], "the anchor stays, so the dashboard shows, with one line where the rows were");
+        assert_eq!(rows[1].title, "No matching apps or sites");
+        assert_eq!(screen_time_list(true, &stats, p, "code", &mut matcher).len(), 2);
+        assert_eq!(screen_time_list(false, &stats, p, "", &mut matcher)[0].title, "Screen Time is off");
+        assert_eq!(screen_time_list(true, &None, p, "", &mut matcher)[0].title, "Loading…");
+        let err = screen_time_list(true, &Some(Err("locked".into())), p, "x", &mut matcher);
+        assert_eq!((err.len(), err[0].title.as_str(), err[0].subtitle.as_str()), (1, "Couldn't read screen time", "locked"));
     }
 
     #[test]
