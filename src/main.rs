@@ -34,7 +34,6 @@ mod timers;
 mod toast;
 mod translate;
 mod wellbeing;
-mod wellbeing_http;
 mod win;
 mod ytmdesktop;
 mod ytmusic;
@@ -456,9 +455,7 @@ fn hotkey_specs(cfg: &Config) -> Vec<String> {
     builtin.into_iter().chain(cfg.launcher.command_hotkeys().map(|(_, h)| h)).cloned().collect()
 }
 
-/// The sampler, plus the dashboard on 127.0.0.1:8737 (which stays up if Screen Time is switched off and on).
 fn start_screen_time(tx: &UnboundedSender<Msg>, browsers: &browser::Browsers, rules: &Arc<RwLock<wellbeing::Rules>>, st: &Arc<RwLock<config::ScreenTime>>) -> wellbeing::Tracker {
-    wellbeing_http::serve(tx.clone(), || _ = wellbeing::flush_pending());
     wellbeing::Tracker::start(tx.clone(), browsers.clone(), rules.clone(), st.clone())
 }
 
@@ -4186,17 +4183,11 @@ impl Launcher {
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
             Act::Cmd(Cmd::ScreenTime) => return self.set_mode(Mode::ScreenTime(wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 }), cx),
             Act::Cmd(Cmd::ScreenTimeWeek) => return self.set_mode(Mode::ScreenTime(wellbeing::Period { range: wellbeing::Range::Week, anchor: win::local_now().0 }), cx),
-            // The dashboard is served only while Screen Time is on; asking again retries a bind that failed (a no-op while it runs).
-            Act::Cmd(Cmd::OpenScreenTimeDashboard) if self.cfg.screen_time.enabled => {
-                wellbeing_http::serve(self.tx.clone(), || _ = wellbeing::flush_pending());
-                win::open(wellbeing_http::URL)
-            }
-            Act::Cmd(Cmd::OpenScreenTimeDashboard) => self.say(Msg::info("Screen Time is off. Run Screen Time to turn it on")),
             Act::MoveToCategory(name) => return self.open_category_menu(name, window, cx),
             Act::ExportScreenTime => return self.export_screen_time(cx),
             Act::EnableScreenTime => {
                 match config::edit_file(&config::path(), |t| config::write_value(t, &["screen_time".into(), "enabled".into()], true.into())) {
-                    // The config poll starts the sampler and the dashboard.
+                    // The config poll starts the sampler.
                     Ok(_) => {
                         self.say(Msg::done("Screen Time is on"));
                         self.set_mode(Mode::Root, cx);

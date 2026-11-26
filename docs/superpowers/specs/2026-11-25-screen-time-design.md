@@ -161,6 +161,8 @@ leading `= + - @`. The JSON shape stays byte-compatible with what `dashboard.htm
 
 ### Dashboard server
 
+> Superseded by 2026-11-26-screen-time-native-dashboard-design.md: the dashboard is native and the web server is gone.
+
 A thread with `TcpListener` on `127.0.0.1:8737`; a failed bind is reported once through
 `Msg::error` ("port 8737 is in use: is micro bot still running?") and the rest of Screen Time
 keeps working. Minimal HTTP/1.1, one request per connection, body ≤ 1 KiB. Routes and guards

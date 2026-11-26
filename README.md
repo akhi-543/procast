@@ -116,7 +116,7 @@ extensions run, so these figures are for a fresh start.<br>
 - **Calendar**: My Schedule and Join Meeting from ICS feeds (Google, Outlook), with a reminder before each meeting
 - **Screenshots**: search your screenshot folders by the text in each picture (Windows OCR), Quick Look, pin, paste the latest
 - **Notes**: a floating Markdown notes window with a live editor, search, and recently deleted notes
-- **Screen Time**: records which apps and websites are in front (idle time is skipped), shows today and this week by category, app and site (**Screen Time**, **Screen Time This Week**), and serves a dashboard at `http://127.0.0.1:8737`. Off by default (`[screen_time] enabled`); websites need the browser extension; **Import Screen Time from micro bot** brings that tracker's history in
+- **Screen Time**: records which apps and websites are in front (idle time is skipped), shows today, this week and this month by category, app and site in a dashboard inside the launcher (**Screen Time**, **Screen Time This Week**). Off by default (`[screen_time] enabled`); websites need the browser extension; **Import Screen Time from micro bot** brings that tracker's history in
 - **Auto HDR for games**: turns HDR on while a full-screen game is in front
 
 **AI**: Quick AI from the search bar with follow-ups, running the Claude Agent SDK on your own Claude Code login

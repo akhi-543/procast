@@ -971,7 +971,7 @@ pill = true                   # false hides the floating Focus timer
 # sites = ["reddit.com", "x.com"]
 
 [screen_time]
-enabled = false               # track time per app and website (shared categories with Focus); the dashboard is at http://127.0.0.1:8737
+enabled = false               # track time per app and website (shared categories with Focus)
 productive = ["Development", "Productivity"]  # categories the dashboard counts as productive
 distracting = ["Social", "Streaming", "Gaming"]  # ... and as distracting
 weekly_summary = true         # a notice on Monday with last week's total

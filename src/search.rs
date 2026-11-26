@@ -173,7 +173,7 @@ impl Act {
             Act::PinClip(_, false) => "Unpin Entry",
             Act::Paste(_) | Act::Clip(_) | Act::Snippet(_) => "Paste",
             Act::DeleteClip(_) => "Delete Entry",
-            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ScreenTime | Cmd::ScreenTimeWeek | Cmd::OpenScreenTimeDashboard | Cmd::YtMusic(_)) => "Open",
+            Act::Cmd(Cmd::SearchFiles | Cmd::ClipboardHistory | Cmd::Emoji | Cmd::InstallExtension | Cmd::BrowseStore | Cmd::QuitApps | Cmd::AskAi | Cmd::SearchScreenshots | Cmd::OpenNotes | Cmd::SearchNotes | Cmd::RecentlyDeletedNotes | Cmd::ScreenTime | Cmd::ScreenTimeWeek | Cmd::YtMusic(_)) => "Open",
             Act::Music(act) => act.label(),
             Act::Cmd(Cmd::CreateNote) => "Create Note",
             Act::OpenNote(_) => "Open Note",

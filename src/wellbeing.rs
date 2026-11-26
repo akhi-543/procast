@@ -724,17 +724,6 @@ pub fn move_name(text: &str, cats: &[FocusCategory], name: &str, category: &str)
     write_categories(text, &changed)
 }
 
-/// `{category: "productive" | "distracting"}`; anything unlisted is neutral.
-pub fn kinds(st: &ScreenTime) -> Value {
-    let mut out = serde_json::Map::new();
-    for (list, kind) in [(&st.productive, "productive"), (&st.distracting, "distracting")] {
-        for c in list {
-            out.insert(c.clone(), json!(kind));
-        }
-    }
-    Value::Object(out)
-}
-
 pub fn db_path() -> PathBuf {
     crate::config::dir().join("screentime.db")
 }
@@ -1381,12 +1370,6 @@ mod tests {
     fn rules_lowercase_names() {
         let r = super::rules(&[cat("Development", &["Code.EXE"], &[])]);
         assert_eq!(classify(Kind::App, "code.exe", &r), "Development");
-    }
-
-    #[test]
-    fn kinds_by_setting() {
-        let st = crate::config::ScreenTime::default();
-        assert_eq!(kinds(&st), json!({"Development": "productive", "Productivity": "productive", "Social": "distracting", "Streaming": "distracting", "Gaming": "distracting"}));
     }
 
     #[test]
