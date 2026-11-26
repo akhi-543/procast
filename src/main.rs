@@ -24,6 +24,7 @@ mod net;
 mod notes;
 mod ntfs;
 mod scripts;
+mod screen_time_view;
 mod search;
 mod settings;
 mod shots;
@@ -117,6 +118,8 @@ const FAV_ROW: f32 = 48.;
 /// The launcher's width before scaling. `width` ≤ 1 is a share of the screen: the window
 /// keeps that share (and its proportions) on every monitor, and its content scales with it.
 const BASE_WIDTH: f32 = 750.;
+/// The least launcher height while the Screen Time dashboard shows (before interface scaling).
+const ST_HEIGHT: f32 = 640.;
 
 /// The launcher's backdrop: acrylic under the translucent glass body; with glass off the body
 /// is solid and the acrylic goes (Transparent, not Opaque: Opaque clears to white, which would
@@ -801,9 +804,9 @@ fn lang_set_menu(sets: &[translate::LangSet], current: usize) -> menu::Menu {
     m
 }
 
-/// Screen Time's actions that need no row: the dashboard and the CSV.
+/// Screen Time's action that needs no row: the period's CSV.
 fn screen_time_actions() -> Vec<(String, Act)> {
-    vec![("Open Dashboard".into(), Act::Cmd(Cmd::OpenScreenTimeDashboard)), (Act::ExportScreenTime.label().into(), Act::ExportScreenTime)]
+    vec![(Act::ExportScreenTime.label().into(), Act::ExportScreenTime)]
 }
 
 /// Screen Time while it is off: nothing is recorded, so one row says how to start.
@@ -812,19 +815,18 @@ fn screen_time_off_row() -> Vec<Item> {
     vec![empty_row(g::MONITOR, "Screen Time is off".into(), "Turn it on to start tracking, or bring micro bot's history in".into(), actions)]
 }
 
-/// Screen Time's list: the span's header (its total against the span before), then a row for
-/// each category, app and site. An app or site moves to another category; a category cannot.
+/// Screen Time's items under the dashboard: an anchor that stands for no row (its title the
+/// span's total against the span before; Enter does nothing, Ctrl+K exports), then a row for
+/// each app and site, which moves to another category.
 fn screen_time_rows(p: wellbeing::Period, stats: &Value) -> Vec<Item> {
     let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
-    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), p, win::local_now().0), "", Icon::Vector(g::MONITOR), Act::Cmd(Cmd::OpenScreenTimeDashboard));
+    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), p, win::local_now().0), "", Icon::Vector(g::MONITOR), Act::None);
     head.extra = screen_time_actions();
-    let rows = wellbeing::rows(stats).into_iter().map(|r| {
-        let (icon, sub, act) = match r.section {
-            "Categories" => (focus::category_icon(&r.name), String::new(), Act::Cmd(Cmd::OpenScreenTimeDashboard)),
-            section => (if section == "Apps" { g::APP } else { g::GLOBE }, r.category.clone(), Act::MoveToCategory(r.name.clone())),
-        };
-        let mut it = Item::new(&r.name, sub, Icon::Vector(icon), act.clone()).acc(wellbeing::duration(r.seconds as f64)).sec(r.section).with_hay(format!("{} {}", r.name, r.category));
-        it.extra = if matches!(act, Act::MoveToCategory(_)) { vec![(act.label().to_string(), act)] } else { vec![] };
+    let rows = wellbeing::rows(stats).into_iter().filter(|r| r.section != "Categories").map(|r| {
+        let act = Act::MoveToCategory(r.name.clone());
+        let icon = if r.section == "Apps" { g::APP } else { g::GLOBE };
+        let mut it = Item::new(&r.name, &r.category, Icon::Vector(icon), act.clone()).acc(wellbeing::duration(r.seconds as f64)).sec(r.section).with_hay(format!("{} {}", r.name, r.category));
+        it.extra = vec![(act.label().to_string(), act)];
         it.extra.extend(screen_time_actions());
         it
     });
@@ -987,6 +989,8 @@ struct Launcher {
     /// Each day's categories over the last 371 days, for the trend line and the heatmap.
     st_days: Option<Value>,
     st_gen: u64,
+    /// The dashboard column's scroll (`screen_time_view`).
+    st_scroll: ScrollHandle,
     matcher: Matcher,
     mode: Mode,
     items: Vec<Item>,
@@ -1211,6 +1215,7 @@ impl Launcher {
             st_hours: Default::default(),
             st_days: None,
             st_gen: 0,
+            st_scroll: ScrollHandle::new(),
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
             mode: Mode::Root,
             items: vec![],
@@ -1304,7 +1309,18 @@ impl Launcher {
 
     /// Window height for the current state, before interface scaling.
     fn target_height(&self, cx: &App) -> f32 {
-        if self.collapsed(cx) { BAR + if self.fav_strip() { FAV_ROW } else { 0. } + 2. } else { window_height(&self.cfg) }
+        if self.collapsed(cx) {
+            BAR + if self.fav_strip() { FAV_ROW } else { 0. } + 2.
+        } else if self.screen_time_shown() {
+            window_height(&self.cfg).max(ST_HEIGHT)
+        } else {
+            window_height(&self.cfg)
+        }
+    }
+
+    /// Screen Time with a period read: the dashboard's height and scroll apply.
+    fn screen_time_shown(&self) -> bool {
+        matches!(self.mode, Mode::ScreenTime(_)) && self.cfg.screen_time.enabled && matches!(self.st_stats, Some(Ok(_)))
     }
 
     /// Asks the message loop to resize the window when its content height changed.
@@ -2546,6 +2562,9 @@ impl Launcher {
                 self.grid_list.scroll_to_reveal_item(at);
             }
             return;
+        }
+        if self.screen_time_shown() {
+            return self.screen_time_scroll();
         }
         let at = display_rows(&self.items, self.mode == Mode::Schedule).iter().position(|r| *r == Some(self.selected)).unwrap_or(0);
         self.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
@@ -4729,13 +4748,18 @@ impl Launcher {
         self.st_gen += 1;
         let today = win::local_now().0;
         let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, today), wellbeing::rules(&cats));
+        // A failed read of the days only leaves the trend line and the heatmap empty.
         let read = cx.background_executor().spawn(async move {
             let _ = wellbeing::flush_pending();
-            let con = wellbeing::open(&wellbeing::db_path()).map_err(|e| e.to_string())?;
-            let stats = wellbeing::stats(&con, span.0, span.1, before, &rules).map_err(|e| e.to_string())?;
-            let hours = if span.0 == span.1 { wellbeing::hours_by_name(&con, span.0).map_err(|e| e.to_string())? } else { Default::default() };
-            let days = wellbeing::days(&con, today - 370, today, &rules).map_err(|e| e.to_string())?;
-            Ok((stats, hours, days))
+            let con = match wellbeing::open(&wellbeing::db_path()) {
+                Ok(con) => con,
+                Err(e) => return (Err(e.to_string()), None),
+            };
+            let read = || -> rusqlite::Result<_> {
+                let hours = if span.0 == span.1 { wellbeing::hours_by_name(&con, span.0)? } else { Default::default() };
+                Ok((wellbeing::stats(&con, span.0, span.1, before, &rules)?, hours))
+            };
+            (read().map_err(|e| e.to_string()), wellbeing::days(&con, today - 370, today, &rules).ok())
         });
         cx.spawn(async move |this, cx| {
             let r = read.await;
@@ -4744,16 +4768,17 @@ impl Launcher {
         .detach();
     }
 
-    fn screen_time_loaded(&mut self, p: wellbeing::Period, generation: u64, r: Result<(Value, wellbeing::Hours, Value), String>, cx: &mut Context<Self>) {
+    fn screen_time_loaded(&mut self, p: wellbeing::Period, generation: u64, (r, days): (Result<(Value, wellbeing::Hours), String>, Option<Value>), cx: &mut Context<Self>) {
         let Mode::ScreenTime(current) = self.mode else { return };
         if !wellbeing::fresh(current, p, self.st_gen, generation) {
             return;
         }
-        let (stats, hours, days) = match r {
-            Ok((stats, hours, days)) => (Ok(stats), hours, Some(days)),
-            Err(e) => (Err(e), Default::default(), None),
+        let (stats, hours) = match r {
+            Ok((stats, hours)) => (Ok(stats), hours),
+            Err(e) => (Err(e), Default::default()),
         };
         (self.st_stats, self.st_hours, self.st_days) = (Some(stats), hours, days);
+        self.request_resize(cx);
         if self.confirm.is_none() {
             let q = self.query(cx);
             self.items = self.screen_time_items(p, &q);
@@ -4772,22 +4797,15 @@ impl Launcher {
                 let mut rows = screen_time_rows(p, stats);
                 // Filtered rows come back best match first: keep each section together.
                 let mut found = search::filter(query, rows.split_off(1), &mut self.matcher);
-                found.sort_by_key(|it| ["Categories", "Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
-                if found.is_empty() {
-                    let (title, hint) = if query.trim().is_empty() { ("Nothing tracked yet", "Screen Time records while procast runs") } else { ("No matches", "") };
-                    return vec![empty_row(g::MONITOR, title.into(), hint.into(), screen_time_actions())];
+                found.sort_by_key(|it| ["Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
+                // With nothing typed an empty span still draws its (empty) cards.
+                if found.is_empty() && !query.trim().is_empty() {
+                    return vec![empty_row(g::MONITOR, "No matches".into(), String::new(), screen_time_actions())];
                 }
                 rows.extend(found);
                 rows
             }
         }
-    }
-
-    /// Screen Time's right-hand pane: the selected row's numbers, the span's on the header row.
-    fn screen_time_detail(&self, t: &Tokens) -> gpui::AnyElement {
-        let Some(Ok(stats)) = &self.st_stats else { return div().flex_1().into_any_element() };
-        let row = self.items.get(self.selected).and_then(|it| wellbeing::rows(stats).into_iter().find(|r| Some(r.section) == it.section.as_deref() && r.name == it.title));
-        div().id("screen-time-detail").flex_1().min_h_0().overflow_y_scroll().px(px(16.)).py(px(12.)).flex().flex_col().children(info_rows(&wellbeing::detail(stats, row.as_ref(), &self.st_hours), t)).into_any_element()
     }
 
     /// Move to Category…: a menu of the categories; the pick files `name` there.
@@ -4831,7 +4849,10 @@ impl Launcher {
     fn export_screen_time(&mut self, cx: &mut Context<Self>) {
         let Mode::ScreenTime(p) = self.mode else { return };
         let Ok(home) = std::env::var("USERPROFILE") else { return self.say(Msg::error("Couldn't find your Downloads folder")) };
-        let ((from, to), tx) = (wellbeing::span(p, win::local_now().0).0, self.tx.clone());
+        // The days so far: a week or month still under way has none after today.
+        let today = win::local_now().0;
+        let ((from, to), tx) = (wellbeing::span(p, today).0, self.tx.clone());
+        let to = to.min(today);
         let rules = wellbeing::rules(&focus::categories(&self.cfg.focus_category));
         let name = format!("screen-time-{}-to-{}.csv", wellbeing::iso(from), wellbeing::iso(to));
         let path = PathBuf::from(home).join("Downloads").join(&name);
@@ -6345,7 +6366,6 @@ impl Render for Launcher {
             Mode::Files if empty.is_none() => Some(self.file_detail(&t)),
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
-            Mode::ScreenTime(_) if empty.is_none() && matches!(self.st_stats, Some(Ok(_))) => Some(self.screen_time_detail(&t)),
             _ => None,
         };
         let selected_item = self.items.get(self.selected);
@@ -6370,6 +6390,7 @@ impl Render for Launcher {
                 Some((title, url)) => format!("Join {title} on {}? Press ↵ again", calendar::link_host(&url).unwrap_or_default()),
                 None => format!("Press ↵ again to {}", it.title),
             },
+            (None, Some(it)) if it.act == Act::None && !actions.is_empty() => "Actions  Ctrl+K".to_string(),
             (None, Some(_)) => match &primary {
                 Some(p) if actions.len() > 1 => format!("{p}  ↵    {}Actions  Ctrl+K", bar_second.as_ref().map(|s| format!("{s}  Ctrl+↵    ")).unwrap_or_default()),
                 Some(p) => format!("{p}  ↵"),
@@ -6462,7 +6483,7 @@ impl Render for Launcher {
         let me = cx.weak_entity();
         let slots = Rc::new(slots);
         // Narrow split lists (detail on the right) get a tighter accessory column.
-        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate | Mode::ScreenTime(_)) { 110. } else { design::ACCESSORY_MAX };
+        let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
         let live_w = design::live_width(window);
         let list = {
             let slots = slots.clone();
@@ -6565,6 +6586,7 @@ impl Render for Launcher {
                 split(list.into_any_element(), Self::render_markdown(&md, &meta, &t, "item-detail", None), &self.cfg)
             }
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
+            _ if self.screen_time_shown() => self.screen_time_dashboard(&t, window, cx),
             _ => div().flex_1().min_h_0().flex().flex_col().children(answer).child(list).into_any_element(),
             }
         };
@@ -7831,11 +7853,11 @@ mod tests {
         });
         let rows = screen_time_rows(wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 }, &stats);
         assert_eq!(rows[0].title, "15m today · 5m more than yesterday");
-        assert_eq!(rows.iter().map(|r| r.section.as_deref()).collect::<Vec<_>>(), [None, Some("Categories"), Some("Apps"), Some("Sites")]);
+        assert_eq!(rows.iter().map(|r| r.section.as_deref()).collect::<Vec<_>>(), [None, Some("Apps"), Some("Sites")], "categories are a card, not rows");
         let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();
-        assert_eq!(labels(&rows[1]), ["Open Dashboard", "Export CSV"], "a category has nothing to move");
-        assert_eq!((labels(&rows[2]), rows[2].act.clone()), (vec!["Move to Category…".into(), "Open Dashboard".into(), "Export CSV".into()], Act::MoveToCategory("code.exe".into())));
-        assert_eq!((rows[3].title.as_str(), rows[3].subtitle.as_str(), rows[3].accessory.as_str()), ("youtube.com", "Streaming", "3m"));
+        assert_eq!((labels(&rows[0]), rows[0].act.clone()), (vec!["Export CSV".to_string()], Act::None), "the anchor: Enter does nothing");
+        assert_eq!((labels(&rows[1]), rows[1].act.clone()), (vec!["Move to Category…".into(), "Export CSV".into()], Act::MoveToCategory("code.exe".into())));
+        assert_eq!((rows[2].title.as_str(), rows[2].subtitle.as_str(), rows[2].accessory.as_str()), ("youtube.com", "Streaming", "3m"));
         let off = screen_time_off_row();
         assert_eq!((off.len(), labels(&off[0])), (1, vec!["Import from micro bot".to_string(), "Turn On Screen Time".into()]));
         assert_eq!(off[0].act, Act::Cmd(Cmd::ImportScreenTime));

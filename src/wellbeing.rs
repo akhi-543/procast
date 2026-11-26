@@ -344,7 +344,6 @@ pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqli
 pub enum Range {
     Day,
     Week,
-    #[allow(dead_code)] // reached by the dashboard's range picker
     Month,
 }
 
@@ -392,7 +391,6 @@ pub fn span(p: Period, today: i64) -> ((i64, i64), (i64, i64)) {
 
 /// The period `dir` (+1 or -1) periods away; a month lands on its 1st. Never one that starts
 /// after today: that returns `p`.
-#[allow(dead_code)] // the dashboard's arrows
 pub fn step(p: Period, dir: i64, today: i64) -> Period {
     let anchor = match p.range {
         Range::Day => p.anchor + dir,
@@ -407,7 +405,6 @@ pub fn step(p: Period, dir: i64, today: i64) -> Period {
 }
 
 /// The same anchor under another range.
-#[allow(dead_code)] // the dashboard's range picker
 pub fn with_range(p: Period, r: Range) -> Period {
     Period { range: r, ..p }
 }
@@ -465,7 +462,6 @@ pub fn caption(p: Period, today: i64) -> String {
 
 /// The categories that own a colour slot, in slot order; a category outside them gets the spare
 /// colour (the largest one) or grey.
-#[allow(dead_code)] // drawn by the dashboard
 pub const SLOTS: [&str; 7] = ["Development", "Productivity", "Messaging", "Social", "Streaming", "Gaming", "Browsing"];
 
 fn day_total(day: Option<&Value>) -> u64 {
@@ -474,7 +470,6 @@ fn day_total(day: Option<&Value>) -> u64 {
 
 /// Productive seconds over total seconds for each of `weeks` weeks from `first_monday`; None for
 /// a week under a minute.
-#[allow(dead_code)] // drawn by the dashboard
 pub fn week_shares(days: &Value, productive: &[String], first_monday: i64, weeks: usize) -> Vec<Option<f64>> {
     (0..weeks as i64)
         .map(|w| {
@@ -490,7 +485,6 @@ pub fn week_shares(days: &Value, productive: &[String], first_monday: i64, weeks
 }
 
 /// A heatmap shade 0..=4 for each day of `from..=to`: 0 under a minute, else by share of the busiest day.
-#[allow(dead_code)] // drawn by the dashboard
 pub fn heat_levels(days: &Value, from: i64, to: i64) -> Vec<u8> {
     let totals: Vec<u64> = (from..=to).map(|d| day_total(days["days"].get(iso(d)))).collect();
     let max = totals.iter().copied().max().unwrap_or(0);
@@ -498,7 +492,6 @@ pub fn heat_levels(days: &Value, from: i64, to: i64) -> Vec<u8> {
 }
 
 /// `(category, now, before)`: the slot categories always, then any other with time in either period.
-#[allow(dead_code)] // drawn by the dashboard
 pub fn compare_rows(stats: &Value) -> Vec<(String, u64, u64)> {
     let now: Vec<(&str, u64)> = stats["categories"].as_array().into_iter().flatten().filter_map(|c| Some((c["name"].as_str()?, c["seconds"].as_u64()?))).collect();
     let before = |n: &str| stats["previous_categories"][n].as_u64().unwrap_or(0);
@@ -513,7 +506,6 @@ pub fn compare_rows(stats: &Value) -> Vec<(String, u64, u64)> {
 }
 
 /// The colour slot of a category: 0..7 its own, 7 the spare for the largest other category, None grey.
-#[allow(dead_code)] // drawn by the dashboard
 pub fn color_slot(category: &str, stats: &Value) -> Option<usize> {
     if let Some(i) = SLOTS.iter().position(|&s| s == category) {
         return Some(i);
@@ -523,7 +515,6 @@ pub fn color_slot(category: &str, stats: &Value) -> Option<usize> {
 }
 
 /// The bucket with the most time: "11 AM" for an hour, "Wed 19" for a day; None when all are empty.
-#[allow(dead_code)] // drawn by the dashboard
 pub fn busiest(stats: &Value) -> Option<(String, u64)> {
     let (label, seconds) = stats["buckets"].as_array()?.iter().map(|b| (&b["label"], day_total(Some(&b["categories"])))).fold((None, 0), |best, (l, s)| if s > best.1 { (Some(l), s) } else { best });
     let name = match label?.as_str().and_then(parse_iso) {
