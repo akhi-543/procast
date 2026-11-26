@@ -97,9 +97,9 @@ The user also chose to **remove the web dashboard** rather than keep both.
 
 ### Window height
 
-The launcher grows to a taller fixed height while the dashboard shows (my call: 640 px before
-interface scaling, or the normal height if that is already taller), and shrinks back on leaving.
-The content scrolls inside it. `target_height` already varies by state; this adds one case.
+The dashboard keeps the launcher's default size and scrolls inside it. (First built at 640 px
+tall; changed on 2026-11-26 by the user's fixed rule in `docs/design/system/README.md`: no view or
+extension ever makes the window bigger.)
 
 ## Layout
 
@@ -221,7 +221,7 @@ action uses it).
 
 1. Comparison for the current period is "to date" (fair), not against the whole previous period
    as the web page did.
-2. The launcher grows to about 640 px tall in this view and scrolls.
+2. ~~The launcher grows to about 640 px tall in this view.~~ Replaced: it keeps the default size and scrolls.
 3. The right-hand detail pane goes; a selected row shows its detail inline.
 4. Past year shows in all three periods.
 5. No Month command; Tab reaches Month.

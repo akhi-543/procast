@@ -96,6 +96,7 @@ When a new idea needs in-app blur, a gradient, an image, a tween, a second blur 
 - A 4 px grid: `space-4`, `space-8`, `space-12`, `space-16`, `space-24`. `space-2` appears only inside controls.
 - Fixed heights: `bar` 56, `row` 40 (the row box inside is 36), `footer` 40, `control` 32, `tile` 28, `cap` 20.
 - Window width 750 before scaling. Height = 2 + `bar` + `row` × (rows shown + 1) + 2 × `list_pad` + `footer`.
+- **Fixed rule: nothing makes the window bigger.** Every view keeps the default window size above: built-in views, dashboards, forms, detail panes and every extension, built in or from the store. Content that needs more room scrolls inside the body, between the `bar` and the `footer`, which stay where they are. The only size changes are the ones the user sets (`width`, `max_results`, the interface size) and compact mode, which only shrinks.
 - Small things get small corners; things that hold other things get large ones: `r-xs` caps and segments, `r-sm` inputs and buttons, `r-md` rows and icon tiles, `r-lg` cards, panels and dialogs, `r-xl` the glass window.
 
 ### Borders, shadows, focus

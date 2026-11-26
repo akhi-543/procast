@@ -119,8 +119,6 @@ const FAV_ROW: f32 = 48.;
 /// The launcher's width before scaling. `width` ≤ 1 is a share of the screen: the window
 /// keeps that share (and its proportions) on every monitor, and its content scales with it.
 const BASE_WIDTH: f32 = 750.;
-/// The least launcher height while the Screen Time dashboard shows (before interface scaling).
-const ST_HEIGHT: f32 = 640.;
 
 /// The launcher's backdrop: acrylic under the translucent glass body; with glass off the body
 /// is solid and the acrylic goes (Transparent, not Opaque: Opaque clears to white, which would
@@ -1344,10 +1342,9 @@ impl Launcher {
     fn target_height(&self, cx: &App) -> f32 {
         if self.collapsed(cx) {
             BAR + if self.fav_strip() { FAV_ROW } else { 0. } + 2.
-        } else if matches!(self.mode, Mode::ScreenTime(_)) && self.cfg.screen_time.enabled && !matches!(self.st_stats, Some(Err(_))) {
-            // Loading too: the dashboard's height from the start, not a jump when it arrives.
-            window_height(&self.cfg).max(ST_HEIGHT)
         } else {
+            // Every view, the Screen Time dashboard and extensions included, keeps this size and
+            // scrolls inside it (docs/design/system/README.md, "Fixed rule").
             window_height(&self.cfg)
         }
     }
