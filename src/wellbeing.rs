@@ -24,7 +24,7 @@ use windows::Win32::{
 const GAP_S: f64 = 10.0;
 /// No input for this long = away.
 const IDLE_S: f64 = 120.0;
-const BROWSERS: [&str; 5] = ["chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe"];
+const BROWSERS: [&str; 6] = ["chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "ardia.exe"];
 const IGNORED: [&str; 2] = ["", "lockapp.exe"];
 const POLL: Duration = Duration::from_secs(2);
 const FLUSH: Duration = Duration::from_secs(30);
@@ -1139,6 +1139,7 @@ mod tests {
     fn account_rules() {
         assert_eq!(account("code.exe", 0.0, "", false, 2.0), vec![(Kind::App, "code.exe".into(), 2.0)]);
         assert_eq!(account("chrome.exe", 0.0, "youtube.com", false, 2.0).len(), 2);
+        assert_eq!(account("ardia.exe", 0.0, "youtube.com", false, 2.0).len(), 2);
         assert_eq!(account("code.exe", 0.0, "youtube.com", false, 2.0).len(), 1); // site only in a browser
         assert!(account("code.exe", 500.0, "", false, 2.0).is_empty()); // idle
         assert!(!account("chrome.exe", 500.0, "youtube.com", true, 2.0).is_empty()); // audible beats idle
