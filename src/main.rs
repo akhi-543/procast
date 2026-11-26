@@ -186,8 +186,8 @@ enum Mode {
     LanguageSets,
     /// Search Notes or Recently Deleted Notes.
     Notes(NotesList),
-    /// Screen Time: today's or this week's categories, apps and sites (see `Launcher::st_stats`).
-    ScreenTime(wellbeing::Range),
+    /// Screen Time: a day's, week's or month's categories, apps and sites (see `Launcher::st_stats`).
+    ScreenTime(wellbeing::Period),
 }
 
 /// Which notes `Mode::Notes` lists.
@@ -814,9 +814,9 @@ fn screen_time_off_row() -> Vec<Item> {
 
 /// Screen Time's list: the span's header (its total against the span before), then a row for
 /// each category, app and site. An app or site moves to another category; a category cannot.
-fn screen_time_rows(range: wellbeing::Range, stats: &Value) -> Vec<Item> {
+fn screen_time_rows(p: wellbeing::Period, stats: &Value) -> Vec<Item> {
     let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
-    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), range), "", Icon::Vector(g::MONITOR), Act::Cmd(Cmd::OpenScreenTimeDashboard));
+    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), p, win::local_now().0), "", Icon::Vector(g::MONITOR), Act::Cmd(Cmd::OpenScreenTimeDashboard));
     head.extra = screen_time_actions();
     let rows = wellbeing::rows(stats).into_iter().map(|r| {
         let (icon, sub, act) = match r.section {
@@ -1742,7 +1742,7 @@ impl Launcher {
                 self.search_notes(list, &query, cx);
                 self.note_items(list, &query, cx)
             }
-            Mode::ScreenTime(range) => self.screen_time_items(range, &query),
+            Mode::ScreenTime(p) => self.screen_time_items(p, &query),
             Mode::Define => match &self.define {
                 _ if query.trim().is_empty() => vec![empty_row(g::BOOK_OPEN, "Type a word to define".into(), String::new(), vec![])],
                 Some(v) => define_rows(v, &self.cfg.search.fallback),
@@ -2650,9 +2650,9 @@ impl Launcher {
         if matches!(mode, Mode::Notes(_)) {
             self.note_rows = None;
         }
-        if let Mode::ScreenTime(range) = mode {
+        if let Mode::ScreenTime(p) = mode {
             self.st_stats = None;
-            self.load_screen_time(range, focus::categories(&self.cfg.focus_category), cx);
+            self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
         }
         if mode == Mode::Tabs {
             self.tabs.clear();
@@ -2680,8 +2680,8 @@ impl Launcher {
         // Within the pop-to-root timeout the launcher reopens where it was.
         if mode == Mode::Root && self.keeps_state() {
             // Reopened where it was: the numbers moved on meanwhile.
-            if let Mode::ScreenTime(range) = self.mode {
-                self.load_screen_time(range, focus::categories(&self.cfg.focus_category), cx);
+            if let Mode::ScreenTime(p) = self.mode {
+                self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
             }
             self.refresh(cx);
         } else {
@@ -4132,8 +4132,8 @@ impl Launcher {
             Act::Cmd(Cmd::SearchFiles) => return self.set_mode(Mode::Files, cx),
             Act::Cmd(Cmd::SearchScreenshots) => return self.set_mode(Mode::Shots, cx),
             Act::Cmd(Cmd::MySchedule) => return self.set_mode(Mode::Schedule, cx),
-            Act::Cmd(Cmd::ScreenTime) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Today), cx),
-            Act::Cmd(Cmd::ScreenTimeWeek) => return self.set_mode(Mode::ScreenTime(wellbeing::Range::Week), cx),
+            Act::Cmd(Cmd::ScreenTime) => return self.set_mode(Mode::ScreenTime(wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 }), cx),
+            Act::Cmd(Cmd::ScreenTimeWeek) => return self.set_mode(Mode::ScreenTime(wellbeing::Period { range: wellbeing::Range::Week, anchor: win::local_now().0 }), cx),
             // The dashboard is served only while Screen Time is on; asking again retries a bind that failed (a no-op while it runs).
             Act::Cmd(Cmd::OpenScreenTimeDashboard) if self.cfg.screen_time.enabled => {
                 wellbeing_http::serve(self.tx.clone(), || _ = wellbeing::flush_pending());
@@ -4719,12 +4719,12 @@ impl Launcher {
     /// Reads the span's stats on the background executor, after writing the sampler's pending
     /// counters so the numbers are current; the answer fills the list (`screen_time_loaded`).
     /// `cats` are the categories to file names under: the config's, or a move's fresh ones.
-    fn load_screen_time(&mut self, range: wellbeing::Range, cats: Vec<config::FocusCategory>, cx: &mut Context<Self>) {
+    fn load_screen_time(&mut self, p: wellbeing::Period, cats: Vec<config::FocusCategory>, cx: &mut Context<Self>) {
         if !self.cfg.screen_time.enabled {
             return;
         }
         self.st_gen += 1;
-        let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(range, win::local_now().0), wellbeing::rules(&cats));
+        let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, win::local_now().0), wellbeing::rules(&cats));
         let read = cx.background_executor().spawn(async move {
             let _ = wellbeing::flush_pending();
             let con = wellbeing::open(&wellbeing::db_path()).map_err(|e| e.to_string())?;
@@ -4734,13 +4734,14 @@ impl Launcher {
         });
         cx.spawn(async move |this, cx| {
             let r = read.await;
-            _ = this.update(cx, |this, cx| this.screen_time_loaded(range, generation, r, cx));
+            _ = this.update(cx, |this, cx| this.screen_time_loaded(p, generation, r, cx));
         })
         .detach();
     }
 
-    fn screen_time_loaded(&mut self, range: wellbeing::Range, generation: u64, r: Result<(Value, wellbeing::Hours), String>, cx: &mut Context<Self>) {
-        if self.st_gen != generation || self.mode != Mode::ScreenTime(range) {
+    fn screen_time_loaded(&mut self, p: wellbeing::Period, generation: u64, r: Result<(Value, wellbeing::Hours), String>, cx: &mut Context<Self>) {
+        let Mode::ScreenTime(current) = self.mode else { return };
+        if !wellbeing::fresh(current, p, self.st_gen, generation) {
             return;
         }
         let (stats, hours) = match r {
@@ -4750,20 +4751,20 @@ impl Launcher {
         (self.st_stats, self.st_hours) = (Some(stats), hours);
         if self.confirm.is_none() {
             let q = self.query(cx);
-            self.items = self.screen_time_items(range, &q);
+            self.items = self.screen_time_items(p, &q);
             self.selected = self.selected.min(self.items.len().saturating_sub(1));
             self.scroll_to_selected();
         }
         cx.notify();
     }
 
-    fn screen_time_items(&mut self, range: wellbeing::Range, query: &str) -> Vec<Item> {
+    fn screen_time_items(&mut self, p: wellbeing::Period, query: &str) -> Vec<Item> {
         match &self.st_stats {
             _ if !self.cfg.screen_time.enabled => screen_time_off_row(),
             None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
             Some(Err(e)) => vec![empty_row(g::MONITOR, "Couldn't read screen time".into(), e.clone(), vec![])],
             Some(Ok(stats)) => {
-                let mut rows = screen_time_rows(range, stats);
+                let mut rows = screen_time_rows(p, stats);
                 // Filtered rows come back best match first: keep each section together.
                 let mut found = search::filter(query, rows.split_off(1), &mut self.matcher);
                 found.sort_by_key(|it| ["Categories", "Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
@@ -4794,7 +4795,7 @@ impl Launcher {
     /// Writes the move to config.toml off the UI thread, then reads the span again with the new
     /// categories (the config poll takes a moment to hand them over).
     fn move_to_category(&mut self, name: String, category: String, cx: &mut Context<Self>) {
-        let Mode::ScreenTime(range) = self.mode else { return };
+        let Mode::ScreenTime(p) = self.mode else { return };
         let (what, to) = (name.clone(), category.clone());
         let write = cx.background_executor().spawn(async move {
             config::edit_file(&config::path(), |text| {
@@ -4807,8 +4808,8 @@ impl Launcher {
             _ = this.update(cx, |this, cx| match done {
                 Ok((c, _)) => {
                     this.status = Some((Tone::Ok, format!("Moved {what} to {to}")));
-                    if this.mode == Mode::ScreenTime(range) {
-                        this.load_screen_time(range, focus::categories(&c.focus_category), cx);
+                    if this.mode == Mode::ScreenTime(p) {
+                        this.load_screen_time(p, focus::categories(&c.focus_category), cx);
                     }
                     cx.notify();
                 }
@@ -4823,9 +4824,9 @@ impl Launcher {
 
     /// Writes the span as a CSV in Downloads on the background executor; the answer is a toast.
     fn export_screen_time(&mut self, cx: &mut Context<Self>) {
-        let Mode::ScreenTime(range) = self.mode else { return };
+        let Mode::ScreenTime(p) = self.mode else { return };
         let Ok(home) = std::env::var("USERPROFILE") else { return self.say(Msg::error("Couldn't find your Downloads folder")) };
-        let ((from, to), tx) = (wellbeing::span(range, win::local_now().0).0, self.tx.clone());
+        let ((from, to), tx) = (wellbeing::span(p, win::local_now().0).0, self.tx.clone());
         let rules = wellbeing::rules(&focus::categories(&self.cfg.focus_category));
         let name = format!("screen-time-{}-to-{}.csv", wellbeing::iso(from), wellbeing::iso(to));
         let path = PathBuf::from(home).join("Downloads").join(&name);
@@ -5349,8 +5350,12 @@ impl Launcher {
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Notes(NotesList::All) => Some("Search Notes".into()),
             Mode::Notes(NotesList::Deleted) => Some("Recently Deleted Notes".into()),
-            Mode::ScreenTime(wellbeing::Range::Today) => Some("Screen Time".into()),
-            Mode::ScreenTime(wellbeing::Range::Week) => Some("Screen Time This Week".into()),
+            Mode::ScreenTime(p) => Some(match p.range {
+                wellbeing::Range::Day => "Screen Time",
+                wellbeing::Range::Week => "Screen Time This Week",
+                wellbeing::Range::Month => "Screen Time This Month",
+            }
+            .into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -5445,8 +5450,7 @@ impl Launcher {
             Mode::Schedule => Icon::Vector(g::CALENDAR_CLOCK),
             Mode::Notes(NotesList::All) => Icon::Vector(g::NOTEBOOK_TABS),
             Mode::Notes(NotesList::Deleted) => Icon::Vector(g::ARCHIVE_RESTORE),
-            Mode::ScreenTime(wellbeing::Range::Today) => Icon::Vector(g::MONITOR),
-            Mode::ScreenTime(wellbeing::Range::Week) => Icon::Vector(g::CALENDAR_CLOCK),
+            Mode::ScreenTime(p) => Icon::Vector(if p.range == wellbeing::Range::Day { g::MONITOR } else { g::CALENDAR_CLOCK }),
             Mode::Form(kind) => Icon::Vector(kind.bar().0),
         }
     }
@@ -7820,7 +7824,7 @@ mod tests {
             "apps": [{"name": "code.exe", "seconds": 600, "category": "Development"}],
             "sites": [{"name": "youtube.com", "seconds": 200, "category": "Streaming"}]
         });
-        let rows = screen_time_rows(wellbeing::Range::Today, &stats);
+        let rows = screen_time_rows(wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 }, &stats);
         assert_eq!(rows[0].title, "15m today · 5m more than yesterday");
         assert_eq!(rows.iter().map(|r| r.section.as_deref()).collect::<Vec<_>>(), [None, Some("Categories"), Some("Apps"), Some("Sites")]);
         let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();

@@ -339,30 +339,145 @@ pub fn export_csv(con: &Connection, from: i64, to: i64, rules: &Rules) -> rusqli
 
 // --- the launcher's Screen Time view ------------------------------------------
 
-/// Which span the launcher's Screen Time view shows.
+/// How long a period the launcher's Screen Time view shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Range {
-    Today,
+    Day,
     Week,
+    #[allow(dead_code)] // reached by the dashboard's range picker
+    Month,
 }
 
-/// The span shown and the one it is compared with, as `(from, to)` day numbers. Today against
-/// yesterday; Monday to today against last Monday to the same weekday (a fair partial week).
-pub fn span(range: Range, today: i64) -> ((i64, i64), (i64, i64)) {
-    match range {
-        Range::Today => ((today, today), (today - 1, today - 1)),
+/// A range and a day inside it: the day, the week or the month holding `anchor`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Period {
+    pub range: Range,
+    pub anchor: i64,
+}
+
+/// First and last day of the month holding `day`.
+fn month_of(day: i64) -> (i64, i64) {
+    let (y, m, _) = civil_from_days(day);
+    (days_from_civil(y, m, 1), days_from_civil(y + m / 12, m % 12 + 1, 1) - 1)
+}
+
+/// The period's days, `(from, to)`: the day, Monday to Sunday, or first to last of the month.
+fn bounds(p: Period) -> (i64, i64) {
+    match p.range {
+        Range::Day => (p.anchor, p.anchor),
         Range::Week => {
-            let monday = today - weekday(today);
-            ((monday, today), (monday - 7, today - 7))
+            let monday = p.anchor - weekday(p.anchor);
+            (monday, monday + 6)
+        }
+        Range::Month => month_of(p.anchor),
+    }
+}
+
+/// The period shown and the one it is compared with, as `(from, to)` day numbers. The shown
+/// one is whole; the one before is the same stretch of it that has happened (a partial week
+/// or month against the same part of the last one), clamped to the last month's length.
+pub fn span(p: Period, today: i64) -> ((i64, i64), (i64, i64)) {
+    let shown = bounds(p);
+    let done = (shown.0, shown.1.min(today));
+    let before = match p.range {
+        Range::Day => (done.0 - 1, done.1 - 1),
+        Range::Week => (done.0 - 7, done.1 - 7),
+        Range::Month => {
+            let (first, last) = month_of(shown.0 - 1);
+            (first, (first + done.1 - done.0).min(last))
+        }
+    };
+    (shown, before)
+}
+
+/// The period `dir` (+1 or -1) periods away; a month lands on its 1st. Never one that starts
+/// after today: that returns `p`.
+#[allow(dead_code)] // the dashboard's arrows
+pub fn step(p: Period, dir: i64, today: i64) -> Period {
+    let anchor = match p.range {
+        Range::Day => p.anchor + dir,
+        Range::Week => p.anchor + 7 * dir,
+        Range::Month => {
+            let (first, last) = month_of(p.anchor);
+            if dir > 0 { last + 1 } else { month_of(first - 1).0 }
+        }
+    };
+    let next = Period { anchor, ..p };
+    if bounds(next).0 > today { p } else { next }
+}
+
+/// The same anchor under another range.
+#[allow(dead_code)] // the dashboard's range picker
+pub fn with_range(p: Period, r: Range) -> Period {
+    Period { range: r, ..p }
+}
+
+fn is_current(p: Period, today: i64) -> bool {
+    let (from, to) = bounds(p);
+    (from..=to).contains(&today)
+}
+
+const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// "Thu 19 Nov"
+fn day_label(day: i64) -> String {
+    let (_, m, d) = civil_from_days(day);
+    format!("{} {d} {}", WEEKDAYS[weekday(day) as usize], &MONTHS[m as usize - 1][..3])
+}
+
+/// "17 – 23 Nov" or "29 Dec – 4 Jan"
+fn week_label(p: Period) -> String {
+    let ((_, m1, d1), (_, m2, d2)) = (civil_from_days(bounds(p).0), civil_from_days(bounds(p).1));
+    let month = |m: i64| &MONTHS[m as usize - 1][..3];
+    if m1 == m2 { format!("{d1} – {d2} {}", month(m2)) } else { format!("{d1} {} – {d2} {}", month(m1), month(m2)) }
+}
+
+/// "Today", "Yesterday", "Thu 19 Nov"; "This week", "17 – 23 Nov"; "This month", "October 2026".
+pub fn title(p: Period, today: i64) -> String {
+    let current = is_current(p, today);
+    match p.range {
+        Range::Day if current => "Today".into(),
+        Range::Day if p.anchor == today - 1 => "Yesterday".into(),
+        Range::Day => day_label(p.anchor),
+        Range::Week if current => "This week".into(),
+        Range::Week => week_label(p),
+        Range::Month if current => "This month".into(),
+        Range::Month => {
+            let (y, m, _) = civil_from_days(p.anchor);
+            format!("{} {y}", MONTHS[m as usize - 1])
         }
     }
 }
 
+/// What follows a total: "so far today", "this week", "this month"; else "on Thu 19 Nov",
+/// "17 – 23 Nov", "in October 2026".
+pub fn caption(p: Period, today: i64) -> String {
+    match (p.range, is_current(p, today)) {
+        (Range::Day, true) => "so far today".into(),
+        (Range::Week, true) => "this week".into(),
+        (Range::Month, true) => "this month".into(),
+        (Range::Day, false) => format!("on {}", day_label(p.anchor)),
+        (Range::Week, false) => week_label(p),
+        (Range::Month, false) => format!("in {}", title(p, today)),
+    }
+}
+
+/// Whether an answer read for `asked` under `asked_gen` still fits what is on screen.
+pub fn fresh(current: Period, asked: Period, current_gen: u64, asked_gen: u64) -> bool {
+    current == asked && current_gen == asked_gen
+}
+
 /// The view's first line: "15m today · 5m more than yesterday".
-pub fn header(total: u64, previous: u64, range: Range) -> String {
-    let (now, then) = match range {
-        Range::Today => ("today", "yesterday"),
-        Range::Week => ("this week", "last week"),
+pub fn header(total: u64, previous: u64, p: Period, today: i64) -> String {
+    let current = is_current(p, today);
+    let (now, then) = match (p.range, current) {
+        (Range::Day, true) => ("today".to_string(), "yesterday"),
+        (Range::Week, true) => ("this week".to_string(), "last week"),
+        (Range::Month, true) => ("this month".to_string(), "last month"),
+        (Range::Day, false) => (caption(p, today), "the day before"),
+        (Range::Week, false) => (caption(p, today), "the week before"),
+        (Range::Month, false) => (caption(p, today), "the month before"),
     };
     let mut text = format!("{} {now}", duration(total as f64));
     if previous > 0 {
@@ -1452,7 +1567,7 @@ mod tests {
     #[test]
     fn rows_from_stats() {
         let d = parse_iso("2026-09-30").unwrap();
-        let s = stats(&fixture(), d, d, span(Range::Today, d).1, &rules()).unwrap();
+        let s = stats(&fixture(), d, d, span(Period { range: Range::Day, anchor: d }, d).1, &rules()).unwrap();
         let got: Vec<_> = rows(&s).into_iter().map(|r| (r.section, r.name, r.seconds, r.category)).collect();
         let row = |s, n: &str, secs, c: &str| (s, n.to_string(), secs, c.to_string());
         assert_eq!(
@@ -1473,28 +1588,79 @@ mod tests {
 
     #[test]
     fn header_compares_with_the_span_before() {
-        assert_eq!(header(900, 300, Range::Today), "15m today · 10m more than yesterday");
-        assert_eq!(header(900, 600, Range::Today), "15m today · 5m more than yesterday");
-        assert_eq!(header(600, 900, Range::Week), "10m this week · 5m less than last week");
-        assert_eq!(header(600, 610, Range::Today), "10m today · same as yesterday");
-        assert_eq!(header(600, 0, Range::Today), "10m today", "nothing before to compare with");
-        assert_eq!(header(0, 0, Range::Week), "0m this week");
+        let t = parse_iso("2026-11-26").unwrap();
+        let (day, week, month) = (Period { range: Range::Day, anchor: t }, Period { range: Range::Week, anchor: t }, Period { range: Range::Month, anchor: t });
+        assert_eq!(header(900, 300, day, t), "15m today · 10m more than yesterday");
+        assert_eq!(header(900, 600, day, t), "15m today · 5m more than yesterday");
+        assert_eq!(header(600, 900, week, t), "10m this week · 5m less than last week");
+        assert_eq!(header(600, 610, day, t), "10m today · same as yesterday");
+        assert_eq!(header(600, 0, day, t), "10m today", "nothing before to compare with");
+        assert_eq!(header(0, 0, week, t), "0m this week");
+        assert_eq!(header(600, 900, month, t), "10m this month · 5m less than last month");
+        let past = |range| Period { range, anchor: t - 40 };
+        assert_eq!(header(900, 300, past(Range::Day), t), "15m on Sat 17 Oct · 10m more than the day before");
+        assert_eq!(header(900, 600, past(Range::Week), t), "15m 12 – 18 Oct · 5m more than the week before");
+        assert_eq!(header(600, 900, past(Range::Month), t), "10m in October 2026 · 5m less than the month before");
     }
 
     #[test]
     fn week_compares_same_weekdays() {
-        let day = |s| parse_iso(s).unwrap();
+        let day = |s: &str| parse_iso(s).unwrap();
         // Wednesday: Monday to Wednesday against last Monday to Wednesday
-        let ((from, to), before) = span(Range::Week, day("2026-09-30"));
-        assert_eq!((iso(from), iso(to)), ("2026-09-28".into(), "2026-09-30".into()));
+        let wk = |today: &str| Period { range: Range::Week, anchor: day(today) };
+        let ((from, to), before) = span(wk("2026-09-30"), day("2026-09-30"));
+        assert_eq!((iso(from), iso(to)), ("2026-09-28".into(), "2026-10-04".into()), "the whole week is shown, the part so far is compared");
         assert_eq!((iso(before.0), iso(before.1)), ("2026-09-21".into(), "2026-09-23".into()));
-        // Monday: the week is one day
-        let (week, before) = span(Range::Week, day("2026-09-28"));
-        assert_eq!((week.0, before), (week.1, (week.0 - 7, week.1 - 7)));
+        // Monday: one day so far, against last Monday
+        let (week, before) = span(wk("2026-09-28"), day("2026-09-28"));
+        assert_eq!((week.1 - week.0, before), (6, (week.0 - 7, week.0 - 7)));
         // Sunday: the whole week against the whole week before
-        let (week, before) = span(Range::Week, day("2026-10-04"));
+        let (week, before) = span(wk("2026-10-04"), day("2026-10-04"));
         assert_eq!((iso(week.0), iso(before.0), iso(before.1)), ("2026-09-28".into(), "2026-09-21".into(), "2026-09-27".into()));
-        assert_eq!(span(Range::Today, day("2026-09-30")), ((day("2026-09-30"), day("2026-09-30")), (day("2026-09-29"), day("2026-09-29"))));
+        assert_eq!(span(Period { range: Range::Day, anchor: day("2026-09-30") }, day("2026-09-30")), ((day("2026-09-30"), day("2026-09-30")), (day("2026-09-29"), day("2026-09-29"))));
+    }
+
+    #[test]
+    fn spans_per_period() {
+        let d = |s| parse_iso(s).unwrap();
+        let today = d("2026-11-26"); // Thursday
+        let p = |range, a| Period { range, anchor: d(a) };
+        assert_eq!(span(p(Range::Day, "2026-11-26"), today), ((today, today), (today - 1, today - 1)));
+        assert_eq!(span(p(Range::Week, "2026-11-26"), today), ((d("2026-11-23"), d("2026-11-29")), (d("2026-11-16"), d("2026-11-19"))));
+        assert_eq!(span(p(Range::Week, "2026-11-12"), today), ((d("2026-11-09"), d("2026-11-15")), (d("2026-11-02"), d("2026-11-08"))));
+        assert_eq!(span(p(Range::Month, "2026-11-26"), today), ((d("2026-11-01"), d("2026-11-30")), (d("2026-10-01"), d("2026-10-26"))));
+        assert_eq!(span(p(Range::Month, "2026-03-31"), today), ((d("2026-03-01"), d("2026-03-31")), (d("2026-02-01"), d("2026-02-28"))));
+    }
+
+    #[test]
+    fn steps_and_titles() {
+        let d = |s| parse_iso(s).unwrap();
+        let today = d("2026-11-26");
+        let p = |range, a| Period { range, anchor: d(a) };
+        assert_eq!(step(p(Range::Month, "2026-01-31"), 1, today), p(Range::Month, "2026-02-01"));
+        assert_eq!(step(p(Range::Month, "2026-01-15"), -1, today), p(Range::Month, "2025-12-01"));
+        assert_eq!(step(p(Range::Day, "2026-11-26"), 1, today), p(Range::Day, "2026-11-26"), "no future");
+        assert_eq!(step(p(Range::Week, "2026-11-26"), 1, today), p(Range::Week, "2026-11-26"));
+        assert_eq!(step(p(Range::Week, "2026-11-26"), -1, today), p(Range::Week, "2026-11-19"));
+        assert_eq!(with_range(p(Range::Day, "2026-11-19"), Range::Month), p(Range::Month, "2026-11-19"));
+        assert_eq!(title(p(Range::Day, "2026-11-26"), today), "Today");
+        assert_eq!(title(p(Range::Day, "2026-11-25"), today), "Yesterday");
+        assert_eq!(title(p(Range::Day, "2026-11-19"), today), "Thu 19 Nov");
+        assert_eq!(title(p(Range::Week, "2026-11-26"), today), "This week");
+        assert_eq!(title(p(Range::Week, "2026-11-19"), today), "16 – 22 Nov");
+        assert_eq!(title(p(Range::Week, "2026-01-01"), today), "29 Dec – 4 Jan");
+        assert_eq!(title(p(Range::Month, "2026-11-02"), today), "This month");
+        assert_eq!(title(p(Range::Month, "2026-10-09"), today), "October 2026");
+        assert_eq!(caption(p(Range::Day, "2026-11-26"), today), "so far today");
+        assert_eq!(caption(p(Range::Week, "2026-11-26"), today), "this week");
+        assert_eq!(caption(p(Range::Month, "2026-11-26"), today), "this month");
+        assert_eq!(caption(p(Range::Day, "2026-11-19"), today), "on Thu 19 Nov");
+        assert_eq!(caption(p(Range::Week, "2026-11-19"), today), "16 – 22 Nov");
+        assert_eq!(caption(p(Range::Month, "2026-10-09"), today), "in October 2026");
+        let a = p(Range::Day, "2026-11-26");
+        assert!(fresh(a, a, 3, 3));
+        assert!(!fresh(p(Range::Week, "2026-11-26"), a, 3, 3), "an answer for another period is dropped");
+        assert!(!fresh(a, a, 4, 3));
     }
 
     #[test]
@@ -1514,7 +1680,7 @@ mod tests {
         let (con, rules) = (fixture(), rules());
         con.execute("INSERT INTO daily VALUES('2026-09-30', 12, 3000.0, '09:05', '17:40')", []).unwrap();
         let d = parse_iso("2026-09-30").unwrap();
-        let s = stats(&con, d, d, span(Range::Today, d).1, &rules).unwrap();
+        let s = stats(&con, d, d, span(Period { range: Range::Day, anchor: d }, d).1, &rules).unwrap();
         let none_hours = Hours::new();
         let by = |section, name: &str| rows(&s).into_iter().find(|r| r.section == section && r.name == name);
         let text = |v: Vec<(String, String)>| v.into_iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>();
@@ -1533,11 +1699,11 @@ mod tests {
         assert_eq!(site[..4], ["Time: 3m", "Share: 22% of total", "Category: Streaming", "09:00: 3m"]);
         assert_eq!(text(detail(&s, None, &hours))[..2], ["Total: 15m", "Before: 2m"]);
         // no per-day focus rows: nothing about focus
-        let none = stats(&con, d - 5, d - 5, span(Range::Today, d - 5).1, &rules).unwrap();
+        let none = stats(&con, d - 5, d - 5, span(Period { range: Range::Day, anchor: d - 5 }, d - 5).1, &rules).unwrap();
         assert_eq!(text(detail(&none, None, &none_hours)), ["Total: 0m", "Before: 0m"]);
         // a week labels its buckets by day and calls the focus times what they are
         let mon = d - 2;
-        let w = stats(&con, mon, d, span(Range::Week, d).1, &rules).unwrap();
+        let w = stats(&con, mon, d, span(Period { range: Range::Week, anchor: d }, d).1, &rules).unwrap();
         let dev = text(detail(&w, rows(&w).iter().find(|r| r.name == "Development"), &none_hours));
         assert!(dev.contains(&"2026-09-30: 10m".to_string()) && dev.contains(&"Earliest start: 09:05".to_string()), "{dev:?}");
     }
