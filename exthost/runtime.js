@@ -322,16 +322,27 @@ const handlers = new Map();
 
 // Handler ids come from the node's position, so an id from a slightly older render still
 // reaches the equivalent handler after a re-render.
+// Functions nested in object props (List `pagination.onLoadMore`) become handlers too;
+// postMessage can't clone a function.
+function prop(v, id) {
+  if (typeof v === "function") {
+    handlers.set(id, v);
+    return { $fn: id };
+  }
+  if (Array.isArray(v)) return v.map((x, i) => prop(x, `${id}.${i}`));
+  if (v && typeof v === "object" && !(v instanceof Date)) {
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = prop(x, `${id}.${k}`);
+    return out;
+  }
+  return typeof v === "symbol" ? undefined : v;
+}
+
 function serialize(node, at) {
   if (node.text !== undefined) return node.text;
   const props = {};
   for (const [k, v] of Object.entries(node.props)) {
-    if (k === "children") continue;
-    if (typeof v === "function") {
-      const id = `${at}:${k}`;
-      handlers.set(id, v);
-      props[k] = { $fn: id };
-    } else if (!React.isValidElement(v)) props[k] = v;
+    if (k !== "children" && !React.isValidElement(v)) props[k] = prop(v, `${at}:${k}`);
   }
   const out = { type: node.type, props };
   const kids = node.children.filter((c) => !c.hidden);

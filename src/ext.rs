@@ -282,8 +282,8 @@ pub struct ExtItem {
     pub icon: Option<String>,
     pub section: Option<String>,
     pub detail: Option<String>,
-    /// List.Item.Detail metadata labels: (title, text).
-    pub detail_meta: Vec<(String, String)>,
+    /// List.Item.Detail metadata rows.
+    pub detail_meta: Vec<Meta>,
     pub actions: Vec<ExtAction>,
 }
 
@@ -320,12 +320,14 @@ pub struct View {
     pub placeholder: Option<String>,
     /// The extension filters itself (onSearchTextChange without filtering=true).
     pub on_search: Option<String>,
+    /// `pagination.onLoadMore` while `hasMore`: called as the list nears its end.
+    pub load_more: Option<String>,
     pub search_text: Option<String>,
     pub show_detail: bool,
     pub items: Vec<ExtItem>,
     pub empty: Option<(String, String)>,
     pub markdown: String,
-    pub metadata: Vec<(String, String)>,
+    pub metadata: Vec<Meta>,
     pub actions: Vec<ExtAction>,
     pub fields: Vec<Field>,
     pub dropdown: Option<Dropdown>,
@@ -394,8 +396,23 @@ fn accessory(a: &Value) -> Option<String> {
     a["date"].as_str().map(|d| d.chars().take(10).collect())
 }
 
-/// Metadata.Label / Link / TagList rows -> (title, text).
-fn metadata(m: &Value) -> Vec<(String, String)> {
+/// A Detail.Metadata row: a Label's or Link's text, or a TagList's tags (text, Raycast colour
+/// such as "color:Red", empty for none).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Meta {
+    pub title: String,
+    pub text: String,
+    pub tags: Vec<(String, String)>,
+}
+
+impl Meta {
+    pub fn label(title: impl Into<String>, text: impl Into<String>) -> Self {
+        Self { title: title.into(), text: text.into(), tags: vec![] }
+    }
+}
+
+/// Metadata.Label / Link / TagList rows; separators and untitled rows drop.
+fn metadata(m: &Value) -> Vec<Meta> {
     kids(m)
         .filter_map(|c| {
             let p = &c["props"];
@@ -403,11 +420,10 @@ fn metadata(m: &Value) -> Vec<(String, String)> {
             if title.is_empty() {
                 return None;
             }
-            let text = match c["type"].as_str()? {
-                "Metadata.TagList" => kids(c).map(|t| s(&t["props"]["text"])).collect::<Vec<_>>().join(", "),
-                _ => s(&p["text"]),
-            };
-            Some((title, text))
+            Some(match c["type"].as_str()? {
+                "Metadata.TagList" => Meta { title, text: String::new(), tags: kids(c).map(|t| (s(&t["props"]["text"]), s(&t["props"]["color"]))).collect() },
+                _ => Meta::label(title, s(&p["text"])),
+            })
         })
         .collect()
 }
@@ -491,6 +507,7 @@ pub fn parse_view(tree: &Value) -> View {
         search_text: p["searchText"].as_str().map(str::to_string),
         show_detail: p["isShowingDetail"].as_bool().unwrap_or(false),
         on_search: fn_id(&p["onSearchTextChange"]).filter(|_| !p["filtering"].as_bool().unwrap_or(false)),
+        load_more: fn_id(&p["pagination"]["onLoadMore"]).filter(|_| p["pagination"]["hasMore"].as_bool().unwrap_or(false)),
         actions: actions(slot(root, "actions")),
         ..View::default()
     };
@@ -601,7 +618,10 @@ pub fn parse_menubar(tree: &Value) -> Option<MenuBar> {
     Some(MenuBar { title: s(&p["title"]), tooltip: s(&p["tooltip"]), icon: icon(&p["icon"]), items: nodes(root) })
 }
 
-/// Markdown -> display lines (heading level, text). Images dropped, links keep their text.
+/// Markdown -> display lines (heading level 0-3, text). 6 is a quote, 7 a rule (`---`), 9 a
+/// code line, and 8 an image: its text is the
+/// source, with Raycast's `?raycast-height=N` hint (an `<img height>` folds into it), one line
+/// per image after the text it sat in. Links keep their text; other HTML tags drop.
 pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
     let mut out = vec![];
     let mut code = false;
@@ -615,13 +635,44 @@ pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
             out.push((9, line.to_string()));
             continue;
         }
-        let level = line.chars().take_while(|c| *c == '#').count() as u8;
-        let mut text = line.trim_start_matches('#').trim().to_string();
-        // ![alt](src) -> "", [text](url) -> text, **b** / __b__ / `c` -> b / c
+        let bare = line.trim();
+        if bare.len() >= 3 && ['-', '*', '_'].iter().any(|c| bare.chars().all(|x| x == *c)) {
+            out.push((7, String::new()));
+            continue;
+        }
+        let quote = bare.strip_prefix('>');
+        let level = if quote.is_some() { 6 } else { line.chars().take_while(|c| *c == '#').count().min(3) as u8 };
+        let mut text = quote.unwrap_or(line).trim_start_matches('#').trim().to_string();
+        // ![alt](src) and <img src> -> image lines, [text](url) -> text, **b** / __b__ / `c` -> b / c
+        let mut images = vec![];
         while let Some(i) = text.find("![") {
             let end = text[i..].find(')').map(|e| i + e + 1).unwrap_or(text.len());
+            if let Some(src) = text[i..end].split_once("](").and_then(|(_, rest)| rest.trim_end_matches(')').split_whitespace().next()) {
+                images.push(src.to_string());
+            }
             text.replace_range(i..end, "");
         }
+        // ASCII lowercasing keeps byte offsets.
+        while let Some(i) = text.to_ascii_lowercase().find("<img") {
+            let end = text[i..].find('>').map(|e| i + e + 1).unwrap_or(text.len());
+            let tag = &text[i..end];
+            if let Some(src) = attr(tag, "src") {
+                images.push(match attr(tag, "height").map(|h| h.trim_end_matches("px").to_string()).filter(|h| h.parse::<f32>().is_ok()) {
+                    Some(h) => format!("{src}{}raycast-height={h}", if src.contains('?') { '&' } else { '?' }),
+                    None => src,
+                });
+            }
+            text.replace_range(i..end, "");
+        }
+        let mut from = 0;
+        while let Some(i) = text[from..].find('<').map(|i| from + i) {
+            let tag = text[i + 1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '/');
+            match text[i..].find('>') {
+                Some(e) if tag => text.replace_range(i..i + e + 1, ""),
+                _ => from = i + 1,
+            }
+        }
+        text = text.trim().to_string();
         while let (Some(a), Some(b)) = (text.find('['), text.find("](")) {
             if b < a {
                 break;
@@ -630,16 +681,48 @@ pub fn markdown_lines(md: &str) -> Vec<(u8, String)> {
             let label = text[a + 1..b].to_string();
             text.replace_range(a..end, &label);
         }
+        // Entities decode after tags strip, so "&lt;b&gt;" stays as text; &amp; goes last.
         let text = text.replace("**", "").replace("__", "").replace('`', "");
+        let text = [("&nbsp;", " "), ("&quot;", "\""), ("&#39;", "'"), ("&apos;", "'"), ("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&")].iter().fold(text, |t, (e, c)| t.replace(e, c));
         let text = match text.strip_prefix("- ").or(text.strip_prefix("* ")) {
             Some(rest) => format!("• {rest}"),
             None => text,
         };
-        if !(text.is_empty() && out.last().is_some_and(|l: &(u8, String)| l.1.is_empty())) {
-            out.push((level.min(3), text));
+        let blank_after_blank = text.is_empty() && out.last().is_some_and(|l: &(u8, String)| l.1.is_empty());
+        if !(blank_after_blank || text.is_empty() && !images.is_empty()) {
+            out.push((level, text));
         }
+        out.extend(images.into_iter().map(|src| (8, src)));
     }
     out
+}
+
+/// An HTML attribute's value: `name="v"`, `name='v'` or `name=v`.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let at = tag.to_ascii_lowercase().find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &tag[at..];
+    match rest.chars().next()? {
+        q @ ('"' | '\'') => rest[1..].split(q).next().map(str::to_string),
+        _ => rest.split([' ', '>', '/']).next().map(str::to_string),
+    }
+}
+
+/// An image line's source without Raycast's size hints, and its `raycast-height`.
+pub fn image_src(line: &str) -> (String, Option<f32>) {
+    let Some((base, query)) = line.split_once('?') else { return (line.to_string(), None) };
+    let mut height = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| match p.split_once('=') {
+            Some(("raycast-height", h)) => {
+                height = h.parse().ok();
+                false
+            }
+            Some((k, _)) => !k.starts_with("raycast-"),
+            None => true,
+        })
+        .collect();
+    (if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) }, height)
 }
 
 /// A PNG asset as a GPUI image (BGRA), shrunk to icon size.
@@ -762,6 +845,9 @@ mod tests {
             ]}]}]);
         let v = parse_view(&tree);
         assert_eq!((v.kind.as_str(), v.on_search.as_deref(), v.show_detail), ("List", Some("p1.0:onSearchTextChange"), true));
+        assert_eq!(v.load_more, None, "no pagination prop, nothing to load");
+        let paged = |more: bool| parse_view(&json!([{"type": "List", "props": {"pagination": {"pageSize": 10, "hasMore": more, "onLoadMore": {"$fn": "p1.0:pagination.onLoadMore"}}}}])).load_more;
+        assert_eq!((paged(true).as_deref(), paged(false)), (Some("p1.0:pagination.onLoadMore"), None));
         let it = &v.items[0];
         assert_eq!((it.title.as_str(), it.subtitle.as_str(), it.section.as_deref()), ("Note A", "today", Some("Recent")));
         assert_eq!(it.accessories, ["3 KB", "work"]);
@@ -821,7 +907,41 @@ mod tests {
         assert_eq!(args[2].kind, ArgKind::Choice(vec![("pc".into(), "Procast".into()), ("docs".into(), "Docs".into())]));
 
         let md = markdown_lines("# Title\nSee [docs](https://x.y) and **bold**\n![img](a.png)\n- item\n```\ncode\n```");
-        assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (0, "".into()), (0, "• item".into()), (9, "code".into())]);
+        assert_eq!(md, [(1, "Title".to_string()), (0, "See docs and bold".into()), (8, "a.png".into()), (0, "• item".into()), (9, "code".into())]);
+    }
+
+    #[test]
+    fn html_images_become_image_lines_and_other_tags_drop() {
+        let md = markdown_lines("<img src=\"https://m.media-amazon.com/a.jpg\" height=\"300\" />\n\nAn <b>insomniac</b> worker<br/>\n![poster](https://x.y/p.png?raycast-width=200 \"Poster\")\na < b");
+        assert_eq!(
+            md,
+            [
+                (8, "https://m.media-amazon.com/a.jpg?raycast-height=300".to_string()),
+                (0, "".into()),
+                (0, "An insomniac worker".into()),
+                (8, "https://x.y/p.png?raycast-width=200".into()),
+                (0, "a < b".into()),
+            ]
+        );
+        assert_eq!(markdown_lines("Tom &amp; Jerry&nbsp;&quot;1940&quot;\n---\n> A cat chases a mouse\n***"), [(0, "Tom & Jerry \"1940\"".to_string()), (7, "".into()), (6, "A cat chases a mouse".into()), (7, "".into())]);
+        assert_eq!(image_src("https://x.y/p.png?v=2&raycast-height=300"), ("https://x.y/p.png?v=2".into(), Some(300.)));
+        assert_eq!(image_src("poster.png?raycast-width=80"), ("poster.png".into(), None));
+    }
+
+    #[test]
+    fn tag_lists_keep_their_tags() {
+        let m = json!({"type": "slot", "children": [
+            {"type": "Metadata.Label", "props": {"title": "Director", "text": "David Fincher"}},
+            {"type": "Metadata.TagList", "props": {"title": "Genres"}, "children": [
+                {"type": "Metadata.TagList.Item", "props": {"text": "Drama", "color": "color:Red"}},
+                {"type": "Metadata.TagList.Item", "props": {"text": "Thriller"}}
+            ]},
+            {"type": "Metadata.Separator", "props": {}}
+        ]});
+        let rows = metadata(&m);
+        assert_eq!(rows[0], Meta { title: "Director".into(), text: "David Fincher".into(), tags: vec![] });
+        assert_eq!(rows[1].tags, [("Drama".to_string(), "color:Red".to_string()), ("Thriller".into(), String::new())]);
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

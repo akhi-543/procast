@@ -637,6 +637,8 @@ struct ExtView {
     /// Recent queries we sent: a controlled `searchText` equal to one of these is a late
     /// echo of our own typing and must not overwrite newer keystrokes.
     sent_recent: Vec<String>,
+    /// Item count when onLoadMore was last called: one call per page.
+    more_at: Option<usize>,
     _subs: Vec<Subscription>,
 }
 
@@ -878,6 +880,8 @@ struct Launcher {
     trays: HashMap<String, (u64, TrayIcon)>,
     confirm: Option<Confirm>,
     images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
+    /// Pictures in extension markdown, decoded larger than icons (`MD_IMAGE_PX`).
+    md_images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
     /// Favicon URLs already asked for this session: a site without one isn't asked again.
     favicons: HashSet<String>,
     /// Store index (None until loaded) and whether a load is running.
@@ -1125,6 +1129,7 @@ impl Launcher {
             trays: HashMap::new(),
             confirm: None,
             images: HashMap::new(),
+            md_images: HashMap::new(),
             favicons: HashSet::new(),
             store: None,
             store_loading: false,
@@ -1473,6 +1478,7 @@ impl Launcher {
             return;
         }
         ev.sent_query = Some(q.clone());
+        ev.more_at = None;
         ev.sent_recent.push(q.clone());
         if ev.sent_recent.len() > 32 {
             ev.sent_recent.remove(0);
@@ -1493,6 +1499,31 @@ impl Launcher {
     /// A web image (http only): drawn from the cache once downloaded, `glyph` until then.
     fn web_icon(&mut self, url: &str, glyph: &'static str) -> Icon {
         net::cached_image(url, &self.tx).and_then(|path| self.image(path)).map_or(Icon::Vector(glyph), Icon::Image)
+    }
+
+    /// The pictures in a markdown body, keyed by image line: web ones from the cache (queued
+    /// until they arrive), others from the extension's assets folder or a file:// path.
+    fn markdown_images(&mut self, md: &str, ext: Option<usize>) -> HashMap<String, Arc<RenderImage>> {
+        let mut out = HashMap::new();
+        for (_, line) in ext::markdown_lines(md).into_iter().filter(|(level, _)| *level == 8) {
+            let (src, _) = ext::image_src(&line);
+            let path = if src.starts_with("http") {
+                net::cached_image(&src, &self.tx)
+            } else if let Some(p) = src.strip_prefix("file://") {
+                Some(PathBuf::from(p))
+            } else {
+                ext.and_then(|e| self.exts.get(e)).map(|(x, _)| x.dir.join("assets").join(&src))
+            };
+            let Some(path) = path else { continue };
+            // ponytail: dropped wholesale past 16 pictures; per-entry LRU if detail views get busy.
+            if self.md_images.len() > 16 && !self.md_images.contains_key(&path) {
+                self.md_images.clear();
+            }
+            if let Some(img) = self.md_images.entry(path.clone()).or_insert_with(|| ext::load_image_sized(&path, MD_IMAGE_PX)).clone() {
+                out.insert(line, img);
+            }
+        }
+        out
     }
 
     fn ext_icon(&mut self, ext: usize, icon: Option<&str>) -> Icon {
@@ -1570,7 +1601,7 @@ impl Launcher {
                     let (glyph, title, sub) = match &view.empty {
                         _ if view.loading => (g::CLOCK, "Loading…".to_string(), String::new()),
                         Some((t, d)) if !t.is_empty() => (g::SEARCH, t.clone(), d.clone()),
-                        _ => (g::SEARCH, "No results".to_string(), String::new()),
+                        _ => (g::SEARCH, "No results".to_string(), "Try another search".to_string()),
                     };
                     rows.push(empty_row(glyph, title, sub, view_actions));
                 }
@@ -3329,7 +3360,7 @@ impl Launcher {
         self.send(ext::run_msg(run, &ext, &cmd, prefs, args, background, self.cfg.extensions.memory_mb));
         if view {
             self.stop_ext_view();
-            self.extv = Some(ExtView { run, ext: e, view: ext::View::default(), depth: 1, values: HashMap::new(), inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] });
+            self.extv = Some(ExtView { run, ext: e, view: ext::View::default(), depth: 1, values: HashMap::new(), inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], more_at: None, _subs: vec![] });
             self.mode = Mode::Ext;
             self.panel = None;
             self.menu = None;
@@ -3470,7 +3501,11 @@ impl Launcher {
                 let first_form = view.kind == "Form" && self.extv.as_ref().is_some_and(|e| e.view.kind != "Form");
                 if let Some(ev) = &mut self.extv {
                     ev.view = view;
-                    ev.depth = v["depth"].as_u64().unwrap_or(1);
+                    let depth = v["depth"].as_u64().unwrap_or(1);
+                    if depth != ev.depth {
+                        ev.more_at = None;
+                    }
+                    ev.depth = depth;
                 }
                 self.sync_form(first_form, window, cx);
                 if let Some(text) = self.extv.as_ref().and_then(|e| e.view.search_text.clone())
@@ -4941,8 +4976,17 @@ impl Launcher {
                     self.refresh_keeping(cx);
                 }
             }
+            Msg::LoadMore(run) => {
+                if let Some(ev) = self.extv.as_mut().filter(|e| e.run == run && !e.view.loading)
+                    && let Some(f) = ev.view.load_more.clone().filter(|_| ev.more_at != Some(ev.view.items.len()))
+                {
+                    ev.more_at = Some(ev.view.items.len());
+                    self.send(json!({"t": "event", "run": run, "fn": f, "args": []}));
+                }
+            }
             Msg::ImageReady(path) => {
                 self.images.remove(&path);
+                self.md_images.remove(&path);
                 self.music.drop_cover(&path);
                 if self.music.cover_is(&path) {
                     self.music_tray_refresh();
@@ -5352,29 +5396,39 @@ impl Launcher {
             .into_any_element()
     }
 
-    fn render_markdown(md: &str, metadata: &[(String, String)], t: &Tokens, id: &'static str, scroll: Option<&ScrollHandle>) -> gpui::AnyElement {
+    /// `images`: the picture for each image line (`ext::markdown_lines` level 8) that has
+    /// arrived; the rest hold their place as an empty frame.
+    fn render_markdown(md: &str, metadata: &[ext::Meta], images: &HashMap<String, Arc<RenderImage>>, t: &Tokens, id: &'static str, scroll: Option<&ScrollHandle>) -> gpui::AnyElement {
+        use design::sp;
         div()
             .id(id)
             .when_some(scroll, |d, h| d.track_scroll(h))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px(px(24.))
-            .py(px(16.))
+            .px(px(sp::S24))
+            .py(px(sp::S16))
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(sp::S4))
             .children(ext::markdown_lines(md).into_iter().map(|(level, text)| {
+                match level {
+                    8 => return markdown_image(images.get(&text), ext::image_src(&text).1, t),
+                    7 => return div().flex_none().h(px(1.)).my(px(sp::S8)).bg(t.hairline).into_any_element(),
+                    _ => {}
+                }
                 let line = div().line_height(px(21.)).child(if text.is_empty() { " ".to_string() } else { text });
                 match level {
-                    1 => line.pt(px(4.)).line_height(px(28.)).font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD),
-                    2 => line.pt(px(4.)).text_size(px(design::ts::HEADING)).font_weight(FontWeight::SEMIBOLD),
-                    3 => line.pt(px(4.)).font_weight(FontWeight::SEMIBOLD),
-                    9 => line.font_family(design::FONT_MONO).text_size(px(design::ts::BODY_SM)).px(px(12.)).bg(t.surface).rounded(px(design::r::XS)),
+                    1 => line.pt(px(sp::S4)).line_height(px(28.)).font_family(design::FONT_DISPLAY).text_size(px(design::ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD),
+                    2 => line.pt(px(sp::S4)).text_size(px(design::ts::HEADING)).font_weight(FontWeight::SEMIBOLD),
+                    3 => line.pt(px(sp::S4)).font_weight(FontWeight::SEMIBOLD),
+                    6 => line.pl(px(sp::S12)).border_l_1().border_color(t.border).text_color(t.text_muted),
+                    9 => line.font_family(design::FONT_MONO).text_size(px(design::ts::BODY_SM)).px(px(sp::S12)).bg(t.surface).rounded(px(design::r::XS)),
                     _ => line.text_color(t.text),
                 }
+                .into_any_element()
             }))
-            .when(!metadata.is_empty(), |d| d.children(info_rows(metadata, t)))
+            .when(!metadata.is_empty(), |d| d.children(meta_rows(metadata, t)))
             .into_any_element()
     }
 
@@ -5921,24 +5975,71 @@ fn image_box(t: &Tokens) -> gpui::Div {
     div().h(px(200.)).flex().items_center().justify_center().rounded(px(design::r::MD)).bg(t.surface).border_1().border_color(t.hairline).overflow_hidden()
 }
 
+/// Tallest a markdown picture draws when the extension gives no `raycast-height`.
+const MD_IMAGE_H: f32 = 240.;
+/// Longest side a markdown picture is decoded at.
+const MD_IMAGE_PX: u32 = 720;
+
+/// A markdown picture at its `raycast-height` (else its own height, at most `MD_IMAGE_H`),
+/// left-aligned and never wider than the pane; until it arrives, an empty frame that size.
+fn markdown_image(image: Option<&Arc<RenderImage>>, height: Option<f32>, t: &Tokens) -> gpui::AnyElement {
+    let frame = div().flex_none().rounded(px(design::r::MD)).overflow_hidden();
+    match image {
+        Some(img) => {
+            let size = img.size(0);
+            let (w, h) = (size.width.0 as f32, size.height.0 as f32);
+            let h = height.unwrap_or(h.min(MD_IMAGE_H));
+            let w = if size.height.0 > 0 { h * w / size.height.0 as f32 } else { 0. };
+            frame.max_w_full().child(gpui::img(img.clone()).w(px(w)).h(px(h)).max_w_full().object_fit(gpui::ObjectFit::Contain)).into_any_element()
+        }
+        None => frame.h(px(height.unwrap_or(MD_IMAGE_H / 2.))).w(px(MD_IMAGE_H)).bg(t.surface).into_any_element(),
+    }
+}
+
 /// "Information" and key / value rows under a detail view.
 fn info_rows(metadata: &[(String, String)], t: &Tokens) -> Vec<gpui::AnyElement> {
-    let head = div().mt(px(12.)).pt(px(12.)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information");
+    meta_rows(&metadata.iter().map(|(k, v)| ext::Meta::label(k, v)).collect::<Vec<_>>(), t)
+}
+
+/// `info_rows` for an extension's metadata: a TagList draws as tags.
+fn meta_rows(metadata: &[ext::Meta], t: &Tokens) -> Vec<gpui::AnyElement> {
+    use design::sp;
+    let head = div().mt(px(sp::S12)).pt(px(sp::S12)).border_t_1().border_color(t.hairline).font_family(design::FONT_SMALL).text_size(px(design::ts::SMALL)).font_weight(FontWeight::SEMIBOLD).text_color(t.text_faint).child("Information");
     std::iter::once(head.into_any_element())
-        .chain(metadata.iter().map(|(k, v)| {
+        .chain(metadata.iter().map(|m| {
+            let value = if m.tags.is_empty() {
+                div().min_w_0().truncate().child(m.text.clone())
+            } else {
+                div().flex().flex_wrap().justify_end().gap(px(sp::S4)).children(m.tags.iter().map(|(text, color)| design::tag(text, tag_tint(color), t)))
+            };
             div()
                 .flex()
+                .items_center()
                 .justify_between()
-                .gap(px(16.))
-                .py(px(8.))
+                .gap(px(sp::S16))
+                .py(px(sp::S8))
                 .border_b_1()
                 .border_color(t.hairline)
                 .text_size(px(design::ts::BODY_SM))
-                .child(div().flex_none().text_color(t.text_muted).child(k.clone()))
-                .child(div().min_w_0().truncate().child(v.clone()))
+                .child(div().flex_none().text_color(t.text_muted).child(m.title.clone()))
+                .child(value)
                 .into_any_element()
         }))
         .collect()
+}
+
+/// A Raycast tag colour ("color:Red") as the nearest kind tint; no purple, and anything else
+/// (no colour, a hex value) stays neutral.
+fn tag_tint(color: &str) -> design::Tint {
+    use design::Tint;
+    match color.strip_prefix("color:").unwrap_or_default() {
+        "Red" => Tint::Danger,
+        "Orange" | "Yellow" => Tint::System,
+        "Green" => Tint::Web,
+        "Blue" => Tint::Paste,
+        "Magenta" | "Purple" => Tint::Calc,
+        _ => Tint::Accent,
+    }
 }
 
 /// Icon for an action in the Ctrl+K panel.
@@ -6031,6 +6132,19 @@ impl Render for Launcher {
             Mode::Translate if empty.is_none() && self.translation.as_ref().is_some_and(|tr| !tr.rows.is_empty()) => Some(self.translate_detail(&lt)),
             Mode::Define if empty.is_none() && !self.items.is_empty() => Some(self.define_detail(&t)),
             _ => None,
+        };
+        // Pictures for whichever markdown body shows below (a Detail, a list's detail pane, the AI chat).
+        let md_images = {
+            let view = self.extv.as_ref().filter(|_| self.mode == Mode::Ext && self.panel.is_none() && self.confirm.is_none()).map(|e| &e.view);
+            let md = match view {
+                Some(v) if v.kind == "Detail" => v.markdown.clone(),
+                Some(v) if v.show_detail => {
+                    self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title)).and_then(|it| it.detail.clone()).unwrap_or_default()
+                }
+                _ if self.mode == Mode::Ai => self.ai.as_ref().map(|chat| chat.markdown().0).unwrap_or_default(),
+                _ => String::new(),
+            };
+            self.markdown_images(&md, self.extv.as_ref().map(|e| e.ext))
         };
         let selected_item = self.items.get(self.selected);
         let actions = selected_item.map(|it| it.actions()).unwrap_or_default();
@@ -6148,9 +6262,16 @@ impl Render for Launcher {
         // Narrow split lists (detail on the right) get a tighter accessory column.
         let acc_max = if view.as_ref().is_some_and(|v| v.show_detail) || matches!(self.mode, Mode::Clipboard | Mode::Translate) { 110. } else { design::ACCESSORY_MAX };
         let live_w = design::live_width(window);
+        // A paginated extension list asks for its next page once the last rows are on screen.
+        let more = self.extv.as_ref().filter(|e| self.mode == Mode::Ext && e.view.load_more.is_some()).map(|e| (e.run, self.tx.clone()));
         let list = {
             let slots = slots.clone();
             uniform_list("rows", slots.len(), move |range, _, _| {
+                if let Some((run, tx)) = &more
+                    && range.end + 5 >= slots.len()
+                {
+                    let _ = tx.unbounded_send(Msg::LoadMore(*run));
+                }
                 range
                     .map(|k| match &slots[k] {
                         Slot::Header(title, count) => design::section_header(title, *count, &t).into_any_element(),
@@ -6225,14 +6346,13 @@ impl Render for Launcher {
         } else {
             match (&empty, &view) {
             _ if self.mode == Mode::Ai => {
-                match self.ai.as_ref().filter(|a| !a.turns.is_empty()) {
-                    None => Self::render_markdown("Type a question, then press Enter.", &[], &t, "ai", Some(&self.ai_scroll)),
-                    Some(chat) => {
-                        let (md, newest) = chat.markdown();
-                        if chat.follow {
+                match self.ai.as_ref().filter(|a| !a.turns.is_empty()).map(|chat| (chat.markdown(), chat.follow)) {
+                    None => Self::render_markdown("Type a question, then press Enter.", &[], &HashMap::new(), &t, "ai", Some(&self.ai_scroll)),
+                    Some(((md, newest), follow)) => {
+                        if follow {
                             self.ai_scroll.scroll_to_top_of_item(newest);
                         }
-                        Self::render_markdown(&md, &[], &t, "ai", Some(&self.ai_scroll))
+                        Self::render_markdown(&md, &[], &md_images, &t, "ai", Some(&self.ai_scroll))
                     }
                 }
             }
@@ -6241,12 +6361,12 @@ impl Render for Launcher {
                 design::empty_state(glyph, &e.title, &e.subtitle, &t).into_any_element()
             }
             _ if self.panel.is_none() && self.is_form() => self.render_form(&t, cx.weak_entity()),
-            (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &t, "detail", None),
+            (_, Some(v)) if v.kind == "Detail" => Self::render_markdown(&v.markdown, &v.metadata, &md_images, &t, "detail", None),
             (_, Some(v)) if v.show_detail && !v.items.is_empty() => {
                 let it = self.items.get(self.selected).and_then(|row| v.items.iter().find(|it| it.title == row.title));
                 let md = it.and_then(|it| it.detail.clone()).unwrap_or_default();
                 let meta = it.map(|it| it.detail_meta.clone()).unwrap_or_default();
-                split(list.into_any_element(), Self::render_markdown(&md, &meta, &t, "item-detail", None), &self.cfg)
+                split(list.into_any_element(), Self::render_markdown(&md, &meta, &md_images, &t, "item-detail", None), &self.cfg)
             }
             _ if self.confirm.is_some() => div().flex_1().into_any_element(),
             _ => div().flex_1().min_h_0().flex().flex_col().children(answer).child(list).into_any_element(),
@@ -7070,7 +7190,7 @@ mod tests {
         let check = ext::Field { id: "ok".into(), kind: FieldKind::Checkbox, title: "Remember".into(), value: json!(false), ..dd.clone() };
         let view = ext::View { kind: "Form".into(), fields: vec![dd.clone(), check.clone()], ..Default::default() };
         let values = HashMap::from([("lang".to_string(), json!("de")), ("ok".to_string(), json!(true))]);
-        let ev = ExtView { run: 1, ext: 0, view, depth: 1, values, inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], _subs: vec![] };
+        let ev = ExtView { run: 1, ext: 0, view, depth: 1, values, inputs: HashMap::new(), field: 0, sent_query: None, sent_recent: vec![], more_at: None, _subs: vec![] };
         let f = ext_field(&dd, &ev);
         assert_eq!((f.label.as_ref(), f.value.as_str()), ("Language", "de"), "the value as last set, not the default");
         let m = field_menu(&f, gpui::point(px(0.), px(0.))).expect("the dropdown opens the shared menu");

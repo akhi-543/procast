@@ -113,6 +113,8 @@ pub enum Msg {
     ShotDeleted(PathBuf, usize, Result<(), String>),
     /// A web image finished downloading into the cache.
     ImageReady(std::path::PathBuf),
+    /// An extension list (by run) scrolled near its end: ask for the next page.
+    LoadMore(u64),
     /// The store index finished loading.
     Store(Vec<crate::ext::StoreEntry>),
     /// Quit Applications: running apps with their icons.
