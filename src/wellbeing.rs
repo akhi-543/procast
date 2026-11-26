@@ -1785,11 +1785,12 @@ mod tests {
     #[test]
     fn comparison_keeps_categories_that_went_quiet() {
         let stats = json!({"categories": [{"name": "Development", "seconds": 120}, {"name": "Reading", "seconds": 60}],
-                           "previous_categories": {"Development": 2340, "Messaging": 120}});
+                           "previous_categories": {"Development": 2340, "Messaging": 120, "Reading": 30, "Cooking": 600}});
         let rows = compare_rows(&stats);
         assert_eq!(&rows[..3], &[("Development".to_string(), 120, 2340), ("Productivity".into(), 0, 0), ("Messaging".into(), 0, 120)]);
-        assert_eq!(rows.len(), 8);
-        assert_eq!(rows[7], ("Reading".to_string(), 60, 0));
+        assert_eq!(rows.len(), 9, "one row per category, none doubled");
+        assert_eq!(rows[7], ("Reading".to_string(), 60, 30), "in both periods");
+        assert_eq!(rows[8], ("Cooking".to_string(), 0, 600), "only in the period before");
     }
 
     #[test]
