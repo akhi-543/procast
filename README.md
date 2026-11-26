@@ -188,7 +188,7 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Translator, dictionary, calendar | ✅ | ✅ |
 | Contacts | ✅ | ⬜ |
 | Floating notes, focus sessions, timer, screenshot search | ✅ | ✅ |
-| Screen time (apps and sites, per day and week, dashboard) | ⬜ | ✅ |
+| Screen time (apps and sites, per day, week and month, dashboard) | ⬜ | ✅ |
 | Auto HDR | ✅ | ✅ |
 | Taskbar widget | ✅ | ⬜ |
 | **App** | | |

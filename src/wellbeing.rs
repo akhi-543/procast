@@ -389,8 +389,9 @@ pub fn span(p: Period, today: i64) -> ((i64, i64), (i64, i64)) {
     (shown, before)
 }
 
-/// The period `dir` (+1 or -1) periods away; a month lands on its 1st. Never one that starts
-/// after today: that returns `p`.
+/// The period `dir` (+1 or -1) periods away; a month lands on its 1st, the current period on
+/// today (so a range switched to afterwards shows today). Never one that starts after today:
+/// that returns `p`.
 pub fn step(p: Period, dir: i64, today: i64) -> Period {
     let anchor = match p.range {
         Range::Day => p.anchor + dir,
@@ -401,7 +402,13 @@ pub fn step(p: Period, dir: i64, today: i64) -> Period {
         }
     };
     let next = Period { anchor, ..p };
-    if bounds(next).0 > today { p } else { next }
+    if bounds(next).0 > today {
+        p
+    } else if is_current(next, today) {
+        Period { anchor: today, ..p }
+    } else {
+        next
+    }
 }
 
 /// The same anchor under another range.
@@ -487,10 +494,12 @@ pub fn week_shares(days: &Value, productive: &[String], first_monday: i64, weeks
     (0..weeks as i64)
         .map(|w| {
             let (mut total, mut good) = (0, 0);
+            // A name listed twice counts once, so the share stays within 0..=1.
+            let names: Vec<&str> = productive.iter().enumerate().filter(|&(i, c)| !productive[..i].contains(c)).map(|(_, c)| c.as_str()).collect();
             for day in first_monday + w * 7..first_monday + w * 7 + 7 {
                 let d = &days["days"][iso(day)];
                 total += day_total(Some(d));
-                good += productive.iter().map(|c| d[c.as_str()].as_u64().unwrap_or(0)).sum::<u64>();
+                good += names.iter().map(|&c| d[c].as_u64().unwrap_or(0)).sum::<u64>();
             }
             (total >= 60).then(|| good as f64 / total as f64)
         })
@@ -545,21 +554,31 @@ pub fn fresh(current: Period, asked: Period, current_gen: u64, asked_gen: u64) -
     current == asked && current_gen == asked_gen
 }
 
+/// The period a total is compared with: "yesterday", "last week", "the month before".
+pub fn before_name(p: Period, today: i64) -> &'static str {
+    match (p.range, is_current(p, today)) {
+        (Range::Day, true) => "yesterday",
+        (Range::Week, true) => "last week",
+        (Range::Month, true) => "last month",
+        (Range::Day, false) => "the day before",
+        (Range::Week, false) => "the week before",
+        (Range::Month, false) => "the month before",
+    }
+}
+
+/// "5m more than yesterday", "same as last week"; None with nothing before to compare with.
+pub fn versus(total: u64, previous: u64, p: Period, today: i64) -> Option<String> {
+    let then = before_name(p, today);
+    let gap = duration(total.abs_diff(previous) as f64);
+    (previous > 0).then(|| if gap == "0m" { format!("same as {then}") } else { format!("{gap} {} than {then}", if total > previous { "more" } else { "less" }) })
+}
+
 /// The view's first line: "15m today · 5m more than yesterday".
 pub fn header(total: u64, previous: u64, p: Period, today: i64) -> String {
-    let current = is_current(p, today);
-    let (now, then) = match (p.range, current) {
-        (Range::Day, true) => ("today".to_string(), "yesterday"),
-        (Range::Week, true) => ("this week".to_string(), "last week"),
-        (Range::Month, true) => ("this month".to_string(), "last month"),
-        (Range::Day, false) => (caption(p, today), "the day before"),
-        (Range::Week, false) => (caption(p, today), "the week before"),
-        (Range::Month, false) => (caption(p, today), "the month before"),
-    };
+    let now = if is_current(p, today) && p.range == Range::Day { "today".to_string() } else { caption(p, today) };
     let mut text = format!("{} {now}", duration(total as f64));
-    if previous > 0 {
-        let gap = duration(total.abs_diff(previous) as f64);
-        text += &if gap == "0m" { format!(" · same as {then}") } else { format!(" · {gap} {} than {then}", if total > previous { "more" } else { "less" }) };
+    if let Some(v) = versus(total, previous, p, today) {
+        text += &format!(" · {v}");
     }
     text
 }
@@ -1661,6 +1680,10 @@ mod tests {
         assert_eq!(header(900, 300, past(Range::Day), t), "15m on Sat 17 Oct · 10m more than the day before");
         assert_eq!(header(900, 600, past(Range::Week), t), "15m 12 – 18 Oct · 5m more than the week before");
         assert_eq!(header(600, 900, past(Range::Month), t), "10m in October 2026 · 5m less than the month before");
+        assert_eq!(versus(900, 600, day, t).as_deref(), Some("5m more than yesterday"));
+        assert_eq!(versus(600, 610, week, t).as_deref(), Some("same as last week"));
+        assert_eq!(versus(600, 1320, past(Range::Month), t).as_deref(), Some("12m less than the month before"));
+        assert_eq!(versus(600, 0, day, t), None, "nothing before to compare with");
     }
 
     #[test]
@@ -1703,6 +1726,8 @@ mod tests {
         assert_eq!(step(p(Range::Day, "2026-11-26"), 1, today), p(Range::Day, "2026-11-26"), "no future");
         assert_eq!(step(p(Range::Week, "2026-11-26"), 1, today), p(Range::Week, "2026-11-26"));
         assert_eq!(step(p(Range::Week, "2026-11-26"), -1, today), p(Range::Week, "2026-11-19"));
+        assert_eq!(step(p(Range::Month, "2026-10-15"), 1, today), p(Range::Month, "2026-11-26"), "into the current month: on today");
+        assert_eq!(step(p(Range::Week, "2026-11-17"), 1, today), p(Range::Week, "2026-11-26"), "into the current week: on today");
         assert_eq!(with_range(p(Range::Day, "2026-11-19"), Range::Month), p(Range::Month, "2026-11-19"));
         assert_eq!([Range::Day, Range::Week, Range::Month].map(|r| cycle(p(r, "2026-11-19"), 1).range), [Range::Week, Range::Month, Range::Day], "Tab wraps");
         assert_eq!([Range::Day, Range::Week, Range::Month].map(|r| cycle(p(r, "2026-11-19"), -1).range), [Range::Month, Range::Day, Range::Week], "Shift+Tab wraps");
@@ -1799,6 +1824,7 @@ mod tests {
         let days = json!({"days": {"2026-11-16": {"Development": 3000, "Other": 1000}, "2026-11-24": {"Other": 30}}});
         let shares = week_shares(&days, &["Development".into()], d("2026-11-16"), 2);
         assert_eq!(shares, vec![Some(0.75), None]);
+        assert_eq!(week_shares(&days, &["Development".into(), "Development".into()], d("2026-11-16"), 1), vec![Some(0.75)], "a name listed twice counts once");
         assert_eq!(heat_levels(&days, d("2026-11-16"), d("2026-11-17")), vec![4, 0]);
         let stats = json!({"categories": [{"name": "Development", "seconds": 9}, {"name": "Reading", "seconds": 8}, {"name": "Cooking", "seconds": 7}, {"name": "Other", "seconds": 6}],
                            "buckets": [{"label": 10, "categories": {"Other": 5}}, {"label": 11, "categories": {"Development": 9}}]});

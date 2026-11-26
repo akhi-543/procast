@@ -817,9 +817,9 @@ fn screen_time_off_row() -> Vec<Item> {
 /// Screen Time's items under the dashboard: an anchor that stands for no row (its title the
 /// span's total against the span before; Enter does nothing, Ctrl+K exports), then a row for
 /// each app and site, which moves to another category.
-fn screen_time_rows(p: wellbeing::Period, stats: &Value) -> Vec<Item> {
+fn screen_time_rows(p: wellbeing::Period, stats: &Value, today: i64) -> Vec<Item> {
     let secs = |key: &str| stats[key].as_u64().unwrap_or(0);
-    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), p, win::local_now().0), "", Icon::Vector(g::MONITOR), Act::None);
+    let mut head = Item::new(wellbeing::header(secs("total"), secs("previous"), p, today), "", Icon::Vector(g::MONITOR), Act::None);
     head.extra = screen_time_actions();
     let rows = wellbeing::rows(stats).into_iter().filter(|r| r.section != "Categories").map(|r| {
         let act = Act::MoveToCategory(r.name.clone());
@@ -835,13 +835,13 @@ fn screen_time_rows(p: wellbeing::Period, stats: &Value) -> Vec<Item> {
 /// `Launcher::screen_time_items`: the anchor and the rows matching `query`; or the one row
 /// saying Screen Time is off, loading, or couldn't read. A filter with no hits keeps the
 /// anchor (so the dashboard stays) and adds a line where the rows would be.
-fn screen_time_list(enabled: bool, stats: &Option<Result<Value, String>>, p: wellbeing::Period, query: &str, matcher: &mut Matcher) -> Vec<Item> {
+fn screen_time_list(enabled: bool, stats: &Option<Result<Value, String>>, p: wellbeing::Period, today: i64, query: &str, matcher: &mut Matcher) -> Vec<Item> {
     match stats {
         _ if !enabled => screen_time_off_row(),
         None => vec![empty_row(g::CLOCK, "Loading…".into(), String::new(), vec![])],
         Some(Err(e)) => vec![empty_row(g::MONITOR, "Couldn't read screen time".into(), e.clone(), vec![])],
         Some(Ok(stats)) => {
-            let mut rows = screen_time_rows(p, stats);
+            let mut rows = screen_time_rows(p, stats, today);
             // Filtered rows come back best match first: keep each section together.
             let mut found = search::filter(query, rows.split_off(1), matcher);
             found.sort_by_key(|it| ["Apps", "Sites"].iter().position(|s| Some(*s) == it.section.as_deref()));
@@ -852,6 +852,12 @@ fn screen_time_list(enabled: bool, stats: &Option<Result<Value, String>>, p: wel
             rows
         }
     }
+}
+
+/// Screen Time's selection after a refresh: the first match (or the no-hits line) while a filter
+/// is typed, so the dashboard scrolls to it and Enter acts on it; else the anchor at the top.
+fn screen_time_selection(query: &str, items: usize) -> usize {
+    usize::from(!query.trim().is_empty() && items > 1)
 }
 
 /// Search Notes' rows (Enter opens the note), or Recently Deleted Notes' (Enter restores and
@@ -1011,6 +1017,8 @@ struct Launcher {
     st_days: Option<Value>,
     /// The day the span was last read as "today" (`wellbeing::reanchor`).
     st_day: i64,
+    /// The day `st_days` was read on: read once per open and again the next day (or after a move).
+    st_days_on: i64,
     st_gen: u64,
     /// The dashboard column's scroll (`screen_time_view`).
     st_scroll: ScrollHandle,
@@ -1238,6 +1246,7 @@ impl Launcher {
             st_hours: Default::default(),
             st_days: None,
             st_day: 0,
+            st_days_on: 0,
             st_gen: 0,
             st_scroll: ScrollHandle::new(),
             matcher: Matcher::new(nucleo_matcher::Config::DEFAULT),
@@ -1335,7 +1344,8 @@ impl Launcher {
     fn target_height(&self, cx: &App) -> f32 {
         if self.collapsed(cx) {
             BAR + if self.fav_strip() { FAV_ROW } else { 0. } + 2.
-        } else if self.screen_time_shown() {
+        } else if matches!(self.mode, Mode::ScreenTime(_)) && self.cfg.screen_time.enabled && !matches!(self.st_stats, Some(Err(_))) {
+            // Loading too: the dashboard's height from the start, not a jump when it arrives.
             window_height(&self.cfg).max(ST_HEIGHT)
         } else {
             window_height(&self.cfg)
@@ -1910,6 +1920,8 @@ impl Launcher {
             root_selection(&self.items, &query, &self.cfg, self.pick_next)
         } else if self.mode == Mode::Translate {
             self.translation.as_ref().map_or(0, |tr| tr.first)
+        } else if matches!(self.mode, Mode::ScreenTime(_)) && self.confirm.is_none() {
+            screen_time_selection(&query, self.items.len())
         } else {
             0
         };
@@ -2730,6 +2742,7 @@ impl Launcher {
                 // Opened on Today yesterday: Today again.
                 let p = wellbeing::reanchor(p, self.st_day, win::local_now().0);
                 self.mode = Mode::ScreenTime(p);
+                self.st_days_on = 0;
                 self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
             }
             self.refresh(cx);
@@ -4770,6 +4783,7 @@ impl Launcher {
         let today = win::local_now().0;
         self.st_day = today;
         let (generation, (span, before), rules) = (self.st_gen, wellbeing::span(p, today), wellbeing::rules(&cats));
+        let read_days = self.st_days.is_none() || self.st_days_on != today;
         // A failed read of the days only leaves the trend line and the heatmap empty.
         let read = cx.background_executor().spawn(async move {
             let _ = wellbeing::flush_pending();
@@ -4781,7 +4795,7 @@ impl Launcher {
                 let hours = if span.0 == span.1 { wellbeing::hours_by_name(&con, span.0)? } else { Default::default() };
                 Ok((wellbeing::stats(&con, span.0, span.1, before, &rules)?, hours))
             };
-            (read().map_err(|e| e.to_string()), wellbeing::days(&con, today - 370, today, &rules).ok())
+            (read().map_err(|e| e.to_string()), read_days.then(|| wellbeing::days(&con, today - 370, today, &rules).ok()).flatten())
         });
         cx.spawn(async move |this, cx| {
             let r = read.await;
@@ -4799,7 +4813,10 @@ impl Launcher {
             Ok((stats, hours)) => (Ok(stats), hours),
             Err(e) => (Err(e), Default::default()),
         };
-        // A failed read of the days keeps the last good ones (they cover the year, not the span).
+        // A failed or skipped read of the days keeps the last good ones (they cover the year, not the span).
+        if days.is_some() {
+            self.st_days_on = self.st_day;
+        }
         (self.st_stats, self.st_hours, self.st_days) = (Some(stats), hours, days.or(self.st_days.take()));
         self.request_resize(cx);
         if self.confirm.is_none() {
@@ -4812,7 +4829,7 @@ impl Launcher {
     }
 
     fn screen_time_items(&mut self, p: wellbeing::Period, query: &str) -> Vec<Item> {
-        screen_time_list(self.cfg.screen_time.enabled, &self.st_stats, p, query, &mut self.matcher)
+        screen_time_list(self.cfg.screen_time.enabled, &self.st_stats, p, win::local_now().0, query, &mut self.matcher)
     }
 
     /// Move to Category…: a menu of the categories; the pick files `name` there.
@@ -4839,6 +4856,8 @@ impl Launcher {
                 Ok((c, _)) => {
                     this.status = Some((Tone::Ok, format!("Moved {what} to {to}")));
                     if this.mode == Mode::ScreenTime(p) {
+                        // The move reclassifies the year's days too.
+                        this.st_days_on = 0;
                         this.load_screen_time(p, focus::categories(&c.focus_category), cx);
                     }
                     cx.notify();
@@ -5029,6 +5048,7 @@ impl Launcher {
 
     /// The caller refreshes the glass decision first (it holds the window, for the backdrop).
     fn reload(&mut self, cx: &mut Context<Self>) {
+        let was_on = self.cfg.screen_time.enabled;
         match config::load() {
             Ok(cfg) => {
                 if hotkey_specs(&cfg) != hotkey_specs(&self.cfg) {
@@ -5099,6 +5119,15 @@ impl Launcher {
             Err(e) => self.notice = Some(e),
         }
         self.rebuild_catalog(cx);
+        // Screen Time turned on or off while shown: the dashboard (and its period) or the off row.
+        if let Mode::ScreenTime(p) = self.mode
+            && self.cfg.screen_time.enabled != was_on
+        {
+            if self.cfg.screen_time.enabled {
+                self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
+            }
+            self.refresh(cx);
+        }
     }
 
     fn on_msg(&mut self, msg: Msg, window: &mut Window, cx: &mut Context<Self>) {
@@ -5383,12 +5412,8 @@ impl Launcher {
             Mode::Schedule => Some("My Schedule".into()),
             Mode::Notes(NotesList::All) => Some("Search Notes".into()),
             Mode::Notes(NotesList::Deleted) => Some("Recently Deleted Notes".into()),
-            Mode::ScreenTime(p) => Some(match p.range {
-                wellbeing::Range::Day => "Screen Time",
-                wellbeing::Range::Week => "Screen Time This Week",
-                wellbeing::Range::Month => "Screen Time This Month",
-            }
-            .into()),
+            // The dashboard's header names the period.
+            Mode::ScreenTime(_) => Some("Screen Time".into()),
             Mode::Form(kind) => Some(kind.bar().1.into()),
             Mode::Ai => Some(self.ai.as_ref().and_then(|a| a.turns.last()).map_or("Ask AI".into(), |t| t.prompt.clone())),
             Mode::Ext => self.extv.as_ref().map(|e| {
@@ -7825,14 +7850,14 @@ mod tests {
         let empty = Some(Ok(json!({"total": 0, "previous": 0, "apps": [], "sites": []})));
         let stats = Some(Ok(json!({"total": 900, "previous": 600, "apps": [{"name": "code.exe", "seconds": 600, "category": "Development"}], "sites": []})));
         let sections = |rows: &[Item]| rows.iter().map(|r| r.section.clone()).collect::<Vec<_>>();
-        assert_eq!(screen_time_list(true, &empty, p, "", &mut matcher).len(), 1, "an empty span is the anchor alone: its cards still draw");
-        let rows = screen_time_list(true, &stats, p, "zzzz", &mut matcher);
+        assert_eq!(screen_time_list(true, &empty, p, p.anchor, "", &mut matcher).len(), 1, "an empty span is the anchor alone: its cards still draw");
+        let rows = screen_time_list(true, &stats, p, p.anchor, "zzzz", &mut matcher);
         assert_eq!(sections(&rows), [None, Some(EMPTY.to_string())], "the anchor stays, so the dashboard shows, with one line where the rows were");
         assert_eq!(rows[1].title, "No matching apps or sites");
-        assert_eq!(screen_time_list(true, &stats, p, "code", &mut matcher).len(), 2);
-        assert_eq!(screen_time_list(false, &stats, p, "", &mut matcher)[0].title, "Screen Time is off");
-        assert_eq!(screen_time_list(true, &None, p, "", &mut matcher)[0].title, "Loading…");
-        let err = screen_time_list(true, &Some(Err("locked".into())), p, "x", &mut matcher);
+        assert_eq!(screen_time_list(true, &stats, p, p.anchor, "code", &mut matcher).len(), 2);
+        assert_eq!(screen_time_list(false, &stats, p, p.anchor, "", &mut matcher)[0].title, "Screen Time is off");
+        assert_eq!(screen_time_list(true, &None, p, p.anchor, "", &mut matcher)[0].title, "Loading…");
+        let err = screen_time_list(true, &Some(Err("locked".into())), p, p.anchor, "x", &mut matcher);
         assert_eq!((err.len(), err[0].title.as_str(), err[0].subtitle.as_str()), (1, "Couldn't read screen time", "locked"));
     }
 
@@ -7903,6 +7928,15 @@ mod tests {
     }
 
     #[test]
+    fn screen_time_selects_the_first_match_while_filtering() {
+        assert_eq!(screen_time_selection("", 5), 0, "the anchor, at the top");
+        assert_eq!(screen_time_selection("  ", 5), 0);
+        assert_eq!(screen_time_selection("code", 3), 1, "the top match, under the cards");
+        assert_eq!(screen_time_selection("zz", 2), 1, "the no-hits line");
+        assert_eq!(screen_time_selection("code", 1), 0, "loading: only one row");
+    }
+
+    #[test]
     fn screen_time_rows_and_their_actions() {
         let stats = json!({
             "total": 900, "previous": 600,
@@ -7910,7 +7944,8 @@ mod tests {
             "apps": [{"name": "code.exe", "seconds": 600, "category": "Development"}],
             "sites": [{"name": "youtube.com", "seconds": 200, "category": "Streaming"}]
         });
-        let rows = screen_time_rows(wellbeing::Period { range: wellbeing::Range::Day, anchor: win::local_now().0 }, &stats);
+        let today = wellbeing::parse_iso("2026-11-26").unwrap();
+        let rows = screen_time_rows(wellbeing::Period { range: wellbeing::Range::Day, anchor: today }, &stats, today);
         assert_eq!(rows[0].title, "15m today · 5m more than yesterday");
         assert_eq!(rows.iter().map(|r| r.section.as_deref()).collect::<Vec<_>>(), [None, Some("Apps"), Some("Sites")], "categories are a card, not rows");
         let labels = |it: &Item| it.actions().into_iter().map(|a| a.0).collect::<Vec<_>>();

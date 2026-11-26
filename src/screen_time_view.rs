@@ -99,20 +99,6 @@ fn detail_line(stats: &Value, it: &Item, hours: &wellbeing::Hours) -> String {
         .join(" · ")
 }
 
-/// "yesterday", "last week", "the month before".
-fn before_name(p: Period, today: i64) -> &'static str {
-    let (shown, _) = wellbeing::span(p, today);
-    let current = (shown.0..=shown.1).contains(&today);
-    match (p.range, current) {
-        (Range::Day, true) => "yesterday",
-        (Range::Week, true) => "last week",
-        (Range::Month, true) => "last month",
-        (Range::Day, false) => "the day before",
-        (Range::Week, false) => "the week before",
-        (Range::Month, false) => "the month before",
-    }
-}
-
 fn secs(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
@@ -144,8 +130,12 @@ fn thin_bar(frac: f32, color: Hsla, t: &Tokens) -> gpui::Div {
 
 impl Launcher {
     /// Shows period `p`: reads it again, keeps the typed filter, and goes back to the top. The
-    /// last period's numbers stay on screen until the new ones arrive.
+    /// last period's numbers stay on screen until the new ones arrive. The period already shown
+    /// does nothing.
     pub(crate) fn screen_time_go(&mut self, p: Period, cx: &mut Context<Self>) {
+        if self.mode == Mode::ScreenTime(p) {
+            return;
+        }
         self.mode = Mode::ScreenTime(p);
         self.load_screen_time(p, focus::categories(&self.cfg.focus_category), cx);
         self.refresh(cx);
@@ -372,6 +362,7 @@ fn st_total(p: Period, today: i64, stats: &Value, t: &Tokens) -> impl IntoElemen
                 .child(div().text_size(px(ts::DISPLAY)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(duration(secs(&stats["total"]) as f64)))
                 .child(div().text_size(px(ts::BODY_SM)).text_color(t.text_muted).child(wellbeing::caption(p, today))),
         )
+        .children(wellbeing::versus(secs(&stats["total"]), secs(&stats["previous"]), p, today).map(|v| muted(v, t)))
         .child(div().relative().w_full().h(px(CHART_H)).children(grid).child(div().absolute().top(px(0.)).bottom(px(0.)).left(px(0.)).right(px(0.)).flex().items_end().gap(px(BAR_GAP)).children(bars)))
         .child(div().flex().gap(px(BAR_GAP)).text_size(px(ts::CAPTION)).text_color(t.text_faint).children(labels))
 }
@@ -397,9 +388,12 @@ fn st_categories(stats: &Value, t: &Tokens) -> impl IntoElement {
     card(t).child(card_title("Categories", t)).children(rows).when(cats.is_empty(), |c| c.child(muted("No screen time recorded", t)))
 }
 
-/// First use, the busiest hour or day, the longest stretch and app switches.
+/// First use (a week's or month's earliest start), the busiest hour or day, the longest stretch
+/// and app switches.
 fn st_tiles(stats: &Value, t: &Tokens) -> impl IntoElement {
     let f = &stats["focus"];
+    let day = stats["from"] == stats["to"];
+    let (first, last) = if day { ("First use", "Last use") } else { ("Earliest start", "Latest end") };
     let busiest = wellbeing::busiest(stats);
     let tile = |label: &str, value: String, sub: Option<String>| {
         div()
@@ -421,8 +415,8 @@ fn st_tiles(stats: &Value, t: &Tokens) -> impl IntoElement {
         .mb(px(12.))
         .flex()
         .gap(px(12.))
-        .child(tile("First use", f["first"].as_str().unwrap_or("—").to_string(), f["last"].as_str().map(|l| format!("Last use {l}"))))
-        .child(tile(if stats["from"] == stats["to"] { "Busiest hour" } else { "Busiest day" }, busiest.as_ref().map_or("—".into(), |b| b.0.clone()), busiest.as_ref().map(|b| duration(b.1 as f64))))
+        .child(tile(first, f["first"].as_str().unwrap_or("—").to_string(), f["last"].as_str().map(|l| format!("{last} {l}"))))
+        .child(tile(if day { "Busiest hour" } else { "Busiest day" }, busiest.as_ref().map_or("—".into(), |b| b.0.clone()), busiest.as_ref().map(|b| duration(b.1 as f64))))
         .child(tile("Longest stretch", duration(secs(&f["longest"]) as f64), None))
         .child(tile("App switches", design::thousands(secs(&f["switches"]) as usize), None))
 }
@@ -444,7 +438,7 @@ fn st_compare(p: Period, today: i64, stats: &Value, t: &Tokens) -> impl IntoElem
             .child(div().w(px(56.)).flex_none().text_right().text_size(px(ts::BODY_SM)).text_color(t.text).child(duration(*now as f64)))
             .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).child(thin_bar(frac(*now, max), color, t)).child(thin_bar(frac(*before, max), design::alpha(color, 0.35), t)))
     });
-    card(t).child(card_title(&format!("Compared with {}", before_name(p, today)), t)).children(lines)
+    card(t).child(card_title(&format!("Compared with {}", wellbeing::before_name(p, today)), t)).children(lines)
 }
 
 #[cfg(test)]

@@ -446,7 +446,14 @@ pub fn set_rect(hwnd: HWND, r: RECT) {
     unsafe { _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE) };
 }
 
-/// Changes only the window's height (logical px), keeping its top-left corner.
+/// A height (physical px) for a window whose top is at `top`, cut to end at the work area's
+/// `bottom`; at least 1.
+fn fit_height(h: i32, top: i32, bottom: i32) -> i32 {
+    h.min(bottom - top).max(1)
+}
+
+/// Changes only the window's height (logical px), keeping its top-left corner; never past the
+/// bottom of the monitor's work area.
 pub fn resize(hwnd: HWND, height: f32) {
     unsafe {
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -454,7 +461,11 @@ pub fn resize(hwnd: HWND, height: f32) {
         let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
         let mut cur = RECT::default();
         let _ = GetWindowRect(hwnd, &mut cur);
-        let h = (height * dx as f32 / 96.) as i32;
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut h = (height * dx as f32 / 96.) as i32;
+        if GetMonitorInfoW(mon, &mut info).as_bool() {
+            h = fit_height(h, cur.top, info.rcWork.bottom);
+        }
         if cur.bottom - cur.top != h {
             let _ = SetWindowPos(hwnd, None, 0, 0, cur.right - cur.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -905,5 +916,18 @@ pub fn set_start_at_login(on: bool) {
         }
         // The entry the app made under its old name.
         let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, &HSTRING::from(crate::config::OLD_NAME));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_height;
+
+    #[test]
+    fn a_tall_window_stops_at_the_work_areas_bottom() {
+        // 640 logical px at 150% from a quarter down a 1080p work area (taskbar 72 px).
+        assert_eq!(fit_height(960, 252, 1008), 756);
+        assert_eq!(fit_height(600, 252, 1008), 600, "one that fits keeps its height");
+        assert_eq!(fit_height(600, 1010, 1008), 1, "a top past the bottom still leaves a window");
     }
 }
