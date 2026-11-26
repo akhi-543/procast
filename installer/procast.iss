@@ -1,10 +1,10 @@
 ; procast installer (Inno Setup 6). Per-user: no admin, installs to %LOCALAPPDATA%\Programs\procast.
 ; Build: cargo build --release, then (cd exthost && npm ci), then
-;   ISCC.exe /DAppVersion=0.1.1 installer\procast.iss
+;   ISCC.exe /DAppVersion=0.2.0 installer\procast.iss
 ; Output: target\installer\procast-setup-<version>.exe
 
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #define AppVersion "0.2.0"
 #endif
 
 [Setup]
