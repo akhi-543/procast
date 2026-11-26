@@ -866,7 +866,7 @@ mod tests {
         assert!(f[1].controlled && f[1].value == json!("hi"));
         assert_eq!((f[2].title.as_str(), &f[2].value), ("Pin it", &json!(false)));
 
-        let repo = std::env::temp_dir().join(format!("procast-store-test-{}", std::process::id()));
+        let repo = crate::test_dir("store-test");
         for (name, manifest) in [
             ("b-ext", json!({"name": "b-ext", "title": "Beta", "author": "ann", "platforms": ["macOS", "Windows"], "commands": [{}, {}]})),
             ("a-ext", json!({"name": "a-ext", "title": "alpha", "description": "mac only"})),
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn images_are_capped_on_their_longest_side() {
-        let dir = std::env::temp_dir().join(format!("procast-image-test-{}", std::process::id()));
+        let dir = crate::test_dir("image-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.png");
         image::RgbaImage::new(400, 200).save(&path).unwrap();

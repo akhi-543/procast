@@ -1395,7 +1395,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("procast-notes-window-{}-{name}", std::process::id()));
+        let d = crate::test_dir(&format!("notes-window-{name}"));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn empty_dir_deletes_inside_only() {
-        let root = std::env::temp_dir().join(format!("procast-empty-{}", std::process::id()));
+        let root = crate::test_dir("empty");
         let keep = root.join("keep");
         let temp = root.join("temp");
         std::fs::create_dir_all(temp.join("sub")).unwrap();

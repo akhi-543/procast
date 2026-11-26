@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_session_survives_a_restart_and_the_closed_apps_are_kept() {
-        let path = std::env::temp_dir().join(format!("procast-focus-test-{}.json", std::process::id()));
+        let path = crate::test_dir("focus-test.json");
         let now = SystemTime::now();
         let mut f = Focus::load(path.clone());
         assert!(f.session.is_none());
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn a_paused_session_survives_a_restart_still_paused() {
-        let path = std::env::temp_dir().join(format!("procast-focus-paused-test-{}.json", std::process::id()));
+        let path = crate::test_dir("focus-paused-test.json");
         let now = SystemTime::now();
         for minutes in [25, 0] {
             let mut f = Focus::load(path.clone());
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn toggle_starts_again_with_the_last_settings() {
-        let path = std::env::temp_dir().join(format!("procast-focus-preset-test-{}.json", std::process::id()));
+        let path = crate::test_dir("focus-preset-test.json");
         let now = SystemTime::now();
         let mut f = Focus::load(path.clone());
         assert!(f.preset.is_none());
@@ -1038,7 +1038,7 @@ mod tests {
         for kind in [ErrorKind::InvalidData, ErrorKind::PermissionDenied, ErrorKind::Other] {
             assert!(text_or_empty(Err(Error::from(kind))).is_err(), "{kind:?}");
         }
-        let path = std::env::temp_dir().join(format!("procast-atomic-test-{}.toml", std::process::id()));
+        let path = crate::test_dir("atomic-test.toml");
         write_atomic(&path, "one").unwrap();
         write_atomic(&path, "two").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");

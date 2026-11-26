@@ -1394,7 +1394,7 @@ mod tests {
 
     #[test]
     fn backup_keeps_seven() {
-        let dir = std::env::temp_dir().join(format!("procast-backup-{}", std::process::id()));
+        let dir = crate::test_dir("backup");
         let _ = std::fs::remove_dir_all(&dir);
         let con = fixture();
         let first = parse_iso("2026-09-01").unwrap();
@@ -1461,7 +1461,7 @@ mod tests {
     // --- import and weekly summary ---
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("procast-st-{}-{name}", std::process::id()));
+        let dir = crate::test_dir(&format!("st-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

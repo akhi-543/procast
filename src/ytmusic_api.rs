@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn session_file_with_sapisid_produces_authorization() {
-        let dir = std::env::temp_dir().join(format!("procast-ytmusic-auth-{}", std::process::id()));
+        let dir = crate::test_dir("ytmusic-auth");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("session.json");
         fs::write(&path, r#"{"SAPISID":"secret"}"#).unwrap();
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn session_prefers_sapisid_then_secure() {
-        let dir = std::env::temp_dir().join(format!("procast-ytmusic-session-{}", std::process::id()));
+        let dir = crate::test_dir("ytmusic-session");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("session.json");
         fs::write(&path, r#"{"SAPISID":"secret","__Secure-3PAPISID":"fallback","PREF":"f1"}"#).unwrap();

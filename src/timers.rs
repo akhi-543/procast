@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn the_save_replaces_the_file_through_a_temp_file() {
-        let path = std::env::temp_dir().join(format!("procast-timers-atomic-{}.json", std::process::id()));
+        let path = crate::test_dir("timers-atomic.json");
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         fs::write(&tmp, "half a file").unwrap();
         let mut t = Timers::load(path.clone());
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn timers_survive_a_restart() {
-        let path = std::env::temp_dir().join(format!("procast-timers-test-{}.json", std::process::id()));
+        let path = crate::test_dir("timers-test.json");
         let mut t = Timers::load(path.clone());
         let (a, b) = (t.start("tea".into(), Duration::from_secs(300)), t.stopwatch(String::new()));
         let mut back = Timers::load(path.clone());

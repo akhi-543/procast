@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn file_info_describes_files() {
-        let root = std::env::temp_dir().join(format!("procast-info-test-{}", std::process::id()));
+        let root = crate::test_dir("info-test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         let text = (1..=50).map(|i| format!("line {i}\n")).collect::<String>();
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn crawl_skips_excluded_and_search_ranks_names() {
-        let root = std::env::temp_dir().join(format!("procast-files-test-{}", std::process::id()));
+        let root = crate::test_dir("files-test");
         let _ = std::fs::remove_dir_all(&root);
         for p in ["docs/Quarterly Report.docx", "docs/report-draft.txt", "node_modules/pkg/report.js", "photos/beach.jpg", "docs/bundle.js"] {
             let p = root.join(p);
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn saved_index_round_trips_and_watcher_changes_apply() {
-        let root = std::env::temp_dir().join(format!("procast-live-test-{}", std::process::id()));
+        let root = crate::test_dir("live-test");
         let _ = std::fs::remove_dir_all(&root);
         for p in ["a/one.txt", "a/sub/two.txt", "b.txt", "skip/x.txt"] {
             let p = root.join(p);
@@ -786,7 +786,7 @@ mod tests {
 
     /// A temp tree of files with the given contents; returns it and its path as a string.
     fn tree(name: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
-        let root = std::env::temp_dir().join(format!("procast-{name}-test-{}", std::process::id()));
+        let root = crate::test_dir(&format!("{name}-test"));
         let _ = std::fs::remove_dir_all(&root);
         for (p, text) in files {
             let p = root.join(p);
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn watcher_reports_new_files() {
-        let root = std::env::temp_dir().join(format!("procast-watch-test-{}", std::process::id()));
+        let root = crate::test_dir("watch-test");
         std::fs::create_dir_all(root.join("deep")).unwrap();
         let (tx, rx) = mpsc::channel();
         let dir = root.clone();

@@ -436,7 +436,7 @@ mod tests {
 
     /// A few synsets of each part of speech, in WordNet's real formats.
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("procast-wordnet-{}-{name}", std::process::id()));
+        let dir = crate::test_dir(&format!("wordnet-{name}"));
         let _ = fs::remove_dir_all(&dir);
         fixture_in(&dir);
         dir
@@ -545,11 +545,11 @@ mod tests {
 
     #[test]
     fn open_needs_the_database_and_locate_finds_it_in_a_subfolder() {
-        let empty = std::env::temp_dir().join(format!("procast-wordnet-{}-empty", std::process::id()));
+        let empty = crate::test_dir("wordnet-empty");
         let _ = fs::remove_dir_all(&empty);
         fs::create_dir_all(&empty).unwrap();
         assert!(WordNet::open(&empty).is_err() && locate(&empty).is_none());
-        let root = empty.with_file_name(format!("procast-wordnet-{}-root", std::process::id()));
+        let root = empty.with_file_name("wordnet-root");
         let _ = fs::remove_dir_all(&root);
         fixture_in(&root.join("dict"));
         assert_eq!(locate(&root), Some(root.join("dict")));
@@ -558,7 +558,7 @@ mod tests {
     #[test]
     fn a_half_unpacked_archive_is_not_installed() {
         let tmp = |name: &str| {
-            let dir = std::env::temp_dir().join(format!("procast-wordnet-{}-{name}", std::process::id()));
+            let dir = crate::test_dir(&format!("wordnet-{name}"));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             dir

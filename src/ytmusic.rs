@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn cache_round_trips() {
-        let dir = std::env::temp_dir().join(format!("procast-ytmusic-test-{}", std::process::id()));
+        let dir = crate::test_dir("ytmusic-test");
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("ytmusic").join("library.json");
         assert!(load_from(&path, "VLLM").is_none(), "no file yet");

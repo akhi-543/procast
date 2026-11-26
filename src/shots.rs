@@ -622,7 +622,7 @@ mod tests {
     use std::{cell::Cell, fs, time::SystemTime};
 
     fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("procast-shots-{name}-{}", std::process::id()));
+        let d = crate::test_dir(&format!("shots-{name}"));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

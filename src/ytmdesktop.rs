@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn ensure_token_errors_when_app_closed() {
-        let dir = std::env::temp_dir().join(format!("procast-ytmdesktop-{}", std::process::id()));
+        let dir = crate::test_dir("ytmdesktop");
         let _ = fs::create_dir_all(&dir);
         let desktop = Desktop { token_path: dir.join("desktop-token"), base: "http://127.0.0.1:1".into() };
         let err = ensure_token(&desktop).unwrap_err();

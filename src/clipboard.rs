@@ -649,7 +649,7 @@ mod tests {
         let back = dib_to_png(&png_to_dib(png.get_ref()).unwrap()).unwrap();
         assert_eq!(image::load_from_memory(&back).unwrap().to_rgba8(), img, "PNG -> DIB -> PNG keeps every pixel");
 
-        let dir = std::env::temp_dir().join(format!("procast-clip-test-{}", std::process::id()));
+        let dir = crate::test_dir("clip-test");
         let _ = fs::create_dir_all(&dir);
         let mut h = History { path: dir.join("clipboard.bin"), entries: vec![], cap: 2, keep: None };
         for (i, t) in ["a", "b", "c"].iter().enumerate() {

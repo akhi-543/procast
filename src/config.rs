@@ -1446,7 +1446,7 @@ to = 3").is_err());
 
     #[test]
     fn edit_file_never_writes_over_a_file_it_could_not_read() {
-        let dir = std::env::temp_dir().join(format!("procast-edit-file-{}", std::process::id()));
+        let dir = crate::test_dir("edit-file");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let current = |t: &str| write_value(t, &["translator".into(), "current".into()], 1i64.into());

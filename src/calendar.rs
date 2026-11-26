@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn the_hidden_store_adds_keys_and_never_overwrites_a_bad_file() {
-        let dir = std::env::temp_dir().join(format!("procast-cal-hidden-{}", std::process::id()));
+        let dir = crate::test_dir("cal-hidden");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("calendar-hidden.json");
         let _ = std::fs::remove_file(&path);
@@ -1111,7 +1111,7 @@ mod tests {
         let left = remove_feed(&two, 1, "https://outlook.live.com/b.ics").unwrap();
         assert_eq!(crate::config::parse(&left).unwrap().calendar_feed.len(), 1);
         // A file that does not parse: the error must not show its (secret) line.
-        let path = std::env::temp_dir().join(format!("procast-feeds-{}.toml", std::process::id()));
+        let path = crate::test_dir("feeds.toml");
         std::fs::write(&path, "[[calendar_feed]]\nurl = \"https://cal.example.com/private-SECRET/basic.ics\"\nname = = 1\n").unwrap();
         let e = save_feeds(&path, |t| add_feed(t, &feed("https://x.example/a.ics"))).unwrap_err();
         assert_eq!(e, "Couldn't save config.toml");

@@ -7454,9 +7454,54 @@ fn main() {
     });
 }
 
+/// A scratch path for a test: `%TEMP%\procast-test-<pid>\<name>`, one folder per run. The
+/// first call deletes the folders of runs that have ended, so a run never leaves more than its own.
+/// ponytail: the latest run's folder stays until the next run; a Drop guard per test if that matters.
+#[cfg(test)]
+fn test_dir(name: &str) -> std::path::PathBuf {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(sweep_test_dirs);
+    let root = std::env::temp_dir().join(format!("procast-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    root.join(name)
+}
+
+/// Deletes `procast-test-<pid>` folders whose process has ended; a run still going (another
+/// `cargo test`) keeps its folder.
+#[cfg(test)]
+fn sweep_test_dirs() {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    for e in std::fs::read_dir(std::env::temp_dir()).into_iter().flatten().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.strip_prefix("procast-test-")?.parse::<u32>().ok()) else { continue };
+        match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(h) => unsafe {
+                let _ = CloseHandle(h);
+            },
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dirs_share_one_folder_per_run_and_old_runs_go() {
+        // u32::MAX is never a live process id.
+        let dead = std::env::temp_dir().join(format!("procast-test-{}", u32::MAX));
+        std::fs::create_dir_all(dead.join("x")).unwrap();
+        let mine = test_dir("probe");
+        assert_eq!(mine.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()), Some(format!("procast-test-{}", std::process::id()).as_str()));
+        sweep_test_dirs();
+        assert!(!dead.exists(), "a finished run's folder is swept");
+        assert!(mine.parent().unwrap().exists(), "this run's folder stays");
+    }
 
     #[test]
     fn note_rows_say_when_each_note_was_opened_and_how_long_it_is() {
