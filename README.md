@@ -126,14 +126,18 @@ extensions run, so these figures are for a fresh start.<br>
 
 ## procast vs Raycast for Windows
 
-Checked against the Raycast for Windows 2.12 settings window. ✅ has it · ◐ partly · ⬜ not yet.
+procast 0.1.0 (`main`, 2026-11-18) against Raycast for Windows 2.12.1, checked feature by feature against
+Raycast's settings window and procast's code. ✅ has it · ◐ partly · ⬜ not yet.
+Of the 60 rows below, procast has 36, has 9 in part and lacks 14 (cloud account and sync are not planned);
+Raycast lacks 4: YouTube Music on Windows, open source, a plain-text settings file and a native UI.
 The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/roadmap.md).
 
 | Feature | Raycast | procast |
 |---|:-:|:-:|
 | **Launcher** | | |
 | Fuzzy app search with frecency | ✅ | ✅ |
-| Global hotkey, double-tap modifier, Hyper key | ✅ | ✅ |
+| Global hotkey, double-tap modifier | ✅ | ✅ |
+| Hyper key | ✅ | ◐ 4 keys to choose from, Raycast has more |
 | Hotkey and alias for any command | ✅ | ✅ |
 | Favourites, hide / disable items, fallback commands | ✅ | ✅ |
 | Compact mode, search history, Vim / Emacs keys, game mode | ✅ | ✅ |
@@ -164,11 +168,12 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Layouts that arrange several apps | ✅ | ◐ config only |
 | Custom size and position presets | ✅ | ⬜ |
 | **Apps and system** | | |
-| App hotkeys (launch / focus / toggle), quit, auto-quit | ✅ | ✅ |
+| App hotkeys (launch / focus / toggle), quit, force-quit | ✅ | ✅ |
+| Auto-quit idle apps | ✅ | ◐ one duration for all apps |
 | Power, volume, Wi-Fi, Bluetooth, Explorer, drives | ✅ | ✅ |
 | Windows Settings pages, Windows Run | ✅ | ✅ |
 | Script commands | ✅ | ✅ |
-| Several script folders managed in Settings | ✅ | ⬜ |
+| Several script folders, per-script settings in Settings | ✅ | ⬜ |
 | **Extensions** | | |
 | Run Raycast store extensions | ✅ | ✅ |
 | Store browser and install | ✅ | ✅ |
@@ -180,6 +185,7 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | **AI** | | |
 | Quick AI from the search bar | ✅ | ✅ on your Claude Code login |
 | AI chat with saved history | ✅ | ◐ follow-ups, not saved |
+| Model choice | ✅ many, local models, own API keys | ◐ Claude Haiku / Sonnet / Opus |
 | AI commands, agents, MCP servers, automations | ✅ | ⬜ |
 | Dictation | ✅ | ⬜ |
 | **Built-in tools** | | |
@@ -193,7 +199,8 @@ The open items are tracked in [TODO.md](TODO.md) and [docs/roadmap.md](docs/road
 | Settings window | ✅ | ✅ |
 | Search in Settings, export / import / backup | ✅ | ⬜ |
 | Installer | ✅ | ✅ |
-| Auto-update | ✅ | ⬜ |
+| Auto-update, About page with diagnostics | ✅ | ⬜ |
+| System proxy | ✅ | ◐ translator only |
 | Hotkeys over admin windows | ✅ | ⬜ |
 | Account, cloud sync, organizations | ✅ | not planned |
 | **Openness** | | |

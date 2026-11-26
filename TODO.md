@@ -1,7 +1,8 @@
 # procast TODO: what Raycast still has that procast doesn't
 
 Source: the Raycast **2.12.0** settings window (labels and options read from its installed settings pages,
-`frontend/*-settings-view-*.js`), compared with procast's code on `design-system` (2026-11-13); ticks updated for the clipboard, snippets and emoji work (2026-11-14).
+`frontend/*-settings-view-*.js`), compared with procast's code on `design-system` (2026-11-13); ticks updated for the clipboard, snippets and emoji work (2026-11-14),
+and against `main` for file search, window management, built-in tools and Raycast 2.12.1 (2026-11-18).
 Extensions (runtime, store, updates, OAuth, `AI.ask`, dev mode, per-extension settings) are left out on purpose.
 IDs in brackets point at [docs/roadmap.md](docs/roadmap.md) where the item already has a row; **new** means it appeared since the 2.10.1 audit.
 
@@ -44,20 +45,20 @@ Size: **S** under a day · **M** a few days · **L** a week or more.
 - [ ] Content index on network and removable drives (toggle) — S
 - [ ] OCR page limit for scanned PDFs — S, needs A7
 - [ ] Stop indexing when the index would not fit on disk — S
-- [ ] Ignore patterns: `.gitignore` / `.ignore` and globs, not only names [J1] — S
-- [ ] Hidden files toggle; network and removable drives toggle [J2] — S
-- [ ] Detail pane: preview, size, modified date [J3] — M
-- [ ] Index status: disk usage, total entries, files / folders / symlinks / invalid, last crawl duration [J4] — S
-- [ ] Rebuild index, reset file-search settings to defaults, restore a removed folder — S
+- [x] Ignore patterns: `.gitignore` / `.ignore` and globs, not only names [J1] — S
+- [ ] Hidden files toggle; network and removable drives toggle [J2] — S (hidden and removable done; network drives left)
+- [x] Detail pane: preview, size, modified date [J3] — M
+- [x] Index status: disk usage, total entries, files / folders / symlinks / invalid, last crawl duration [J4] — S
+- [ ] Rebuild index, reset file-search settings to defaults, restore a removed folder — S (rebuild done)
 
 ## Window management
-- [ ] Quarters, sixths, top/bottom thirds, reasonable size [K1] — S
-- [ ] Window gap and screen gap [K2] — S
-- [ ] Cycle on repeat: Left Half again goes ½ → ⅔ → ⅓; cycle displays on repeat [K3] — S
-- [ ] Minimize, minimize others, close others, toggle full screen [K4] — S
-- [ ] Virtual desktops: move window to next desktop, auto-close empty ones [K5] — M
+- [x] Quarters, sixths, top/bottom thirds, reasonable size [K1] — S
+- [x] Window gap and screen gap [K2] — S
+- [x] Cycle on repeat: Left Half again goes ½ → ⅔ → ⅓; cycle displays on repeat [K3] — S
+- [ ] Minimize, minimize others, close others, toggle full screen [K4] — S (all but toggle full screen)
+- [x] Virtual desktops: move window to next desktop, auto-close empty ones [K5] — M
 - [ ] Custom commands: own size presets (tiny / small / medium / large / extra large) and positions — M
-- [ ] Layouts: one command opens and arranges several apps, quicklinks, files or URLs (with arguments); "Add visible windows" captures the current arrangement; reorder front/back [K6] — M
+- [ ] Layouts: one command opens and arranges several apps, quicklinks, files or URLs (with arguments); "Add visible windows" captures the current arrangement; reorder front/back [K6] — M (layouts run from config.toml; Settings page and "Add visible windows" left)
 
 ## Applications
 - [ ] Auto Quit: "quit apps closed to tray" option (today procast only closes windows politely) — S
@@ -83,24 +84,27 @@ Size: **S** under a day · **M** a few days · **L** a week or more.
 ## Settings window and app
 - [ ] Search box in Settings [P1] — S
 - [ ] Export / import settings; scheduled backup (daily / weekly / monthly) to a folder, keep latest / last 5 / last 10 [P2] — S
-- [ ] System proxy and extra CA certificate for network calls [P3] — S
+- [ ] System proxy and extra CA certificate for network calls [P3] — S (translator has its own proxy)
 - [ ] Sync between PCs through a folder (OneDrive / Git), procast's answer to Cloud Sync [P4] — M
 - [ ] About page: version, diagnostics ("all checks passed"), updates [P6] — S
-- [ ] Auto-update + installer (winget / MSIX) [P6] — M
+- [ ] Auto-update + installer (winget / MSIX) [P6] — M (Inno Setup installer done; auto-update and winget left)
 - [ ] Hotkeys over elevated windows (UIAccess helper, needs signing) [P5] — L
 
 ## Built-in tools Raycast ships
-- [ ] Translator, with saved "translate to…" commands; output opens the translator or replaces the selection in place [O3] — S
-- [ ] Dictionary / define word [O4] — S
-- [ ] Calendar: upcoming meetings, join link, reminder 2–30 min before, confirm before joining, ignore keywords [O5] — M
+- [x] Translator, with saved "translate to…" commands; output opens the translator or replaces the selection in place [O3] — S
+- [x] Dictionary / define word [O4] — S
+- [x] Calendar: upcoming meetings, join link, reminder 2–30 min before, confirm before joining, ignore keywords [O5] — M
 - [ ] Contacts search, sort by first or last name — M
-- [ ] Focus sessions: block apps and sites, snooze 1–10 min [O6] — M
-- [ ] Floating notes [O1] — M
-- [ ] Screenshot search: several folders, retention 1 day … unlimited, OCR [O2] — M
-- [ ] Timer / stopwatch [O7] — S
+- [x] Focus sessions: block apps and sites, snooze 1–10 min [O6] — M
+- [x] Floating notes [O1] — M
+- [x] Screenshot search: several folders, retention 1 day … unlimited, OCR [O2] — M
+- [x] Timer / stopwatch [O7] — S
 - [ ] **new** Taskbar widget: performance monitor and calendar, docked top / bottom / left / right, flyout — M
 - [ ] **new** Browser companion: search open tabs, history, bookmarks; paired-browser list and diagnostics [M3] — L (open tabs and prefer-existing-tab done; history, bookmarks, diagnostics left)
-- [ ] Auto HDR while a game is in front [O8] — S
+- [x] Auto HDR while a game is in front [O8] — S
+
+## Beyond Raycast
+- [x] YouTube Music: search, library cover grid, Now Playing, quick actions, tray player (Raycast's extension is macOS-only)
 
 ## AI (beyond the Quick AI / Ask AI that exist)
 - [ ] AI commands: saved prompts over selection or clipboard; create, duplicate, disable, export [U2] — M
